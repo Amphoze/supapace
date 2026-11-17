@@ -6,5 +6,5 @@
 set -euo pipefail
 src=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 mkdir -p "$src/bin"
-(cd "$src" && CGO_ENABLED=0 go build -o "$src/bin/check-public" ./cmd/check-public)
+(cd "$src" && CGO_ENABLED=0 go build -buildvcs=false -o "$src/bin/check-public" ./cmd/check-public)
 exec "$src/bin/check-public" "$@"

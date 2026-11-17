@@ -38,10 +38,10 @@ setup:
 
 build:
 	@mkdir -p $(BIN)
-	@if ls cmd/*/*.go >/dev/null 2>&1; then CGO_ENABLED=0 $(GO) build -o $(BIN)/ ./cmd/...; fi
+	@if ls cmd/*/*.go >/dev/null 2>&1; then CGO_ENABLED=0 $(GO) build -buildvcs=false -trimpath -o $(BIN)/ ./cmd/...; fi
 	@if [ -d test/reach ]; then CGO_ENABLED=0 $(GO) test -c -tags reach -o $(BIN)/reach.test ./test/reach; fi
 
-images:
+images: build
 	scripts/cache-images.sh "$(IMAGE_CACHE)"
 	@if [ -f deploy/gateway/Dockerfile ]; then \
 		docker build -t $(GATEWAY_IMAGE) -f deploy/gateway/Dockerfile . && \
