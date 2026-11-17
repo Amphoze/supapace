@@ -1,0 +1,23 @@
+# build output
+/bin/
+/dist/
+*.test
+*.out
+
+# local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!testdata/**/*.key
+
+# local state
+/.data/
+/tmp/
+node_modules/
+
+# editors
+.idea/
+.vscode/
+*.swp
