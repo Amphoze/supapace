@@ -204,3 +204,33 @@ patch surface, backup model) were verified against upstream source first.
 - The suite needs from the system: the CLI's JSON documents, the admin socket, the dev CA,
   the rendered key-set file of each project's PostgREST, and a unique nft `comment` on
   every rule a control deletes.
+
+### 2026-11-18 — network experiments (`test/harness/experiments/e01, e02, e03, e10, e11`)
+
+- Scripts that reproduce, inside a bare node, the kernel and Docker facts the network design
+  rests on. Each prints `VERDICT ENN: confirmed|fallback|unknown — …`; run with
+  `docker exec -i <node> sh -s < test/harness/experiments/eNN.sh`. Re-run them when the
+  kernel, nftables or the node's Docker version changes. Every "blocked" result in them has
+  a control that connects when one rule is removed.
+- Facts established (Docker 29.10 in the node, nftables 1.1):
+  - bridge-family conntrack, the bridge-name wildcard and the masked address match work in
+    a nested network namespace; open connections survive a conntrack flush or table reload;
+  - `iifkind`/`oifkind "bridge"` match named and unnamed bridges; a macvlan child or a plain
+    veth is treated like an uplink;
+  - Docker's isolated gateway mode keeps the embedded resolver, gives the bridge no IPv4
+    address, and the bridge still has an IPv6 link-local address; `network inspect` reports
+    the gateway as an invalid address;
+  - with the **userland proxy on** (the default) dockerd never loads `br_netfilter` and
+    never touches the bridge-nf switches; with the proxy off it loads the module and turns
+    `bridge-nf-call-iptables` back on at every network create, which diverts bridged frames
+    into the routed chains. Published ports need an explicit IPv4 bind
+    (`-p 0.0.0.0:443:8443`), otherwise the proxy also serves IPv6 clients and the container
+    sees them all with the bridge address;
+  - a static address outside the network's `--ip-range` is accepted and stable; dynamic
+    members never leave the range; Docker does not reserve a stopped member's address, and
+    `network connect --ip` succeeds even while a running container holds the address (only
+    the start fails);
+  - a bridge member with Docker's default capabilities can take over a neighbour's address
+    with one ARP frame; with all capabilities dropped it cannot.
+- `e10.sh` loads no kernel module in its default run; the proxy-off demonstration needs
+  `E10_LOAD_MODULE=1` and leaves `br_netfilter` loaded until reboot.
