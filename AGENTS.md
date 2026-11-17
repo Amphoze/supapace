@@ -103,3 +103,23 @@ patch surface, backup model) were verified against upstream source first.
   skips other entries; it refuses the set when no usable key remains, when a usable key is
   malformed or shares a kid, or when any entry carries private or symmetric key material.
   Key ids are RFC 7638 thumbprints.
+
+### 2026-11-17 — `internal/store`
+
+- Control-plane database layer on pgx over a unix socket: schema and one-shot migration
+  (serialised by an advisory lock), node row, projects, placement, the operation queue,
+  per-ref advisory locks, wrapped data keys, sealed secrets and project keys.
+- Placement: a per-node monotonic uid counter (a uid is never reused), the lowest free
+  network slice (released only at purge or abort), admission against the node's memory and
+  pids ceilings counting `provisioning`, `active`, `restarting` and `deleting` projects.
+  `EnsureNode` refuses changed address or uid ranges and applies changed ceilings.
+- Operations: `restart` and `delete` are accepted only for an `active` project with no open
+  operation; `RetryOperation` has the same guard. Step, failure and finish writes succeed
+  only in the states that allow them, so a worker that lost a race with an abort gets
+  `ErrConflict`. `MarkAborted` works from `provisioning`, and from `active` while the create
+  is aborting. A project ref is never reused.
+- `SetProjectState` has no transition rules: reaching `purged` or `aborted` goes through
+  `MarkPurged` / `MarkAborted`, which release the slice. Each held or waiting `LockRef` pins
+  one of the pool's 8 connections.
+- Tests run against a throw-away `postgres` container (`--network none`, unix socket,
+  removed by a detached watchdog) and are skipped without Docker.
