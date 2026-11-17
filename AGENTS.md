@@ -29,3 +29,36 @@ against Studio. GoTrue is deliberately absent; identity comes from an external O
 Skeleton only: licence, readme, agent notes, Go module. Architecture under design; the
 decisions that gate it (shared Realtime/Storage/pg-meta/edge-runtime viability, Studio
 patch surface, backup model) were verified against upstream source first.
+
+### 2026-11-17 — scaffolding, shared types, public gate
+
+- Public-content gate: `cmd/check-public` (Go, stdlib only), run through
+  `scripts/check-public.sh`. Modes: `--staged`, `--tree`, `--message FILE`,
+  `--range <rev-list args>`, `--tag OBJECT`. It refuses e-mail addresses, home-directory
+  paths, addresses outside the platform and documentation ranges, non-test host names and
+  every pattern of the operator's deny-list (`SUPAPACE_DENYLIST`, kept outside the
+  repository). It scans blobs as bytes (binary files, invalid UTF-8, UTF-16, CRLF and
+  symlink targets included), path names, whole commit messages and commit identities, and
+  fails closed on a missing, unreadable, empty or non-compiling deny-list and on any git
+  error. Findings show file, line and rule only. Exact exceptions live in
+  `scripts/public-allow.txt`, each with a reason; the file is read from the index.
+  What a pattern gate cannot catch is listed in the package comment.
+- `make setup` installs the hooks: `pre-commit`, `commit-msg`, `pre-merge-commit` and
+  `pre-push` (the last scans exactly what is being pushed: every commit's identities,
+  headers, message and introduced blobs, tags and ref names). Commits are made with
+  `TZ=UTC` under a noreply identity; anything else is refused at commit (cherry-pick and
+  rebase run no commit hook) and at push.
+- `scripts/test-check-public.sh` runs the gate's end-to-end cases (`make gate-test`, part
+  of `make unit`).
+- `internal/nodecfg`: `node.json` type, fixed defaults and validation (overlapping networks,
+  uid range, domain), slice and platform-address arithmetic, every on-disk path (`Paths`,
+  rootable for tests), and `images.lock` (upstream images pinned by multi-platform digest,
+  embedded).
+- `internal/routes`: the gateway route-file type with strict parse and marshal. Unknown
+  fields, trailing data, an empty domain and a generation below 1 are rejected. Case-variant
+  and duplicate JSON keys stay accepted (the file is written by a trusted local component).
+- `go.mod` pins `github.com/jackc/pgx/v5`, the only dependency; `internal/store/doc.go` keeps
+  the requirement until the store package lands.
+- `Makefile`: `setup build images unit gate-test node-up node-bare node-down reach
+  reach-reboot reach-host measure public-check`; reach runs are bracketed by a suite reset
+  whose failure fails the target.

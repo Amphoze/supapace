@@ -1,0 +1,28 @@
+#!/bin/sh
+# Refuse a push whose ref names, tag objects or new commits (identities, messages,
+# paths, blobs) break the public-content gate. stdin: <local ref> <local sha> <remote ref> <remote sha>
+# Commits and tags are made with TZ=UTC: an author, committer or tagger time zone
+# other than +0000 is refused.
+gate="$(git rev-parse --show-toplevel)/scripts/check-public.sh" || exit 1
+zero=$(git hash-object --stdin </dev/null | tr 0-9a-f 0)
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+# Commits the destination already holds ($2 is the push URL) are not scanned again.
+# ls-remote must not read the ref lines on stdin; at most 2000 shas are passed on.
+have=$(git ls-remote "$2" 2>/dev/null </dev/null | cut -f1 | grep -E '^[0-9a-f]{40,64}$' | sort -u | head -n 2000 |
+	while read -r s; do git cat-file -e "$s^{commit}" 2>/dev/null && printf ' %s' "$s"; done)
+while read -r lref lsha rref rsha; do
+	[ "$lsha" = "$zero" ] && continue # deletion
+	printf '%s\n' "$rref" >"$tmp" && "$gate" --message "$tmp" </dev/null || exit 1
+	obj=$lsha
+	while [ "$(git cat-file -t "$obj")" = tag ]; do # annotated tag: tagger and message, then peel
+		"$gate" --tag "$obj" </dev/null || exit 1
+		git cat-file tag "$obj" >"$tmp" || exit 1
+		obj=$(sed -n 's/^object //p;/^$/q' "$tmp")
+	done
+	commit=$(git rev-parse --verify -q "$obj^{commit}") || exit 1
+	# Everything the destination does not hold: for a new ref, or a forced update
+	# over a commit unknown here, that is the history down to what it does hold.
+	# shellcheck disable=SC2086
+	"$gate" --range "$commit" ${have:+--not $have} </dev/null || exit 1
+done

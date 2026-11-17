@@ -1,0 +1,6 @@
+# Exact tokens the public-content gate accepts (cmd/check-public). One token per
+# line, each with the reason. Keep this list short: every entry is a reviewed exception.
+github.com        # Go module paths (go.mod, go.sum, imports)
+golang.org        # Go module paths in go.sum
+gopkg.in          # Go module paths in go.sum
+www.apache.org    # licence URL in LICENSE
