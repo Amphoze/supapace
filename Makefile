@@ -17,11 +17,11 @@ REACH_FLAGS := -test.v -test.parallel 1
 REACH_ARGS ?=
 
 # Suite reset, run on the node before and after every reach run whatever its exit
-# status: drop the drift hold, reload our tables, remove every scratch object
+# status: drop the drift hold and any failpoint, reload our tables, remove every scratch object
 # labelled supapace.test=1 and the second source address of test 17. A failed rules
 # load stops at once; any other failed step fails the reset after the rest has run.
 # $(1) is the supapaced binary.
-reset = s=0; rm -f /run/supapace/drift-hold || s=1; $(1) nft load || exit 1; \
+reset = s=0; rm -f /run/supapace/drift-hold /run/supapace/failpoint || s=1; $(1) nft load || exit 1; \
 	docker ps -aq --filter label=supapace.test=1 | xargs -r docker rm -f || s=1; \
 	docker network ls -q --filter label=supapace.test=1 | xargs -r docker network rm || s=1; \
 	ip -o addr show to 198.51.100.7/32 | while read -r _ d _; do ip addr del 198.51.100.7/32 dev "$$d" || exit 1; done || s=1; \

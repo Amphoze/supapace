@@ -172,3 +172,35 @@ patch surface, backup model) were verified against upstream source first.
   `conn N LEN` + LEN bytes, prints `listening` once bound and logging, never completes
   authentication (clients need their own timeout) and leaves no record for a connection
   that sends nothing.
+
+### 2026-11-18 — reach suite: helpers and path tests
+
+- `test/reach` is the end-to-end suite that runs as root on a node (`make reach`). It is
+  written ahead of the system under test: until the daemon and CLI exist the tagged binary
+  stops in `TestMain` naming what is missing. `helpers_test.go` is untagged, so
+  `go test ./...` runs the golden JSON-shape test and the helper self-tests
+  (`helpers_self_test.go`, `!reach`); the suite itself is in files tagged `reach`.
+- Rules the helpers enforce, which later tests must keep:
+  - a refusal by the gateway is asserted by its error body (`invalid_apikey`,
+    `invalid_token`, `no_apikey`, `body_too_large`) and fails on any `PGRST` code — the
+    upstream refuses the same tokens, so a status code alone proves nothing about the
+    gateway;
+  - every refusal is preceded by an accepted twin on the same path; "not reached" from
+    `postgrestDirect` or a failed dial is never a refusal without a control that reaches;
+  - `probe` requires the verdict line and the exit code of `sp-probe` to agree and fails
+    the test on a bad namespace, a missing binary or an `error` verdict;
+  - failure text is redacted (no query, token, key or password in test output);
+  - every created object carries `supapace.test=1`; every external command has a
+    deadline and is killed with its process group; cleanups are idempotent.
+- Fixture projects A and B persist between runs (so a reboot test has tenants that existed
+  before it) and are rebuilt when the daemon binary changes; `fixtureScratch` holds one
+  extra project at a time and removes it whatever state it is in.
+- The suite reset (in `TestMain` and in the Makefile, before and after the binary) removes
+  the drift hold and the failpoint file, reloads the rules and removes labelled objects.
+- Tests so far: signature and project separation (01), key class and role, including the
+  bearer defects only the gateway refuses (02), `auth.uid()` (08), gateway headers (12),
+  GraphQL (15), gateway limits (17). The defective bearers come from one helper,
+  `gatewayOnlyBearers`, checked by a self-test to carry exactly one defect each.
+- The suite needs from the system: the CLI's JSON documents, the admin socket, the dev CA,
+  the rendered key-set file of each project's PostgREST, and a unique nft `comment` on
+  every rule a control deletes.
