@@ -62,3 +62,14 @@ patch surface, backup model) were verified against upstream source first.
 - `Makefile`: `setup build images unit gate-test node-up node-bare node-down reach
   reach-reboot reach-host measure public-check`; reach runs are bracketed by a suite reset
   whose failure fails the target.
+
+### 2026-11-17 — `internal/dockerx`
+
+- Drives the `docker` CLI by argv only (no shell): `Run`, `RunInput`, `InspectContainer`,
+  `InspectNetwork`, `ListContainers`, `ServerVersion`. 60 s default timeout (an earlier
+  caller deadline wins); on timeout or cancel the whole process group is killed.
+- An inspect returns `nil, nil` only when docker itself reports the object as absent, in its
+  own wording at the start of stderr. An unreachable daemon, a missing binary or any other
+  failure is an error: "does not exist" and "could not ask" are never confused.
+- Object names are passed after `--`. Errors name only the docker verb and carry at most
+  64 KiB of stderr, never later arguments or environment values.
