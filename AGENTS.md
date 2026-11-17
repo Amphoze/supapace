@@ -147,3 +147,28 @@ patch surface, backup model) were verified against upstream source first.
   for amd64 and arm64; the package does not build elsewhere.
 - Tests that need root and XFS skip on a workstation and run as root on the node; the
   `reach`-tagged file holds the quota tests.
+
+### 2026-11-18 — node harness and `sp-probe`
+
+- `make node-up` / `node-bare` run the node as a privileged Docker-in-Docker container
+  (`NODE ?= sp-node`, 4 GiB, stop timeout 60 s): loop-backed XFS with user and project
+  quotas, then init → rules load → dockerd → cached image archives → supervisor loop; `bare`
+  stops after the filesystem and a bare dockerd. Set `NODE` to run several side by side.
+  A corrupt image archive fails the boot; the node reclaims its own cgroup's file cache and
+  never touches host-wide settings. Host side effects: the `xfs` module, one loop device
+  per running node, the shared node image tag and the image cache directory.
+- Image archives are re-tagged in their `index.json`, so digest references resolve after
+  `docker load` (containerd image store).
+- `sp-probe tcp|udp|dns` prints one verdict line — `connected`, `answered`,
+  `refused <errno>`, `unreachable <errno>`, `timeout`, `negative <rcode>`, `error …` — and
+  exits 0 / 1 / 2 / 3 for reached / refused or negative / timeout / usage or internal
+  error. An internal failure is never 1. **A caller must require the line and the exit code
+  to agree**: through `nsenter`, a bad namespace path also exits 1 and a missing binary 127.
+  UDP probes carry a nonce; a unicast target must answer from the probed address, multicast
+  and broadcast targets from any. `dns` exits 0 only for NOERROR with an address of the
+  queried type.
+- `sp-probe listen` binds exactly one address family and echoes UDP from the address the
+  datagram was sent to. `sp-probe fakepg` logs every byte a client sends as records
+  `conn N LEN` + LEN bytes, prints `listening` once bound and logging, never completes
+  authentication (clients need their own timeout) and leaves no record for a connection
+  that sends nothing.

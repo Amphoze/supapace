@@ -2,7 +2,9 @@
 SHELL := bash
 GO ?= go
 BIN := bin
-NODE := sp-node
+# Node container name; set NODE to run several harnesses side by side. Its two
+# volumes are $(NODE)-docker and $(NODE)-state; the node image is shared.
+NODE ?= sp-node
 NODE_IMAGE := supapace-node:local
 NODE_BIN := /opt/supapace/bin
 GATEWAY_IMAGE := supapace-gateway:local
@@ -60,22 +62,26 @@ node-bare: MODE := bare
 node-up node-bare:
 	docker build --build-arg NODE_IMAGE=$(NODE_BASE) -t $(NODE_IMAGE) test/harness/node
 	mkdir -p $(BIN) "$(IMAGE_CACHE)"
-	docker run -d --privileged --cgroupns private --memory 4g --name $(NODE) -e SP_NODE_MODE=$(MODE) \
-		-v sp-node-docker:/var/lib/docker -v sp-node-state:/var/lib/sp \
+	docker run -d --privileged --cgroupns private --memory 4g --stop-timeout 60 --name $(NODE) -e SP_NODE_MODE=$(MODE) \
+		-v $(NODE)-docker:/var/lib/docker -v $(NODE)-state:/var/lib/sp \
 		-v "$(CURDIR)/$(BIN)":$(NODE_BIN):ro -v "$(IMAGE_CACHE)":/images:ro $(NODE_IMAGE)
-	@for i in $$(seq 120); do docker exec $(NODE) docker info >/dev/null 2>&1 && exit 0; sleep 1; done; \
+	@for i in $$(seq 300); do \
+		docker exec $(NODE) sh -c 'test -e /run/sp-node-ready && docker info' >/dev/null 2>&1 && exit 0; \
+		if [ "$$(docker inspect -f '{{.State.Running}}' $(NODE))" != true ]; then \
+			echo "node: $(NODE) stopped during boot:" >&2; docker logs --tail 20 $(NODE) >&2; exit 1; fi; \
+		sleep 1; done; \
 		echo "node: docker did not come up" >&2; exit 1
 
 # Volumes go too: a kept Docker volume would leave stale proj-* networks behind.
 node-down:
 	-docker rm -f $(NODE)
-	-docker volume rm sp-node-docker sp-node-state
+	-docker volume rm $(NODE)-docker $(NODE)-state
 
 reach: build
 	$(call node_reach,$(REACH_ARGS))
 
 reach-reboot: build
-	docker restart $(NODE)
+	docker restart -t 60 $(NODE)
 	@for i in $$(seq 180); do docker exec $(NODE) test -S /run/supapace/admin.sock && exit 0; sleep 1; done; \
 		echo "node: admin socket did not appear" >&2; exit 1
 	$(call node_reach,-test.run 'TestReach05_AfterReboot|TestReach03' $(REACH_ARGS))
