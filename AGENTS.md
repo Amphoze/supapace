@@ -73,3 +73,17 @@ patch surface, backup model) were verified against upstream source first.
   failure is an error: "does not exist" and "could not ask" are never confused.
 - Object names are passed after `--`. Errors name only the docker verb and carry at most
   64 KiB of stderr, never later arguments or environment values.
+
+### 2026-11-17 — `internal/secrets`
+
+- Envelope encryption: a node key-encryption key (KEK) in a 0400 file, one data key per
+  project wrapped by the KEK with the project ref bound, project secrets sealed under the data
+  key with `(ref, name)` bound. AES-256-GCM, random 12-byte nonces. Every authentication
+  failure returns the same error; no error carries key, plaintext or ciphertext bytes.
+- `ref` must be 20 lower-case alphanumerics and `name` non-empty in all four seal/wrap calls.
+- `GenerateKEK` writes a temporary file, syncs it and hard-links it into place: an existing
+  file is never modified. If the directory sync fails, the new key is removed again so a
+  retry starts clean. `LoadKEK` refuses anything but a regular 0400 file of the right size
+  and owner, opened without following a final symlink and without blocking.
+- The key directory must be root-owned; the caller removes `.<name>.tmp-*` leftovers of a
+  crashed run before generating.
