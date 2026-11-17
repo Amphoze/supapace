@@ -87,3 +87,19 @@ patch surface, backup model) were verified against upstream source first.
   and owner, opened without following a final symlink and without blocking.
 - The key directory must be root-owned; the caller removes `.<name>.tmp-*` leftovers of a
   crashed run before generating.
+
+### 2026-11-17 — `internal/jwtx`
+
+- RS256 tokens only; the verifier fixes the algorithm. `Verify(token, keys, now)` checks, in
+  order: size (8 KiB) and alphabet, three unpadded base64url segments, strict JSON with
+  duplicate members refused at any depth (depth limit 64), `alg`, no `crit`, exactly one
+  supplied key with the token's `kid`, the signature, then `exp`, `nbf` (30 s leeway), `role`
+  and `sub`. Numeric dates are integers. It reads no clock and starts no goroutine.
+- `CheckRole` binds the verifying key's class to the claimed role: the anon key may claim
+  only `anon`, the service key only `service_role`, an issuer key only `authenticated` or a
+  role the project lists — never a reserved or platform role, even if listed. Callers must
+  call it after every `Verify`.
+- `ParseJWKS` (64 KiB cap) keeps RSA signature keys of 2048–4096 bits with `e = 65537` and
+  skips other entries; it refuses the set when no usable key remains, when a usable key is
+  malformed or shares a kid, or when any entry carries private or symmetric key material.
+  Key ids are RFC 7638 thumbprints.
