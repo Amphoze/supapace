@@ -123,3 +123,27 @@ patch surface, backup model) were verified against upstream source first.
   one of the pool's 8 connections.
 - Tests run against a throw-away `postgres` container (`--network none`, unix socket,
   removed by a detached watchdog) and are skipped without Docker.
+
+### 2026-11-18 — `internal/nodefs`
+
+- Root-side filesystem work of a node: `CreateProjectDir` (project directory with `data/`
+  and `sock/`, owned by the project's uid and gid, outer chown last so an interrupted
+  creation is resumed, a finished one is never touched again), `SetQuota`,
+  `RemoveEmptyProjectDir` (one non-recursive `unlinkat`), `WriteFile` (atomic rendering of
+  root-owned files below the render roots only) and `CheckRange` (the platform's id range
+  against passwd, group, subuid and subgid).
+- Everything below a project directory is reached by descriptor (`O_NOFOLLOW`, `fstat`
+  before acting) and only while the directory is still root-owned; root makes no path-based
+  call on a name a tenant can replace.
+- The disk limit is the XFS **user quota** on the project's uid: a block limit and an inode
+  limit of `max(65536, 256 × MiB)`. The project id and inherit flag are set for usage
+  accounting only and **no project limit is set** — a file's owner can tag files with any
+  project id, so a project limit could be spent by another tenant. `SetQuota` refuses to set
+  a limit unless user-quota accounting and enforcement are on, runs `xfs_quota` with
+  `LC_ALL=C`, treats any stderr output as failure (the tool exits 0 on errors) and reads the
+  limits back. `SetQuota(p, uid, 0)` clears.
+- Project ids must lie in [65536, 2^31−1]. `WriteFile` creates no directories, always
+  replaces its target and may leave `.<name>.tmp-*` after a crash. The ioctl constants are
+  for amd64 and arm64; the package does not build elsewhere.
+- Tests that need root and XFS skip on a workstation and run as root on the node; the
+  `reach`-tagged file holds the quota tests.
