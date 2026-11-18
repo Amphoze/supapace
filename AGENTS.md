@@ -349,3 +349,43 @@ patch surface, backup model) were verified against upstream source first.
   it: long-running containers are started detached and polled.
 - Known limit, unchanged: when a child exits while a descendant still holds its output pipe
   open, the call returns an error after the 2 s wait delay and the descendant is left running.
+
+### 2026-11-18 — `internal/pgconf`
+
+- Pure functions (no filesystem, network or process access; a test checks the imports)
+  that render what a project's cluster and PostgREST containers start with:
+  - `Overrides(gucs, memMB)` — the platform's override file: defaults merged with settings
+    from `GUCAllowList` (`max_connections` 16–400, `shared_buffers` 16 MB to 40 % of
+    `memMB`, `effective_cache_size` between `shared_buffers` and `memMB`,
+    `cron.max_running_jobs` 1–32, `archive_timeout` 30–3600 s, `work_mem`,
+    `maintenance_work_mem`). `memMB` is the cluster container's memory limit; the defaults
+    need at least 384. Values are 1–64 bytes of `[A-Za-z0-9.]`; **a number starting with
+    `0` followed by a digit or letter is refused** — the server reads such values as octal
+    or hex. Names are case-sensitive.
+  - `OverrideFile` (`zz-supapace.conf`) is the name the override file is written under: the
+    server reads the image's include directory in byte order and a later file wins, so the
+    platform's file must sort last. **Call `SortsLast` on the directory's file names before
+    rendering.**
+  - `CommandLine(imageConf)` — the `-c name=value` pairs that pin `hba_file`, `ident_file`
+    and the three preload lists on the command line, read from the image's main file; a
+    file in the include directory cannot move them. (`pg_settings.source` shows `override`
+    for the two files and `command line` for the lists.)
+  - `HBA(slice)`, `Ident()` — no `trust` line; the platform's roles cannot connect over
+    TCP; the one `peer` line is the socket-only backup role.
+  - `Supautils(image, outbound)` — the image's file with the backup role added to the
+    reserved roles and, unless outbound access is enabled, the network-capable extensions
+    removed from the privileged list. This is a product default, not a boundary. A test
+    pins the image's full extension list so that an image bump forces a look.
+  - `Passwd`, `Group` — the image's files with the `postgres` entry moved to the project's
+    ids (the image needs an entry for the uid it runs as).
+  - `PostgREST(c)` — its configuration; the password is percent-encoded byte by byte (the
+    pinned PostgREST's parser treats `$` specially) and the connection string carries
+    `require_auth=scram-sha-256`, which the pinned version honours: it sends no password
+    to a server that asks for cleartext.
+- Checked on the pinned images: every accepted boundary value passes `postgres -C`; a start
+  with only rendered files takes all settings from the platform's file even with
+  conflicting values planted in an image file. `postgres -C` validates one setting per run
+  (several `-C` flags print nothing and still exit 0) and does not validate settings of
+  preloaded libraries.
+- The PostgREST container's command is `/bin/postgrest <config file>` (the image has no
+  entrypoint).
