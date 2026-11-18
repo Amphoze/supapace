@@ -1827,3 +1827,80 @@ Known limits: temporaries left by a killed process stay in the spool and beside 
 consumer must ignore and expire .tmp-* entries); a Go runtime fatal error, or a shell that cannot
 fork, exits 2, which the server reads as "not in the archive"; whatever the cluster writes to the
 spool or the restore spool is its own and is checked again by the platform's jobs.
+
+### 2026-11-19 — internal/s3x: minimal object-store client; sp-probe s3
+
+internal/s3x is the only client of the S3-compatible object store: signature version 4, one
+bucket per client, only the calls the off-site copy needs.
+
+- Config{Endpoint, Region, Bucket, PathStyle, AccessKey, SecretKey, CAPEM, Addrs, Timeout}.
+- New(Config) (*Client, error): checks only, sends nothing. Refuses an endpoint that is not
+  https://name[:port], an invalid bucket name, an empty region, access key or secret, a
+  timeout <= 0, an invalid address and a CA bundle without a certificate.
+- Put(ctx, key, body, meta, ifAbsent) (versionID, error): one request; ifAbsent sends
+  If-None-Match: * (the conditional create).
+- Head(ctx, key, versionID) (Object, error); Get(ctx, key, versionID, w, max) (Object, error):
+  a body over max is an error (nothing written when the length is known, else cut at max).
+- List(ctx, prefix, token): one page of current objects; next is "" on the last page.
+- ListVersions(ctx, prefix, keyMarker, versionMarker): one page of versions and delete
+  markers in the store's order (by key, a key's versions newest first). Never re-sort by
+  Modified: some stores keep whole seconds.
+- CreateMultipart, UploadPart (part 1..10000), CompleteMultipart(..., etags, ifAbsent): the
+  write-once condition is evaluated at completion, never at create.
+- AbortMultipart(ctx, key, uploadID): refuses an empty upload id.
+- Sign(r, payloadSHA256, accessKey, secretKey, region, now): signs every header r carries and
+  sets r's escaped path and query to their canonical forms.
+- (*Client).HTTPClient(): a copy of the client's own HTTP client, for a request the caller
+  builds and signs with Sign (a probe's delete, a wrong-digest probe).
+- ErrExists (412, also a completion answered 200 with a PreconditionFailed document),
+  ErrNotFound (404), ErrDenied (any 403: a refused right, a wrong signature, an unknown key
+  and clock skew alike), ErrChecksum (400 BadDigest or XAmzContentSHA256Mismatch). Match
+  them with errors.Is.
+
+Callers' rules:
+- A sentinel means refused, nothing created. Any other error (a 5xx, a reset, a cut answer,
+  a timeout) is an unknown outcome: the object may exist. Retry the conditional create; an
+  ErrExists then is settled by Head and the stored sha256 metadata, never by overwriting.
+- A negative check satisfied by ErrDenied needs a positive control with the same credential.
+- Put and CompleteMultipart fail (not a sentinel) when the answer has no version id or
+  "null" (versioning off or suspended). Every write returns a version id to record.
+- A refused or failed completion leaves the upload open: abort it. A failed abort is left to
+  the bucket's abort-incomplete lifecycle rule.
+- Timeout bounds one call from the dial to the last body byte. Size it from the transfer
+  (a large Get needs a large Timeout), or pass a ctx.
+
+Key rule: a key is 1-1024 bytes with no leading or trailing "/" and no empty, "." or ".."
+segment; a listing prefix the same, but it may be empty or end in "/". Anything else is
+refused before a request: stores rewrite such names (a//b is stored as a/b, a trailing "/"
+makes a directory entry without a version), so two names could be one object.
+
+Connection rules: TLS 1.2 or later; CAPEM replaces the system roots; the certificate must
+match the endpoint name. With Addrs set, each connection tries the addresses in order and the
+name is never resolved (it is the TLS server name and Host only). No proxy, whatever the
+environment says. No redirect is followed; a 3xx is an error. No compressed answer is decoded.
+
+Bounds: response headers 64 KiB; an XML document 4 MiB (read no further); an error document
+64 KiB; error codes in messages are letters and digits only, at most 64. A listing entry
+outside the requested prefix, a truncated page without a new token, and a version page that
+hands back the markers it was asked with are errors. Paging that never ends with fresh
+markers is bounded only by the caller: cap pages or pass a ctx. Every request body carries
+Content-MD5 and its signed SHA-256: stores verify both when sent but need not require them.
+
+Never: no call deletes an object or a version. The one DELETE request is AbortMultipart's,
+which needs an upload id (TestNoObjectDeleteInPackage). Nothing of the keys, a signature or
+an Authorization header appears in an error.
+
+sp-probe s3 SUBCOMMAND (mkbucket, versioning, lock, lifecycle, put, get, head, rm, versions)
+drives a store for the harness, path style. The grammar is the comment at the top of
+cmd/sp-probe/s3.go: options, one verdict line per call, exits 0 ok, 1 refused (denied,
+not-found, exists, bad-digest), 2 timeout, 3 error. rm is the only destructive verb, for
+harness set-up keys; the product never runs sp-probe.
+
+Stand-in tests: TestStandin_* start the pinned stand-in image by digest, with a certificate
+made in the test, and run only with SUPAPACE_STANDIN_TEST=1. The image must already be in
+the local store. A detached watchdog removes the container (sp-test-s3x-standin-*) however
+the test process ends. Not to be confused with the suite's SUPAPACE_STANDIN and its
+needStandin(t).
+
+Known limits: the pinned stand-in accepts any region, refuses a key segment over 255 bytes
+(500), answers a.b/./c and ../ names with 400, and its write right includes delete.

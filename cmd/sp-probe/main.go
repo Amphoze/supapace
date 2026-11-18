@@ -23,6 +23,9 @@
 //	                                            chunk; --password-file and --salt are given
 //	                                            for the post-authentication modes and refused
 //	                                            for the others
+//	sp-probe s3 SUB … --endpoint URL --keys FILE --bucket B
+//	                                            object-store calls for the harness
+//	                                            (s3.go)
 //	sp-probe sys                                which system calls and socket types this
 //	                                            process may use (see below)
 //
@@ -231,6 +234,9 @@ var dispatch = command
 func command(args []string, stdout io.Writer) verdict {
 	if len(args) == 0 {
 		return errorVerdict("usage: no subcommand")
+	}
+	if args[0] == "s3" {
+		return s3Command(args[1:], stdout)
 	}
 	fs := flag.NewFlagSet("sp-probe "+args[0], flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
