@@ -169,9 +169,9 @@ patch surface, backup model) were verified against upstream source first.
   queried type.
 - `sp-probe listen` binds exactly one address family and echoes UDP from the address the
   datagram was sent to. `sp-probe fakepg` logs every byte a client sends as records
-  `conn N LEN` + LEN bytes, prints `listening` once bound and logging, never completes
-  authentication (clients need their own timeout) and leaves no record for a connection
-  that sends nothing.
+  `conn N LEN` + LEN bytes, prints `listening` once bound and logging, and leaves no
+  record for a connection that sends nothing (clients need their own timeout). Its modes
+  and socket rule are in the `sp-probe sys` entry below.
 
 ### 2026-11-18 — reach suite: helpers and path tests
 
@@ -486,3 +486,81 @@ patch surface, backup model) were verified against upstream source first.
 - Tests: `go test ./internal/pgsock/` runs without root; two tests need root and two need
   Docker (they start the pinned cluster image) and skip otherwise. A full pass takes about
   16 s, about 55 s with `-race`.
+
+### 2026-11-18 — `sp-probe sys`, `--device`, hostile `fakepg` modes
+
+- **`sp-probe sys`** prints `seccomp 0|1|2`, `nonewprivs 0|1`, `capeff <16 hex>`,
+  `capbnd <16 hex>` (this process's status), then one line per call in a fixed order:
+  getpid, unshare-user, keyctl, add_key, request_key, mount, bpf, perf_event_open,
+  userfaultfd, io_uring_setup, kexec_load, init_module, open_by_handle_at, clock_settime,
+  syslog, socket-icmp, socket-raw. Each call runs in its own short-lived, non-dumpable
+  child with arguments that change nothing when allowed. Each line is `sys NAME VERDICT`:
+  - `ok` — the call succeeded, or failed only in its own argument checks: it passed any
+    seccomp filter and the capability checks made before those. For mount, bpf,
+    perf_event_open, userfaultfd, io_uring_setup, open_by_handle_at and clock_settime this
+    means "passed the filter", not "would succeed".
+  - `errno 1 EPERM` — refused by a seccomp errno action or a missing capability;
+    `errno 13 EACCES` for socket-icmp (`net.ipv4.ping_group_range`). An LSM refusal also
+    reads as its errno.
+  - `signal 31 SIGSYS` — refused by a seccomp kill-process action.
+  - `unknown host SWITCH` — EPERM that a host-wide setting alone explains:
+    `io_uring_disabled`; `unprivileged_bpf_disabled` (kernels before 6.5);
+    `unprivileged_userfaultfd` (before 5.11); `unprivileged_userns_clone` — each counts when
+    set and not overridden by a capability held, and as not set when unreadable. Only while
+    CAP_SYS_BOOT or CAP_SYS_MODULE is held: `kexec_load_disabled`,
+    `kexec_load_limit_reboot`, `lockdown`, `modules_disabled` — these count as set when
+    unreadable (a container never sees the lockdown state).
+  - `unknown …` — anything else: another errno, another signal, a child failure, or no
+    answer within 2 s. A seccomp kill-thread action (`SCMP_ACT_KILL` in a Docker profile)
+    reads `unknown timeout`.
+  - A verdict holds for the probed arguments only; unshare-user probes
+    `clone(CLONE_NEWUSER)`. Exit 0 once every line is printed; exit 3 with one `error …`
+    line on a usage error or an unreadable status file.
+- **Consumers of `sys`:**
+  - "nothing but getpid succeeds" means every other line is not `ok`;
+  - "refused by the sandbox" may be claimed only for `errno …` and `signal 31 SIGSYS`;
+    `unknown host …` says nothing about the sandbox;
+  - lines required to differ between a confined run and its unconfined control must read
+    `errno 1 EPERM` or `signal 31 SIGSYS` confined and `ok` in the control; any `unknown …`
+    there fails the test, with the line as the diagnosis.
+- **`sp-probe tcp|udp HOST:PORT --device IFACE`** binds the socket to IFACE
+  (`SO_BINDTODEVICE`) before it connects or sends, also for multicast and broadcast
+  targets, so the probe leaves by that interface whatever the routes say. Usage error
+  (exit 3) when the name is empty or longer than 15 bytes, or with any other subcommand.
+  A failing setsockopt (no such device; a missing CAP_NET_RAW only before Linux 5.7) reads
+  `error … SO_BINDTODEVICE IFACE: setsockopt: …`, exit 3. From a member of a bridge the
+  node has no route back to, a bound probe to a node address times out whatever the
+  firewall does: such a probe needs a control on the same path to mean anything.
+- **`sp-probe fakepg --socket PATH --log FILE [--mode MODE] [--password-file F --salt HEX]`**
+  — a fake, untrusted Postgres backend on a Unix socket.
+  - Before it binds: a stale socket at PATH (a connect to it is refused) is removed. A live
+    socket (a connect succeeds; that server sees one connection that sends nothing), any
+    other file, or a socket that cannot be tried makes it fail with exit 3. **Start one
+    fake per path at a time.**
+  - `conn N` numbers accepted connections, and a connection that sends nothing leaves no
+    record: count connections by records and read the log by `LEN`.
+  - On SIGTERM or SIGINT it exits 0 and removes its socket only if PATH still holds the
+    socket it bound. It reaps nothing, so it can run as a container's init.
+  - It declines SSL and GSS encryption requests and never closes a connection first. What a
+    mode streams stops after 1 GiB per connection; the connection is then held.
+  - Modes before authentication (a client never authenticates): `sasl` (default, the
+    request then nothing), `cleartext`, `md5`, `authok` (AuthenticationOk without any
+    exchange; queries get no answer), `sasl-iter` (a server-first message with a random
+    salt and ten million iterations), `huge` (a header announcing 1 GiB, then its body),
+    `flood` (ParameterStatus and NoticeResponse without end), `stall` (nothing), `trickle`
+    (the SASL request, one byte per second).
+  - Post-authentication modes need `--password-file` and `--salt` (refused for every other
+    mode): they complete a real SCRAM-SHA-256 exchange with that password, that salt and
+    4096 iterations, then answer a simple Query, or the Sync of an extended batch:
+    `row-huge` (a DataRow announcing 64 MiB), `rows-endless` (1 KiB DataRows without end),
+    `stall-auth` (no reply), `escapes` (notices and an error whose message, detail and hint
+    carry terminal escape sequences, control bytes and invalid UTF-8; every such field
+    starts with `fake-marker`).
+  - Put the fake's log on a size-limited tmpfs in tests that run the endless modes.
+- A plain client library, pointed at these modes without the bounds of `internal/pgsock`,
+  sends the password on `cleartext`, logs in on `authok`, allocates the announced size on
+  `huge` and `row-huge`, and otherwise waits for its own timeout.
+- `go test ./cmd/sp-probe/` installs seccomp filters in its own children; one case uses a
+  kill-process action. The test first checks that the child is non-dumpable and stops
+  before installing any filter if it is not, so a regression cannot run the host's crash
+  handler. One `--device` test row needs IPv6 on the host.

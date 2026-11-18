@@ -1,8 +1,10 @@
 // Command sp-probe is the static network helper of the reach suite. It runs inside
 // a container's network namespace (nsenter) or inside a container (docker exec).
 //
-//	sp-probe tcp HOST:PORT [--timeout 1s]      connect
-//	sp-probe udp HOST:PORT [--timeout 1s]      send a nonce, wait for it to be echoed
+//	sp-probe tcp HOST:PORT [--device IFACE] [--timeout 1s]
+//	                                            connect
+//	sp-probe udp HOST:PORT [--device IFACE] [--timeout 1s]
+//	                                            send a nonce, wait for it to be echoed
 //	sp-probe dns NAME --server ADDR [--type A|AAAA] [--timeout 1s]
 //	                                            one query over UDP
 //	sp-probe listen tcp|udp ADDR:PORT [--join GROUP]
@@ -14,10 +16,15 @@
 //	                                            (the kernel's choice if ADDR is unspecified).
 //	                                            A UDP echo to a unicast destination leaves
 //	                                            from that destination address
-//	sp-probe fakepg --socket PATH [--mode sasl|cleartext] --log FILE
-//	                                            fake Postgres backend on a Unix socket; mode
-//	                                            defaults to sasl; FILE gets every byte sent,
-//	                                            as "conn N LEN" + LEN bytes per chunk
+//	sp-probe fakepg --socket PATH [--mode MODE] --log FILE [--password-file F --salt HEX]
+//	                                            fake, untrusted Postgres backend on a Unix
+//	                                            socket; mode defaults to sasl; FILE gets every
+//	                                            byte sent, as "conn N LEN" + LEN bytes per
+//	                                            chunk; --password-file and --salt are given
+//	                                            for the post-authentication modes and refused
+//	                                            for the others
+//	sp-probe sys                                which system calls and socket types this
+//	                                            process may use (see below)
 //
 // tcp, udp and dns print exactly one verdict line on stdout and exit with its code:
 //
@@ -32,6 +39,12 @@
 //	error TEXT                3  usage, name resolution, a failing socket, bind or
 //	                             setsockopt call, a truncated or malformed DNS answer,
 //	                             or a panic ("error panic")
+//
+// --device binds the tcp or udp socket to interface IFACE (SO_BINDTODEVICE)
+// before it connects or sends, so the probe leaves by that interface whatever the
+// routes say; it is a usage error when empty, longer than 15 bytes or given to any
+// other subcommand. A failing setsockopt (no such device; a missing CAP_NET_RAW
+// only before Linux 5.7) is "error … SO_BINDTODEVICE IFACE: setsockopt: …", exit 3.
 //
 // An exit status alone is not trustworthy through nsenter or docker exec (a bad
 // namespace path exits 1, a Go runtime crash exits 2): callers must require the
@@ -48,13 +61,117 @@
 // "error" (EINVAL from connect), exit 3. listen --join needs a multicast-capable
 // route on the interface it joins on.
 //
-// listen and fakepg print "listening ADDR" once ready and run until killed.
+// listen and fakepg print "listening ADDR" once ready. listen runs until killed;
+// fakepg runs until killed, or until SIGTERM or SIGINT, on which it exits 0 (so
+// it can be a container's init: it reaps nothing) and removes its socket — only
+// if PATH still holds the socket it bound (same inode).
+//
+// fakepg first removes a stale socket at PATH (a connect to it is refused, as for
+// one a killed fake left behind). A live socket (a connect succeeds; that live
+// server sees one connection that sends nothing), any other file, or a socket
+// that cannot be tried makes it fail with exit 3; it never takes over a live
+// server's path. It declines SSL and GSS encryption requests with 'N'
+// and, after the startup packet, behaves as MODE says. It never closes a
+// connection first; whatever a mode streams stops after 1 GiB per connection,
+// and the connection is then held. The modes before authentication never let a
+// client authenticate; the post-authentication modes complete a real SCRAM login
+// first. Clients need their own timeout in every mode.
+//
+//	sasl          AuthenticationSASL (SCRAM-SHA-256), nothing more
+//	cleartext     AuthenticationCleartextPassword, nothing more
+//	md5           AuthenticationMD5Password with a 4-byte salt, nothing more
+//	authok        AuthenticationOk without any exchange, then ParameterStatus,
+//	              BackendKeyData and ReadyForQuery; queries get no answer
+//	sasl-iter     AuthenticationSASL; to the client-first message a server-first
+//	              message with a random salt and i=10000000; nothing more
+//	huge          a message header 'R' announcing 1 GiB, then its body of zeros
+//	flood         ParameterStatus and NoticeResponse messages without end, never an
+//	              authentication request
+//	stall         nothing
+//	trickle       AuthenticationSASL one byte per second
+//
+// The post-authentication modes need --password-file (its content less one
+// trailing newline is the password) and --salt (hex). They complete a SCRAM-SHA-256
+// exchange with that password, that salt and 4096 iterations (a wrong proof gets
+// ErrorResponse 28P01), send ReadyForQuery, and then answer a Query, or the Sync
+// of an extended-protocol batch (after ParseComplete and an empty
+// ParameterDescription), as follows:
+//
+//	row-huge      a one-column RowDescription and a DataRow whose column announces
+//	              64 MiB, streamed; nothing after it
+//	rows-endless  a one-column RowDescription and 1 KiB DataRows without end
+//	stall-auth    nothing, to any query
+//	escapes       two NoticeResponses and an ErrorResponse whose texts carry CSI and
+//	              OSC escape sequences, C1 CSI (as UTF-8 and as the raw byte 0x9b),
+//	              LF, CR, TAB, backspace, DEL and invalid UTF-8, in the message,
+//	              detail and hint fields; the error's message field is cut by a NUL,
+//	              so a second message field follows; every message, detail and
+//	              hint field starts with the marker "fake-marker"; then
+//	              ReadyForQuery
+//
+// sys prints four lines from /proc/self/status — "seccomp 0|1|2", "nonewprivs
+// 0|1", "capeff HEX16", "capbnd HEX16" — then one line per call, in this order:
+// getpid, unshare-user, keyctl, add_key, request_key, mount, bpf, perf_event_open,
+// userfaultfd, io_uring_setup, kexec_load, init_module, open_by_handle_at,
+// clock_settime, syslog (SYSLOG_ACTION_SIZE_UNREAD: reads nothing, needs
+// CAP_SYSLOG whatever dmesg_restrict says), socket-icmp (an AF_INET ping
+// socket), socket-raw (an AF_INET raw ICMP socket). Each line is
+// "sys NAME VERDICT":
+//
+//	ok                  permitted: the call succeeded, or failed with an errno only
+//	                    its own argument checks return (it passed the seccomp filter
+//	                    and the capability checks the kernel makes before those)
+//	errno N SYMBOL      denied: EPERM (a seccomp filter's errno action or a missing
+//	                    capability), or EACCES for socket-icmp
+//	                    (net.ipv4.ping_group_range)
+//	signal 31 SIGSYS    denied: the child was killed by a seccomp kill action
+//	unknown host SWITCH could not be determined: EPERM, and a host-wide setting is
+//	                    the only reason — without it, and without a seccomp filter,
+//	                    the call would have passed its permission checks for this
+//	                    process. For calls open to unprivileged processes:
+//	                    io_uring_disabled, unprivileged_bpf_disabled (kernels before
+//	                    6.5), unprivileged_userfaultfd (before 5.11),
+//	                    unprivileged_userns_clone, each when set and not overridden
+//	                    by a capability held. For calls that need a capability on
+//	                    every host, only while it is held: kexec_load_disabled,
+//	                    kexec_load_limit_reboot (0) or lockdown with CAP_SYS_BOOT for
+//	                    kexec_load, modules_disabled with CAP_SYS_MODULE for
+//	                    init_module; without the capability EPERM is a denial.
+//	                    While the capability is held, a setting that cannot be read
+//	                    counts as set (a container never sees the lockdown file);
+//	                    otherwise an unreadable setting counts as not set
+//	unknown DETAIL      could not be determined: any other errno ("unknown errno 38
+//	                    ENOSYS"), signal or failure, or no answer within 2 s
+//
+// For a consumer: "ok" means the call went through; "errno …" and "signal 31
+// SIGSYS" mean it was refused for this process; "unknown host SWITCH" means it
+// was refused, but by a host setting, so the line says nothing about the sandbox;
+// any other "unknown …" means the probe could not tell. A seccomp kill-thread
+// action — what SCMP_ACT_KILL means in a Docker profile — leaves the child hung
+// and reads "unknown timeout"; a profile should use kill-process or an errno
+// action. An LSM denial (AppArmor's user-namespace mediation, for one) reads as
+// its errno, EACCES or EPERM; it is not handled as a host switch.
+//
+// Every call runs in its own short-lived, non-dumpable child process (a child
+// killed by a seccomp kill action dumps no core), with arguments that change
+// nothing when the call is allowed. unshare-user probes clone(2) with
+// CLONE_NEWUSER — the child is created in a new user namespace — not unshare(2).
+// The header shows this process's status; the children are re-executed, so a
+// non-root caller whose capabilities are not ambient probes with fewer than capeff
+// shows. Each child therefore reports its own effective capabilities, and a host
+// switch is judged against those (for unshare-user, against this process's,
+// which made the clone). A verdict holds for the arguments probed: a filter that tells arguments
+// apart may treat other arguments of the same call differently. A run takes at
+// most 2 s per call. sys exits 0 once every line is printed, 3 (one "error …"
+// line) on a usage error or an unreadable status file.
 package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -75,7 +192,12 @@ const (
 	exitError   = 3
 )
 
-func main() { os.Exit(run(os.Args[1:], os.Stdout)) }
+func main() {
+	if name := sysChildName(os.Args[1:], os.Getenv(sysChildEnv)); name != "" {
+		os.Exit(sysChild(name, os.Stdout))
+	}
+	os.Exit(run(os.Args[1:], os.Stdout))
+}
 
 // verdict is the one line tcp, udp and dns print, with its exit status.
 type verdict struct {
@@ -119,24 +241,46 @@ func command(args []string, stdout io.Writer) verdict {
 	socket := fs.String("socket", "", "")
 	mode := fs.String("mode", "sasl", "")
 	logFile := fs.String("log", "", "")
+	passwordFile := fs.String("password-file", "", "")
+	saltHex := fs.String("salt", "", "")
+	device := fs.String("device", "", "")
 	pos, err := parse(fs, args[1:])
 	if err != nil {
 		return errorVerdict("usage: %v", err)
+	}
+	deviceSet := false
+	fs.Visit(func(f *flag.Flag) { deviceSet = deviceSet || f.Name == "device" })
+	if deviceSet && (args[0] != "tcp" && args[0] != "udp" || *device == "" || len(*device) >= syscall.IFNAMSIZ) {
+		return errorVerdict("usage: --device takes an interface name and only with tcp or udp")
 	}
 	if *timeout <= 0 {
 		return errorVerdict("usage: --timeout must be positive")
 	}
 	switch {
+	case args[0] == "sys" && len(pos) == 0 && fs.NFlag() == 0:
+		return sysCommand(stdout)
 	case args[0] == "tcp" && len(pos) == 1:
-		return probeTCP(pos[0], *timeout)
+		return probeTCP(pos[0], *device, *timeout)
 	case args[0] == "udp" && len(pos) == 1:
-		return probeUDP(pos[0], *timeout)
+		return probeUDP(pos[0], *device, *timeout)
 	case args[0] == "dns" && len(pos) == 1 && *server != "" && (*qtype == "A" || *qtype == "AAAA"):
 		return probeDNS(pos[0], *server, *qtype, *timeout)
 	case args[0] == "listen" && len(pos) == 2 && (pos[0] == "tcp" || pos[0] == "udp") && (*join == "" || pos[0] == "udp"):
 		err = listen(pos[0], pos[1], *join, stdout)
-	case args[0] == "fakepg" && len(pos) == 0 && *socket != "" && *logFile != "" && (*mode == "sasl" || *mode == "cleartext"):
-		err = fakePG(*socket, *mode, *logFile, stdout)
+	case args[0] == "fakepg" && len(pos) == 0 && *socket != "" && *logFile != "" && fakeModes[*mode] &&
+		postAuth[*mode] == (*passwordFile != "") && postAuth[*mode] == (*saltHex != ""):
+		cfg := fakeConfig{mode: *mode}
+		if postAuth[*mode] {
+			if cfg.salt, err = hex.DecodeString(*saltHex); err != nil || len(cfg.salt) == 0 {
+				return errorVerdict("usage: --salt must be hex")
+			}
+			pw, err := os.ReadFile(*passwordFile)
+			if err != nil {
+				return errorVerdict("%v", err)
+			}
+			cfg.password = strings.TrimSuffix(string(pw), "\n")
+		}
+		err = fakePG(*socket, cfg, *logFile, stdout)
 	default:
 		return errorVerdict("usage: bad arguments %q", args)
 	}
@@ -198,8 +342,28 @@ func classify(err error) verdict {
 	return errorVerdict("%v", err)
 }
 
-func probeTCP(addr string, timeout time.Duration) verdict {
-	c, err := net.DialTimeout("tcp", addr, timeout)
+// bindDevice returns a socket control function that binds the socket to
+// device (SO_BINDTODEVICE) before it connects or sends; nil for no device.
+func bindDevice(device string) func(string, string, syscall.RawConn) error {
+	if device == "" {
+		return nil
+	}
+	return func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		if err := rc.Control(func(fd uintptr) {
+			serr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, device)
+		}); err != nil {
+			return err
+		}
+		if serr != nil {
+			return fmt.Errorf("SO_BINDTODEVICE %s: %w", device, os.NewSyscallError("setsockopt", serr))
+		}
+		return nil
+	}
+}
+
+func probeTCP(addr, device string, timeout time.Duration) verdict {
+	c, err := (&net.Dialer{Timeout: timeout, Control: bindDevice(device)}).Dial("tcp", addr)
 	if err == nil {
 		c.Close()
 	}
@@ -210,7 +374,7 @@ func probeTCP(addr string, timeout time.Duration) verdict {
 // takes. A unicast target gets a connected socket, so only its own answers count
 // and ICMP errors surface as receive errors. A multicast or broadcast target gets
 // an unconnected socket, since its answers come from unicast addresses.
-func exchange(addr string, msg []byte, timeout time.Duration, accept func([]byte) bool) ([]byte, error) {
+func exchange(addr, device string, msg []byte, timeout time.Duration, accept func([]byte) bool) ([]byte, error) {
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -222,7 +386,7 @@ func exchange(addr string, msg []byte, timeout time.Duration, accept func([]byte
 		if ua.IP.To4() == nil {
 			network = "udp6"
 		}
-		c, err := net.ListenPacket(network, ":0")
+		c, err := (&net.ListenConfig{Control: bindDevice(device)}).ListenPacket(context.Background(), network, ":0")
 		if err != nil {
 			return nil, err
 		}
@@ -243,10 +407,11 @@ func exchange(addr string, msg []byte, timeout time.Duration, accept func([]byte
 			}
 		}
 	}
-	c, err := net.DialUDP("udp", nil, ua)
+	nc, err := (&net.Dialer{Control: bindDevice(device)}).Dial("udp", ua.String())
 	if err != nil {
 		return nil, err
 	}
+	c := nc.(*net.UDPConn)
 	defer c.Close()
 	if err := c.SetDeadline(deadline); err != nil {
 		return nil, err
@@ -292,9 +457,9 @@ func isBroadcast(ip net.IP) bool {
 	return false
 }
 
-func probeUDP(addr string, timeout time.Duration) verdict {
+func probeUDP(addr, device string, timeout time.Duration) verdict {
 	nonce := []byte("sp-probe " + rand.Text() + "\n")
-	_, err := exchange(addr, nonce, timeout, func(b []byte) bool { return bytes.Equal(b, nonce) })
+	_, err := exchange(addr, device, nonce, timeout, func(b []byte) bool { return bytes.Equal(b, nonce) })
 	if err == nil {
 		return verdict{exitOK, "answered"}
 	}
@@ -324,7 +489,7 @@ func probeDNS(name, server, qtype string, timeout time.Duration) verdict {
 	q = append(q, 0)
 	q = binary.BigEndian.AppendUint16(q, typ)
 	q = append(q, 0, 1) // class IN
-	r, err := exchange(server, q, timeout, func(b []byte) bool {
+	r, err := exchange(server, "", q, timeout, func(b []byte) bool {
 		return len(b) >= 12 && b[0] == idb[0] && b[1] == idb[1] && b[2]&0x80 != 0
 	})
 	if err != nil {

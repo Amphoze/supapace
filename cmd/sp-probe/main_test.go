@@ -217,7 +217,14 @@ func TestUsage_ExitCodes(t *testing.T) {
 		{"dns", "a.sp.test", "--server", "127.0.0.1", "--type", "MX"},
 		{"listen", "sctp", "127.0.0.1:0"},
 		{"listen", "tcp", "127.0.0.1:0", "--join", "ff02::fb"},
-		{"fakepg", "--socket", "s", "--log", "l", "--mode", "md5"},
+		{"fakepg", "--socket", "s", "--log", "l", "--mode", "undefined"},
+		{"fakepg", "--socket", "s", "--log", "l", "--mode", "huge", "--salt", "00"},
+		{"fakepg", "--socket", "s", "--log", "l", "--password-file", "/dev/null"},
+		{"fakepg", "--socket", "s", "--log", "l", "--mode", "md5", "--password-file", "/dev/null", "--salt", "00"},
+		{"fakepg", "--socket", "s", "--log", "l", "--mode", "row-huge", "--salt", "00"},
+		{"fakepg", "--socket", "s", "--log", "l", "--mode", "row-huge", "--password-file", "/dev/null"},
+		{"fakepg", "--socket", "s", "--log", "l", "--mode", "row-huge", "--password-file", "/dev/null", "--salt", "zz"},
+		{"fakepg", "--socket", "s", "--log", "l", "--mode", "row-huge", "--password-file", "missing-file", "--salt", "00"},
 		{"tcp", "127.0.0.1:1", "--bogus"},
 		{"tcp", "127.0.0.1"},
 	} {
@@ -559,5 +566,40 @@ func TestFakePG_ListeningOnlyWhenBoundAndLogging(t *testing.T) {
 	_, logf = startFake(t)
 	if fi, err := os.Stat(logf); err != nil || fi.Size() != 0 {
 		t.Errorf("log after listening: %v", err)
+	}
+}
+
+// --device binds tcp and udp probes to an interface; it is refused for every
+// other subcommand and when empty or longer than an interface name can be. A
+// failing setsockopt is a local error (exit 3) that names the option.
+func TestDevice_Arguments(t *testing.T) {
+	open := start(t, "listen", "tcp", "127.0.0.1:0")
+	echo := start(t, "listen", "udp", "127.0.0.1:0")
+	expect(t, "tcp on lo", 0, "connected", "tcp", open, "--device", "lo", "--timeout", "500ms")
+	expect(t, "udp on lo", 0, "answered", "udp", echo, "--device", "lo", "--timeout", "500ms")
+	for _, args := range [][]string{
+		{"tcp", open, "--device", ""},
+		{"udp", echo, "--device", "abcdefghijklmnop"},
+		{"dns", "a.sp.test", "--server", "127.0.0.1", "--device", "lo"},
+		{"listen", "tcp", "127.0.0.1:0", "--device", "lo"},
+		{"fakepg", "--socket", "s", "--log", "l", "--device", "lo"},
+		{"sys", "--device", "lo"},
+	} {
+		if got, out := probe(t, args...); got != 3 || !strings.HasPrefix(out, "error usage") {
+			t.Errorf("%q: exit %d, output %q", args, got, out)
+		}
+	}
+	for _, args := range [][]string{
+		{"tcp", open, "--device", "sp-none0", "--timeout", "500ms"},
+		{"udp", echo, "--device", "sp-none0", "--timeout", "500ms"},
+		// Multicast and broadcast targets take the unconnected-socket path.
+		{"udp", "[ff02::1]:9", "--device", "sp-none0", "--timeout", "500ms"},
+		{"udp", "127.255.255.255:9", "--device", "sp-none0", "--timeout", "500ms"},
+	} {
+		got, out := probe(t, args...)
+		if got != 3 || !strings.HasPrefix(out, "error ") || !strings.Contains(out, "SO_BINDTODEVICE") ||
+			strings.Count(out, "\n") != 1 {
+			t.Errorf("%q: exit %d, output %q", args, got, out)
+		}
 	}
 }
