@@ -2010,6 +2010,40 @@ func TestTryLockRefChecked_DetectsLostLock(t *testing.T) {
 	}
 }
 
+// A rolled-back restart ends aborted from running: final, not open, not
+// retryable; other kinds still reach aborted only from aborting.
+func TestFinishOperation_RolledBackRestartAborted(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	c := mustCreate(t, s, ref(1))
+	must(t, s.StartOperation(ctx, c))
+	wantErr(t, s.FinishOperation(ctx, c, "aborted", ""), ErrConflict) // a running create
+	must(t, s.FinishOperation(ctx, c, "done", ""))
+	must(t, s.SetProjectState(ctx, ref(1), "active"))
+	d, err := s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
+	must(t, err)
+	wantErr(t, s.FinishOperation(ctx, d, "aborted", ""), ErrConflict) // pending
+	must(t, s.StartOperation(ctx, d))
+	wantErr(t, s.FinishOperation(ctx, d, "aborted", ""), ErrConflict) // a running delete
+	must(t, s.FinishOperation(ctx, d, "failed", "internal: x"))
+
+	activate(t, s, ref(2), mustCreate(t, s, ref(2)))
+	r, err := s.SubmitOperation(ctx, ref(2), "restart", nil, 1, time.Now())
+	must(t, err)
+	wantErr(t, s.FinishOperation(ctx, r, "aborted", ""), ErrConflict) // pending
+	must(t, s.StartOperation(ctx, r))
+	must(t, s.FinishOperation(ctx, r, "aborted", "rolled_back: x"))
+	op, err := s.GetOperation(ctx, r)
+	must(t, err)
+	if op.State != "aborted" || op.LastError != "rolled_back: x" {
+		t.Fatalf("op = %+v", op)
+	}
+	wantErr(t, s.RetryOperation(ctx, r), ErrConflict)
+	if _, err := s.SubmitOperation(ctx, ref(2), "restart", nil, 1, time.Now()); err != nil {
+		t.Fatalf("next restart after a rolled-back one: %v", err)
+	}
+}
+
 // TestOpenOperation_ConflictNamesIt: a refusal for an open operation names
 // its id, kind and state, for a submit and for a retry.
 func TestOpenOperation_ConflictNamesIt(t *testing.T) {

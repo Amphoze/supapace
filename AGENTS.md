@@ -1476,3 +1476,34 @@ Known limits
     connection-error details can show the project cluster's private address;
   - an upstream that answers before reading the body while the client stalls its body
     cannot be relayed before the read timeout; the client then sees the connection close.
+
+### 2026-11-18 — Operation worker: restart retries, drain wait, rolled-back outcome, logs
+
+- Restart resumed after R3 (a daemon restart, a back-off, `op retry`, also in the
+  roll-forward): R3 runs again (stop, quota, promote, start) before R4, so R4 only
+  waits on a cluster this attempt started. A server that never answered is no
+  longer adopted again; a healthy one gets one extra clean stop and start. The
+  ownership check still runs first, before any agent call.
+- R2 waits for the gateway to serve the draining route file (same helper and step
+  deadline as create 11 and D1) before PostgREST is stopped, in both passes.
+  Clients see `503 project_restarting`, not 502. A gateway that does not catch up
+  fails R2; after five attempts the restart is `failed` with the project
+  `restarting` and PostgREST running; `op retry` continues it.
+- A restart rolled back after a failed health check ends `aborted` (was `done`),
+  step R5, `last_error` "rolled_back: the project runs its previous
+  configuration at generation N; the restart to generation M was rolled back
+  because its health check failed: <code>: <message>" (sanitised, 1 KiB).
+  `generation` stays M. The CLI exits 1 with no retry hint; `op retry` answers
+  409 conflict "operation is aborted; only a failed operation can be retried".
+  It is not open: the next restart or delete is accepted. A `done` operation
+  never carries `last_error`. `rollback_gen`/`rollback_error` stay in params.
+- Store: `FinishOperation` also moves a running restart to `aborted`; every other
+  kind reaches `aborted` only from `aborting`. `RetryOperation` refusal text now
+  ends "; only a failed operation can be retried".
+- Logs: `step failed` carries `final` (and `retry_in` when retried); a final
+  failure is logged once recorded. One `operation finished` line per ending (op,
+  ref, kind, outcome done|failed|aborted|rolled_back, step, attempts, duration
+  since created_at); no error text, no parameters. The old `aborted` line is gone.
+- Known limits: a parked abort that is re-armed logs two summary lines; duration
+  includes back-off and a purge's retention; with the gateway slow in both passes
+  an attempt can reach its 900 s deadline and resume on the next one.

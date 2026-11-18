@@ -71,7 +71,7 @@ func (x *job) compensate(ctx context.Context, lastError string) {
 		r.log.Error("finishing an abort", "op", op.ID, "ref", op.Ref, "err", r.text(err))
 		return
 	}
-	r.log.Info("aborted", "op", op.ID, "ref", op.Ref)
+	x.finished("aborted")
 }
 
 // compensating reports whether a create's compensation has started.
@@ -136,6 +136,8 @@ func (x *job) compensationFailed(ctx context.Context, id string, err error) {
 		return
 	}
 	r.log.Warn("abort parked failed; `project abort` re-arms it", "op", op.ID, "ref", op.Ref)
+	x.op = cur
+	x.finished("failed")
 }
 
 // requestAbort is store.RequestAbort; tests replace it to make it fail.

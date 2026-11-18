@@ -214,9 +214,14 @@ func (x *job) finishFailed(ctx context.Context, err error) {
 	if x.record(ctx) != nil {
 		return
 	}
-	if err := x.r.st.FinishOperation(ctx, x.op.ID, "failed", x.r.lastError(err)); err != nil {
+	msg := x.r.lastError(err)
+	if err := x.r.st.FinishOperation(ctx, x.op.ID, "failed", msg); err != nil {
 		x.r.log.Error("recording a failed operation", "op", x.op.ID, "ref", x.op.Ref, "err", x.r.text(err))
+		return
 	}
+	x.r.log.Warn("step failed", "op", x.op.ID, "ref", x.op.Ref, "kind", x.op.Kind, "after", x.op.Step,
+		"attempt", x.op.Attempts, "final", true, "err", msg)
+	x.finished("failed")
 }
 
 // steps runs the operation's table from the step after the recorded one,
@@ -251,7 +256,9 @@ func (x *job) steps(ctx, actx context.Context) error {
 			continue
 		}
 		if errors.Is(err, errFinished) {
+			x.op.Step = s.id
 			x.r.log.Info("step done", "op", x.op.ID, "ref", x.op.Ref, "kind", x.op.Kind, "step", s.id)
+			x.finished("done")
 			return nil
 		}
 		if err != nil {
@@ -269,7 +276,27 @@ func (x *job) steps(ctx, actx context.Context) error {
 	if err := x.record(ctx); err != nil {
 		return err
 	}
-	return x.r.st.FinishOperation(ctx, x.op.ID, "done", x.doneNote())
+	state, note := x.outcome()
+	if err := x.r.st.FinishOperation(ctx, x.op.ID, state, note); err != nil {
+		return err
+	}
+	if note != "" {
+		state = "rolled_back"
+	}
+	x.finished(state)
+	return nil
+}
+
+// finished logs the one summary line of an operation that has ended: no
+// error text (the failure's own line carries it), no parameters.
+func (x *job) finished(outcome string) {
+	level := slog.LevelInfo
+	if outcome != "done" {
+		level = slog.LevelWarn
+	}
+	x.r.log.Log(context.Background(), level, "operation finished", "op", x.op.ID, "ref", x.op.Ref, "kind", x.op.Kind,
+		"outcome", outcome, "step", x.op.Step, "attempts", x.op.Attempts,
+		"duration", time.Since(x.op.CreatedAt).Round(time.Millisecond).String())
 }
 
 // start returns the index of the first step to run: the one after the
@@ -368,14 +395,20 @@ func (x *job) afterError(ctx context.Context, err error) {
 		return
 	}
 	msg := r.lastError(err)
-	r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,
-		"attempt", cur.Attempts, "err", msg)
+	// logRetry logs a failure that is not the operation's end; a final one
+	// is logged as final once it is recorded.
+	logRetry := func(in time.Duration) {
+		r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,
+			"attempt", cur.Attempts, "final", false, "retry_in", in.String(), "err", msg)
+	}
 	var f *failure
 	var werr error
 	requeued := requeues(cur.Params)
 	switch {
 	case errors.Is(err, store.ErrNodeFull) && op.Kind == "create":
 		// Nothing to resume: straight to the compensation list.
+		r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,
+			"attempt", cur.Attempts, "final", true, "compensating", true, "err", msg)
 		if _, werr = r.st.RequestAbort(ctx, op.Ref); werr == nil {
 			cur, werr = r.st.GetOperation(ctx, op.ID)
 		}
@@ -387,14 +420,21 @@ func (x *job) afterError(ctx context.Context, err error) {
 	case errors.Is(err, agent.ErrContainment) && r.ag.ContainmentFailed():
 		// The node's fault, not the project's: back in the queue, not
 		// counted against the attempts, taken again once the flag clears.
+		logRetry(r.containmentRetry)
 		if werr = r.patchParams(ctx, &cur, "requeued", requeued+1); werr == nil {
 			werr = r.st.FailAttempt(ctx, op.ID, msg, time.Now().Add(r.containmentRetry))
 		}
 	case errors.Is(err, agent.ErrContainment), errors.Is(err, bootstrap.ErrAssertion), errors.Is(err, agent.ErrEpochDivergence),
 		errors.As(err, &f) && f.final, cur.Attempts-requeued >= maxAttempts:
-		werr = r.st.FinishOperation(ctx, op.ID, "failed", msg)
+		if werr = r.st.FinishOperation(ctx, op.ID, "failed", msg); werr == nil {
+			r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,
+				"attempt", cur.Attempts, "final", true, "err", msg)
+			x.finished("failed")
+		}
 	default:
-		werr = r.st.FailAttempt(ctx, op.ID, msg, time.Now().Add(r.backoffAfter(cur.Attempts-requeued)))
+		in := r.backoffAfter(cur.Attempts - requeued)
+		logRetry(in)
+		werr = r.st.FailAttempt(ctx, op.ID, msg, time.Now().Add(in))
 	}
 	if werr != nil {
 		if errors.Is(werr, store.ErrConflict) {

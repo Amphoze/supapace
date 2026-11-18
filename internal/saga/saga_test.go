@@ -1771,7 +1771,7 @@ func TestRestart_RollsForwardOnHealthTimeout(t *testing.T) {
 	r := e.runner()
 	id := e.restart(r, ref, withGUC("max_connections", "200"))
 	e.start(r)
-	op := e.waitState(id, "done")
+	op := e.waitState(id, "aborted") // rolled back
 	var gens []int64
 	for _, c := range e.ag.callsOf(ref, "EnsureCluster") {
 		gens = append(gens, c.Gen)
@@ -1817,7 +1817,7 @@ func TestRestart_ResumeIntoRollback(t *testing.T) {
 	e.ag.reset()
 	e.ag.setErr(nil)
 	e.start(e.runner())
-	e.waitState(id, "done")
+	e.waitState(id, "aborted") // rolled back
 	if c := e.ag.callsOf(ref, "Prevalidate"); len(c) != 1 || c[0].Gen != 3 || len(c[0].GUC) != 0 {
 		t.Fatalf("resume did not continue the rollback: %+v", c)
 	}
@@ -2742,7 +2742,7 @@ func TestRestart_ResumePastBump(t *testing.T) {
 			<-e.run(r)
 			e.ag.setErr(nil)
 			e.start(e.runner())
-			e.waitState(id, "done")
+			e.waitState(id, "aborted") // rolled back
 			if p := e.project(ref); p.Generation != 3 || p.State != "active" || len(p.Config.GUC) != 0 {
 				t.Fatalf("project %+v", p)
 			}
@@ -3034,4 +3034,274 @@ func TestCreate_LockLostBeforeFinish(t *testing.T) {
 		u()
 	}
 	e.waitState(id, "done")
+}
+
+// A restart whose health step failed because its started server never
+// answers (it waits on a tenant's file at start) is continued by `op retry`
+// with a fresh start of the cluster once the cause is gone: the retry never
+// adopts the server that did not answer.
+func TestRestart_RetryRestartsAClusterThatNeverAnswered(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	// Every start while the cause is present hangs; a hung server stays hung
+	// until it is stopped.
+	var cause, hung atomic.Bool
+	cause.Store(true)
+	e.ag.setHook(func(ctx context.Context, c call) {
+		switch {
+		case c.Method == "StopCluster":
+			hung.Store(false)
+		case c.Method == "EnsureCluster" && c.HealthWait < 0 && cause.Load():
+			hung.Store(true)
+		}
+	})
+	e.ag.setErr(func(c call) error {
+		if c.Method == "EnsureCluster" && c.HealthWait == 0 && hung.Load() {
+			return errors.New("the cluster did not answer")
+		}
+		return nil
+	})
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "130"))
+	e.start(r)
+	e.waitState(id, "failed")
+	if p := e.project(ref); p.State != "restarting" || p.Generation != 3 {
+		t.Fatalf("project %+v", p)
+	}
+	cause.Store(false) // the operator removes the cause
+	e.ag.reset()
+	must(t, e.st.RetryOperation(context.Background(), id))
+	op := e.settled(id)
+	if p := e.project(ref); p.State != "active" || p.Generation != 3 || p.AppliedGen != 3 {
+		t.Fatalf("retry after the cause was removed: project %s at %d, op %s", p.State, p.Generation, brief(op))
+	}
+	if m := e.ag.methods(ref); len(m) < 3 || !slices.Equal(m[:3], []string{"StopCluster", "PromoteCandidate", "EnsureCluster"}) {
+		t.Fatalf("the retry did not start the cluster afresh: %v", m)
+	}
+}
+
+// R2 stops PostgREST only once the gateway serves the draining route, in the
+// first pass and in the roll-forward.
+func TestRestart_DrainWaitsForGateway(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	failVerifyAt(e, 2)
+	e.ag.locked(func() { e.ag.gwLag = 2 })
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	e.settled(id)
+	calls := e.ag.methods("")
+	n := 0
+	for i, m := range calls {
+		if m != "StopPostgREST" {
+			continue
+		}
+		n++
+		j := i - 1
+		for j >= 0 && calls[j] != "SetRoute" {
+			j--
+		}
+		if j < 0 || !slices.Contains(calls[j:i], "GatewayGeneration") {
+			t.Fatalf("PostgREST stopped before the gateway was asked for the draining route: %v", calls)
+		}
+	}
+	if n != 2 {
+		t.Fatalf("%d StopPostgREST calls, want 2 (first pass and roll-forward): %v", n, calls)
+	}
+}
+
+// A restart that was rolled back ends aborted with code rolled_back and says
+// where the project is; it cannot be retried, is not open, and does not block
+// the next restart.
+func TestRestart_RolledBackEndsAbortedNotRetryable(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	failVerifyAt(e, 2)
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	op := e.settled(id)
+	if op.State != "aborted" || !strings.HasPrefix(op.LastError, "rolled_back: ") ||
+		!strings.Contains(op.LastError, "previous configuration at generation 3") || !strings.Contains(op.LastError, "boom") {
+		t.Fatalf("rolled-back restart: %s", brief(op))
+	}
+	if err := e.st.RetryOperation(context.Background(), id); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("retry of a rolled-back restart: %v", err)
+	}
+	e.ag.setErr(nil)
+	next := e.restart(r, ref, withGUC("max_connections", "150"))
+	if op := e.waitState(next, "done"); op.LastError != "" {
+		t.Fatalf("next restart %s", brief(op))
+	}
+	if p := e.project(ref); p.State != "active" || p.Generation != 4 || p.Config.GUC["max_connections"] != "150" {
+		t.Fatalf("project %+v", p)
+	}
+}
+
+// A failure that is retried is logged with its back-off; the one that ends
+// the operation is logged as final; every finished operation has one summary
+// line.
+func TestLogs_FinalFailureAndSummary(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	e.ag.setErr(failOn("Prevalidate"))
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	e.waitState(id, "failed")
+	// The lines follow the write that ends the operation.
+	for deadline := time.Now().Add(10 * time.Second); len(e.logs.records("operation finished")) < 2; time.Sleep(2 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no summary line: %s", e.logs.String())
+		}
+	}
+	var fails []map[string]any
+	for _, m := range e.logs.records("step failed") {
+		if m["op"] == float64(id) {
+			fails = append(fails, m)
+		}
+	}
+	if len(fails) != maxAttempts {
+		t.Fatalf("%d step failed records: %s", len(fails), e.logs.String())
+	}
+	for i, m := range fails {
+		last := i == len(fails)-1
+		if m["final"] != last || (m["retry_in"] != nil) == last {
+			t.Fatalf("record %d of %d: %v", i+1, len(fails), m)
+		}
+	}
+	sums := map[string]map[string]any{}
+	for _, m := range e.logs.records("operation finished") {
+		sums[m["kind"].(string)] = m
+	}
+	if m := sums["create"]; m == nil || m["outcome"] != "done" || m["step"] != "12" || m["attempts"] != float64(1) || m["ref"] != ref || m["duration"] == nil {
+		t.Fatalf("create summary %v", m)
+	}
+	if m := sums["restart"]; m == nil || m["op"] != float64(id) || m["outcome"] != "failed" || m["step"] != "R0" || m["attempts"] != float64(maxAttempts) {
+		t.Fatalf("restart summary %v", m)
+	}
+	if n := len(e.logs.records("operation finished")); n != 2 {
+		t.Fatalf("%d summary lines", n)
+	}
+}
+
+// R2 polls the gateway until it serves the draining route file, in the first
+// pass and in the roll-forward: a gateway that lags by two polls is asked
+// three times before PostgREST is stopped.
+func TestRestart_DrainPollsUntilGatewayServesRoute(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	failVerifyAt(e, 2)
+	e.ag.setHook(func(ctx context.Context, c call) {
+		if c.Method == "SetRoute" && c.State == "draining" {
+			e.ag.locked(func() { e.ag.gwLag = 2 })
+		}
+	})
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	e.settled(id)
+	var polls []int
+	n, draining := 0, false
+	e.ag.locked(func() {
+		for _, c := range e.ag.calls {
+			switch {
+			case c.Method == "SetRoute":
+				n, draining = 0, c.State == "draining"
+			case c.Method == "GatewayGeneration":
+				n++
+			case c.Method == "StopPostgREST" && c.Ref == ref && draining:
+				polls = append(polls, n)
+			}
+		}
+	})
+	if !slices.Equal(polls, []int{3, 3}) {
+		t.Fatalf("gateway polls before each StopPostgREST: %v, want [3 3]", polls)
+	}
+}
+
+// The rolled_back message is bounded like every last_error, also when the
+// health error it quotes is long.
+func TestRestart_RolledBackMessageBounded(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	long := errors.New(strings.Repeat("x", 4*maxLastError))
+	e.ag.setErr(func(c call) error {
+		if c.Method == "VerifyCluster" && c.Gen == 2 {
+			return long
+		}
+		return nil
+	})
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	op := e.settled(id)
+	if op.State != "aborted" || !strings.HasPrefix(op.LastError, "rolled_back: the project runs its previous configuration at generation 3") ||
+		len(op.LastError) > maxLastError {
+		t.Fatalf("rolled-back restart: state %s, %d bytes: %.120q", op.State, len(op.LastError), op.LastError)
+	}
+}
+
+// summaries waits until op has n "operation finished" lines and returns their
+// outcomes and steps.
+func (e *env) summaries(op int64, n int) []string {
+	e.t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+		var out []string
+		for _, m := range e.logs.records("operation finished") {
+			if m["op"] == float64(op) {
+				out = append(out, fmt.Sprint(m["outcome"], "@", m["step"]))
+			}
+		}
+		if len(out) >= n || time.Now().After(deadline) {
+			return out
+		}
+	}
+}
+
+// A restart that ends through its last step logs its summary: rolled_back
+// for one rolled back, done otherwise.
+func TestLogs_SummaryAfterLastStep(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	failVerifyAt(e, 2)
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	e.settled(id)
+	if s := e.summaries(id, 1); !slices.Equal(s, []string{"rolled_back@R5"}) {
+		t.Fatalf("rolled-back restart summaries %v", s)
+	}
+	e.ag.setErr(nil)
+	next := e.restart(r, ref, withGUC("max_connections", "150"))
+	e.waitState(next, "done")
+	if s := e.summaries(next, 1); !slices.Equal(s, []string{"done@R5"}) {
+		t.Fatalf("restart summaries %v", s)
+	}
+}
+
+// A compensation logs a summary when it is parked failed and again when the
+// re-armed abort ends aborted.
+func TestLogs_SummaryOfCompensation(t *testing.T) {
+	e := newEnv(t)
+	ref, id := e.create()
+	e.failpoint("create:4")
+	<-e.run(e.runner())
+	e.ag.setErr(failOn("PurgeDir"))
+	r := e.runner()
+	_, err := r.Abort(context.Background(), ref)
+	must(t, err)
+	e.start(r)
+	e.waitState(id, "failed")
+	if s := e.summaries(id, 1); len(s) != 1 || !strings.HasPrefix(s[0], "failed@") {
+		t.Fatalf("parked abort summaries %v", s)
+	}
+	e.ag.setErr(nil)
+	_, err = r.Abort(context.Background(), ref)
+	must(t, err)
+	e.waitState(id, "aborted")
+	if s := e.summaries(id, 2); len(s) != 2 || !strings.HasPrefix(s[1], "aborted@") {
+		t.Fatalf("aborted summaries %v", s)
+	}
 }

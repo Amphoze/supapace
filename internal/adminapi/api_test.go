@@ -1400,6 +1400,38 @@ func TestAPI_DiskQuotaFloor(t *testing.T) {
 	e.wantOK(t, "POST", "/v1/projects/"+demoRef+"/restart", `{"disk_quota_mb":1024}`, 202)
 }
 
+// A restart that was rolled back is shown aborted with code rolled_back; its
+// retry is refused, and the project takes the next restart and a delete.
+func TestAPI_RolledBackRestart(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.active(t, demoRef)
+	rop, err := e.st.SubmitOperation(ctx, demoRef, "restart", nil, 1, time.Now())
+	must(t, err)
+	must(t, e.st.StartOperation(ctx, rop))
+	must(t, e.st.FinishOperation(ctx, rop, "aborted", "rolled_back: the project runs its previous configuration at generation 3"))
+	var o struct {
+		State     string `json:"state"`
+		LastError string `json:"last_error"`
+	}
+	json.Unmarshal(e.wantOK(t, "GET", "/v1/operations/"+strconv.FormatInt(rop, 10), "", 200), &o)
+	if o.State != "aborted" || !strings.HasPrefix(o.LastError, "rolled_back: ") {
+		t.Fatalf("operation %+v", o)
+	}
+	eb := e.wantCode(t, "POST", "/v1/operations/"+strconv.FormatInt(rop, 10)+"/retry", "", 409, "conflict")
+	if !strings.Contains(eb.Message, "only a failed operation can be retried") {
+		t.Fatalf("retry refusal %+v", eb)
+	}
+	e.wantOK(t, "POST", "/v1/projects/"+demoRef+"/restart", `{}`, 202)
+	other := "rolledback0000000002"
+	e.active(t, other)
+	rop, err = e.st.SubmitOperation(ctx, other, "restart", nil, 1, time.Now())
+	must(t, err)
+	must(t, e.st.StartOperation(ctx, rop))
+	must(t, e.st.FinishOperation(ctx, rop, "aborted", "rolled_back: x"))
+	e.wantOK(t, "DELETE", "/v1/projects/"+other, "", 202)
+}
+
 // ───────── where to connect, admission, messages, list filter ─────────
 
 // writeCert issues a certificate for name signed by parent (self-signed when

@@ -176,14 +176,16 @@ func (s *Store) FailAttempt(ctx context.Context, id int64, lastError string, ret
 }
 
 // FinishOperation ends a running operation as done or failed, or an aborting
-// one as aborted.
+// one as aborted. A running restart may also end aborted: it was rolled back
+// to its previous configuration, which is final (RetryOperation takes only a
+// failed operation) and not open.
 func (s *Store) FinishOperation(ctx context.Context, id int64, state, lastError string) error {
 	from := map[string]string{"done": "running", "failed": "running", "aborted": "aborting"}[state]
 	if from == "" {
 		return fmt.Errorf("%w: %q is not a final state", ErrConflict, state)
 	}
 	return s.opUpdate(ctx, `update operation set state = $2, last_error = nullif($3, ''), updated_at = now()
-		where id = $1 and state = $4`, id, state, lastError, from)
+		where id = $1 and (state = $4 or $2 = 'aborted' and kind = 'restart' and state = 'running')`, id, state, lastError, from)
 }
 
 // RetryOperation puts a failed operation back to pending with attempts 0,
@@ -202,7 +204,7 @@ func (s *Store) RetryOperation(ctx context.Context, id int64) error {
 			return err
 		}
 		if state != "failed" {
-			return fmt.Errorf("%w: operation is %s", ErrConflict, state)
+			return fmt.Errorf("%w: operation is %s; only a failed operation can be retried", ErrConflict, state)
 		}
 		if err := openOperation(ctx, tx, ref, id); err != nil {
 			return err

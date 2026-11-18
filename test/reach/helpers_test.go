@@ -518,7 +518,9 @@ func removeProject(t testing.TB, ref string) bool {
 					return false
 				}
 				retried[op.ID] = true
-				if ok = verb("op", "retry", strconv.FormatInt(op.ID, 10)); ok {
+				// --no-wait: a retried restart that rolls back ends aborted
+				// (exit 1) with the project active, which the loop removes.
+				if ok = verb("op", "retry", strconv.FormatInt(op.ID, 10), "--no-wait"); ok {
 					if _, ok = pollOp(t, op.ID, deadline); !ok {
 						t.Errorf("removing project %s: retried operation %d not finished at the deadline", ref, op.ID)
 					}

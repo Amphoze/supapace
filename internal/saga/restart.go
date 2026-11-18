@@ -8,6 +8,7 @@ import (
 	"maps"
 
 	"github.com/Amphoze/supapace/internal/agent"
+	"github.com/Amphoze/supapace/internal/pgsock"
 	"github.com/Amphoze/supapace/internal/store"
 )
 
@@ -101,6 +102,13 @@ func (x *job) restartStart(ctx context.Context, table []step) (int, error) {
 			return 0, final("conflict", fmt.Errorf("restart targets generation %d; the project is %s at generation %d, not by this restart",
 				gen, p.State, p.Generation))
 		}
+		if i == indexOf(table, "R4") {
+			// R4 waits only for a cluster this attempt started. One that an
+			// earlier attempt started may never answer (its server can wait
+			// at start on a file of the tenant's), and adopting it again would
+			// only repeat the wait: R3 stops it and starts the target afresh.
+			i = indexOf(table, "R3")
+		}
 		return i, nil
 	}
 	// Before the first bump the project must still be at the generation the
@@ -145,7 +153,8 @@ func (x *job) prevalidate(ctx context.Context) error {
 }
 
 // R2: the desired generation and configuration, and the state restarting, in
-// one statement (a no-op when resumed); the route draining; PostgREST stopped.
+// one statement (a no-op when resumed); the route draining and the gateway at
+// that route file; PostgREST stopped.
 func (x *job) drain(ctx context.Context) error {
 	gen, cfg, err := x.target()
 	if err != nil {
@@ -161,7 +170,11 @@ func (x *job) drain(ctx context.Context) error {
 		return err
 	}
 	rt := x.r.ag.RouteFor(s, "draining")
-	if _, err := x.r.ag.SetRoute(ctx, x.op.Ref, &rt); err != nil {
+	rgen, err := x.r.ag.SetRoute(ctx, x.op.Ref, &rt)
+	if err != nil {
+		return err
+	}
+	if err := x.r.waitGateway(ctx, rgen); err != nil {
 		return err
 	}
 	return x.r.ag.StopPostgREST(ctx, x.op.Ref)
@@ -269,12 +282,19 @@ func (x *job) resume(ctx context.Context) error {
 	return x.r.st.SetApplied(ctx, x.op.Ref, s.Generation)
 }
 
-// doneNote is the last_error a finished operation keeps: why a restart
-// rolled forward ("<code>: <message>" of the R4 failure), else nothing.
-func (x *job) doneNote() string {
+// outcome is how an operation whose steps all ran ends: done, or, for a
+// restart that rolled forward to its previous configuration, aborted with
+// code rolled_back. The setting asked for is not in force, so it is not a
+// success; and it is not failed, which `op retry` would take up again.
+func (x *job) outcome() (state, lastError string) {
 	if x.op.Kind != "restart" {
-		return ""
+		return "done", ""
 	}
 	rp, _ := x.restartParams()
-	return rp.RollbackError
+	if rp.RollbackGen == 0 {
+		return "done", ""
+	}
+	return "aborted", pgsock.Sanitize(fmt.Sprintf("rolled_back: the project runs its previous configuration at generation %d; "+
+		"the restart to generation %d was rolled back because its health check failed: %s",
+		rp.RollbackGen, x.op.Generation, rp.RollbackError), maxLastError)
 }

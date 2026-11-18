@@ -106,7 +106,11 @@ func TestRestart_CrashAtEveryBoundary(t *testing.T) {
 				e.ag.reset()
 				e.ag.setErr(nil)
 				e.start(e.runner())
-				e.waitState(id, "done")
+				end := "done"
+				if rollback {
+					end = "aborted" // rolled back
+				}
+				e.waitState(id, end)
 				want, guc := int64(2), "200"
 				if rollback {
 					want, guc = 3, ""
@@ -359,7 +363,7 @@ func TestRestart_RollbackRestoresQuota(t *testing.T) {
 	next.DiskQuotaMB = 4096
 	id := e.restart(r, ref, next)
 	e.start(r)
-	e.waitState(id, "done")
+	e.waitState(id, "aborted") // rolled back
 	var quotas []int
 	for _, c := range e.ag.callsOf(ref, "SetQuota") {
 		quotas = append(quotas, c.Quota)
