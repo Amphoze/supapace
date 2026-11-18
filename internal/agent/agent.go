@@ -73,6 +73,10 @@ type Spec struct {
 	// HealthWait bounds the wait for a phase-B start to become healthy:
 	// zero means 120 s, negative means do not wait.
 	HealthWait time.Duration
+	// FirstBoot is set only by a create. Without it a project that has no
+	// state file is refused instead of being given a first boot, which
+	// empties its data directory.
+	FirstBoot bool
 }
 
 // String and GoString keep the secrets out of every fmt verb and log line.
