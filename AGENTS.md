@@ -308,7 +308,8 @@ patch surface, backup model) were verified against upstream source first.
   client-supplied forwarding headers replaced.
 - Refusals are JSON `{"code": …}`: `no_apikey`, `invalid_apikey`, `invalid_token` (401),
   `not_found` (404), `body_too_large` (413), `misdirected` (421), `too_many_requests` (429,
-  per project), `unavailable` (503, gateway-wide or draining), `upstream_unavailable` (502),
+  per project), `unavailable` (503, gateway-wide or an empty table), `project_restarting` (503,
+  a draining project), `bad_request` and `upgrade_not_supported` (400), `upstream_unavailable` (502),
   `upstream_timeout` (504). The gateway refuses tokens without `kid`,
   `exp` or `role`, with an unknown `crit`, a duplicate `role`, or `role = authenticator`.
 - Limits (constants next to each other in `server.go` / `limit.go`, pinned by tests):
