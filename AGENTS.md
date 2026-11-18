@@ -290,3 +290,9 @@ patch surface, backup model) were verified against upstream source first.
     can move it to any project id.
   - a node restart re-attaches exactly one loop device, keeps quota limits and loads no
     image again.
+
+### 2026-11-18 — image fixture: `postgresql.conf`
+
+- `internal/pgconf/testdata/image/postgresql.conf` is the pinned cluster image's main
+  configuration file, unmodified (its preload lists and `include` lines are what the
+  command-line pins and the restart check are built from).
