@@ -1209,9 +1209,11 @@ func TestBudget_TotalBytes(t *testing.T) {
 	}), true)
 }
 
-// A row stream that never ends, at the default byte budget.
+// A row stream that never ends, at the default byte budget. The byte budget ends it;
+// the time bound only catches a session that never ends, so it is wide: several
+// hundred thousand one-byte rows take seconds under the race detector on a slow machine.
 func TestBudget_EndlessRows(t *testing.T) {
-	runBudget(t, budget(func(b *Budget) { b.Bytes = DefaultBudget.Bytes }), 5*time.Second, afterQuery(func(c *fconn) error {
+	runBudget(t, budget(func(b *Budget) { b.Bytes = DefaultBudget.Bytes }), 30*time.Second, afterQuery(func(c *fconn) error {
 		var b []byte
 		b = append(b, msg('T', []byte{0, 1, 'x', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0})...)
 		row := msg('D', []byte{0, 1, 0, 0, 0, 1, '1'})
