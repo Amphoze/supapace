@@ -92,6 +92,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.URL.Path == "/-/health":
 		w.Header().Set("Content-Type", "application/json")
+		sandbox(w.Header())
 		fmt.Fprintf(w, `{"generation":%d}`, g.table.Generation())
 		return
 	}
@@ -206,6 +207,7 @@ func Redirect() http.Handler {
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
+		sandbox(w.Header())
 		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusPermanentRedirect)
 	})
 }

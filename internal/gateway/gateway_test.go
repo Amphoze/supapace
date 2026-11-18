@@ -767,6 +767,9 @@ func TestHealth_ReportsGenerationWithoutAuth(t *testing.T) {
 			if w.Code != 200 || strings.TrimSpace(w.Body.String()) != fmt.Sprintf(`{"generation":%d}`, want) {
 				t.Errorf("health host %q: %d %s, want generation %d", host, w.Code, w.Body, want)
 			}
+			if w.Header().Get("Content-Security-Policy") != "sandbox" || w.Header().Get("X-Content-Type-Options") != "nosniff" {
+				t.Errorf("health host %q: no sandbox headers: %v", host, w.Header())
+			}
 		}
 	}
 	if len(e.requests()) != 0 {
@@ -822,6 +825,9 @@ func TestRedirect_ToHTTPS(t *testing.T) {
 	Redirect().ServeHTTP(w, req("POST", hostA+":80", "/rest/v1/items?id=eq.1", nil))
 	if w.Code != http.StatusPermanentRedirect || w.Header().Get("Location") != "https://"+hostA+"/rest/v1/items?id=eq.1" {
 		t.Errorf("redirect %d %q", w.Code, w.Header().Get("Location"))
+	}
+	if w.Header().Get("Content-Security-Policy") != "sandbox" || w.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("redirect: no sandbox headers: %v", w.Header())
 	}
 }
 

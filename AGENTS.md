@@ -276,9 +276,9 @@ patch surface, backup model) were verified against upstream source first.
   - **A key file that is not a valid key set is used as a shared HS256 secret**, and a set
     containing a symmetric key enables HS256: whatever renders that file must build it only
     from validated public keys and replace it atomically.
-  - PostgREST alone accepts tokens with no `kid`, no `exp`, no `role`, an unknown `crit`
-    header, `role = authenticator`, or a duplicate `role`; refusing those is the gateway's
-    job.
+  - Token strictness is the gateway's job, not the upstream's: a token with no `kid`, no
+    `exp`, no `role`, an unknown `crit` header, `role = authenticator` or a duplicate
+    `role` must be refused before it is forwarded.
   - `SO_PEERCRED` on a cluster's socket reports the process that called `listen()` — the
     container's init — stably across forks, reloads and crash recovery; a listener planted
     at the same path by another process of the same uid reports its own pid, so the pid and
@@ -309,7 +309,7 @@ patch surface, backup model) were verified against upstream source first.
 - Refusals are JSON `{"code": …}`: `no_apikey`, `invalid_apikey`, `invalid_token` (401),
   `not_found` (404), `body_too_large` (413), `misdirected` (421), `too_many_requests` (429,
   per project), `unavailable` (503, gateway-wide or draining), `upstream_unavailable` (502),
-  `upstream_timeout` (504). The gateway — not the upstream — refuses tokens without `kid`,
+  `upstream_timeout` (504). The gateway refuses tokens without `kid`,
   `exp` or `role`, with an unknown `crit`, a duplicate `role`, or `role = authenticator`.
 - Limits (constants next to each other in `server.go` / `limit.go`, pinned by tests):
   2,048 connections and 64 per source (an IPv6 /64 is one source); 2,048 proxied requests in
@@ -335,3 +335,4 @@ patch surface, backup model) were verified against upstream source first.
 - The image is `scratch` with the static binary, numeric user 65531; without TLS files the
   process exits 1; a second termination signal ends the 10 s grace period at once. Publish
   its ports with an explicit IPv4 bind.
+- The health answer and the plain-HTTP redirect carry the two sandbox headers as well.
