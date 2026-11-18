@@ -138,9 +138,21 @@ if [ "$loaded" = 1 ]; then
 	echo "$(awk '/^file /{print $2}' /sys/fs/cgroup/memory.stat) swappiness=0" >/sys/fs/cgroup/memory.reclaim 2>/dev/null || :
 fi
 
-# 5. The supervisor a real node gets from Restart=always.
+# 5. The supervisor a real node gets from Restart=always. The daemon's output
+# also goes to $LOG (emptied at node start); before each daemon start the loop
+# cuts the file to its last 4 MiB once it exceeds 8 MiB, so the file is bounded
+# by 8 MiB plus what one daemon run writes. docker logs still shows it.
+LOG=/var/log/supapaced.log
 if [ "$mode" = full ]; then
-	(while :; do "$BIN/supapaced" serve || :; sleep 1; done) &
+	: >"$LOG"
+	(while :; do
+		if [ "$(wc -c <"$LOG")" -gt 8388608 ]; then
+			tail -c 4194304 "$LOG" >"$LOG.tmp" && cat "$LOG.tmp" >"$LOG"
+			rm -f "$LOG.tmp"
+		fi
+		"$BIN/supapaced" serve 2>&1 | tee -a "$LOG" >&2 || :
+		sleep 1
+	done) &
 	loop_pid=$!
 fi
 # The harness (make node-up) waits for this, so no caller races the image load.

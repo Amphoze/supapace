@@ -1300,3 +1300,90 @@ Store additions
 Known limits
 - Between the lock check and the write it guards there is one round trip in which a dying
   connection goes unnoticed.
+
+### 2026-11-18 — `supapaced serve`
+
+- `supapaced serve` takes no arguments. It runs until SIGTERM or SIGINT; a second signal during
+  the bounded shutdown ends the process. Exit 0 after a signal (also during start-up), 1 when
+  start-up fails (the supervisor starts it again after 1 s), 2 on usage.
+- Start-up order:
+  1. `pgsock.CheckEnv`, `node.json`, the key-encryption key.
+  2. The run directory `/run/supapace` (created 0700 when absent; must be a real directory
+     owned by the daemon's uid, no group or other bits), an exclusive `flock` on
+     `serve.lock` there for the life of the process, and the admin socket path (anything but
+     a socket there is refused). A second daemon, or a bad path, exits 1 here, before
+     anything on the node is touched.
+  3. Remove the drift hold. Render the ruleset; when the installed file differs, write it
+     (0600) and load it. Bridge-nf switches off, `nft.Check`, on failure one load and a
+     second check.
+  4. `EnsurePlatformNetworks`, `EnsureImageFiles`, `EnsureControlPlaneDB`, then the store
+     (open, migrate, node row), retried for up to 3 minutes.
+  5. `DrainAllRoutes`; the boot record (`boot.json`, once per boot, before any tenant is
+     started); `NodeCheck`.
+  6. The pending-adoption set is marked for a refill and filled with every `active`
+     project (a failed listing is retried by the adoption loop).
+  7. `EnsureGateway`, `Runner.ResumeAll`, the admin socket, the drift timer and
+     `Runner.Run`; then the adoption loop in the background.
+- Containment at start: the first failure of the firewall check (any error, an
+  unverifiable result included), of the platform networks, of the drain or of a node-check
+  row sets the flag, drains every route and stops every tenant at once, before any step
+  that can fail or wait. A signal during start-up is not a finding.
+- Adoption (one round at start, on each signal of the drift timer, every 60 s; never two
+  rounds at once; none while the flag is set):
+  - projects in ref order, at most 4 at a time, each within 180 s, the ref lock only tried
+    (`TryLockRefChecked`): a held lock defers the project and frees its slot at once;
+  - under the lock the row is read again: a project no longer `active` leaves the set; one
+    with a pending, running or aborting operation is left to that operation;
+  - `SpecFor`, `EnsureCluster` with a negative health wait (no cluster session, never a
+    first boot), `EnsurePostgREST`, a check that the lock is still held, then the route
+    `active`. Only host-side facts restore a route;
+  - then an advisory `CheckCluster` with no slot and no lock (repeated every 2 s for up to
+    90 s while the cluster does not answer yet); its result is only logged;
+  - a failure is logged with its ref, leaves the route draining and the project pending.
+- Pending set: filled at start and at every containment failure. Until a listing has
+  succeeded every project counts as pending. A project leaves the set when its adoption
+  succeeds, unless a refill happened meanwhile. `restart` and `delete` of a pending
+  project answer `conflict` "not yet adopted". A project created after start never enters
+  it; one whose own operation re-activates its route leaves it at the next round.
+- Drift timer (10 s, own goroutine, waits on no adoption and no cluster):
+  - a hold file younger than 15 minutes skips the tick with a WARN carrying its age; an
+    older one, or one dated in the future, is ignored;
+  - bridge-nf switches, `nft.Check`; an unverifiable result acts on the third in a row,
+    anything else at once; one reload and a second check;
+  - still failing and not yet flagged: flag, drain every route, stop every tenant, refill
+    the pending set (bounded to 5 s, retried by the adoption loop);
+  - while flagged, every tick that does not clear the flag stops the tenants again; the
+    first tick on which the firewall check and every blocking node-check row pass clears
+    the flag and signals the adoption loop without waiting for it.
+- Admin API operations: `Submit` (restart, delete) through the worker, refused for pending
+  projects; `Abort` through the worker; `VerifyProject` = `SpecFor` + `CheckCluster` within
+  75 s, codes `peer` (`pgsock.ErrPeer`), `timeout` (`pgsock.IsBudget` or a deadline),
+  `internal` otherwise, message sanitised to 1 KiB; `NodeCheck` within 75 s;
+  `ContainmentOK` is the flag cleared.
+- Socket `/run/supapace/admin.sock`, 0600; a stale socket is removed, a live one refused.
+  HTTP limits: header read 5 s, read 30 s, write 90 s, idle 60 s, headers 64 KiB. At
+  shutdown requests get 10 s and are then cut; the worker, the drift timer and the
+  adoption loop are stopped and waited for; the store is closed last. Tenant and platform
+  containers are left running.
+- Logs: one text handler on stderr; text from Docker or a cluster is sanitised (control
+  characters removed) and capped at 1 KiB; no spec, key or session target is logged.
+- Related changes:
+  - `internal/agent`: when a fact of a running cluster's adoption check cannot be read,
+    the check is read once more after 1 s; a refusal, a second failure or a node already
+    marked not contained still removes the cluster at once.
+  - `internal/store`: `TryLockRefChecked(ctx, ref) (unlock, held, ok, err)`; `TryLockRef`
+    wraps it.
+  - `supapaced.service`: `RuntimeDirectory=supapace`, mode 0700, kept across daemon
+    restarts (the boot record is once per boot; a reboot empties `/run`).
+  - Test node: the daemon's output also goes to `/var/log/supapaced.log`, emptied at node
+    start and cut to its last 4 MiB above 8 MiB before each daemon start.
+- Known limits:
+  - a `node.json` or key that does not load exits 1 before any containment step: running
+    tenants and active routes stay as they were while the daemon restarts every second,
+    as with the daemon stopped;
+  - the node check at start runs after the store is reachable, and the drift timer runs it
+    only while the flag is set;
+  - an adoption that ends after the flag was set can leave a started container for at most
+    one tick;
+  - in the test node a killed log pipe ends the daemon at its next log line (it is started
+    again after 1 s).

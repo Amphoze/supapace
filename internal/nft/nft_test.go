@@ -373,6 +373,11 @@ func TestUnits_Ordering(t *testing.T) {
 	// The daemon restarts with Docker; its start-up brings the projects back.
 	expect(daemon, "Unit.PartOf", "docker.service")
 	expect(daemon, "Service.UMask", "0077")
+	// /run/supapace exists before the daemon starts, root 0700, and is kept
+	// across daemon restarts (the boot record is written once per boot).
+	expect(daemon, "Service.RuntimeDirectory", "supapace")
+	expect(daemon, "Service.RuntimeDirectoryMode", "0700")
+	expect(daemon, "Service.RuntimeDirectoryPreserve", "yes")
 }
 
 // Stopping the tables unit must leave the tables in place: a stop of Docker or

@@ -140,11 +140,15 @@ func (s *Store) LockRefChecked(ctx context.Context, ref string) (unlock func(), 
 		c.Release()
 		return nil, nil, wrap(err)
 	}
-	held = func(ctx context.Context) error {
+	return unlocker(c, ref), heldOn(c), nil
+}
+
+// heldOn reports whether the lock held on c is still held.
+func heldOn(c *pgxpool.Conn) func(context.Context) error {
+	return func(ctx context.Context) error {
 		_, err := c.Exec(ctx, "select 1")
 		return err
 	}
-	return unlocker(c, ref), held, nil
 }
 
 // unlocker releases the ref lock held on c, then c. It is idempotent; if the
@@ -167,9 +171,16 @@ func unlocker(c *pgxpool.Conn, ref string) func() {
 // TryLockRef is LockRef without waiting: ok is false, and no connection is
 // kept, when another session holds the lock.
 func (s *Store) TryLockRef(ctx context.Context, ref string) (unlock func(), ok bool, err error) {
+	unlock, _, ok, err = s.TryLockRefChecked(ctx, ref)
+	return unlock, ok, err
+}
+
+// TryLockRefChecked is TryLockRef that also returns held, as LockRefChecked
+// does: one round trip on the lock's connection, an error once it is gone.
+func (s *Store) TryLockRefChecked(ctx context.Context, ref string) (unlock func(), held func(context.Context) error, ok bool, err error) {
 	c, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, false, wrap(err)
+		return nil, nil, false, wrap(err)
 	}
 	if err := c.QueryRow(ctx, "select pg_try_advisory_lock($1, hashtext($2))", lockClassRef, ref).Scan(&ok); err != nil || !ok {
 		if err != nil {
@@ -177,9 +188,9 @@ func (s *Store) TryLockRef(ctx context.Context, ref string) (unlock func(), ok b
 			c.Conn().Close(context.Background())
 		}
 		c.Release()
-		return nil, false, wrap(err)
+		return nil, nil, false, wrap(err)
 	}
-	return unlocker(c, ref), true, nil
+	return unlocker(c, ref), heldOn(c), true, nil
 }
 
 func (s *Store) tx(ctx context.Context, f func(pgx.Tx) error) error {

@@ -2379,3 +2379,50 @@ func TestPurgeDir_GuardBeforeAbsentDirectory(t *testing.T) {
 		t.Fatalf("quota changed: %q", f.calls())
 	}
 }
+
+// A failed read during the adoption check (Docker did not answer) is read
+// once more before a running cluster is removed; a refusal is not.
+func TestEnsureCluster_AdoptionReadFailureRetriedOnce(t *testing.T) {
+	old := adoptRetry
+	adoptRetry = 0
+	t.Cleanup(func() { adoptRetry = old })
+	for _, fails := range []int{1, 2} {
+		t.Run(fmt.Sprintf("fails=%d", fails), func(t *testing.T) {
+			a, f, s, _ := clSetup(t)
+			clToPhaseB(t, a, f, s)
+			s.HealthWait = -1
+			inner := dockerInspectNetwork
+			n := 0
+			dockerInspectNetwork = func(ctx context.Context, name string) (*dockerx.Network, error) {
+				if name == "proj-"+s.Ref && n < fails {
+					n++
+					return nil, errors.New("docker network inspect: Cannot connect to the Docker daemon")
+				}
+				return inner(ctx, name)
+			}
+			t.Cleanup(func() { dockerInspectNetwork = inner })
+			f.resetLog()
+			err := a.EnsureCluster(context.Background(), s)
+			m := f.mutations()
+			if fails == 1 {
+				if err != nil || len(m) != 0 {
+					t.Fatalf("one failed read: err %v, mutations %q; want the running cluster adopted", err, m)
+				}
+				return
+			}
+			wantContainment(t, err, "two failed reads")
+			if !slices.Equal(m, []string{"docker rm -f -v -- pg-" + s.Ref}) {
+				t.Fatalf("two failed reads: mutations %q, want the forced removal", m)
+			}
+		})
+	}
+	// A refusal (a fact read and wrong) is not read again.
+	a, f, s, _ := clSetup(t)
+	clToPhaseB(t, a, f, s)
+	f.ip["-j -d addr show dev spp14"] = bridgeIface("spp14", true)
+	f.resetLog()
+	wantContainment(t, a.EnsureCluster(context.Background(), s), "refusal")
+	if n := strings.Count(strings.Join(f.calls(), "\n"), "inspect network proj-"+s.Ref); n != 1 {
+		t.Fatalf("refusal read the project network %d times, want 1", n)
+	}
+}

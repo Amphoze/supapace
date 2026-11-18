@@ -1984,3 +1984,28 @@ func TestRace_FinishCreateVersusRequestAbort(t *testing.T) {
 		}
 	}
 }
+
+func TestTryLockRefChecked_DetectsLostLock(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	unlock, held, ok, err := s.TryLockRefChecked(ctx, ref(1))
+	must(t, err)
+	if !ok {
+		t.Fatal("free lock not acquired")
+	}
+	defer unlock()
+	must(t, held(ctx))
+	if _, _, ok, err := s.TryLockRefChecked(ctx, ref(1)); err != nil || ok {
+		t.Fatalf("held lock acquired again (ok %v, err %v)", ok, err)
+	}
+	if _, err := s.pool.Exec(ctx, "select pg_terminate_backend(pid) from pg_locks where locktype = 'advisory' and pid <> pg_backend_pid()"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for held(ctx) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("held reports a lock whose connection was terminated")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

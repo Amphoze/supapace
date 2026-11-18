@@ -9,6 +9,9 @@ ExecStart=/usr/local/bin/supapaced serve
 Restart=always
 RestartSec=1
 UMask=0077
+RuntimeDirectory=supapace
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 
 [Install]
 WantedBy=multi-user.target

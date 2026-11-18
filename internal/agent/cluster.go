@@ -39,6 +39,7 @@ var (
 
 	readyPoll  = time.Second       // between two login attempts while a cluster starts
 	phaseAWait = 120 * time.Second // the first-boot server must answer within this
+	adoptRetry = time.Second       // before the one repeat of an adoption check whose read failed
 )
 
 // clusterHealthWait is the default bound of a phase-B start's health wait
@@ -147,7 +148,17 @@ func (a *Agent) clusterPhaseB(ctx context.Context, s Spec, st State) error {
 	}
 	if c != nil {
 		if !first && a.clusterAdoptable(s, st, c) {
-			if err := a.CheckAdopted(ctx, s); err != nil {
+			err := a.CheckAdopted(ctx, s)
+			if err != nil && readFailed(err) && !a.ContainmentFailed() {
+				// A fact could not be read (a Docker hiccup): read once more
+				// before removing a running cluster. A refusal is final.
+				select {
+				case <-ctx.Done():
+				case <-time.After(adoptRetry):
+				}
+				err = a.CheckAdopted(ctx, s)
+			}
+			if err != nil {
 				// Off its networks at once, no grace period: it just failed a
 				// containment check.
 				return a.removeRefusedCluster(ctx, s.Ref, err)
@@ -723,4 +734,15 @@ func labelValue(args []string, key string) string {
 		}
 	}
 	return ""
+}
+
+// readFailed: the adoption check failed because a fact could not be read
+// (an error not of the gate, or a refusal carrying the read's own error),
+// not because a fact it read refused the container.
+func readFailed(err error) bool {
+	if !errors.Is(err, ErrContainment) {
+		return true
+	}
+	m, ok := err.(interface{ Unwrap() []error })
+	return ok && len(m.Unwrap()) > 1
 }
