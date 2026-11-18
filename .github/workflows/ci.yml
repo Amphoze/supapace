@@ -1,3 +1,11 @@
+      - name: Daemon log
+        if: failure()
+        run: sudo journalctl -u supapaced --no-pager -n 300 || true
+      - name: Docker unit state
+        if: failure()
+        run: |
+          sudo systemctl status docker.service --no-pager -l || true
+          sudo journalctl -u docker.service --no-pager -n 80 || true
 # Continuous integration. Actions are pinned by major tag, not by commit.
 #
 #   public      the content gate over the tree and over the pushed or proposed commits
@@ -202,6 +210,11 @@ jobs:
           sudo mkfs.xfs -q /var/lib/supapace-projects.img
           sudo mkdir -p /var/lib/supapace/projects
           sudo mount -o loop,usrquota,prjquota /var/lib/supapace-projects.img /var/lib/supapace/projects
+          # The host tests restart Docker several times within a minute; without this the
+          # unit's start rate limit refuses the last of them.
+          sudo mkdir -p /etc/systemd/system/docker.service.d
+          printf '[Unit]\nStartLimitIntervalSec=0\n' | sudo tee /etc/systemd/system/docker.service.d/90-ci-no-start-limit.conf >/dev/null
+          sudo systemctl daemon-reload
       # The key escrow goes to a file the runner user writes, not to the job log.
       - name: Install the node
         run: |
