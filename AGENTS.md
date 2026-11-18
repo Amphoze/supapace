@@ -612,3 +612,60 @@ patch surface, backup model) were verified against upstream source first.
   container flags): tests 03, 04 (the half without the daemon), 06 and 16. Everything that
   needs the daemon, the CLI, the gateway or a real project is unexercised until those
   exist.
+
+### 2026-11-18 — `supapaced init`, `supapaced nft`, `scripts/install-node.sh`
+
+- CLI: `supapaced init --domain D [--dev] [--no-systemd] [--ack-escrow]
+  [--tls-cert F --tls-key F]`; `supapaced nft load|check`. `cmd/supapaced/main.go` holds
+  only the command map and the dispatcher; each subcommand registers itself from its own
+  file, so a new subcommand is a new file.
+- Exit codes: 0 success, 1 failure, 2 usage; `nft load|check` also 3 (a table is absent),
+  4 (drift: the file or the installed tables differ from the last load), 5 (a
+  bridge-netfilter switch is on), 6 (not verified: `nft` could not run, failed or timed
+  out). Errors are one line on stderr.
+- `init` runs as root and offline (no Docker, no database). It checks every input before
+  writing, writes atomically and skips unchanged files: a second run changes nothing. It
+  refuses an invalid domain; a `node.json` that does not load or names another domain; ids
+  of the reserved range in passwd, group, subuid or subgid; a `daemon.json` holding any
+  other key or value (it prints the merged document to apply by hand); a link at a unit
+  path (a masked unit); an `/etc/supapace`, `tls/` or `ca/` that is not a root-owned 0700
+  directory; an operator certificate that does not match its key, does not cover a project
+  host of the domain, has expired, is not yet valid, or has an extended key usage without
+  serverAuth. An empty or subset `daemon.json`, or one not root 0644, is rewritten with
+  exactly init's settings.
+- Files: `/etc/supapace` (0700) with `node.json`, `nftables.nft`, `nft.sha256` (written by
+  `nft load`), `kek.escrowed`, `dev-mode` (all 0600) and `kek` (0400); `tls/cert.pem`,
+  `tls/key.pem` (0600); with `--dev`, `ca/ca.key` (0400) and `ca/ca.pem` (0644);
+  `/etc/docker/daemon.json` (address pool, `ipv6: false`, the `local` log driver; **no**
+  `userland-proxy`, `icc` or `live-restore` key); unless `--no-systemd`, the three unit
+  files of `internal/nft`. Temporary files left by an interrupted write are removed at the
+  start of the next run, by exact name pattern; a link is unlinked, never followed.
+- **Escrow rule.** The key-encryption key is generated once and never replaced. Its text is
+  shown on every run until the marker `kek.escrowed` exists — decided by the marker, never
+  by the key file. The marker is written only after the text was written to standard
+  output and acknowledged, by the typed word or by `--ack-escrow`. `--ack-escrow` is
+  refused when standard output is the null device (a closed standard output counts). A
+  failed write ends with exit 1 and no marker; the next run shows the same key. With the
+  marker present the key file must be a regular file, 0400, 32 bytes, root-owned;
+  otherwise init refuses and never makes a new key.
+- **Development mode** is fixed at the first init, like the domain: `--dev` on a node set
+  up without it, and a run without `--dev` on a development node, are refused before any
+  write. `--dev` refuses the TLS flags and issues a CA that is name-constrained (critical)
+  to the node's domain and the gateway's ingress address, plus a server certificate for
+  `*.<domain>` and that address, valid 825 days and issued again from the same CA whenever
+  the pair cannot be loaded or expires within 30 days. The `dev-mode` marker makes
+  host-global node checks informational.
+- `scripts/install-node.sh --domain D (--dev | --tls-cert F --tls-key F) [--ack-escrow]`,
+  as root: requires systemd, Docker and `nft`, and the projects filesystem mounted (the
+  topmost mount) at `/var/lib/supapace/projects` as XFS with user-quota enforcement
+  (`usrquota` in `/proc/mounts`) and project accounting (`prjquota` or `pqnoenforce`). It
+  writes the modprobe block that keeps `br_netfilter` from loading and
+  `kernel.core_pattern = core`, installs the binaries to `/usr/local/bin`, runs `init`,
+  enables the units, restarts Docker and ends with `supapaced nft check`. It is safe to
+  rerun and refuses the no-systemd flag. **Do not run it on a host before the daemon binary
+  provides `serve`**: the daemon unit is pulled in by Docker's drop-in.
+- Not verified until a host with systemd: unit ordering on boot and on a Docker restart,
+  reload propagation from the distribution's nftables service, the modprobe block and
+  `core_pattern` across a reboot, socket activation of Docker, the typed acknowledgement
+  from a terminal, and exit code 5 end to end. The script's tests run it against a scratch
+  root with stand-ins for `supapaced`, `systemctl`, `sysctl`, `dockerd` and `nft`.
