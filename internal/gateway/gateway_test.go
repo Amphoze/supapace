@@ -882,6 +882,167 @@ func TestServer_SlowBodyCut(t *testing.T) {
 	}
 }
 
+// dropUpstream points every upstream dial of e at a server that reads a
+// request's header and n bytes of its body, then closes the connection, as a
+// server guarding against slow senders does. It returns the count of
+// connections it has closed.
+func dropUpstream(t *testing.T, e *env, n int64) *atomic.Int32 {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	closed := new(atomic.Int32)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer closed.Add(1)
+				defer c.Close()
+				if r, err := http.ReadRequest(bufio.NewReader(c)); err == nil {
+					io.CopyN(io.Discard, r.Body, n)
+				}
+			}()
+		}
+	}()
+	e.gw.transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", ln.Addr().String())
+	}
+	return closed
+}
+
+// TestServer_StalledBodyNotBlamedOnUpstream: a client that sends its header
+// and part of its body, then stalls, is cut when the read timeout fires, also
+// when the upstream gave up on the body first: over HTTP/1.1 the connection
+// closes with no response, over HTTP/2 the stream is reset; no 5xx, nothing
+// logged as an upstream fault, slots returned, upstream connection closed.
+func TestServer_StalledBodyNotBlamedOnUpstream(t *testing.T) {
+	var buf syncBuf
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+	a, _, _ := keys()
+	tok := a.anon.token(t, "anon")
+	const timeout = 500 * time.Millisecond
+	for _, mode := range []string{"plain", "tls", "h2"} {
+		for _, drop := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/upstream_drops=%v", mode, drop), func(t *testing.T) {
+				buf.Reset()
+				e := newEnv(t, active())
+				var closed *atomic.Int32
+				if drop {
+					closed = dropUpstream(t, e, 2)
+				}
+				addr := e.serve(t, mode != "plain", func(s *http.Server) { s.ReadTimeout, s.WriteTimeout = timeout, timeout })
+				start := time.Now()
+				// The body comes one byte per 100 ms, far slower than the read
+				// timeout allows, as a slow sender's would.
+				var send func() error
+				result := make(chan string, 1)
+				if mode == "h2" {
+					h := h2open(t, addr)
+					h.headers(1, [][2]string{{":method", "POST"}, {":scheme", "https"}, {":authority", hostA},
+						{":path", "/rest/v1/t"}, {"apikey", tok}, {"content-length", "1048576"}}, false, maxH2Frame)
+					h.frame(0, 0, 1, []byte("xxxx"))
+					send = func() error { return h.frame(0, 0, 1, []byte("x")) }
+					go func() {
+						if got := h.wait(t, 1, 5*time.Second); !strings.HasPrefix(got, "reset:") {
+							result <- got + ", want a reset"
+						}
+						close(result)
+					}()
+				} else {
+					var c net.Conn
+					var err error
+					if mode == "tls" {
+						c, err = tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, ServerName: hostA})
+					} else {
+						c, err = net.Dial("tcp", addr)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer c.Close()
+					io.WriteString(c, "POST /rest/v1/t HTTP/1.1\r\nHost: "+hostA+"\r\napikey: "+tok+"\r\nContent-Length: 1048576\r\n\r\nxxxx")
+					send = func() error { _, err := c.Write([]byte("x")); return err }
+					c.SetReadDeadline(time.Now().Add(5 * time.Second))
+					go func() {
+						b, err := io.ReadAll(c)
+						switch {
+						case errors.Is(err, os.ErrDeadlineExceeded):
+							result <- "connection not closed by the server"
+						case len(b) != 0:
+							result <- fmt.Sprintf("answered %q (%v), want the connection closed", firstLine(string(b)), err)
+						}
+						close(result)
+					}()
+				}
+			feed:
+				for {
+					select {
+					case msg, ok := <-result:
+						if ok {
+							t.Error("slow body: " + msg)
+						}
+						break feed
+					case <-time.After(100 * time.Millisecond):
+						send() // fails once the server has given up; the reader reports
+					}
+				}
+				if d := time.Since(start); d < timeout || d > 3*time.Second {
+					t.Errorf("cut after %v, want the read timeout", d)
+				}
+				eventually(t, func() bool { return idle(e) }, "slots not returned")
+				if drop {
+					eventually(t, func() bool { return closed.Load() == 1 }, "upstream connection not closed")
+				}
+				if s := buf.String(); strings.Contains(s, "upstream") {
+					t.Errorf("logged as an upstream fault: %s", s)
+				}
+			})
+		}
+	}
+}
+
+// TestServer_UpstreamDropsMidBodyFastClient: when the upstream closes while a
+// client that keeps sending is still uploading, the gateway reads the rest of
+// the body and answers its 502, which the client then reads whole.
+func TestServer_UpstreamDropsMidBodyFastClient(t *testing.T) {
+	a, _, _ := keys()
+	e := newEnv(t, active())
+	closed := dropUpstream(t, e, 2)
+	addr := e.serve(t, false, nil)
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	io.WriteString(c, "POST /rest/v1/t HTTP/1.1\r\nHost: "+hostA+"\r\napikey: "+a.anon.token(t, "anon")+"\r\nContent-Length: 100\r\n\r\nxxxx")
+	eventually(t, func() bool { return closed.Load() == 1 }, "upstream did not close")
+	io.WriteString(c, strings.Repeat("x", 96))
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 502 || strings.TrimSpace(string(b)) != `{"code":"upstream_unavailable"}` {
+		t.Errorf("got %d %s", resp.StatusCode, b)
+	}
+}
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
+func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+func (s *syncBuf) Reset()                      { s.mu.Lock(); defer s.mu.Unlock(); s.b.Reset() }
+
 func TestServer_BodyLimit413(t *testing.T) {
 	a, _, _ := keys()
 	e := newEnv(t, active())
@@ -897,6 +1058,19 @@ func TestServer_BodyLimit413(t *testing.T) {
 	r = withKey(req("POST", hostA, "/rest/v1/t", io.MultiReader(bytes.NewReader(make([]byte, maxBody)))), anon)
 	r.ContentLength = -1
 	e.expect(t, "streamed body at the cap", r, 200, "")
+}
+
+// TestServer_BodyLimitExpectContinue: a client that asks before sending gets
+// the 413 and no 100 Continue, so it never sends the body.
+func TestServer_BodyLimitExpectContinue(t *testing.T) {
+	a, _, _ := keys()
+	e := newEnv(t, active())
+	addr := e.serve(t, false, nil)
+	out := raw(t, addr, "POST /rest/v1/t HTTP/1.1\r\nHost: "+hostA+"\r\napikey: "+a.anon.token(t, "anon")+
+		"\r\nExpect: 100-continue\r\nContent-Length: "+fmt.Sprint(maxBody+1)+"\r\n\r\n")
+	if !strings.HasPrefix(out, "HTTP/1.1 413 ") || strings.Contains(out, " 100 ") || !strings.Contains(out, `{"code":"body_too_large"}`) {
+		t.Errorf("got %q", out)
+	}
 }
 
 // TestServer_RequestShapes covers the framing a front proxy must not pass on
@@ -1823,11 +1997,16 @@ func TestForward_UpstreamResponse(t *testing.T) {
 	}
 }
 
-// TestErrors_BodiesCarryNothing: every refusal body is {"code":…} only.
+// TestErrors_BodiesCarryNothing: every refusal body is {"code":…}, with a
+// "message" only for a refused credential, taken from the fixed list.
 func TestErrors_BodiesCarryNothing(t *testing.T) {
 	a, b, _ := keys()
 	e := newEnv(t, active())
 	anon := a.anon.token(t, "anon")
+	fixed := map[string]bool{}
+	for _, m := range tokenMessages {
+		fixed[m] = true
+	}
 	for _, r := range []*http.Request{
 		withKey(req("GET", hostA, "/rest/v1/?a;b", nil), anon),
 		withKey(req("GET", hostA, "/nope", nil), anon),
@@ -1836,13 +2015,78 @@ func TestErrors_BodiesCarryNothing(t *testing.T) {
 	} {
 		w := e.do(r)
 		var m map[string]any
-		if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil || len(m) != 1 || m["code"] == nil {
+		err := json.Unmarshal(w.Body.Bytes(), &m)
+		msg, hasMsg := m["message"].(string)
+		if err != nil || m["code"] == nil || len(m) != 1 && !(len(m) == 2 && hasMsg && fixed[msg]) {
 			t.Errorf("body %s", w.Body)
 		}
 		for _, s := range []string{"10.212.", "sp.test", refA, "eyJ"} {
 			if strings.Contains(w.Body.String(), s) || strings.Contains(fmt.Sprint(w.Header()), s) {
 				t.Errorf("refusal carries %q: %s %v", s, w.Body, w.Header())
 			}
+		}
+	}
+}
+
+// TestAuth_RefusalMessages: each refused credential names its cause with a
+// fixed message; status and code are unchanged.
+func TestAuth_RefusalMessages(t *testing.T) {
+	a, b, stranger := keys()
+	e := newEnv(t, active())
+	anon, user := a.anon.token(t, "anon"), a.iss.token(t, "authenticated")
+	expired, err := jwtx.Sign(a.iss.priv, a.iss.kid, map[string]any{"role": "authenticated", "exp": time.Now().Unix() - 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	early, err := jwtx.Sign(a.iss.priv, a.iss.kid, map[string]any{"role": "authenticated", "exp": time.Now().Unix() + 300, "nbf": time.Now().Unix() + 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noRole, err := jwtx.Sign(a.iss.priv, a.iss.kid, map[string]any{"exp": time.Now().Unix() + 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seg := strings.Split(user, ".")
+	none := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","kid":"`+a.iss.kid+`"}`)) + "." + seg[1] + "." + seg[2]
+	noKID := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`)) + "." + seg[1] + "." + seg[2]
+	dup := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"`+a.iss.kid+`","kid":"x"}`)) + "." + seg[1] + "." + seg[2]
+	badSig := seg[0] + "." + seg[1] + "." + strings.Repeat("A", len(seg[2]))
+	for _, c := range []struct{ name, apikey, query, auth, code, msg string }{
+		{"no apikey", "", "", "", "no_apikey", ""},
+		{"two query apikeys", "", "apikey=" + anon + "&apikey=" + anon, "", "invalid_apikey", "more than one apikey"},
+		{"header and query differ", anon, "apikey=" + a.svc.token(t, "service_role"), "", "invalid_apikey", "apikey header and query parameter differ"},
+		{"issuer token as apikey", user, "", "", "invalid_apikey", "apikey is not an anon or service_role key"},
+		{"other project's apikey", b.anon.token(t, "anon"), "", "", "invalid_apikey", "token kid is not a key of this project"},
+		{"malformed apikey", "abc", "", "", "invalid_apikey", "token is malformed"},
+		{"expired", anon, "", "Bearer " + expired, "invalid_token", "token is expired or has no exp"},
+		{"not yet valid", anon, "", "Bearer " + early, "invalid_token", "token is not yet valid"},
+		{"unknown issuer", anon, "", "Bearer " + stranger.token(t, "authenticated"), "invalid_token", "token kid is not a key of this project"},
+		{"role not allowed", anon, "", "Bearer " + a.iss.token(t, "service_role"), "invalid_token", "token role is not allowed for its key"},
+		{"no role", anon, "", "Bearer " + noRole, "invalid_token", "token has no role"},
+		{"alg none", anon, "", "Bearer " + none, "invalid_token", "token algorithm is not RS256"},
+		{"no kid", anon, "", "Bearer " + noKID, "invalid_token", "token has no kid"},
+		{"duplicate member", anon, "", "Bearer " + dup, "invalid_token", "token has a duplicate member name"},
+		{"bad signature", anon, "", "Bearer " + badSig, "invalid_token", "token signature is invalid"},
+		{"malformed bearer", anon, "", "Bearer x.y", "invalid_token", "token is malformed"},
+		{"not Bearer", anon, "", "Basic " + user, "invalid_token", `Authorization is not "Bearer <token>"`},
+		{"two Authorization", anon, "", "two", "invalid_token", "more than one Authorization header"},
+	} {
+		r := req("GET", hostA, "/rest/v1/?"+c.query, nil)
+		if c.apikey != "" {
+			withKey(r, c.apikey)
+		}
+		switch c.auth {
+		case "":
+		case "two":
+			r.Header["Authorization"] = []string{"Bearer " + user, "Bearer " + user}
+		default:
+			r.Header.Set("Authorization", c.auth)
+		}
+		w := e.do(r)
+		var got struct{ Code, Message string }
+		json.Unmarshal(w.Body.Bytes(), &got)
+		if w.Code != 401 || got.Code != c.code || got.Message != c.msg {
+			t.Errorf("%s: %d %s, want 401 %q %q", c.name, w.Code, w.Body, c.code, c.msg)
 		}
 	}
 }
@@ -2062,14 +2306,26 @@ func (f *failingBody) Read(p []byte) (int, error) {
 	return 1, nil
 }
 
-// TestServer_ClientBodyFailure400: a body that breaks off is the client's
-// fault, not the upstream's.
-func TestServer_ClientBodyFailure400(t *testing.T) {
+// TestServer_ClientBodyFailureAborts: a body that breaks off is the client's
+// fault, not the upstream's: nothing is answered, the handler aborts, the
+// slots come back.
+func TestServer_ClientBodyFailureAborts(t *testing.T) {
 	a, _, _ := keys()
 	e := newEnv(t, active())
 	r := withKey(req("POST", hostA, "/rest/v1/t", nil), a.anon.token(t, "anon"))
 	r.Body, r.ContentLength = io.NopCloser(&failingBody{n: 3}), 100
-	e.expect(t, "broken body", r, 400, "bad_request")
+	w := httptest.NewRecorder()
+	func() {
+		defer func() {
+			if p := recover(); p != http.ErrAbortHandler {
+				t.Errorf("broken body: recovered %v, want http.ErrAbortHandler", p)
+			}
+		}()
+		e.gw.ServeHTTP(w, r)
+	}()
+	if w.Body.Len() != 0 || len(e.requests()) != 0 || !idle(e) {
+		t.Errorf("broken body: answered %d %s, upstream saw %d, idle %v", w.Code, w.Body, len(e.requests()), idle(e))
+	}
 }
 
 // TestShutdown_DrainsInFlight: Shutdown lets a running request finish, stops
@@ -2134,4 +2390,46 @@ func TestShutdown_DrainsInFlight(t *testing.T) {
 		t.Errorf("grace exceeded: %v after %v", err, time.Since(start))
 	}
 	s.Close()
+}
+
+// TestServer_ClientGivesUpDuringBodyRead: after the upstream dropped a
+// partial body, the gateway reads the rest; a client that then closes its
+// connection (HTTP/1.1) or resets its stream (HTTP/2) ends that read at once,
+// not at the read timeout, and the slots come back.
+func TestServer_ClientGivesUpDuringBodyRead(t *testing.T) {
+	a, _, _ := keys()
+	tok := a.anon.token(t, "anon")
+	for _, mode := range []string{"h1", "h2"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newEnv(t, active())
+			closed := dropUpstream(t, e, 2)
+			addr := e.serve(t, mode == "h2", func(s *http.Server) { s.ReadTimeout, s.WriteTimeout = 10*time.Second, 10*time.Second })
+			var giveUp func()
+			if mode == "h2" {
+				h := h2open(t, addr)
+				h.headers(1, [][2]string{{":method", "POST"}, {":scheme", "https"}, {":authority", hostA},
+					{":path", "/rest/v1/t"}, {"apikey", tok}, {"content-length", "1048576"}}, false, maxH2Frame)
+				h.frame(0, 0, 1, []byte("xxxx"))
+				giveUp = func() { h.frame(3, 0, 1, []byte{0, 0, 0, 8}) } // RST_STREAM CANCEL
+			} else {
+				c, err := net.Dial("tcp", addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				io.WriteString(c, "POST /rest/v1/t HTTP/1.1\r\nHost: "+hostA+"\r\napikey: "+tok+"\r\nContent-Length: 1048576\r\n\r\nxxxx")
+				giveUp = func() { c.Close() }
+			}
+			eventually(t, func() bool { return closed.Load() == 1 }, "upstream did not drop the body")
+			time.Sleep(100 * time.Millisecond) // the error handler is now reading the rest
+			if idle(e) {
+				t.Fatal("slots already back: the rest of the body is not being read")
+			}
+			start := time.Now()
+			giveUp()
+			eventually(t, func() bool { return idle(e) }, "slots not returned")
+			if d := time.Since(start); d > 2*time.Second {
+				t.Errorf("slots back %v after the client gave up, want at once", d)
+			}
+		})
+	}
 }

@@ -1426,3 +1426,53 @@ Known limits
   still exactly one JSON document. An operation with no step reads "before its first step".
 - Limits: the create serialisation is in-process (one daemon per node); the pre-check is
   advisory and counts creates not placed yet, so it can refuse slightly earlier than `Place`.
+
+### 2026-11-18 — gateway: slow or broken client bodies; refusal messages
+
+- A request body that fails to arrive (the 60 s read timeout, broken chunked framing, a
+  reset) or a client that goes away now ends the request without a response: HTTP/1.1
+  closes the connection, HTTP/2 resets the stream. Nothing is logged and the upstream is
+  not blamed. Before: `502 upstream_unavailable` when the upstream had given up on the
+  slow body first, otherwise `400 bad_request` written after the write deadline (over TLS
+  a broken record). `bad_request` no longer covers request bodies.
+- When the upstream round trip fails after the upstream began receiving the body (it
+  closed or reset mid-upload), the gateway reads the rest of the body, within the read
+  timeout and the 8 MiB cap and keeping the request's slots, then answers `502`
+  or `504`: a body that ends in time makes it the upstream's fault. A client that gives
+  up during that read ends it at once. When the upstream was never reached (connection
+  refused, dial timeout), the gateway answers at once without reading the body, so an
+  `Expect: 100-continue` client gets no `100 Continue` and uploads nothing.
+- `invalid_apikey` and `invalid_token` refusals (401) now carry a fixed message:
+  `{"code":…,"message":…}`. This supersedes "Refusals are JSON `{"code": …}`" in the
+  gateway entry for those two codes; `no_apikey` and every other refusal stay `{"code":…}`.
+  The closed list:
+  - `token is malformed`
+  - `token has a duplicate member name`
+  - `token algorithm is not RS256`
+  - `token has no kid`
+  - `token kid is not a key of this project`
+  - `token signature is invalid`
+  - `token is expired or has no exp`
+  - `token is not yet valid`
+  - `token has no role`
+  - `token role is not allowed for its key`
+  - `token is invalid` (any other token error)
+  - `more than one apikey`
+  - `apikey header and query parameter differ`
+  - `apikey is not an anon or service_role key`
+  - `Authorization is not "Bearer <token>"`
+  - `more than one Authorization header`
+  Nothing of the token, the keys or the upstream is echoed. Before the signature check a
+  caller learns only whether its kid is one of the project's (key ids are public in every
+  key and token); the claim messages need a validly signed token.
+- Callers: assert gateway refusals by `code`; message texts may change.
+- Known limits:
+  - an oversized request header block gets the standard library's plain-text `431`
+    (HTTP/1.1) or a stream reset (HTTP/2); there is no hook short of a custom parser;
+  - a body declared over 8 MiB is refused `413` unread and the connection closed; a client
+    still sending may see a reset instead, and `Expect: 100-continue` gets the 413
+    reliably;
+  - upstream response bodies, 5xx included, pass through byte for byte, so the upstream's
+    connection-error details can show the project cluster's private address;
+  - an upstream that answers before reading the body while the client stalls its body
+    cannot be relayed before the read timeout; the client then sees the connection close.

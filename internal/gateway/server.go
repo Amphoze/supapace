@@ -77,7 +77,8 @@ func (g *Gateway) releaseProject(ref string) {
 
 // ServeHTTP answers /-/health, then resolves the project, checks the
 // credentials and the route, and forwards. Every refusal is a JSON body
-// {"code":…} carrying nothing from the request, the keys or the upstream.
+// {"code":…}, for a refused credential with a fixed "message" naming the
+// cause, carrying nothing from the request, the keys or the upstream.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// HTTP/2 keeps a stream's request until its response is on the wire, so a
 	// client that does not read would pin up to the header limit per stream.
@@ -121,9 +122,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	bearer, code := authenticate(r.Header, queryKeys, p, time.Now())
+	bearer, code, msg := authenticate(r.Header, queryKeys, p, time.Now())
 	if code != "" {
-		fail(w, http.StatusUnauthorized, code)
+		refuse(w, http.StatusUnauthorized, code, msg)
 		return
 	}
 	path, graphql, ok := route(r)
@@ -151,7 +152,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.forward(w, r, name, ref, p, path, query, bearer, graphql)
 }
 
-func fail(w http.ResponseWriter, status int, code string) {
+func fail(w http.ResponseWriter, status int, code string) { refuse(w, status, code, "") }
+
+// refuse writes the gateway's error body: the code, and a message from a
+// fixed list when one is given.
+func refuse(w http.ResponseWriter, status int, code, msg string) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
 	sandbox(h)
@@ -162,7 +167,11 @@ func fail(w http.ResponseWriter, status int, code string) {
 		h.Set("Retry-After", "1")
 	}
 	w.WriteHeader(status)
-	fmt.Fprintf(w, `{"code":%q}`, code)
+	if msg == "" {
+		fmt.Fprintf(w, `{"code":%q}`, code)
+		return
+	}
+	fmt.Fprintf(w, `{"code":%q,"message":%q}`, code, msg)
 }
 
 // NewServer returns a server with the gateway's timeouts, header cap and TLS

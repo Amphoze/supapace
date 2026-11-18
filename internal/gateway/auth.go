@@ -10,47 +10,72 @@ import (
 )
 
 // authenticate checks the request's credentials against p's keys and returns
-// the bearer to forward, or the code of a 401.
+// the bearer to forward, or the code of a 401 and its message.
 //
 // The apikey comes from one header or one query parameter (or both, equal)
 // and must be a valid anon or service_role token of this project. A single
 // "Authorization: Bearer" header, when present, is verified on its own and is
 // what is forwarded; otherwise the apikey is.
-func authenticate(h http.Header, queryKeys []string, p *project, now time.Time) (bearer, code string) {
+func authenticate(h http.Header, queryKeys []string, p *project, now time.Time) (bearer, code, msg string) {
 	hk := headerValues(h, "apikey")
 	if len(hk) > 1 || len(queryKeys) > 1 {
-		return "", "invalid_apikey"
+		return "", "invalid_apikey", "more than one apikey"
 	}
 	var key string
 	switch {
 	case len(hk) == 0 && len(queryKeys) == 0:
-		return "", "no_apikey"
+		return "", "no_apikey", ""
 	case len(hk) == 1 && len(queryKeys) == 1 && hk[0] != queryKeys[0]:
-		return "", "invalid_apikey"
+		return "", "invalid_apikey", "apikey header and query parameter differ"
 	case len(hk) == 1:
 		key = hk[0]
 	default:
 		key = queryKeys[0]
 	}
 	k, err := p.verify(key, now)
-	if err != nil || (k.Class != "anon" && k.Class != "service_role") {
-		return "", "invalid_apikey"
+	if err != nil {
+		return "", "invalid_apikey", tokenMessage(err)
+	}
+	if k.Class != "anon" && k.Class != "service_role" {
+		return "", "invalid_apikey", "apikey is not an anon or service_role key"
 	}
 	az := headerValues(h, "Authorization")
 	switch len(az) {
 	case 0:
-		return key, ""
+		return key, "", ""
 	case 1:
 		tok, ok := cutBearer(az[0])
 		if !ok {
-			return "", "invalid_token"
+			return "", "invalid_token", "Authorization is not \"Bearer <token>\""
 		}
 		if _, err := p.verify(tok, now); err != nil {
-			return "", "invalid_token"
+			return "", "invalid_token", tokenMessage(err)
 		}
-		return tok, ""
+		return tok, "", ""
 	}
-	return "", "invalid_token"
+	return "", "invalid_token", "more than one Authorization header"
+}
+
+// tokenMessages names why a token was refused. The messages are constants:
+// nothing of the token, the keys or the project is echoed.
+var tokenMessages = map[error]string{
+	jwtx.ErrMalformed:       "token is malformed",
+	jwtx.ErrDuplicateMember: "token has a duplicate member name",
+	jwtx.ErrAlg:             "token algorithm is not RS256",
+	jwtx.ErrNoKID:           "token has no kid",
+	jwtx.ErrUnknownKID:      "token kid is not a key of this project",
+	jwtx.ErrSignature:       "token signature is invalid",
+	jwtx.ErrExpired:         "token is expired or has no exp",
+	jwtx.ErrNotYetValid:     "token is not yet valid",
+	jwtx.ErrNoRole:          "token has no role",
+	jwtx.ErrRole:            "token role is not allowed for its key",
+}
+
+func tokenMessage(err error) string {
+	if m, ok := tokenMessages[err]; ok {
+		return m
+	}
+	return "token is invalid"
 }
 
 // verify is the only way a token is accepted: signature and dates by

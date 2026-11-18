@@ -84,6 +84,10 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, name, ref stri
 	}
 	b := &body{ReadCloser: http.MaxBytesReader(w, r.Body, maxBody)}
 	r.Body = b
+	// The server sees b as the request's body and, after the handler, reads
+	// up to 256 KiB of an unread one before it answers unless the original is
+	// closed: a client waiting for 100-continue would never get the answer.
+	defer b.ReadCloser.Close()
 	peer, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		peer = r.RemoteAddr
@@ -116,15 +120,29 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, name, ref stri
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			// The upstream may give up on a body that is still arriving (its
+			// own guard against slow senders): read the rest, within the
+			// server's read timeout and the body cap, to learn whose fault it
+			// is. A complete body is answered as the upstream's failure. Only
+			// a body the transport began to send is read: an upstream never
+			// reached has asked for nothing, and reading would send a client
+			// that expects 100-continue its go-ahead.
+			if b.started.Load() { // a finished or failed body returns at once
+				_, derr := io.Copy(io.Discard, b)
+				err = errors.Join(err, derr)
+			}
 			var tooLarge *http.MaxBytesError
 			var ne net.Error
 			switch {
 			case errors.As(err, &tooLarge):
 				fail(w, http.StatusRequestEntityTooLarge, "body_too_large")
 				return
-			case b.failed.Load():
-				fail(w, http.StatusBadRequest, "bad_request")
-				return
+			case b.failed.Load() || r.Context().Err() != nil:
+				// The client's read timed out or it went away: nothing is
+				// answered (a write now could break mid-record once the write
+				// deadline, equal to the read one, has passed). The server
+				// closes the HTTP/1.1 connection or resets the HTTP/2 stream.
+				panic(http.ErrAbortHandler)
 			case errors.As(err, &ne) && ne.Timeout():
 				fail(w, http.StatusGatewayTimeout, "upstream_timeout")
 			default:
@@ -211,19 +229,24 @@ func hasDomain(cookie string) bool {
 }
 
 // body records whether reading the client's body failed (a timeout or a
-// broken connection), so that is not reported as an upstream fault.
+// broken connection), so that is not reported as an upstream fault, and
+// whether the transport began reading it. The transport's Close is ignored,
+// so the error handler can still read the rest; forward closes it on return.
 type body struct {
 	io.ReadCloser
-	failed atomic.Bool
+	started, failed atomic.Bool
 }
 
 func (b *body) Read(p []byte) (int, error) {
+	b.started.Store(true)
 	n, err := b.ReadCloser.Read(p)
 	if err != nil && err != io.EOF {
 		b.failed.Store(true)
 	}
 	return n, err
 }
+
+func (b *body) Close() error { return nil }
 
 // sandbox sets the headers every final response carries, replacing any
 // upstream value: no content sniffing, and a sandboxed origin, so a response
