@@ -1343,22 +1343,28 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 		// create is refused at once with node_full and writes no row (no
 		// tombstone, no ref burned). Control: after S3 is deleted a fourth
 		// project fits (S4 below); S3's slice stays held.
-		rows := len(listPlacements(t))
-		_, _, jwks := newIssuer(t)
-		out, code = cli(t, "project", "create", "--name", scratchName, "--issuer-jwks", jwks, "--no-wait")
-		var full errorJSON
-		json.Unmarshal([]byte(out), &full)
-		if code == 0 {
-			var m mutationJSON
-			if json.Unmarshal([]byte(out), &m) == nil && m.Ref != "" {
-				t.Cleanup(func() { removeProject(t, m.Ref) })
+		// The test node is sized so that four projects fill it; a host install
+		// has the machine's own memory, so there the refusal is not asserted.
+		if os.Getenv("SUPAPACE_HOST") == "1" {
+			t.Log("host install: four projects do not fill this machine; the full-node refusal is asserted in the test node")
+		} else {
+			rows := len(listPlacements(t))
+			_, _, jwks := newIssuer(t)
+			out, code = cli(t, "project", "create", "--name", scratchName, "--issuer-jwks", jwks, "--no-wait")
+			var full errorJSON
+			json.Unmarshal([]byte(out), &full)
+			if code == 0 {
+				var m mutationJSON
+				if json.Unmarshal([]byte(out), &m) == nil && m.Ref != "" {
+					t.Cleanup(func() { removeProject(t, m.Ref) })
+				}
 			}
-		}
-		if code != 1 || full.Code != "node_full" {
-			t.Fatalf("a create on a full node: exit %d code %q, want exit 1 and node_full", code, full.Code)
-		}
-		if n := len(listPlacements(t)); n != rows {
-			t.Fatalf("a create refused with node_full changed the project list from %d to %d rows", rows, n)
+			if code != 1 || full.Code != "node_full" {
+				t.Fatalf("a create on a full node: exit %d code %q, want exit 1 and node_full", code, full.Code)
+			}
+			if n := len(listPlacements(t)); n != rows {
+				t.Fatalf("a create refused with node_full changed the project list from %d to %d rows", rows, n)
+			}
 		}
 		out, code = cli(t, "project", "delete", S3.Ref)
 		decode(t, "project delete", out, &op)
