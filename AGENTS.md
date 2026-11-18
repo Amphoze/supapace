@@ -736,3 +736,87 @@ patch surface, backup model) were verified against upstream source first.
 - Tests in both packages start a throw-away control-plane database with Docker and skip
   without it. The limits quoted in the usage text and in the API's messages are pinned by
   tests against `jwtx` and `pgconf`.
+
+### 2026-11-18 — `internal/bootstrap`
+
+- Prepares a project's cluster once, at its first boot, and later reports where a running
+  cluster differs from what the platform expects. **The database server is treated as
+  untrusted**: what the checks report is drift for that project, never a guarantee, and every
+  value read from the server is bounded and sanitised before it reaches a finding.
+- API: `LoadBaseline() (Baseline, error)` (the embedded, strictly parsed baseline of the pinned
+  image); `Run(ctx, conn, Secrets) error`; `Assert(ctx, conn, Baseline, renderedConf []byte)
+  ([]nodecfg.CheckResult, error)`; `AssertHBA(ctx, conn, renderedHBA []byte)
+  ([]nodecfg.CheckResult, error)`; `ErrAssertion`. `Secrets` holds the three platform passwords,
+  the pgsodium root key and `ScramSalts` (role → salt from `pgsock.ScramSalt`).
+- `Run`, in order, each step idempotent (a run cut short is repeated on a new session):
+  1. the passwords of `supabase_admin`, `postgres` and `authenticator` (three distinct values)
+     are set as SCRAM-SHA-256 verifiers computed here with the role's salt and 4096
+     iterations — no password reaches the server;
+  2. `supabase_realtime_admin` (NOLOGIN NOINHERIT) and `supapace_backup` (LOGIN, no other
+     attribute, NOINHERIT) are created if absent; `supapace_backup` gets
+     `pg_read_all_settings` and EXECUTE on the four backup functions;
+  3. as `supabase_auth_admin`, `auth.uid()`, `auth.role()`, `auth.email()` and `auth.jwt()`
+     are defined: plain SQL, stable, no SET clause, not security definer, every function,
+     type and operator written `pg_catalog.`-qualified and no construct that looks an operator
+     up by name, so a caller's search path cannot change the result and the planner still
+     inlines them. Each reads the per-claim setting first, then the JSON claims. The session
+     role is reset afterwards, also after an error.
+- `Assert` and `AssertHBA` read with plain, schema-qualified SQL only. Each returns one
+  `OK:false` row per difference — `Name` from a frozen set, `Detail` sanitised and at most 256
+  bytes, at most 32 rows per check plus one "further findings omitted" — and nothing when the
+  cluster matches. The error is reserved for a failed session or query.
+
+  - `presence`: a required role or one of the schemas `auth`, `extensions`, `realtime`,
+    `storage` is absent
+  - `superuser`: the set of roles with the superuser attribute differs from the baseline
+  - `attributes`: one of the seven compared attributes of a baseline role (except `postgres`)
+    or of a platform role differs
+  - `memberships-reserved`: a membership held by a platform role differs from the baseline
+    (plus the one bootstrap grants)
+  - `memberships-dangerous`: a membership in a platform role or a server-file role is not
+    in the baseline
+  - `role-settings`: the settings of a platform role differ from the baseline (compared as
+    sets), or one has per-database settings
+  - `schema-acl`: `auth`, `storage` or `realtime`: absent, other owner, a baseline entry
+    missing or changed, or an extra entry granted by the baseline owner or a platform role
+  - `event-triggers`: the event triggers owned by a superuser, other than extension members,
+    differ from the baseline
+  - `auth-functions`: an auth helper function is absent, has another owner or body, is
+    security definer, or `authenticated` may not execute it
+  - `configuration`: a setting of the platform's override file is not in force from that
+    file at its line, is not a setting of the cluster, or a line of the file is not a setting
+  - `source-file`: a setting is in force from, or written in, a file outside the image's and
+    the platform's files (one finding per setting and file), or the command-line settings
+    or the pinned `hba_file`/`ident_file` differ
+  - `hba`: the rules in force differ from the rendered `pg_hba.conf`, or a rule has an error
+  - `service-passwords`: one of the six service roles has a password
+
+- Not reported, by design: access entries on those schemas granted by any other role (a
+  role holding a grant option); event triggers owned by a role without the superuser
+  attribute; per-database and per-role setting values; the project's own roles, schemas and
+  extensions.
+- The grantor of an access entry is read by parsing the entry from its start as the server
+  writes it (quoted names, doubled quotes, an empty grantee for PUBLIC); text not in that form
+  has no grantor.
+- **Callers must**
+  - call `Run` only in the first-boot phase, before any project credential exists, on a
+    session from `pgsock.Dial` as `supabase_admin`, and close the session afterwards;
+  - treat findings as blocking only at create; afterwards they are a drift list;
+  - pass the platform's rendered override file and `pg_hba.conf` bytes exactly as written;
+  - follow the caller rules of `internal/pgsock` (one session per step, close after any
+    error, every error through `pgsock.Clean`, `IsBudget` for bounds).
+- **Callers must not** rely on any finding — or on its absence — as a security property of
+  the project.
+- Every statement is a constant run under `pgsock.Stmt`; values travel as parameters. The one
+  exception, a password statement completed with a checked verifier, is enforced by
+  `verifierStatement` (only the package's three password statements, only a well-formed
+  verifier) and a static test.
+- Known limits: a check reads every line of every configuration file through
+  `pg_file_settings`. An include of a FIFO makes the check end in the budget error and leaves
+  one server process of that project waiting for each check. An include of a very large file
+  can exhaust that project's server memory and end the check in a session error. Both affect
+  only the project whose files they are; run the drift check at a bounded rate.
+- Tests: the Docker-backed tests start the pinned cluster image (skipped without Docker or the
+  image); about 50 s with `-race`. As root they run the server at an unprivileged project uid.
+  `TestAssert_NamesAreFrozen` fixes the check names; `TestAssert_AllowListMatchesImageFixture`
+  ties the source-file allow-list to the image fixture.
