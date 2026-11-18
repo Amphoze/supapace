@@ -564,3 +564,51 @@ patch surface, backup model) were verified against upstream source first.
   kill-process action. The test first checks that the child is non-dumpable and stops
   before installing any filter if it is not, so a regression cannot run the host's crash
   handler. One `--device` test row needs IPv6 on the host.
+
+### 2026-11-18 — reach suite: containment tests
+
+- New tests in `test/reach` (tagged `reach`): cluster egress (03), unknown bridges (04),
+  boot, restart and reload (05, with `TestReach05_AfterReboot`), container posture and the
+  search for secrets (06), the platform bridge (16) and upstream responses (17). The
+  gateway-limits test (17) now expects the gateway's 60 s read timeout.
+- Helpers that need no daemon are in the untagged `imagectr_test.go` with self-tests, so
+  `go test ./...` covers them.
+- Running: `make build`, then `make reach` on a node from `make node-up`
+  (`REACH_ARGS='-test.run …'` to select); `make reach-reboot` after the node has run the
+  suite once, so that the fixture projects predate the boot — it passes
+  `SUPAPACE_REBOOT=1`, under which the after-reboot test fails instead of skipping;
+  `make reach-host` on a host prepared by `scripts/install-node.sh`. `node_reach` in the
+  Makefile takes extra `docker exec` options as its second parameter.
+- **Every negative has a control on the same path:**
+  - a rule is shown to be the barrier by deleting it by its comment (`withRuleDeleted`) on
+    a scratch bridge of the same class that has the route or host address the real one
+    lacks; routed paths need both forward drops deleted before anything connects;
+  - unknown bridges: the tables are deleted, with a receive counter in the routed
+    neighbour's namespace, so a one-way leak fails;
+  - the platform bridge: its one drop rule deleted;
+  - posture: scratch containers of the real image with the real flags minus one (seccomp
+    unconfined; uid 0 with default capabilities; no ping sysctl; health check kept; host
+    IPC).
+- Topology is asserted before any sweep: each container's networks and addresses must be
+  exactly the expected set, and the sweep's expected verdicts come from that set.
+- The search for secrets covers every bind and tmpfs mount resolved through the
+  container's own links (each root must yield a file; a walk error fails), the environment
+  and command line of every process in the container, and the configured command,
+  environment and labels — for the cluster and the PostgREST container. Its control is
+  finding the project's own key.
+- Posture by `sp-probe sys`: getpid must be `ok`; every other call refused or
+  `unknown host …`, never another `unknown`; in the unconfined control the compared calls
+  must flip to `ok`. IPv6 must be disabled in the cluster and PostgREST containers.
+- **Drift hold:** every section that creates a scratch network, a bridge member or a
+  foreign member of the platform bridge takes the hold before the first object exists and
+  releases it after the last is removed. No test writes `rp_filter`.
+- **Reset** (Makefile, before and after every run, and `TestMain`): removes the failpoint,
+  reloads the tables, removes labelled containers with their volumes and labelled
+  networks, kills left-over listeners started from the suite's binary directory, deletes
+  the neighbour link and the second source address, and drops the drift hold **last**.
+  It is safe to run twice and on a clean node. After a timeout or a kill, the hold stays
+  until this reset.
+- Checked so far only against a stand-in (a bare node with the real ruleset, images and
+  container flags): tests 03, 04 (the half without the daemon), 06 and 16. Everything that
+  needs the daemon, the CLI, the gateway or a real project is unexercised until those
+  exist.

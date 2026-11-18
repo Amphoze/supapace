@@ -8,3 +8,9 @@ www.apache.org    # licence URL in LICENSE
 21:21::           # uid:gid fields of the image's passwd fixture
 100:101::         # uid:gid fields of the image's passwd fixture
 101:102::         # uid:gid fields of the image's passwd fixture
+example.com       # reserved documentation domain: the external name a tenant must not resolve (reach test 3)
+224.0.0.252       # LLMNR multicast group: a host listener a tenant must not reach (reach test 3)
+224.0.0.251       # mDNS multicast group: a host listener a tenant must not reach (reach test 3)
+172.16.0.1        # private-range probe target a tenant must not reach (reach test 3)
+192.168.0.1       # private-range probe target a tenant must not reach (reach test 3)
+100.64.0.1        # shared-address-space (CGNAT) probe target a tenant must not reach (reach test 3)

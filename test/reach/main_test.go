@@ -84,10 +84,8 @@ func preflight() string {
 // supapace.test=1, no second source address.
 func suiteReset() error {
 	var errs []error
-	for _, f := range []string{paths.DriftHold(), paths.Failpoint()} {
-		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, err)
-		}
+	if err := os.Remove(paths.Failpoint()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		errs = append(errs, err)
 	}
 	if r, err := run(cmdTimeout, nil, daemonBin, "nft", "load"); err != nil || r.code != 0 {
 		return fmt.Errorf("supapaced nft load: %v exit %d %s", err, r.code, brief(r.stderr))
@@ -102,7 +100,7 @@ func suiteReset() error {
 		if len(ids) == 0 {
 			continue
 		}
-		rm := []string{"docker", "rm", "-f"}
+		rm := []string{"docker", "rm", "-f", "-v"}
 		if kind[0] == "network" {
 			rm = []string{"docker", "network", "rm"}
 		}
@@ -110,7 +108,19 @@ func suiteReset() error {
 			errs = append(errs, fmt.Errorf("removing scratch objects: %v %s", err, brief(r.stderr)))
 		}
 	}
+	// Probe listeners of a killed run keep scratch namespaces (and the routed
+	// neighbour's veth) alive.
+	if r, err := run(cmdTimeout, nil, "pkill", "-x", "-f", probeBin+" listen .*"); err != nil || r.code > 1 {
+		errs = append(errs, fmt.Errorf("pkill of left-over listeners: %v exit %d", err, r.code))
+	}
+	if r, err := run(cmdTimeout, nil, "ip", "link", "del", "sp-nb0"); err != nil || (r.code != 0 && !strings.Contains(r.stderr, "Cannot find")) {
+		errs = append(errs, fmt.Errorf("ip link del sp-nb0: %v %s", err, brief(r.stderr)))
+	}
 	if err := delSourceAddr(); err != nil {
+		errs = append(errs, err)
+	}
+	// The drift hold goes last: scratch networks and members are gone by now.
+	if err := os.Remove(paths.DriftHold()); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

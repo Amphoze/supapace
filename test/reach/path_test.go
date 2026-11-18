@@ -385,7 +385,7 @@ func TestReach17_GatewayLimits(t *testing.T) {
 		// The request line is written as soon as the handshake ends, and the
 		// window is measured from that write.
 		c := gatewayConn(t, A, src1)
-		c.SetReadDeadline(time.Now().Add(50 * time.Second))
+		c.SetReadDeadline(time.Now().Add(80 * time.Second))
 		start := time.Now()
 		if _, err := io.WriteString(c, head); err != nil {
 			t.Fatal(err)
@@ -406,8 +406,8 @@ func TestReach17_GatewayLimits(t *testing.T) {
 			case e = <-ended:
 				break feed
 			case <-time.After(time.Second):
-				if time.Since(start) > 45*time.Second {
-					t.Fatal("a body sent one byte per second was not cut within 45 s")
+				if time.Since(start) > 75*time.Second {
+					t.Fatal("a body sent one byte per second was not cut within 75 s")
 				}
 				c.Write(body[i : i+1]) // fails once the gateway has closed; the reader reports when
 			}
@@ -415,8 +415,8 @@ func TestReach17_GatewayLimits(t *testing.T) {
 		if e.status != 0 && e.status != 400 {
 			t.Fatalf("slow body: answered %d, want the connection closed (a 400 at most)", e.status)
 		}
-		if e.after < 30*time.Second || e.after > 40*time.Second {
-			t.Fatalf("slow body: connection closed %v after the request line, want 30–40 s", e.after.Round(time.Millisecond))
+		if e.after < 60*time.Second || e.after > 70*time.Second {
+			t.Fatalf("slow body: connection closed %v after the request line, want 60–70 s", e.after.Round(time.Millisecond))
 		}
 	})
 

@@ -669,27 +669,13 @@ type Listener struct {
 }
 
 // nodeListeners lists every TCP and UDP listening address of the node's own
-// namespace (ss -Htlnu). A dual-stack wildcard ("*") is reported as both
+// namespace (ss -Htlnu), sorted. A dual-stack wildcard ("*") is reported as both
 // 0.0.0.0 and [::]; an IPv6 zone is kept, an IPv4 interface suffix dropped.
 func nodeListeners(t testing.TB) []Listener {
 	t.Helper()
-	out := must(t, cmdTimeout, "ss", "-Htlnu")
-	var l []Listener
-	for line := range strings.Lines(out) {
-		f := strings.Fields(line)
-		if len(f) < 5 {
-			continue
-		}
-		if f[0] != "tcp" && f[0] != "udp" {
-			t.Fatalf("ss: unexpected protocol %q", f[0])
-		}
-		aps, err := parseListener(f[4])
-		if err != nil {
-			t.Fatalf("ss: %v", err)
-		}
-		for _, a := range aps {
-			l = append(l, Listener{f[0], a})
-		}
+	l, err := parseSS(must(t, cmdTimeout, "ss", "-Htlnu"))
+	if err != nil {
+		t.Fatalf("ss: %v", err)
 	}
 	slices.SortFunc(l, func(a, b Listener) int {
 		if c := strings.Compare(a.Proto, b.Proto); c != 0 {
@@ -700,6 +686,31 @@ func nodeListeners(t testing.TB) []Listener {
 	return slices.Compact(l)
 }
 
+// parseSS parses `ss -Htlnu` output.
+func parseSS(out string) ([]Listener, error) {
+	var l []Listener
+	for line := range strings.Lines(out) {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		if f[0] != "tcp" && f[0] != "udp" {
+			return nil, fmt.Errorf("unexpected protocol %q", f[0])
+		}
+		aps, err := parseListener(f[4])
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range aps {
+			l = append(l, Listener{f[0], a})
+		}
+	}
+	return l, nil
+}
+
+// parseListener parses a local address as ss prints it: "0.0.0.0:22",
+// "127.0.0.53%lo:53" (interface dropped), "[::]:443", "[fe80::1]%eth0:546" and
+// "[fe80::1%eth0]:546" (zone kept), "*:5353" (both families).
 func parseListener(s string) ([]netip.AddrPort, error) {
 	i := strings.LastIndexByte(s, ':')
 	if i < 0 {
@@ -709,17 +720,26 @@ func parseListener(s string) ([]netip.AddrPort, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bad local address %q", s)
 	}
-	host := strings.TrimSuffix(strings.TrimPrefix(s[:i], "["), "]")
+	host, zone := s[:i], ""
+	if strings.HasPrefix(host, "[") {
+		end := strings.IndexByte(host, ']')
+		if end < 0 {
+			return nil, fmt.Errorf("bad local address %q", s)
+		}
+		host, zone = host[1:end], strings.TrimPrefix(host[end+1:], "%")
+	} else if j := strings.IndexByte(host, '%'); j >= 0 {
+		host = host[:j]
+	}
 	if host == "*" {
 		return []netip.AddrPort{netip.AddrPortFrom(netip.IPv4Unspecified(), uint16(port)),
 			netip.AddrPortFrom(netip.IPv6Unspecified(), uint16(port))}, nil
 	}
 	ip, err := netip.ParseAddr(host)
-	if err != nil && strings.Contains(host, "%") {
-		ip, err = netip.ParseAddr(host[:strings.IndexByte(host, '%')]) // "127.0.0.53%lo"
-	}
 	if err != nil {
 		return nil, fmt.Errorf("bad local address %q", s)
+	}
+	if zone != "" && ip.Is6() {
+		ip = ip.WithZone(zone)
 	}
 	return []netip.AddrPort{netip.AddrPortFrom(ip, uint16(port))}, nil
 }
@@ -889,14 +909,15 @@ func scratchNet(t testing.TB, name string, opts ...string) string {
 
 // scratchContainer runs a container of the control-plane image with sleep as
 // its entrypoint, labelled supapace.test=1 (args are `docker run` options, e.g.
-// --network, --ip, --user uid:gid), and removes it in cleanup.
+// --network, --ip, --user uid:gid), and removes it with its anonymous volumes
+// in cleanup (the image declares one for its data directory).
 func scratchContainer(t testing.TB, name string, args ...string) string {
 	t.Helper()
 	img, err := nodecfg.LockedImages()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { rmIgnoringAbsent(t, "rm", "-f", name) })
+	t.Cleanup(func() { rmIgnoringAbsent(t, "rm", "-f", "-v", name) })
 	docker(t, slices.Concat([]string{"run", "-d", "--label", testLabel, "--name", name}, args,
 		[]string{"--entrypoint", "sleep", img.ControlPlane, "infinity"})...)
 	return name

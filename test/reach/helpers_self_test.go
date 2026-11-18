@@ -122,6 +122,8 @@ func TestHelpers_ParseListener(t *testing.T) {
 		"[::]:443":           "[::]:443",
 		"[fe80::1%eth0]:546": "[fe80::1%eth0]:546",
 		"*:5353":             "0.0.0.0:5353 [::]:5353",
+		// the form ss prints for a zoned socket (a DHCPv6 client's, a bridge canary's)
+		"[fe80::1]%spp3:7001": "[fe80::1%spp3]:7001",
 	} {
 		aps, err := parseListener(in)
 		var got []string
@@ -132,7 +134,7 @@ func TestHelpers_ParseListener(t *testing.T) {
 			t.Errorf("parseListener(%q) = %v, %v; want %s", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"", "nocolon", "192.0.2.1:x", "host:80", "192.0.2.1:70000"} {
+	for _, bad := range []string{"", "nocolon", "192.0.2.1:x", "host:80", "192.0.2.1:70000", "[fe80::1:22"} {
 		if _, err := parseListener(bad); err == nil {
 			t.Errorf("parseListener(%q) accepted", bad)
 		}
@@ -609,5 +611,102 @@ esac
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("removeProject still waiting 10 s into a 2 s deadline")
+	}
+}
+
+// nodeListeners and nsListeners read the same ss output: a zoned link-local
+// listener among others is a listener, not a failure.
+func TestHelpers_ParseSSWithZonedListener(t *testing.T) {
+	out := "udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*\n" +
+		"udp UNCONN 0 0 [fe80::f54b:1]%eth0:546 [::]:*\n" +
+		"tcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\n"
+	l, err := parseSS(out)
+	want := []Listener{
+		{"udp", netip.MustParseAddrPort("127.0.0.53:53")},
+		{"udp", netip.MustParseAddrPort("[fe80::f54b:1%eth0]:546")},
+		{"tcp", netip.MustParseAddrPort("0.0.0.0:22")},
+	}
+	if err != nil || !slices.Equal(l, want) {
+		t.Fatalf("parseSS = %v, %v; want %v", l, err, want)
+	}
+	if _, err := parseSS("raw UNCONN 0 0 0.0.0.0:1 0.0.0.0:*\n"); err == nil {
+		t.Error("an unexpected protocol was accepted")
+	}
+}
+
+// args renders every field it reads back, and nothing for the zero value: a
+// field it dropped would make a "same flags" control differ for the wrong
+// reason. An empty User renders no --user: the image's own user applies, which
+// is root only when the image says so.
+func TestHelpers_RunFlagsArgs(t *testing.T) {
+	if a := (runFlags{}).args(); len(a) != 0 {
+		t.Fatalf("zero flags render %q", a)
+	}
+	f := runFlags{User: "700000:700000", CapDrop: []string{"ALL"}, CapAdd: []string{"CHOWN"}, NoNewPrivs: true,
+		OtherSecurity: []string{"apparmor=x"}, Seccomp: "/p.json", ReadOnly: true,
+		Tmpfs: map[string]string{"/tmp": "size=64m", "/run": ""}, Memory: 512 << 20, Swap: 512 << 20,
+		NanoCPUs: 1_500_000_000, PidsLimit: 256, ShmSize: 64 << 20, Ulimits: []string{"nofile=65536:65536"},
+		IpcMode: "private", Sysctls: map[string]string{"b": "2", "a": "1 0"}, NoHealthcheck: true, Binds: []string{"/s:/d:ro"}}
+	want := []string{"--user", "700000:700000", "--cap-drop", "ALL", "--cap-add", "CHOWN",
+		"--security-opt", "no-new-privileges", "--security-opt", "apparmor=x", "--security-opt", "seccomp=/p.json",
+		"--read-only", "--tmpfs", "/run", "--tmpfs", "/tmp:size=64m", "--memory", "536870912", "--memory-swap", "536870912",
+		"--cpus", "1.5", "--pids-limit", "256", "--shm-size", "67108864", "--ulimit", "nofile=65536:65536",
+		"--ipc", "private", "--sysctl", "a=1 0", "--sysctl", "b=2", "--no-healthcheck", "-v", "/s:/d:ro"}
+	if got := f.args(); !slices.Equal(got, want) {
+		t.Fatalf("args:\n got %q\nwant %q", got, want)
+	}
+}
+
+// parseSys accepts the probe's whole frozen output contract, including a call
+// killed by a seccomp kill action and an errno the probe cannot classify.
+func TestHelpers_ParseSysContractLines(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("seccomp 2\nnonewprivs 1\ncapeff 0000000000000000\ncapbnd 0000000000000000\n")
+	for _, c := range sysCalls {
+		switch c {
+		case "getpid":
+			b.WriteString("sys getpid ok\n")
+		case "bpf":
+			b.WriteString("sys bpf signal 31 SIGSYS\n")
+		case "keyctl":
+			b.WriteString("sys keyctl unknown errno 22 EINVAL\n")
+		default:
+			b.WriteString("sys " + c + " errno 1 EPERM\n")
+		}
+	}
+	rep, err := parseSys(b.String())
+	if err != nil || rep.Calls["bpf"] != "signal 31 SIGSYS" || rep.Calls["keyctl"] != "unknown errno 22 EINVAL" {
+		t.Fatalf("contract lines: %v %+v", err, rep.Calls)
+	}
+	for _, bad := range []string{"sys bpf signal 9 SIGKILL\n", "sys bpf unknown\n"} {
+		if _, err := parseSys(strings.Replace(b.String(), "sys bpf signal 31 SIGSYS\n", bad, 1)); err == nil {
+			t.Errorf("%q accepted", strings.TrimSpace(bad))
+		}
+	}
+}
+
+// scratchContainer's cleanup removes the anonymous volume the control-plane
+// image declares; one is leaked per call otherwise.
+func TestHelpers_ScratchContainerLeavesNoVolume(t *testing.T) {
+	needRoot(t, "docker")
+	if _, err := nodecfg.LockedImages(); err != nil {
+		t.Skip(err)
+	}
+	vols := func() []string {
+		return strings.Fields(must(t, cmdTimeout, "docker", "volume", "ls", "-q", "--filter", "dangling=true"))
+	}
+	before := vols()
+	var mounted string
+	if fails(func(tb testing.TB) {
+		name := scratchContainer(tb, "sp-test-selfvol", "--network", "none")
+		mounted = strings.TrimSpace(docker(tb, "inspect", "-f", `{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}`, name))
+	}) {
+		t.Fatal("scratchContainer failed")
+	}
+	if mounted == "" {
+		t.Fatal("control: the scratch container mounted no anonymous volume; the image no longer declares one")
+	}
+	if after := vols(); slices.Contains(after, mounted) || len(after) > len(before) {
+		t.Fatalf("volume %s left behind (dangling before %d, after %d)", mounted, len(before), len(after))
 	}
 }
