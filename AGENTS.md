@@ -1103,3 +1103,105 @@ patch surface, backup model) were verified against upstream source first.
   `TestHTTP2_HeaderBlockAcrossContinuation` fail about once in a few hundred runs and could
   let its over-limit steps pass for the wrong reason. The gateway is unchanged.
 - Rule for tests that drive a connection frame by frame: one goroutine writes.
+
+### 2026-11-18 — `internal/agent`: cluster and task containers
+
+- API: `EnsureCluster(ctx, Spec)`, `CheckCluster(ctx, Spec) ([]nodecfg.CheckResult, error)`,
+  `VerifyCluster(ctx, Spec)`, `StopCluster(ctx, ref)`, `Prevalidate(ctx, Spec)`,
+  `PromoteCandidate(ctx, ref)`, `PurgeDir(ctx, Spec)`; all idempotent. `Spec.FirstBoot`
+  marks a create; `Spec.HealthWait` bounds health waits.
+- **State file** `<platform>/projects/<ref>/state.json` (root 0600): `epoch`,
+  `generation`, `phase` (`A-done` or `B`), `pm_pid`, `pm_start` (the container init's
+  pid and start time); listener fields 0. Only the agent writes it; a file that is not
+  exactly one such record is an error.
+- **One phase per `EnsureCluster` call:**
+  - no state file and `FirstBoot`: first boot. Any `pg-<ref>` is removed, the platform
+    files are rendered, `data/` is emptied at the project's uid, and the cluster starts
+    with `--network none`, the image's own `pg_hba` and a random throwaway
+    `POSTGRES_PASSWORD`. A trust session over the socket (peer = the container's init)
+    runs bootstrap and the blocking catalog check; the container is stopped and removed;
+    only then is `A-done` written.
+  - no state file without `FirstBoot`: an error; nothing is touched (no first boot
+    outside a create, so a lost state file never empties a database).
+  - `A-done`: any `pg-<ref>` is removed (never adopted); the first networked start
+    always waits for a SCRAM login (120 s when `HealthWait` ≤ 0) and runs the blocking
+    check including `pg_hba`; then `B` with the init's pid and start time.
+  - `B`: adoption, or re-creation without bootstrap or check.
+- **Every start** is `docker create`, the start gate, `docker start`, with no Docker call
+  between the gate and the start. A refused start (the gate, or the cluster's address
+  held by another container: a containment error) removes the created container on a
+  fresh bounded context, with the error joined. Any other failed start keeps the
+  container for its logs until the next ensure.
+- **Cluster container:** `--user uid:gid --cap-drop ALL --security-opt no-new-privileges
+  --security-opt seccomp=<platform>/seccomp.json --read-only --tmpfs /tmp
+  --memory/--memory-swap <MemMB>m --cpus 1 --pids-limit <Pids> --shm-size 64m
+  --ulimit core=0 --ulimit nofile=65536:65536 --no-healthcheck --ipc private
+  --stop-timeout 45`, no restart policy.
+  - Mounts: `data/` and `sock/` read-write; passwd, group, pgsodium key, `conf.d`,
+    supautils and tools read-only.
+  - Networked starts add `--network proj-<ref> --ip <slice base+2>`, the IPv6-off and
+    no-ping sysctls, and read-only `pg_hba`/`pg_ident`.
+  - Command: `postgres -D /etc/postgresql` plus the image's pinned `-c` settings.
+  - Logs are bounded by the daemon-wide `local` log driver.
+- **Labels:** `supapace.role=cluster`, `.ref`, `.generation`, `.epoch`, `.phase`
+  (`A`/`B`). Networked starts add `.image` (the configured reference) and `.config`:
+  SHA-256 over the create arguments (options, image and command; no secret), the
+  rendered files (`zz-supapace.conf`, supautils, `pg_hba`, `pg_ident`, passwd, group),
+  the image's `postgresql.conf` and the seccomp profile, as on disk.
+- **Adoption:** a running container is adopted only when every label equals the desired
+  one (`.config` recomputed now), `state.json` records phase `B` at the desired epoch
+  and generation, and its init's pid and start time equal `pm_pid`/`pm_start`.
+  - It is then gated by `CheckAdopted`; on failure it is removed at once (no grace
+    period) and the containment error returned.
+  - A running networked container that is not adoptable is stopped (45 s grace) and
+    re-created; anything else is removed at once.
+  - A restart of the same daemon binary adopts every healthy cluster. An upgrade that
+    changes the cluster's arguments, rendered files or seccomp profile restarts every
+    cluster once, cleanly, at its next ensure.
+- `HealthWait`: 0 means wait up to 120 s for a SCRAM login after a networked start or
+  adoption; negative means no wait and no session (except the first networked start).
+- `CheckCluster`: one session to the recorded process; returns at once after a failed
+  statement. Its error is the operational verdict (login within the bounds,
+  `pg_stat_archiver.failed_count = 0`); its rows are drift. `VerifyCluster` logs the
+  drift at WARN and fails on the operational facts only.
+- `StopCluster`: `docker stop -t 45`, then `docker rm -v`; nil when absent.
+- **Task containers** `task-<ref>-wipe|prevalidate|purge`: the cluster image at the
+  project's uid, `--network none`, the same hardening, `--memory 128m --memory-swap 128m
+  --pids-limit 64`. They are not gated and have no restart policy or healthcheck.
+  - Lifecycle: run detached after removing a leftover of the same name, polled every
+    second, bounded at 300 s or the caller's earlier deadline, removed by name on a
+    fresh context.
+  - Output: stdout and stderr (read with `dockerx.RunOutput`), each sanitised and
+    capped at 64 KiB.
+  - Wipe: `supapaced rmtree --keep-root /p/data`. Purge: `supapaced rmtree /p/data
+    /p/sock`. Both mount the daemon's own executable read-only and `<projects>/<ref>`
+    at `/p`; the helper works by descriptor and refuses uid 0. The wipe needs the
+    project directory and launches nothing without it.
+  - Purge refuses while `pg-<ref>` or `postgrest-<ref>` exists in any state (a failed
+    read is an error). It then clears the uid's quota limits, runs the task, and the
+    daemon removes the empty project directory (non-recursive). An absent directory
+    launches nothing.
+  - Prevalidate: `postgres -C max_connections` against `<render>/candidate/conf.d`, with
+    an empty tmpfs at the data path and no tenant data or key. The value must appear on
+    stdout; a refusal reports stderr. `PromoteCandidate` removes the live `conf.d` and
+    renames the candidate over it; it can be resumed.
+- `dockerx.RunOutput(ctx, args...) (stdout, stderr string, err error)`: `Run`'s bounds
+  (60 s, 4 MiB stdout, first 64 KiB of stderr), with stderr returned on success too.
+- **Callers must:**
+  - run one `EnsureCluster` per project at a time (hold the project's lock);
+  - set `FirstBoot` only in a create's cluster steps;
+  - expect a resumed first-boot step to perform the first networked start, the next
+    call then adopting;
+  - stop the cluster before `PromoteCandidate`;
+  - stop and remove both tenant containers before `PurgeDir` (`StopCluster`,
+    `StopPostgREST`); `PurgeDir` checks this and refuses otherwise;
+  - install `supapaced` as a static binary executable by every uid (task containers
+    run it);
+  - treat an adoption's `ErrContainment` as "container removed";
+  - never edit `state.json`.
+- **Known limits:**
+  - The log bound depends on the node's Docker configuration.
+  - `PromoteCandidate` is a remove plus rename, not one atomic step.
+  - A purge task that fails leaves the uid without quota limits until the purge
+    completes (no tenant container exists by then).
+  - A failed first boot leaves its network-less container until the next attempt.

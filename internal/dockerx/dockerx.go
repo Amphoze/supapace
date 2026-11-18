@@ -47,7 +47,15 @@ func Run(ctx context.Context, args ...string) (string, error) {
 
 // RunInput is Run with stdin supplied to the child.
 func RunInput(ctx context.Context, stdin []byte, args ...string) (string, error) {
-	return run(ctx, stdin, args)
+	out, _, err := run(ctx, stdin, args)
+	return out, err
+}
+
+// RunOutput is Run that also returns the start of stderr (at most 64 KiB),
+// whether or not the call succeeds: `docker logs` writes a container's
+// stderr there.
+func RunOutput(ctx context.Context, args ...string) (stdout, stderr string, err error) {
+	return run(ctx, nil, args)
 }
 
 // ErrOutputTooLarge is the cause of a call whose stdout exceeded maxStdout.
@@ -138,7 +146,7 @@ func isAbsent(err error, re *regexp.Regexp) bool {
 	return errors.As(re2.cause, &ee) && re.MatchString(strings.TrimSpace(re2.stderr))
 }
 
-func run(ctx context.Context, stdin []byte, args []string) (string, error) {
+func run(ctx context.Context, stdin []byte, args []string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
 	ctx, kill := context.WithCancel(ctx) // cancelled when stdout hits its cap
@@ -155,7 +163,7 @@ func run(ctx context.Context, stdin []byte, args []string) (string, error) {
 	cmd.Stdout, cmd.Stderr = out, errb
 	err := cmd.Run()
 	if err == nil && !out.hit {
-		return out.String(), nil
+		return out.String(), errb.String(), nil
 	}
 	verb := ""
 	if len(args) > 0 {
@@ -163,11 +171,11 @@ func run(ctx context.Context, stdin []byte, args []string) (string, error) {
 	}
 	switch {
 	case out.hit:
-		return "", &runError{verb: verb, cause: ErrOutputTooLarge, stderr: errb.String()}
+		return "", errb.String(), &runError{verb: verb, cause: ErrOutputTooLarge, stderr: errb.String()}
 	case ctx.Err() != nil:
 		err = ctx.Err()
 	}
-	return out.String(), &runError{verb: verb, cause: err, stderr: errb.String()}
+	return out.String(), errb.String(), &runError{verb: verb, cause: err, stderr: errb.String()}
 }
 
 type rawContainer struct {

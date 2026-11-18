@@ -70,8 +70,9 @@ type Spec struct {
 	UserRoles                []string
 	Secrets                  bootstrap.Secrets
 	Keys                     []jwtx.Key
-	// HealthWait bounds the wait for a phase-B start to become healthy:
-	// zero means 120 s, negative means do not wait.
+	// HealthWait bounds the wait for a SCRAM login after a networked start or
+	// an adoption: zero means 120 s, negative means no wait — except the first
+	// networked start, which always waits (120 s when zero or negative).
 	HealthWait time.Duration
 	// FirstBoot is set only by a create. Without it a project that has no
 	// state file is refused instead of being given a first boot, which

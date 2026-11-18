@@ -517,3 +517,24 @@ func TestInspect_NeverAbsentOnOtherErrors(t *testing.T) {
 		})
 	}
 }
+
+// RunOutput returns the call's stderr on success too, with the caps and
+// errors of Run.
+func TestRunOutput_ReturnsStderr(t *testing.T) {
+	dir := fake(t)
+	put(t, dir, "logs_--.out", "stdout line\n")
+	put(t, dir, "logs_--.err", "helper: refused\n"+strings.Repeat("x", 1<<20))
+	out, errOut, err := RunOutput(context.Background(), "logs", "--", "c")
+	if err != nil || out != "stdout line\n" || !strings.HasPrefix(errOut, "helper: refused\n") || len(errOut) != 64<<10 {
+		t.Fatalf("out %q, stderr %d bytes starting %.20q, err %v", out, len(errOut), errOut, err)
+	}
+	put(t, dir, "logs_--.rc", "1")
+	if _, errOut, err := RunOutput(context.Background(), "logs", "--", "c"); err == nil || !strings.HasPrefix(errOut, "helper: refused") {
+		t.Fatalf("failed call: stderr %.20q, err %v", errOut, err)
+	}
+	put(t, dir, "logs_--.rc", "0")
+	put(t, dir, "logs_--.endless", "")
+	if out, _, err := RunOutput(context.Background(), "logs", "--", "c"); !errors.Is(err, ErrOutputTooLarge) || out != "" {
+		t.Fatalf("stdout over the cap: %d bytes, %v", len(out), err)
+	}
+}
