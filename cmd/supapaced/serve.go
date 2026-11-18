@@ -44,6 +44,7 @@ type nodeAgent interface {
 	EnsureCluster(context.Context, agent.Spec) error
 	EnsurePostgREST(context.Context, agent.Spec) error
 	CheckCluster(context.Context, agent.Spec) ([]nodecfg.CheckResult, error)
+	CheckHost(context.Context, agent.Spec) []nodecfg.CheckResult
 	RouteFor(agent.Spec, string) routes.Project
 	SetRoute(context.Context, string, *routes.Project) (int64, error)
 }
@@ -84,6 +85,7 @@ type daemon struct {
 	nftCheck    func(context.Context) error
 	bridgeNF    func() error
 	listTenants func(context.Context) ([]string, error) // names of the running tenant containers
+	containers  func(ctx context.Context, label string) ([]dockerx.Container, error)
 	connect     func(context.Context) (*backend, error)
 	now         func() time.Time
 
@@ -104,6 +106,7 @@ type daemon struct {
 
 	mu        sync.Mutex
 	pending   map[string]bool // active projects not yet adopted since boot or the last containment failure
+	drained   map[string]bool // adopted projects whose route a failed repair drained
 	refillDue bool            // the set must be filled again; until then every project counts as pending
 	gen       uint64          // refills and due marks, so an adoption never undoes a later refill
 	wake      chan struct{}   // one slot: the drift timer cleared the flag
@@ -117,11 +120,12 @@ func newDaemon(p nodecfg.Paths, ag nodeAgent) *daemon {
 		nftCheck:    func(ctx context.Context) error { return nft.Check(ctx, p) },
 		bridgeNF:    nft.EnsureBridgeNF,
 		listTenants: runningTenants,
+		containers:  dockerx.ListContainers,
 		now:         time.Now,
 		slots:       4, budget: 180 * time.Second, retryEvery: 60 * time.Second,
 		healthWait: 90 * time.Second, checkEvery: 2 * time.Second, verifyMax: 75 * time.Second,
-		driftEvery: 10 * time.Second, holdMax: 15 * time.Minute, grace: 10 * time.Second,
-		pending: map[string]bool{}, wake: make(chan struct{}, 1)}
+		driftEvery: 10 * time.Second, holdMax: agent.DriftHoldMax, grace: 10 * time.Second,
+		pending: map[string]bool{}, drained: map[string]bool{}, wake: make(chan struct{}, 1)}
 }
 
 // serveCmd runs the daemon until SIGTERM or SIGINT. Exit 0 after a signal,

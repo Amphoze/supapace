@@ -331,8 +331,10 @@ func TestAgent_ResumeAfterKillBetweenRunAndStateWrite(t *testing.T) {
 }
 
 // TestAgent_StopAllTenants_SigtermIgnoringInit: two tenant containers whose
-// init ignores SIGTERM (a pid 1 without a handler) are off every network and
-// not running within 5 s.
+// init ignores SIGTERM (a pid 1 without a handler) are off every network
+// within 5 s, while the cluster's stop is still under way; the PostgREST
+// container is killed (not running within 5 s), the cluster is stopped at the
+// end of its 45 s grace, when Docker kills it (bound 55 s).
 func TestAgent_StopAllTenants_SigtermIgnoringInit(t *testing.T) {
 	a := nodeAgent(t)
 	net := "cl-stoptest"
@@ -361,22 +363,36 @@ func TestAgent_StopAllTenants_SigtermIgnoringInit(t *testing.T) {
 		}
 	}
 	start := time.Now()
-	if err := a.StopAllTenants(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	done := make(chan error, 1)
+	go func() { done <- a.StopAllTenants(context.Background()) }()
 	for _, n := range names {
-		for {
-			c := clInspectCtr(t, n)
-			if !c.State.Running && len(c.NetworkSettings.Networks) == 0 {
-				break
-			}
+		for len(clInspectCtr(t, n).NetworkSettings.Networks) != 0 {
 			if time.Since(start) > 5*time.Second {
-				t.Fatalf("%s after 5 s: running %v networks %v", n, c.State.Running, c.NetworkSettings.Networks)
+				t.Fatalf("%s still on a network after 5 s", n)
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	t.Logf("stopped in %v", time.Since(start))
+	if !clInspectCtr(t, names[0]).State.Running {
+		t.Fatal("control: the cluster was not given its grace period")
+	}
+	off := time.Since(start)
+	for _, c := range []struct {
+		i     int
+		bound time.Duration
+	}{{1, 5 * time.Second}, {0, 55 * time.Second}} {
+		i, bound := c.i, c.bound
+		for clInspectCtr(t, names[i]).State.Running {
+			if time.Since(start) > bound {
+				t.Fatalf("%s still running %v after the stop began (bound %v)", names[i], time.Since(start), bound)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("off every network in %v, stopped and returned in %v", off, time.Since(start))
 }
 
 // TestAgent_TaskFailureReportsHelperMessage: a purge and a wipe that the

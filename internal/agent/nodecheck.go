@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,8 +24,10 @@ import (
 // Every row is blocking (OK false makes the caller set containment_failed)
 // except docker-firewall-backend and drift-hold, which are always OK; on a
 // development node (the dev-mode marker) the host-global rows core_pattern,
-// br_netfilter and file-max are informational too. Only host-side facts are
-// read.
+// br_netfilter and file-max are informational too. The rows gateway and
+// control-plane-db report the platform services (running, with this
+// daemon's configuration): they fail but do not block (Blocking). Only
+// host-side facts are read.
 func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	var rows []nodecfg.CheckResult
 	add := func(name string, err error) {
@@ -76,10 +79,157 @@ func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	}
 	rows = append(rows, nodecfg.CheckResult{Name: "docker-firewall-backend", OK: true, Detail: fw})
 	if fi, err := os.Lstat(a.p.DriftHold()); err == nil {
-		age := time.Since(fi.ModTime()) / time.Second
-		rows = append(rows, nodecfg.CheckResult{Name: "drift-hold", OK: true, Detail: fmt.Sprintf("present, age %ds", age)})
+		age := time.Since(fi.ModTime())
+		d := fmt.Sprintf("present, age %ds: drift check and project repairs paused", age/time.Second)
+		if age < 0 || age >= DriftHoldMax {
+			d = fmt.Sprintf("stale, ignored: age %ds, honoured below %ds", age/time.Second, DriftHoldMax/time.Second)
+		}
+		rows = append(rows, nodecfg.CheckResult{Name: "drift-hold", OK: true, Detail: d})
 	}
+	add(rowControlPlane, a.checkPlatformContainer(ctx, cpName, nil, func() (string, error) {
+		_, _, conf, err := a.cpConfig()
+		return conf, err
+	}))
+	add(rowGateway, a.checkPlatformContainer(ctx, gatewayName,
+		map[string]string{ingressNet: a.cfg.GatewayIngressIP, platformNet: a.cfg.GatewayIP}, func() (string, error) {
+			_, _, conf, err := a.gatewayConfig(ctx)
+			return conf, err
+		}))
 	return rows
+}
+
+// DriftHoldMax: the drift timer honours a hold file younger than this.
+const DriftHoldMax = 15 * time.Minute
+
+// The node-check rows of the platform's own services. They fail while the
+// service is not running as configured, which the daemon repairs; they are
+// not containment.
+const (
+	rowControlPlane = "control-plane-db"
+	rowGateway      = "gateway"
+)
+
+// Blocking reports whether r is a failing row that makes the node
+// containment_failed: every failing row except the platform services'.
+func Blocking(r nodecfg.CheckResult) bool {
+	return !r.OK && r.Name != rowControlPlane && r.Name != rowGateway
+}
+
+// checkPlatformContainer: name exists, runs, carries the configuration label
+// this daemon would create it with, and holds the given addresses.
+func (a *Agent) checkPlatformContainer(ctx context.Context, name string, addrs map[string]string, conf func() (string, error)) error {
+	c, err := dockerInspectContainer(ctx, name)
+	switch {
+	case err != nil:
+		return err
+	case c == nil:
+		return fmt.Errorf("%s absent", name)
+	case !c.Running:
+		return fmt.Errorf("%s not running", name)
+	}
+	want, err := conf()
+	if err != nil {
+		return err
+	}
+	if c.Labels[labelConfig] != want {
+		return fmt.Errorf("%s runs with another configuration than this daemon's", name)
+	}
+	for n, ip := range addrs {
+		if c.IPs[n] != ip {
+			return fmt.Errorf("%s at %q on %s, want %s", name, c.IPs[n], n, ip)
+		}
+	}
+	return nil
+}
+
+// CheckHost reports the host-side facts of s's project, read from Docker,
+// state.json and the route file, never from a tenant process: its cluster
+// and PostgREST containers exist, run, carry the labels and addresses an
+// adoption requires, and its route is active. Rows: cluster-container,
+// rest-container, route.
+func (a *Agent) CheckHost(ctx context.Context, s Spec) []nodecfg.CheckResult {
+	var rows []nodecfg.CheckResult
+	add := func(name string, err error) {
+		r := nodecfg.CheckResult{Name: name, OK: err == nil}
+		if err != nil {
+			r.Detail = err.Error()
+		}
+		rows = append(rows, r)
+	}
+	if err := a.clusterSpec(s); err != nil {
+		add("cluster-container", err)
+		return rows
+	}
+	add("cluster-container", a.checkClusterHost(ctx, s))
+	add("rest-container", a.checkRESTHost(ctx, s))
+	add("route", a.checkRouteHost(s.Ref))
+	return rows
+}
+
+func (a *Agent) checkClusterHost(ctx context.Context, s Spec) error {
+	name := clusterName(s.Ref)
+	c, err := dockerInspectContainer(ctx, name)
+	switch {
+	case err != nil:
+		return err
+	case c == nil:
+		return fmt.Errorf("%s absent", name)
+	case !c.Running:
+		return fmt.Errorf("%s not running", name)
+	}
+	st, have, err := a.readState(s.Ref)
+	if err != nil {
+		return err
+	}
+	if !have || st.Phase != PhaseB || st.Epoch != s.Epoch || !a.clusterAdoptable(s, st, c) {
+		return fmt.Errorf("%s is not the container state.json records at generation %d", name, s.Generation)
+	}
+	want := map[string]string{networkName(s.Ref): a.cfg.ClusterAddr(s.SubnetIndex).String()}
+	if !maps.Equal(c.IPs, want) {
+		return fmt.Errorf("%s on networks %v, want %v", name, c.IPs, want)
+	}
+	return nil
+}
+
+func (a *Agent) checkRESTHost(ctx context.Context, s Spec) error {
+	name := postgrestName(s.Ref)
+	confs, err := a.existing(ctx, name)
+	switch {
+	case err != nil:
+		return err
+	case len(confs) == 0:
+		return fmt.Errorf("%s absent", name)
+	case !confs[0].Running:
+		return fmt.Errorf("%s not running", name)
+	}
+	fileHash, err := renderedHash(a.postgrestDir(s.Ref), postgrestConf)
+	if err != nil {
+		return err
+	}
+	flags, tail := a.postgrestArgs(s)
+	label, err := a.configLabel(fileHash, slices.Concat(flags, tail))
+	if err != nil {
+		return err
+	}
+	if !a.adoptable(confs[0], s, label) {
+		return fmt.Errorf("%s does not carry the desired labels or is not on exactly %s and %s at its addresses", name, networkName(s.Ref), platformNet)
+	}
+	return nil
+}
+
+func (a *Agent) checkRouteHost(ref string) error {
+	f, err := a.readRoutes()
+	if err != nil {
+		return err
+	}
+	r, ok := f.Projects[ref]
+	switch {
+	case !ok:
+		return errors.New("no route: requests answer 404")
+	case r.State != "active":
+		return fmt.Errorf("route %s: requests answer 503", r.State)
+	}
+	return nil
 }
 
 // orErr is err when set, else check().

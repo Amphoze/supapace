@@ -1507,3 +1507,86 @@ Known limits
 - Known limits: a parked abort that is re-armed logs two summary lines; duration
   includes back-off and a purge's retention; with the gateway slow in both passes
   an attempt can reach its 900 s deadline and resume on the next one.
+
+### 2026-11-18 — `supapaced serve`: repair round, graceful containment stop, truthful checks
+
+- Supersedes, in the entry "`supapaced serve`": start-up step order 4-5, "Adoption" (now the
+  round below), the drift-timer hold rule (now shared with the round) and the known limit "the
+  node check at start runs after the store is reachable". In the agent core entry: the
+  `StopAllTenants` line and the node-check row list. In the PostgREST entry: `postgrest.conf`
+  gains one key.
+- Start-up: the boot record and `NodeCheck` now run right after `EnsurePlatformNetworks`,
+  before `EnsureImageFiles`, `EnsureControlPlaneDB` and the store wait, so a failing blocking
+  row stops tenants even when the store never comes up. `DrainAllRoutes` stays before any
+  tenant is started.
+- The round (at start, on each drift-timer signal, every 60 s; never two at once; none while
+  `containment_failed`): `EnsureControlPlaneDB` and `EnsureGateway` first, then the pending
+  adoptions, then a repair of every other `active` project whose cluster or PostgREST
+  container is not running or absent, or whose route a failed repair drained. Same 4 slots,
+  180 s budget per project, ref lock only tried, row re-read under the lock, no repair while
+  the project has a pending, running or aborting operation. A repair never enters the pending
+  set, so restart and delete stay accepted. A repair is the adoption's host-side ensure
+  (`EnsureCluster` with no health wait, `EnsurePostgREST`, lock still held); it never stops a
+  running container and never re-checks a running one (pid, labels, networks).
+- Cost: a healthy round is two container listings plus the platform ensures' inspects, none
+  per healthy project; a healthy container is never bounced.
+- Routes: a failed repair drains the route once (503 `project_restarting` instead of gateway
+  timeouts); the next successful repair restores it. A repair whose ref lock was lost writes
+  no route. A repair that succeeds without a prior drain leaves the route as it is.
+- Drift hold (`/run/supapace/drift-hold`, root only; removed at every daemon start): honoured
+  when present, not dated in the future and younger than 15 minutes. It skips the drift tick
+  (WARN each tick) and pauses the round's project repairs (INFO `repair: drift hold present
+  (age Ns); project repairs paused this round`); the platform ensures and pending adoptions
+  still run, and no route is drained or restored for a paused repair.
+- Logs: INFO `repair: started` with `ref` and `containers`, or `container=sp-gateway|sp-cp-db`;
+  WARN `repair failed; route draining, retried at the next round` (ref, step, err), at most
+  once per round per ref (`repair failed; retried at the next round` when the ref lock was
+  lost: no route is written then); WARN `repair: ensure failed; retried at the next round` with
+  `container` for a platform container; INFO
+  `re-creating sp-gateway: its configuration changed|its addresses changed` or `re-creating
+  sp-cp-db: its configuration changed` with `was=running|stopped`, before a platform
+  container is re-created (a gateway re-creation cuts its in-flight requests).
+- Advisory check after an adoption, or after a repair that started the cluster: repeated every
+  2 s for up to 90 s while the cluster is not ready (`pgsock.ErrPeer`, `ErrNotSocket`,
+  `ErrConnect`, SQLSTATE 57P03); a cluster container that is no longer running ends the wait
+  at once with a WARN and is started again by the next round. Its result changes no route.
+- `node check`: rows `control-plane-db` and `gateway` (running, configuration label, the
+  gateway's two addresses) fail without blocking (`agent.Blocking` is false for them): the
+  document reads `ok:false`, `containment_failed:false`, and the CLI exits 1; no tenant is
+  stopped. `drift-hold` (informational) reads `present, age Ns: drift check and project
+  repairs paused`, or `stale, ignored: age Ns, honoured below 900s`.
+- `project check`: rows `cluster-container`, `rest-container` and `route` (`agent.CheckHost`:
+  exists, running, adoptable, expected networks; route active) are read before and
+  independent of the cluster session. Failing rows come first in `drift`; when the session
+  passes, a failing row gives code `internal` with message `host-side: <name>: <detail>`.
+  Existing check names and codes are unchanged.
+- `StopAllTenants` (containment failure only): every network disconnect of every running
+  cluster and PostgREST container first, in parallel, all returned before any stop; then, in
+  parallel, clusters `docker stop -t 45` (clean shutdown, no crash recovery at the next start)
+  and PostgREST containers `docker kill`; a container whose disconnect failed is killed too.
+  Each kill has its own 10 s bound that survives the caller's cancellation; the call is
+  bounded at 60 s plus that. Callers' flag → drain → stop order is unchanged; a drift tick
+  that finds nothing running stays fast.
+- PostgREST: `postgrest.conf` sets `openapi-server-proxy-uri = "https://<ref>.<domain>/rest/v1"`,
+  so the OpenAPI root advertises the public URL. The configuration hash changes: every
+  PostgREST container is re-created once at its next ensure after an upgrade (503 for 1-2 s).
+- `internal/pgsock`: `ErrConnect` marks a failed connect to the checked socket (before any
+  byte from the server); a connect that ran out of budget is `ErrBudget`, not `ErrConnect`.
+  The error text is unchanged; `Clean` keeps the sentinel.
+- `internal/saga` worker: while the operation queue cannot be read, ERROR `operation queue`
+  is logged at the first failure, then at most every 30 s with `failures` and `since`; INFO
+  `operation queue readable again` with `down_for` on recovery.
+- Test node (`node-init.sh`): the supervisor loop says `supapaced serve ended (status N|signal
+  N)` instead of a bare `Killed`; `supapaced init`'s output (it shows the key escrow) goes to
+  `/var/lib/sp/init.out`, root 0600, not to the node's log; shutdown matches the daemon by its
+  full command line.
+- Caller rules: a test or operator that stops or replaces a tenant container on purpose while
+  the daemon runs takes the drift hold first and refreshes it within 15 minutes; otherwise the
+  next round starts the container again.
+- Known limits: a running container that is not adoptable or is off its network is handled
+  only at the next daemon start or containment clear (`project check` shows it); a route left
+  draining by a failed operation of an `active` project is not restored by the round; a
+  cluster that exits at every start is re-created once per round (one INFO and one WARN per
+  minute); when the store is unreachable a dead container's route stays active; a hold that is
+  refreshed forever pauses project repairs forever; a daemon stopped during the disconnect
+  phase of `StopAllTenants` kills every tenant (crash recovery at the next start).

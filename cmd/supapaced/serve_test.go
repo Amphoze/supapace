@@ -23,6 +23,7 @@ import (
 	"github.com/Amphoze/supapace/internal/adminapi"
 	"github.com/Amphoze/supapace/internal/agent"
 	"github.com/Amphoze/supapace/internal/bootstrap"
+	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgsock"
 	"github.com/Amphoze/supapace/internal/routes"
@@ -82,12 +83,38 @@ type fakeAgent struct {
 	nodeCheckWait   bool // NodeCheck waits for its context to end
 	platformErr     error
 	drainErr        error
+	checkHost       func(agent.Spec) []nodecfg.CheckResult
 
 	mu     sync.Mutex
 	routes map[string]string // ref → state
+	up     map[string]bool   // container name → running, as the ensures and the stop leave it
 }
 
-func newFakeAgent(c *calls) *fakeAgent { return &fakeAgent{c: c, routes: map[string]string{}} }
+func newFakeAgent(c *calls) *fakeAgent {
+	return &fakeAgent{c: c, routes: map[string]string{}, up: map[string]bool{}}
+}
+
+// setUp records name as running or not (a test kills a container with it).
+func (a *fakeAgent) setUp(name string, running bool) {
+	a.mu.Lock()
+	a.up[name] = running
+	a.mu.Unlock()
+}
+
+// containers is the daemon's listing seam over the model: label is a key
+// (every container) or supapace.ref=<ref>.
+func (a *fakeAgent) containers(_ context.Context, label string) ([]dockerx.Container, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ref, byRef := strings.CutPrefix(label, "supapace.ref=")
+	var out []dockerx.Container
+	for n, r := range a.up {
+		if !byRef || n == "pg-"+ref || n == "postgrest-"+ref {
+			out = append(out, dockerx.Container{Name: n, Running: r})
+		}
+	}
+	return out, nil
+}
 
 func (a *fakeAgent) SetContainmentFailed(f bool) {
 	a.c.add(fmt.Sprintf("SetContainmentFailed(%v)", f))
@@ -104,9 +131,14 @@ func (a *fakeAgent) EnsureImageFiles(context.Context) error {
 }
 func (a *fakeAgent) EnsureControlPlaneDB(context.Context) error {
 	a.c.add("EnsureControlPlaneDB")
+	a.setUp("sp-cp-db", true)
 	return nil
 }
-func (a *fakeAgent) EnsureGateway(context.Context) error { a.c.add("EnsureGateway"); return nil }
+func (a *fakeAgent) EnsureGateway(context.Context) error {
+	a.c.add("EnsureGateway")
+	a.setUp("sp-gateway", true)
+	return nil
+}
 func (a *fakeAgent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	a.c.add("NodeCheck")
 	if a.nodeCheckWait {
@@ -126,20 +158,43 @@ func (a *fakeAgent) DrainAllRoutes(context.Context) (int64, error) {
 	a.mu.Unlock()
 	return 1, a.drainErr
 }
-func (a *fakeAgent) StopAllTenants(context.Context) error { a.c.add("StopAllTenants"); return nil }
+func (a *fakeAgent) StopAllTenants(context.Context) error {
+	a.c.add("StopAllTenants")
+	a.mu.Lock()
+	for n := range a.up {
+		if strings.HasPrefix(n, "pg-") || strings.HasPrefix(n, "postgrest-") {
+			a.up[n] = false
+		}
+	}
+	a.mu.Unlock()
+	return nil
+}
 func (a *fakeAgent) EnsureCluster(ctx context.Context, s agent.Spec) error {
 	a.c.add(fmt.Sprintf("EnsureCluster:%s:%d:%v", s.Ref, s.Generation, s.HealthWait))
 	if a.ensureCluster != nil {
-		return a.ensureCluster(ctx, s)
+		if err := a.ensureCluster(ctx, s); err != nil {
+			return err
+		}
 	}
+	a.setUp("pg-"+s.Ref, true)
 	return nil
 }
 func (a *fakeAgent) EnsurePostgREST(ctx context.Context, s agent.Spec) error {
 	a.c.add("EnsurePostgREST:" + s.Ref)
 	if a.ensurePostgREST != nil {
-		return a.ensurePostgREST(ctx, s)
+		if err := a.ensurePostgREST(ctx, s); err != nil {
+			return err
+		}
 	}
+	a.setUp("postgrest-"+s.Ref, true)
 	return nil
+}
+func (a *fakeAgent) CheckHost(_ context.Context, s agent.Spec) []nodecfg.CheckResult {
+	a.c.add("CheckHost:" + s.Ref)
+	if a.checkHost != nil {
+		return a.checkHost(s)
+	}
+	return []nodecfg.CheckResult{{Name: "route", OK: true}}
 }
 func (a *fakeAgent) CheckCluster(ctx context.Context, s agent.Spec) ([]nodecfg.CheckResult, error) {
 	a.c.add("CheckCluster:" + s.Ref)
@@ -317,6 +372,7 @@ func newWorld(t *testing.T) *world {
 	}
 	d.bridgeNF = func() error { c.add("bridgeNF"); return nil }
 	d.listTenants = func(context.Context) ([]string, error) { c.add("listTenants"); return w.tenants, nil }
+	d.containers = w.ag.containers
 	d.connect = func(context.Context) (*backend, error) {
 		c.add("connect")
 		return &backend{st: w.st, rn: w.rn, api: func(o adminapi.Ops) http.Handler {
@@ -423,8 +479,8 @@ func TestBoot_Order(t *testing.T) {
 	}
 	w.start()
 	eventually(t, 5*time.Second, "route active", func() bool { return w.ag.route(refN(1)) == "active" })
-	want := []string{"nftCheck", "EnsurePlatformNetworks", "EnsureImageFiles", "EnsureControlPlaneDB", "connect",
-		"DrainAllRoutes", "listTenants", "NodeCheck", "EnsureGateway", "ResumeAll", "EnsureCluster:" + refN(1),
+	want := []string{"nftCheck", "EnsurePlatformNetworks", "listTenants", "NodeCheck", "EnsureImageFiles", "EnsureControlPlaneDB",
+		"connect", "DrainAllRoutes", "EnsureGateway", "ResumeAll", "EnsureCluster:" + refN(1),
 		"EnsurePostgREST:" + refN(1), "SetRoute:" + refN(1) + ":active"}
 	last := -1
 	for _, s := range want {
@@ -505,8 +561,10 @@ func TestBoot_AdoptsRunningTenants(t *testing.T) {
 	w.st.add(refN(1), "active")
 	w.st.add(refN(2), "active")
 	w.start()
-	eventually(t, 5*time.Second, "routes active", func() bool {
-		return w.ag.route(refN(1)) == "active" && w.ag.route(refN(2)) == "active"
+	// The route is restored before the project leaves the pending set: wait for both.
+	eventually(t, 5*time.Second, "routes active and adoptions finished", func() bool {
+		return w.ag.route(refN(1)) == "active" && w.ag.route(refN(2)) == "active" &&
+			!w.d.isPending(refN(1)) && !w.d.isPending(refN(2))
 	})
 	if n := w.c.count("StopAllTenants"); n != 0 {
 		t.Fatalf("StopAllTenants called %d times at a healthy boot", n)
@@ -1011,7 +1069,7 @@ func TestOps_VerifyProjectMapsCodes(t *testing.T) {
 			return []nodecfg.CheckResult{{Name: "superuser", Detail: "x"}}, c.err
 		}
 		code, msg, drift := o.VerifyProject(context.Background(), refN(1))
-		if code != c.code || len(drift) != 1 || strings.ContainsAny(msg, "\x1b") || (c.err == nil) != (msg == "") {
+		if code != c.code || len(drift) != 2 || drift[1].Name != "superuser" || strings.ContainsAny(msg, "\x1b") || (c.err == nil) != (msg == "") {
 			t.Fatalf("%v → %q %q %v; want %q", c.err, code, msg, drift, c.code)
 		}
 	}

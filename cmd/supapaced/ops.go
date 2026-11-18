@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgsock"
@@ -25,16 +26,29 @@ func (o ops) Submit(ctx context.Context, kind, ref string, params json.RawMessag
 
 func (o ops) Abort(ctx context.Context, ref string) (int64, error) { return o.d.rn.Abort(ctx, ref) }
 
-// VerifyProject is one session to the project's cluster: the operational
-// facts decide the code, the findings are its drift.
+// VerifyProject reads the project's host-side facts (its containers and its
+// route), then opens one session to its cluster. The failing host-side rows
+// come first in the drift; the session's operational facts decide the code;
+// when the session passes, a failing host-side row makes the check fail with
+// code internal and those rows in the message.
 func (o ops) VerifyProject(ctx context.Context, ref string) (code, message string, drift []nodecfg.CheckResult) {
 	ctx, cancel := context.WithTimeout(ctx, o.d.verifyMax)
 	defer cancel()
 	spec, err := o.d.rn.SpecFor(ctx, ref)
+	var host []string
 	if err == nil {
+		rows := o.d.ag.CheckHost(ctx, spec)
+		for _, r := range rows {
+			if !r.OK {
+				host = append(host, r.Name+": "+r.Detail)
+			}
+		}
 		drift, err = o.d.ag.CheckCluster(ctx, spec)
+		drift = append(rows, drift...)
 	}
 	switch {
+	case err == nil && len(host) > 0:
+		return "internal", pgsock.Sanitize("host-side: "+strings.Join(host, "; "), 1024), drift
 	case err == nil:
 		return "", "", drift
 	case errors.Is(err, pgsock.ErrPeer):

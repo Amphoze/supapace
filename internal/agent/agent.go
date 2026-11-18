@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -194,11 +195,28 @@ func ipCommand(ctx context.Context, args ...string) ([]byte, error) {
 	return stdout.buf.Bytes(), nil
 }
 
-// StopAllTenants disconnects every running cluster and PostgREST container
-// from all its networks and kills it, every call in parallel and none
-// waiting on a tenant; the killed containers are left for the next ensure,
-// which removes what it cannot adopt. Used on containment failure only.
+// StopAllTenants' bounds: the clusters' grace period (as in StopCluster),
+// each kill, and the whole call.
+const (
+	clusterStopGrace = 45
+	killMax          = 10 * time.Second
+	stopAllMax       = 60 * time.Second
+)
+
+// StopAllTenants first disconnects every running cluster and PostgREST
+// container from all its networks, every call in parallel and none waiting on
+// a tenant. Only when every disconnect has returned are the containers
+// stopped, in parallel: a cluster with its grace period (Docker kills it at
+// the end of it), so it shuts down cleanly and needs no crash recovery at its
+// next start; a PostgREST container is killed (it holds no state and, as pid
+// 1, ignores the stop signal); a container whose disconnect failed is killed
+// too. Each kill has its own short bound, so a kill still runs when the
+// disconnect failed on the call's bound. The whole call takes at most
+// stopAllMax plus killMax. The stopped containers are left for the next
+// ensure. Used on containment failure only.
 func (a *Agent) StopAllTenants(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, stopAllMax)
+	defer cancel()
 	var running []dockerx.Container
 	for _, role := range []string{"cluster", "postgrest"} {
 		cs, err := dockerListContainers(ctx, labelRole+"="+role)
@@ -214,21 +232,38 @@ func (a *Agent) StopAllTenants(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errs []error
-	call := func(args ...string) {
+	failed := map[string]bool{} // containers whose disconnect failed
+	call := func(c string, args ...string) {
 		defer wg.Done()
-		if _, err := dockerRun(ctx, args...); err != nil {
+		cctx := ctx
+		if args[0] == "kill" {
+			var kcancel context.CancelFunc
+			cctx, kcancel = context.WithTimeout(context.WithoutCancel(ctx), killMax)
+			defer kcancel()
+		}
+		if _, err := dockerRun(cctx, args...); err != nil {
 			mu.Lock()
 			errs = append(errs, err)
+			if args[0] == "network" {
+				failed[c] = true
+			}
 			mu.Unlock()
 		}
 	}
 	for _, c := range running {
 		for n := range c.IPs {
 			wg.Add(1)
-			go call("network", "disconnect", "-f", "--", n, c.Name)
+			go call(c.Name, "network", "disconnect", "-f", "--", n, c.Name)
+		}
+	}
+	wg.Wait()
+	for _, c := range running {
+		args := []string{"kill", "--", c.Name}
+		if c.Labels[labelRole] == "cluster" && !failed[c.Name] { // no goroutine writes failed any more
+			args = []string{"stop", "-t", strconv.Itoa(clusterStopGrace), "--", c.Name}
 		}
 		wg.Add(1)
-		go call("kill", "--", c.Name)
+		go call(c.Name, args...)
 	}
 	wg.Wait()
 	return errors.Join(errs...)

@@ -57,18 +57,7 @@ func (a *Agent) EnsurePostgREST(ctx context.Context, s Spec) error {
 	}
 	name := postgrestName(s.Ref)
 	i := s.SubnetIndex
-	flags := []string{"create", "--name", name, "--user", fmt.Sprintf("%d:%d", postgrestUID, postgrestUID),
-		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(),
-		"--read-only", "--memory", "256m", "--memory-swap", "256m", "--pids-limit", "64",
-		"--ulimit", "core=0", "--ulimit", "nofile=65536:65536", "--no-healthcheck", "--ipc", "private",
-		"--sysctl", "net.ipv4.ping_group_range=1 0", "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
-		"-e", "GHCRTS=-N2",
-		"--network", networkName(s.Ref), "--ip", a.cfg.PostgRESTAddr(i).String(),
-		"-v", a.postgrestDir(s.Ref) + ":/etc/postgrest:ro",
-		"--label", labelRole + "=postgrest", "--label", labelRef + "=" + s.Ref,
-		"--label", labelGeneration + "=" + strconv.FormatInt(s.Generation, 10), "--label", labelEpoch + "=" + strconv.FormatInt(s.Epoch, 10),
-		"--label", labelImage + "=" + a.cfg.Images.PostgREST}
-	tail := []string{"--", a.cfg.Images.PostgREST, "/bin/postgrest", "/etc/postgrest/" + postgrestConf}
+	flags, tail := a.postgrestArgs(s)
 	label, err := a.configLabel(fileHash, slices.Concat(flags, tail))
 	if err != nil {
 		return err
@@ -107,6 +96,26 @@ func (a *Agent) EnsurePostgREST(ctx context.Context, s Spec) error {
 		return err
 	}
 	return nil
+}
+
+// postgrestArgs is postgrest-<ref>'s create options (without its
+// configuration label) and, from "--" on, image and command.
+func (a *Agent) postgrestArgs(s Spec) (flags, tail []string) {
+	name := postgrestName(s.Ref)
+	i := s.SubnetIndex
+	flags = []string{"create", "--name", name, "--user", fmt.Sprintf("%d:%d", postgrestUID, postgrestUID),
+		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(),
+		"--read-only", "--memory", "256m", "--memory-swap", "256m", "--pids-limit", "64",
+		"--ulimit", "core=0", "--ulimit", "nofile=65536:65536", "--no-healthcheck", "--ipc", "private",
+		"--sysctl", "net.ipv4.ping_group_range=1 0", "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
+		"-e", "GHCRTS=-N2",
+		"--network", networkName(s.Ref), "--ip", a.cfg.PostgRESTAddr(i).String(),
+		"-v", a.postgrestDir(s.Ref) + ":/etc/postgrest:ro",
+		"--label", labelRole + "=postgrest", "--label", labelRef + "=" + s.Ref,
+		"--label", labelGeneration + "=" + strconv.FormatInt(s.Generation, 10), "--label", labelEpoch + "=" + strconv.FormatInt(s.Epoch, 10),
+		"--label", labelImage + "=" + a.cfg.Images.PostgREST}
+	tail = []string{"--", a.cfg.Images.PostgREST, "/bin/postgrest", "/etc/postgrest/" + postgrestConf}
+	return flags, tail
 }
 
 // removeRefused removes a container that was created and connected but
@@ -173,6 +182,9 @@ func (a *Agent) renderPostgREST(s Spec) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// The OpenAPI root advertises the project's public URL (the ref and the
+	// domain are validated names), not the listen address.
+	conf = fmt.Appendf(conf, "openapi-server-proxy-uri = \"https://%s.%s/rest/v1\"\n", s.Ref, a.cfg.Domain)
 	if err := a.ensurePlatformDir(); err != nil {
 		return "", err
 	}

@@ -316,13 +316,15 @@ func TestEnsurePostgREST_Flags(t *testing.T) {
 			t.Fatalf("a docker call carries the password: %q", args[0])
 		}
 	}
-	// The files: postgrest.conf (0400, PostgREST's uid) is pgconf's render; jwks.json
+	// The files: postgrest.conf (0400, PostgREST's uid) is pgconf's render plus the
+	// OpenAPI root's public URL (the setting name of the pinned release); jwks.json
 	// (0444, root) holds exactly the spec's public keys.
 	conf := f.writes[filepath.Join(render, "postgrest.conf")]
 	want, err := pgconf.PostgREST(pgconf.PostgRESTConfig{ClusterAddr: a.cfg.ClusterAddr(14), AuthenticatorPassword: s.Secrets.AuthenticatorPassword})
 	if err != nil {
 		t.Fatal(err)
 	}
+	want = append(want, "openapi-server-proxy-uri = \"https://"+s.Ref+".sp.test/rest/v1\"\n"...)
 	if conf.Mode != 0o400 || conf.UID != 65532 || conf.GID != 65532 || !bytes.Equal(conf.Data, want) {
 		t.Errorf("postgrest.conf written %o %d:%d, want 0400 65532:65532 and pgconf's bytes", conf.Mode, conf.UID, conf.GID)
 	}
@@ -1830,5 +1832,47 @@ func TestEnsurePostgREST_RefusalRemovesAfterCallerCancel(t *testing.T) {
 	wantContainment(t, a.EnsurePostgREST(ctx, s), "gate after cancel")
 	if c := f.ctrs["postgrest-"+s.Ref]; c != nil {
 		t.Fatalf("refused container left behind after the caller's context ended: %+v", c)
+	}
+}
+
+// A container created from a postgrest.conf without the OpenAPI root's
+// public URL (an earlier binary) is re-created once at its next ensure and
+// adopted untouched by the one after.
+func TestEnsurePostgREST_OpenAPIURLRecreatesOnce(t *testing.T) {
+	a, f, s := prAgent(t, 14)
+	prRunning(t, a, f, s)
+	dir := a.postgrestDir(s.Ref)
+	conf, err := os.ReadFile(filepath.Join(dir, "postgrest.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := "openapi-server-proxy-uri = \"https://" + s.Ref + ".sp.test/rest/v1\"\n"
+	old, ok := bytes.CutSuffix(conf, []byte(line))
+	if !ok {
+		t.Fatalf("postgrest.conf does not end with %q", line)
+	}
+	os.Chmod(filepath.Join(dir, "postgrest.conf"), 0o600)
+	if err := os.WriteFile(filepath.Join(dir, "postgrest.conf"), old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldHash, err := renderedHash(dir, "postgrest.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	flags, tail := a.postgrestArgs(s)
+	f.ctrs["postgrest-"+s.Ref].Labels["supapace.config"] = prLabel(t, a, oldHash, slices.Concat(flags, tail))
+	f.resetLog()
+	if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if m := f.mutations(); len(m) == 0 || m[0] != "docker rm -f -- postgrest-"+s.Ref || !f.ctrs["postgrest-"+s.Ref].Running {
+		t.Fatalf("the earlier configuration was adopted or not replaced: %q", m)
+	}
+	f.resetLog()
+	if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if m := f.mutations(); len(m) != 0 {
+		t.Fatalf("re-created a second time: %q", m)
 	}
 }

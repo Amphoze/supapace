@@ -131,11 +131,12 @@ type job struct {
 func (r *Runner) Run(ctx context.Context) {
 	r.worker.Lock()
 	defer r.worker.Unlock()
+	var queue queueErrors
 	for ctx.Err() == nil {
 		if !r.ag.ContainmentFailed() {
 			op, ok, err := r.st.NextOperation(ctx)
-			if err != nil && ctx.Err() == nil {
-				r.log.Error("operation queue", "err", r.text(err))
+			if ctx.Err() == nil {
+				queue.report(r.log, time.Now(), err, r.text)
 			}
 			if ok {
 				r.attempt(ctx, op)
@@ -519,4 +520,34 @@ func (r *Runner) Submit(ctx context.Context, kind, ref string, params json.RawMe
 // holds or next takes the ref lock compensates.
 func (r *Runner) Abort(ctx context.Context, ref string) (int64, error) {
 	return r.st.RequestAbort(ctx, ref)
+}
+
+// queueErrorEvery: while the queue cannot be read (the store is down), its
+// error is logged at most this often.
+const queueErrorEvery = 30 * time.Second
+
+// queueErrors keeps the worker's log readable while the store is down: the
+// first failure, then at most one line every queueErrorEvery while it
+// persists, and one line when the queue can be read again.
+type queueErrors struct {
+	failing     bool
+	since, last time.Time
+	n           int // failures since the last line
+}
+
+func (q *queueErrors) report(log *slog.Logger, now time.Time, err error, text func(error) string) {
+	switch {
+	case err != nil && !q.failing:
+		q.failing, q.since, q.last, q.n = true, now, now, 0
+		log.Error("operation queue", "err", text(err))
+	case err != nil:
+		q.n++
+		if now.Sub(q.last) >= queueErrorEvery {
+			log.Error("operation queue", "err", text(err), "failures", q.n, "since", q.since.UTC().Format(time.RFC3339))
+			q.last, q.n = now, 0
+		}
+	case q.failing:
+		q.failing = false
+		log.Info("operation queue readable again", "down_for", now.Sub(q.since).Round(time.Second).String())
+	}
 }

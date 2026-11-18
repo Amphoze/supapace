@@ -341,3 +341,13 @@ func TestDrift_StopsAgainWhileNodeCheckFails(t *testing.T) {
 		t.Fatalf("StopAllTenants %d times over two ticks with a failing node check: %q", n, w.c.all())
 	}
 }
+
+// No hold file: the tick checks and says nothing about a hold.
+func TestDrift_NoHoldNoWarn(t *testing.T) {
+	l := captureLogs(t)
+	w := driftWorld(t)
+	w.d.driftTick(context.Background())
+	if w.c.index("nftCheck") < 0 || strings.Contains(l.String(), "drift hold") {
+		t.Fatalf("calls %q, log:\n%s", w.c.all(), l)
+	}
+}

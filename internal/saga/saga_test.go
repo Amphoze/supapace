@@ -3305,3 +3305,27 @@ func TestLogs_SummaryOfCompensation(t *testing.T) {
 		t.Fatalf("aborted summaries %v", s)
 	}
 }
+
+// While the queue cannot be read the worker logs the first failure, then at
+// most one line every 30 s, and one line when it recovers.
+func TestQueueErrors_RateLimited(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	var q queueErrors
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	down := errors.New("failed to connect")
+	text := func(err error) string { return err.Error() }
+	q.report(log, t0, nil, text) // healthy: nothing
+	for s := 0; s < 65; s++ {    // one poll a second for 65 s
+		q.report(log, t0.Add(time.Duration(s)*time.Second), down, text)
+	}
+	q.report(log, t0.Add(66*time.Second), nil, text)
+	q.report(log, t0.Add(67*time.Second), nil, text)
+	out := buf.String()
+	if n := strings.Count(out, `msg="operation queue"`); n != 3 { // at 0 s, 30 s, 60 s
+		t.Fatalf("%d error lines over 65 s of failures, want 3:\n%s", n, out)
+	}
+	if strings.Count(out, "readable again") != 1 || !strings.Contains(out, "down_for=1m6s") || strings.Count(out, "failures=30") != 2 {
+		t.Fatalf("log:\n%s", out)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/agent"
 	"github.com/Amphoze/supapace/internal/nft"
 )
 
@@ -39,19 +40,18 @@ func (d *daemon) driftLoop(ctx context.Context) {
 // is still wrong (or could not be examined three times running) the node is
 // marked not contained, then every route drained, then every tenant
 // stopped, in that order. While the flag is set the tick also runs the node
-// check, and the first tick on which both pass clears the flag and signals
+// check, and the first tick on which the firewall check and every blocking
+// row (agent.Blocking) pass clears the flag and signals
 // the ensure loop. Only host-side facts reach the flag.
 func (d *daemon) driftTick(ctx context.Context) {
-	if fi, err := os.Lstat(d.p.DriftHold()); err == nil {
-		if age := d.now().Sub(fi.ModTime()); age >= 0 && age < d.holdMax {
-			slog.Warn(fmt.Sprintf("drift check skipped: hold file present, age %ds", int64(age/time.Second)))
-			return
-		}
-		if age := d.now().Sub(fi.ModTime()); age < 0 {
-			slog.Warn(fmt.Sprintf("drift hold dated in the future (age %ds); checking", int64(age/time.Second)))
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	switch honoured, age, err := d.hold(); {
+	case err != nil:
 		slog.Warn("drift hold unreadable; checking", "err", clean(err))
+	case honoured:
+		slog.Warn(fmt.Sprintf("drift check skipped: hold file present, age %ds", int64(age/time.Second)))
+		return
+	case age < 0:
+		slog.Warn(fmt.Sprintf("drift hold dated in the future (age %ds); checking", int64(age/time.Second)))
 	}
 	if err := d.bridgeNF(); err != nil {
 		slog.Warn("drift: bridge-nf switches", "err", clean(err))
@@ -61,6 +61,9 @@ func (d *daemon) driftTick(ctx context.Context) {
 		d.strikes++
 		if d.strikes < unverifiedStrikes {
 			slog.Warn("drift: firewall state could not be examined", "strike", d.strikes, "err", clean(err))
+			if d.ag.ContainmentFailed() {
+				d.stopTenants(ctx) // still flagged: one may have been started since
+			}
 			return
 		}
 	} else {
@@ -99,7 +102,7 @@ func (d *daemon) driftTick(ctx context.Context) {
 		return
 	}
 	for _, r := range d.ag.NodeCheck(ctx) {
-		if !r.OK {
+		if agent.Blocking(r) {
 			slog.Warn("drift: node check still failing", "check", r.Name, "detail", clean(errors.New(r.Detail)))
 			d.stopTenants(ctx)
 			return
@@ -114,4 +117,19 @@ func (d *daemon) stopTenants(ctx context.Context) {
 	if err := d.ag.StopAllTenants(ctx); err != nil {
 		slog.Error("drift: stopping tenants", "err", clean(err))
 	}
+}
+
+// hold reads the drift hold file: honoured when present, not dated in the
+// future and younger than holdMax; age is 0 when it is absent. The drift
+// tick and the round's project repairs both pause on it.
+func (d *daemon) hold() (honoured bool, age time.Duration, err error) {
+	fi, err := os.Lstat(d.p.DriftHold())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			err = nil
+		}
+		return false, 0, err
+	}
+	age = d.now().Sub(fi.ModTime())
+	return age >= 0 && age < d.holdMax, age, nil
 }

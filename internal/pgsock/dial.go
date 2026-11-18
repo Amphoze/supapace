@@ -75,6 +75,10 @@ var (
 	ErrScramParams        = errors.New("pgsock: SCRAM parameters differ from the platform's")
 	ErrBudget             = errors.New("pgsock: session budget exceeded")
 	ErrEnvironment        = errors.New("pgsock: connection settings in the environment")
+	// ErrConnect: connecting to the checked socket failed (nothing listens
+	// on it, for one); its text is the word "connect" alone, so the error
+	// reads as before it was wrapped.
+	ErrConnect = errors.New("connect")
 )
 
 // String prints t with Password and ScramSalt redacted; Format, GoString and
@@ -187,7 +191,7 @@ func Clean(err error) error {
 	if se != nil {
 		causes = append(causes, se)
 	}
-	for _, s := range []error{ErrNotSocket, ErrPeer, ErrCleartextRequested, ErrNotScram, ErrScramParams,
+	for _, s := range []error{ErrNotSocket, ErrPeer, ErrConnect, ErrCleartextRequested, ErrNotScram, ErrScramParams,
 		ErrBudget, ErrEnvironment, context.DeadlineExceeded, context.Canceled} {
 		if errors.Is(err, s) {
 			causes = append(causes, s)
@@ -325,7 +329,7 @@ func dialChecked(ctx context.Context, t Target) (*net.UnixConn, error) {
 		if c := context.Cause(ctx); errors.Is(c, ErrBudget) {
 			return nil, fmt.Errorf("%w: connect: %v", ErrBudget, err)
 		}
-		return nil, fmt.Errorf("connect: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrConnect, err)
 	}
 	uc := c.(*net.UnixConn)
 	if err := checkPeer(uc, t); err != nil {

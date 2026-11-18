@@ -1800,3 +1800,55 @@ func TestCheckEnv(t *testing.T) {
 	wantErr(t, err, ErrEnvironment)
 	f.noConnection(t)
 }
+
+// A socket nobody listens on (left by a server that died): the connect
+// fails with ErrConnect, which survives Clean, and the text reads as it did
+// before the sentinel existed.
+func TestDial_RefusedConnectIsErrConnect(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, testRef, "sock")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", filepath.Join(dir, ".s.PGSQL.5432"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.(*net.UnixListener).SetUnlinkOnClose(false)
+	l.Close()
+	tg := Target{ProjectsDir: root, Ref: testRef, UID: os.Getuid(), PostmasterPid: os.Getpid(), PostmasterStart: selfStart(t),
+		User: testUser, Password: testPassword, ScramSalt: testSalt(), Budget: Budget{Connect: 5 * time.Second}}
+	_, err = Dial(context.Background(), tg)
+	if !errors.Is(err, ErrConnect) || IsBudget(err) {
+		t.Fatalf("error %v: want ErrConnect, not a budget", err)
+	}
+	if want := "pgsock: project " + testRef + ": socket: connect: connect: connection refused"; err.Error() != want {
+		t.Fatalf("text %q, want %q", err.Error(), want)
+	}
+	if errors.Is(Clean(errors.New("pgsock: project x: socket: connect: connect: connection refused")), ErrConnect) {
+		t.Fatal("text alone reads as ErrConnect")
+	}
+}
+
+// A connect that ran out of its budget is a budget error, not ErrConnect: a
+// caller waiting for a cluster to come up must not wait on a timeout.
+func TestDial_ConnectBudgetIsNotErrConnect(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, testRef, "sock")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", filepath.Join(dir, ".s.PGSQL.5432"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	afterCheck = func() { time.Sleep(50 * time.Millisecond) } // past the connect budget
+	t.Cleanup(func() { afterCheck = nil })
+	tg := Target{ProjectsDir: root, Ref: testRef, UID: os.Getuid(), PostmasterPid: os.Getpid(), PostmasterStart: selfStart(t),
+		User: testUser, Password: testPassword, ScramSalt: testSalt(), Budget: Budget{Connect: time.Millisecond}}
+	_, err = Dial(context.Background(), tg)
+	if !IsBudget(err) || errors.Is(err, ErrConnect) {
+		t.Fatalf("error %v: want a budget error, not ErrConnect", err)
+	}
+}

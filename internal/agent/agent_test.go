@@ -8,12 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1387,51 +1390,121 @@ func TestStopAllTenants_ByRoleLabel(t *testing.T) {
 	}
 	for _, m := range f.mutations() {
 		if strings.Contains(m, "sp-gateway") || strings.Contains(m, "sp-cp-db") || strings.Contains(m, "task-x") ||
-			strings.Contains(m, "exited") || strings.HasPrefix(m, "docker stop") {
+			strings.Contains(m, "exited") {
 			t.Errorf("unexpected call %q", m)
 		}
 	}
 }
 
-func TestStopAllTenants_ParallelDisconnectAndKill(t *testing.T) {
+// Containment waits on no tenant: the three disconnects (pg: 1 network,
+// postgrest: 2) are all issued, in parallel, and all return before any stop
+// or kill is issued. Then, in parallel, the cluster is stopped with its grace
+// period and PostgREST is killed, all within a bounded context.
+func TestStopAllTenants_DisconnectAllThenStopClusterKillREST(t *testing.T) {
 	a, f, s := newTestAgent(t)
 	healthy(a, f, s)
 	tenants(a, f, s)
-	// 3 disconnects (pg: 1 network, postgrest: 2) and 2 kills; none returns
-	// before all five have been issued.
-	const want = 5
-	var mu sync.Mutex
-	arrived := 0
-	all := make(chan struct{})
-	f.before = func(args []string) {
-		if args[0] != "kill" && !(args[0] == "network" && args[1] == "disconnect") {
-			return
-		}
-		mu.Lock()
-		arrived++
-		if arrived == want {
-			close(all)
-		}
-		mu.Unlock()
-		select {
-		case <-all:
-		case <-time.After(5 * time.Second):
-			t.Errorf("call %v waited for the others in vain: calls are not issued in parallel", args)
+	barrier := func(want int) func() {
+		var mu sync.Mutex
+		n, all := 0, make(chan struct{})
+		return func() {
+			mu.Lock()
+			if n++; n == want {
+				close(all)
+			}
+			mu.Unlock()
+			select {
+			case <-all:
+			case <-time.After(5 * time.Second):
+				t.Errorf("a call waited for the other %d in vain: not issued in parallel", want-1)
+			}
 		}
 	}
+	disc, end := barrier(3), barrier(2)
+	var mu sync.Mutex
+	var order []string
+	f.before = func(args []string) {
+		mu.Lock()
+		order = append(order, args[0])
+		mu.Unlock()
+		switch {
+		case args[0] == "network" && args[1] == "disconnect":
+			disc()
+		case args[0] == "stop" || args[0] == "kill":
+			end()
+		}
+	}
+	var noDeadline atomic.Bool
+	inner := dockerRun
+	t.Cleanup(swap(&dockerRun, func(ctx context.Context, args ...string) (string, error) {
+		if d, ok := ctx.Deadline(); !ok || time.Until(d) > stopAllMax {
+			noDeadline.Store(true)
+		}
+		return inner(ctx, args...)
+	}))
 	if err := a.StopAllTenants(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if arrived != want {
-		t.Fatalf("%d disconnect/kill calls, want %d", arrived, want)
+	if noDeadline.Load() {
+		t.Error("a call ran without a bound")
+	}
+	last := slices.Index(order, "network")
+	for i, o := range order {
+		if o == "network" {
+			last = i
+		}
+	}
+	if first := slices.IndexFunc(order, func(o string) bool { return o != "network" }); first < 0 || first < last {
+		t.Fatalf("a stop or kill was issued before every disconnect: %q", order)
 	}
 	for _, d := range f.argv("network", "disconnect") {
 		if !slices.Contains(d, "-f") {
 			t.Errorf("disconnect without -f: %v", d)
 		}
 	}
-	if len(f.argv("stop")) != 0 {
-		t.Fatal("docker stop used")
+	st, k := f.argv("stop"), f.argv("kill")
+	if !slices.EqualFunc(st, [][]string{{"stop", "-t", "45", "--", "pg-" + s.Ref}}, slices.Equal) ||
+		!slices.EqualFunc(k, [][]string{{"kill", "--", "postgrest-" + s.Ref}}, slices.Equal) {
+		t.Fatalf("stops %q, kills %q; want the cluster stopped with 45 s and PostgREST killed", st, k)
+	}
+	for _, n := range []string{"pg-" + s.Ref, "postgrest-" + s.Ref} {
+		if f.ctrs[n].Running || len(f.ctrs[n].Nets) != 0 {
+			t.Errorf("%s: running %v, networks %v", n, f.ctrs[n].Running, f.ctrs[n].Nets)
+		}
+	}
+}
+
+// A cluster whose disconnect failed is killed at once, not given a grace
+// period on a network it may still hold, and the kill runs on its own bound
+// even when the call's context has ended meanwhile.
+func TestStopAllTenants_DisconnectFailureKills(t *testing.T) {
+	a, f, s := newTestAgent(t)
+	healthy(a, f, s)
+	tenants(a, f, s)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var killCtxDone atomic.Bool
+	inner := dockerRun
+	t.Cleanup(swap(&dockerRun, func(c context.Context, args ...string) (string, error) {
+		if args[0] == "network" && args[1] == "disconnect" && args[len(args)-1] == "pg-"+s.Ref {
+			cancel() // the bound ran out while this disconnect hung
+			return "", errors.New("docker: daemon busy")
+		}
+		if args[0] == "kill" && c.Err() != nil {
+			killCtxDone.Store(true)
+		}
+		return inner(c, args...)
+	}))
+	if err := a.StopAllTenants(ctx); err == nil {
+		t.Fatal("a failed disconnect was not reported")
+	}
+	k, st := f.argv("kill"), f.argv("stop")
+	slices.SortFunc(k, func(x, y []string) int { return strings.Compare(x[2], y[2]) })
+	if len(st) != 0 || !slices.EqualFunc(k, [][]string{{"kill", "--", "pg-" + s.Ref}, {"kill", "--", "postgrest-" + s.Ref}}, slices.Equal) {
+		t.Fatalf("kills %q, stops %q; want both killed, nothing stopped", k, st)
+	}
+	if killCtxDone.Load() || f.ctrs["pg-"+s.Ref].Running {
+		t.Fatal("the kill ran on the call's ended context")
 	}
 }
 
@@ -2141,5 +2214,184 @@ func TestNodeCheck_DevModeHostGlobalRowsInformational(t *testing.T) {
 	}
 	if after["ptrace_scope"].OK {
 		t.Error("dev mode made ptrace_scope informational")
+	}
+}
+
+// ───────── platform services' rows, stale hold, host-side project facts ─────────
+
+// The gateway and control-plane rows pass for the containers the ensures
+// made and fail, without blocking, when one is absent, stopped or created
+// with another configuration.
+func TestNodeCheck_PlatformServiceRows(t *testing.T) {
+	a, f := goodNode(t)
+	delete(f.ctrs, "sp-gateway")
+	writeTLS(t, a)
+	ctx := context.Background()
+	if err := a.EnsureControlPlaneDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EnsureGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"gateway", "control-plane-db"} {
+		if r := rows(t, a)[n]; !r.OK {
+			t.Fatalf("control: %s row %+v after its ensure", n, r)
+		}
+	}
+	for name, ctr := range map[string]string{"gateway": "sp-gateway", "control-plane-db": "sp-cp-db"} {
+		c := f.ctrs[ctr]
+		for what, change := range map[string]func(){
+			"not running":   func() { c.Running = false },
+			"configuration": func() { c.Labels["supapace.config"] = "other" },
+			"absent":        func() { delete(f.ctrs, ctr) },
+		} {
+			saved := *c
+			saved.Labels = maps.Clone(c.Labels)
+			change()
+			r := rows(t, a)[name]
+			if r.OK || Blocking(r) {
+				t.Errorf("%s %s: row %+v blocking %v; want failing, not blocking", name, what, r, Blocking(r))
+			}
+			f.ctrs[ctr] = c
+			*c = saved
+		}
+	}
+	if !Blocking(nodecfg.CheckResult{Name: "kek"}) || Blocking(nodecfg.CheckResult{Name: "kek", OK: true}) {
+		t.Fatal("Blocking does not follow the other rows")
+	}
+	f.ctrs["sp-gateway"].Nets["platform"] = "10.212.0.9"
+	if r := rows(t, a)["gateway"]; r.OK {
+		t.Fatal("gateway at another platform address passes")
+	}
+}
+
+func TestNodeCheck_DriftHoldStale(t *testing.T) {
+	a, _ := goodNode(t)
+	hold := a.p.DriftHold()
+	if err := os.WriteFile(hold, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for age, want := range map[time.Duration]string{
+		-time.Hour:       "stale, ignored",
+		16 * time.Minute: "stale, ignored: age 96",
+		time.Minute:      "present, age 6",
+	} {
+		ts := time.Now().Add(-age)
+		os.Chtimes(hold, ts, ts)
+		if r := rows(t, a)["drift-hold"]; !r.OK || !strings.HasPrefix(r.Detail, want) {
+			t.Errorf("hold aged %v: row %+v, want detail %q…", age, r, want)
+		}
+	}
+}
+
+// CheckHost reads the project's containers and route from the host: all
+// pass for adopted containers and an active route; a stopped or absent
+// container, one off its networks, and a draining route fail by name.
+func TestCheckHost(t *testing.T) {
+	a, f, s, _ := clSetup(t)
+	pg := clToPhaseB(t, a, f, s)
+	s.FirstBoot = false
+	s.Keys = prKeys(t)
+	if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	r := a.RouteFor(s, "active")
+	if _, err := a.SetRoute(context.Background(), s.Ref, &r); err != nil {
+		t.Fatal(err)
+	}
+	failing := func() []string {
+		var out []string
+		for _, r := range a.CheckHost(context.Background(), s) {
+			if !r.OK {
+				out = append(out, r.Name)
+			}
+		}
+		return out
+	}
+	if got := failing(); len(got) != 0 {
+		t.Fatalf("control: healthy project fails %q: %+v", got, a.CheckHost(context.Background(), s))
+	}
+	for what, c := range map[string]struct {
+		change func()
+		want   string
+	}{
+		"rest stopped": {func() { f.ctrs["postgrest-"+s.Ref].Running = false }, "rest-container"},
+		"rest off platform": {func() {
+			f.ctrs["postgrest-"+s.Ref].Nets = map[string]string{"proj-" + s.Ref: a.cfg.PostgRESTAddr(s.SubnetIndex).String()}
+		}, "rest-container"},
+		"cluster stopped":  {func() { pg.Running = false }, "cluster-container"},
+		"cluster absent":   {func() { delete(f.ctrs, "pg-"+s.Ref) }, "cluster-container"},
+		"cluster off-net":  {func() { pg.Nets = map[string]string{} }, "cluster-container"},
+		"other generation": {func() { pg.Labels["supapace.generation"] = "9" }, "cluster-container"},
+		"route draining": {func() {
+			r := a.RouteFor(s, "draining")
+			a.SetRoute(context.Background(), s.Ref, &r)
+		}, "route"},
+	} {
+		saved, savedPR := *pg, *f.ctrs["postgrest-"+s.Ref]
+		saved.Labels, saved.Nets = maps.Clone(pg.Labels), maps.Clone(pg.Nets)
+		savedPR.Nets = maps.Clone(savedPR.Nets)
+		c.change()
+		if got := failing(); !slices.Equal(got, []string{c.want}) {
+			t.Errorf("%s: failing %q, want [%s]", what, got, c.want)
+		}
+		if what == "rest stopped" {
+			if r := a.CheckHost(context.Background(), s)[1]; !strings.HasSuffix(r.Detail, " not running") {
+				t.Errorf("rest stopped: detail %q, want it to say not running", r.Detail)
+			}
+		}
+		*pg, *f.ctrs["postgrest-"+s.Ref] = saved, savedPR
+		f.ctrs["pg-"+s.Ref] = pg
+		r := a.RouteFor(s, "active")
+		a.SetRoute(context.Background(), s.Ref, &r)
+	}
+}
+
+// A platform container re-created by an ensure is announced first, in
+// neutral words; one left untouched is not.
+func TestEnsurePlatform_RecreationLogged(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	a, f, s := newTestAgent(t)
+	healthy(a, f, s)
+	delete(f.ctrs, "sp-gateway")
+	writeTLS(t, a)
+	ctx := context.Background()
+	if err := a.EnsureControlPlaneDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EnsureGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EnsureGateway(ctx); err != nil { // healthy: untouched
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("logged without a re-creation:\n%s", &buf)
+	}
+	f.ctrs["sp-gateway"].Labels["supapace.config"] = "older"
+	f.ctrs["sp-cp-db"].Labels["supapace.config"] = "older"
+	f.ctrs["sp-cp-db"].Running = false
+	if err := a.EnsureGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EnsureControlPlaneDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.ctrs["sp-gateway"].Nets["platform"] = "10.212.0.9"
+	if err := a.EnsureGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`msg="re-creating sp-gateway: its configuration changed" was=running`,
+		`msg="re-creating sp-cp-db: its configuration changed" was=stopped`,
+		`msg="re-creating sp-gateway: its addresses changed" was=running`} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("log lacks %s:\n%s", want, &buf)
+		}
+	}
+	if strings.Contains(buf.String(), "--") || strings.Contains(buf.String(), "POSTGRES") {
+		t.Errorf("arguments in the log:\n%s", &buf)
 	}
 }

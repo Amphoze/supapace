@@ -20,8 +20,9 @@ loop_pid='' dockerd_pid=''
 stop() {
 	trap - TERM INT
 	[ -z "$loop_pid" ] || kill -TERM "$loop_pid" 2>/dev/null || :
-	pkill -TERM -x supapaced || :
-	while pgrep -x supapaced >/dev/null; do sleep 0.2; done
+	# BusyBox matches -x against the full command line only with -f.
+	pkill -TERM -x -f "$BIN/supapaced serve" || :
+	while pgrep -x -f "$BIN/supapaced serve" >/dev/null; do sleep 0.2; done
 	if [ -n "$dockerd_pid" ]; then
 		docker ps -q 2>/dev/null | xargs -r docker stop -t 10 >/dev/null 2>&1 || :
 		kill -TERM "$dockerd_pid" 2>/dev/null || :
@@ -79,10 +80,14 @@ until mountpoint -q "$PROJECTS"; do
 	sleep 1
 done
 
-# 2, 3. Node configuration, then our tables before Docker's.
+# 2, 3. Node configuration, then our tables before Docker's. init shows the
+# key escrow (the key-encryption key) on its output: that goes to a file only
+# root reads, never to the node's log.
 if [ "$mode" = full ]; then
-	[ -e /etc/supapace/node.json ] ||
-		"$BIN/supapaced" init --dev --no-systemd --ack-escrow --domain sp.test
+	if [ ! -e /etc/supapace/node.json ]; then
+		(umask 077 && "$BIN/supapaced" init --dev --no-systemd --ack-escrow --domain sp.test >"$STATE/init.out" 2>&1) ||
+			{ log "supapaced init failed; its output is in $STATE/init.out"; exit 1; }
+	fi
 	"$BIN/supapaced" nft load
 	nft list tables >"$STATE/boot/pre-dockerd.txt"
 fi
@@ -150,7 +155,11 @@ if [ "$mode" = full ]; then
 			tail -c 4194304 "$LOG" >"$LOG.tmp" && cat "$LOG.tmp" >"$LOG"
 			rm -f "$LOG.tmp"
 		fi
-		"$BIN/supapaced" serve 2>&1 | tee -a "$LOG" >&2 || :
+		# The shell reports a daemon killed by a signal on the waited command's
+		# stderr: that is /dev/null here, and the loop says what ended instead.
+		{ sh -c 'exec "$0" serve 2>&1' "$BIN/supapaced" 2>/dev/null && s=0 || s=$?
+			[ "$s" -gt 128 ] && s="signal $((s - 128))" || s="status $s"
+			echo "node-init: supapaced serve ended ($s); starting it again in 1 s"; } | tee -a "$LOG" >&2 || :
 		sleep 1
 	done) &
 	loop_pid=$!

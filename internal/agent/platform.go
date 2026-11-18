@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -132,22 +133,10 @@ func (a *Agent) EnsureControlPlaneDB(ctx context.Context) error {
 	if err := writeFile(a.p, etc, "pg_ident.conf", []byte("cp root supapaced\ncp postgres supapaced\n"), 0o444, os.Geteuid(), os.Getegid()); err != nil {
 		return err
 	}
-	opts := []string{"run", "-d", "--name", cpName, "--network", "none", "--user", fmt.Sprintf("%d:%d", cpUID, cpUID),
-		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(),
-		"--read-only", "--tmpfs", "/tmp", "--memory", "256m", "--pids-limit", "128", "--ulimit", "core=0",
-		"--restart", "unless-stopped", "--label", labelRole + "=cp-db",
-		"-e", "POSTGRES_USER=supapaced", "-e", "POSTGRES_DB=supapaced",
-		"-v", filepath.Join(cp, "data") + ":/var/lib/postgresql/data", "-v", filepath.Join(cp, "sock") + ":/var/run/postgresql",
-		"-v", etc + ":/etc/sp:ro"}
-	cmd := []string{a.cfg.Images.ControlPlane,
-		"postgres", "-c", "listen_addresses=", "-c", "hba_file=/etc/sp/pg_hba.conf", "-c", "ident_file=/etc/sp/pg_ident.conf"}
-	// What the server reads at start, as now on disk: the profile and the
-	// two access files.
-	extra, err := fileDigests(a.seccompFile(), filepath.Join(etc, "pg_hba.conf"), filepath.Join(etc, "pg_ident.conf"))
+	opts, cmd, conf, err := a.cpConfig()
 	if err != nil {
 		return err
 	}
-	conf := configHash(opts, cmd, extra...)
 	c, err := dockerInspectContainer(ctx, cpName)
 	if err != nil {
 		return err
@@ -161,6 +150,7 @@ func (a *Agent) EnsureControlPlaneDB(ctx context.Context) error {
 		}
 		// Created with other arguments (or not by this daemon): its data
 		// stays in the mounted directory.
+		logRecreate(cpName, "its configuration changed", c.Running)
 		if err := removeControlPlaneDB(ctx, c.Running); err != nil {
 			return err
 		}
@@ -174,6 +164,29 @@ func (a *Agent) EnsureControlPlaneDB(ctx context.Context) error {
 	_, err = dockerRun(ctx, slices.Concat(opts, []string{"-e", "POSTGRES_PASSWORD=" + hex.EncodeToString(pw),
 		"--label", labelConfig + "=" + conf, "--"}, cmd)...)
 	return err
+}
+
+// cpConfig is sp-cp-db's create options, command and configuration label,
+// the label computed from the files as now on disk.
+func (a *Agent) cpConfig() (opts, cmd []string, conf string, err error) {
+	cp := a.p.CPDir()
+	etc := filepath.Join(cp, "etc")
+	opts = []string{"run", "-d", "--name", cpName, "--network", "none", "--user", fmt.Sprintf("%d:%d", cpUID, cpUID),
+		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(),
+		"--read-only", "--tmpfs", "/tmp", "--memory", "256m", "--pids-limit", "128", "--ulimit", "core=0",
+		"--restart", "unless-stopped", "--label", labelRole + "=cp-db",
+		"-e", "POSTGRES_USER=supapaced", "-e", "POSTGRES_DB=supapaced",
+		"-v", filepath.Join(cp, "data") + ":/var/lib/postgresql/data", "-v", filepath.Join(cp, "sock") + ":/var/run/postgresql",
+		"-v", etc + ":/etc/sp:ro"}
+	cmd = []string{a.cfg.Images.ControlPlane,
+		"postgres", "-c", "listen_addresses=", "-c", "hba_file=/etc/sp/pg_hba.conf", "-c", "ident_file=/etc/sp/pg_ident.conf"}
+	// What the server reads at start, as now on disk: the profile and the
+	// two access files.
+	extra, err := fileDigests(a.seccompFile(), filepath.Join(etc, "pg_hba.conf"), filepath.Join(etc, "pg_ident.conf"))
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return opts, cmd, configHash(opts, cmd, extra...), nil
 }
 
 // removeControlPlaneDB removes sp-cp-db. A running one is first stopped
@@ -272,26 +285,10 @@ func (a *Agent) EnsureGateway(ctx context.Context) error {
 	if err := writeFile(a.p, tlsDir, "key.pem", key, 0o400, gatewayUID, gatewayUID); err != nil {
 		return err
 	}
-
-	opts := []string{"create", "--name", gatewayName, "--user", fmt.Sprintf("%d:%d", gatewayUID, gatewayUID),
-		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(),
-		"--read-only", "--memory", "768m", "--memory-swap", "768m", "--pids-limit", "256", "--ulimit", "core=0",
-		"--stop-timeout", "15", "--restart", "unless-stopped", "--label", labelRole + "=gateway",
-		"--network", ingressNet, "--ip", a.cfg.GatewayIngressIP, "-p", "0.0.0.0:443:8443", "-p", "0.0.0.0:80:8080",
-		"-v", gw + ":/etc/supapace/gateway:ro"}
-	cmd := []string{a.cfg.Images.Gateway}
-	// What the gateway takes at create and start, as now on disk and in the
-	// image store: its certificate (never the key), the profile, and the image
-	// the tag names (a rebuilt image under the same tag re-creates it).
-	extra, err := fileDigests(filepath.Join(tlsDir, "cert.pem"), a.seccompFile())
+	opts, cmd, conf, err := a.gatewayConfig(ctx)
 	if err != nil {
 		return err
 	}
-	img, err := imageID(ctx, a.cfg.Images.Gateway)
-	if err != nil {
-		return err
-	}
-	conf := configHash(opts, cmd, append(extra, "image id="+img)...)
 	confs, err := a.existing(ctx, gatewayName)
 	if err != nil {
 		return err
@@ -312,6 +309,11 @@ func (a *Agent) EnsureGateway(ctx context.Context) error {
 			return err
 		}
 		// At other addresses or created with other arguments.
+		why := "its configuration changed"
+		if c.Labels[labelConfig] == conf {
+			why = "its addresses changed"
+		}
+		logRecreate(gatewayName, why, c.Running)
 		if _, err := dockerRun(ctx, "rm", "-f", "--", gatewayName); err != nil {
 			return err
 		}
@@ -324,6 +326,30 @@ func (a *Agent) EnsureGateway(ctx context.Context) error {
 	}
 	_, err = dockerRun(ctx, "start", "--", gatewayName)
 	return err
+}
+
+// gatewayConfig is sp-gateway's create options, command and configuration
+// label: what the gateway takes at create and start, as now on disk and in
+// the image store — its certificate (never the key), the profile, and the
+// image the tag names (a rebuilt image under the same tag re-creates it).
+func (a *Agent) gatewayConfig(ctx context.Context) (opts, cmd []string, conf string, err error) {
+	gw := a.p.GatewayDir()
+	opts = []string{"create", "--name", gatewayName, "--user", fmt.Sprintf("%d:%d", gatewayUID, gatewayUID),
+		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(),
+		"--read-only", "--memory", "768m", "--memory-swap", "768m", "--pids-limit", "256", "--ulimit", "core=0",
+		"--stop-timeout", "15", "--restart", "unless-stopped", "--label", labelRole + "=gateway",
+		"--network", ingressNet, "--ip", a.cfg.GatewayIngressIP, "-p", "0.0.0.0:443:8443", "-p", "0.0.0.0:80:8080",
+		"-v", gw + ":/etc/supapace/gateway:ro"}
+	cmd = []string{a.cfg.Images.Gateway}
+	extra, err := fileDigests(filepath.Join(gw, "tls", "cert.pem"), a.seccompFile())
+	if err != nil {
+		return nil, nil, "", err
+	}
+	img, err := imageID(ctx, a.cfg.Images.Gateway)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return opts, cmd, configHash(opts, cmd, append(extra, "image id="+img)...), nil
 }
 
 // ensurePlatformDir makes /var/lib/supapace (root 0700) and its platform tree
@@ -458,4 +484,14 @@ func regularFiles(archive string, dir bool) (map[string][]byte, error) {
 		}
 		out[name] = b
 	}
+}
+
+// logRecreate says, before a platform container is re-created, why: in
+// neutral words, never its arguments.
+func logRecreate(name, why string, running bool) {
+	state := "stopped"
+	if running {
+		state = "running"
+	}
+	slog.Info("re-creating "+name+": "+why, "was", state)
 }
