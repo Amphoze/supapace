@@ -260,3 +260,33 @@ patch surface, backup model) were verified against upstream source first.
 - `internal/pgconf/testdata/image/`: `passwd`, `group`, `supautils.conf` and `conf.d/*`
   copied unmodified out of the pinned image (the allow file carries four exact tokens for
   the `passwd` fixture).
+
+### 2026-11-18 — PostgREST, socket and quota experiments (`e04, e05, e08, e09, e14`)
+
+- Scripts for a bare node (`cat lib-rest.sh eNN.sh | docker exec -i <node> sh -s`; `e14.sh`
+  runs on the workstation with the node name); `e08` and `e09` need their Go helpers built
+  into `bin/`. Facts established:
+  - **PostgREST 16.5** starts one runtime worker per CPU and dies at a pids limit of 64 on a
+    many-core host; with `GHCRTS=-N2` it idles at about 9 threads and peaks near 23. It
+    selects the key by `kid` from a multi-key set and re-reads its whole configuration on
+    `SIGUSR2` **and on `NOTIFY pgrst, 'reload config'` from any database session**; only
+    `SIGUSR1` / `'reload schema'` rebuild the schema cache. `db-config = false` makes it
+    ignore `pgrst.*` role settings. Without an admin port there is no readiness endpoint
+    (`GET /` answers). It logs no token and no database password.
+  - **A key file that is not a valid key set is used as a shared HS256 secret**, and a set
+    containing a symmetric key enables HS256: whatever renders that file must build it only
+    from validated public keys and replace it atomically.
+  - PostgREST alone accepts tokens with no `kid`, no `exp`, no `role`, an unknown `crit`
+    header, `role = authenticator`, or a duplicate `role`; refusing those is the gateway's
+    job.
+  - `SO_PEERCRED` on a cluster's socket reports the process that called `listen()` — the
+    container's init — stably across forks, reloads and crash recovery; a listener planted
+    at the same path by another process of the same uid reports its own pid, so the pid and
+    start time are the check, not the uid.
+  - a Unix socket can be dialled as `/proc/self/fd/<n>` for an `O_PATH` descriptor of the
+    checked socket inode, which keeps working when the name is swapped afterwards; dialling
+    by name follows the swap.
+  - XFS: the user quota (blocks and inodes) holds wherever the uid writes; a file's owner
+    can move it to any project id.
+  - a node restart re-attaches exactly one loop device, keeps quota limits and loads no
+    image again.
