@@ -337,3 +337,14 @@ patch surface, backup model) were verified against upstream source first.
   process exits 1; a second termination signal ends the 10 s grace period at once. Publish
   its ports with an explicit IPv4 bind.
 - The health answer and the plain-HTTP redirect carry the two sandbox headers as well.
+
+### 2026-11-18 — `internal/dockerx`: bounded output
+
+- Captured stdout is capped at 4 MiB while the child writes: a call that would exceed it
+  kills the child's process group and returns an error matching `ErrOutputTooLarge`, with no
+  partial output. Captured stderr keeps its **first** 64 KiB (the "absent" detection reads the
+  start) and never fails the call by itself. Once the cap is hit that error wins over a
+  time-out. The default time-out is still 60 s and a longer caller deadline does not extend
+  it: long-running containers are started detached and polled.
+- Known limit, unchanged: when a child exits while a descendant still holds its output pipe
+  open, the call returns an error after the 2 s wait delay and the descendant is left running.

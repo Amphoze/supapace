@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -26,6 +27,7 @@ printf '%s\0' "$@" >> "$d/argv.log"; printf '\n' >> "$d/argv.log"
 cat > "$d/stdin.log"
 case "$1" in ps|version) k=$1;; *) k=$1_$2;; esac
 if [ -f "$d/$k.sleep" ]; then sleep "$(cat "$d/$k.sleep")" & echo $! > "$d/gpid"; wait; fi
+[ -f "$d/$k.endless" ] && exec yes aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 [ -f "$d/$k.out" ] && cat "$d/$k.out"
 [ -f "$d/$k.err" ] && cat "$d/$k.err" >&2
 [ -f "$d/$k.rc" ] && exit "$(cat "$d/$k.rc")"
@@ -381,12 +383,111 @@ func TestListContainers_RetriesOnceWhenContainerVanishes(t *testing.T) {
 
 func TestError_StderrCapped(t *testing.T) {
 	dir := fake(t)
-	put(t, dir, "run_x.err", strings.Repeat("a", 200<<10)+"TAIL\n")
+	put(t, dir, "run_x.err", "HEAD "+strings.Repeat("a", 200<<10)+"TAIL\n")
 	put(t, dir, "run_x.rc", "1")
 	_, err := Run(context.Background(), "run", "x")
-	if err == nil || len(err.Error()) > 65<<10 || !strings.HasSuffix(err.Error(), "TAIL") {
+	if err == nil || len(err.Error()) > 65<<10 || !strings.Contains(err.Error(), "HEAD ") || strings.Contains(err.Error(), "TAIL") {
 		t.Fatalf("len=%d", len(err.Error()))
 	}
+}
+
+func TestRun_StdoutCapReturnsError(t *testing.T) {
+	dir := fake(t)
+	put(t, dir, "run_x.out", strings.Repeat("a", 5<<20))
+	put(t, dir, "run_y.out", "a")
+	alloc := func(arg string) (string, error, uint64) {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		out, err := Run(context.Background(), "run", arg)
+		runtime.ReadMemStats(&after)
+		return out, err, after.TotalAlloc - before.TotalAlloc
+	}
+	alloc("y")               // warm up
+	_, _, base := alloc("y") // cost of a call that returns almost nothing
+	out, err, got := alloc("x")
+	if !errors.Is(err, ErrOutputTooLarge) || out != "" || !strings.HasPrefix(err.Error(), "docker run: ") {
+		t.Fatalf("out=%d err=%v", len(out), err)
+	}
+	if got > base+4<<20+64<<10 {
+		t.Fatalf("allocated %d bytes (baseline call %d)", got, base)
+	}
+}
+
+// A child that never stops writing is killed once the cap is hit.
+func TestRun_StdoutCapKillsEndlessWriter(t *testing.T) {
+	dir := fake(t)
+	put(t, dir, "run_x.endless", "")
+	start := time.Now()
+	_, err := Run(context.Background(), "run", "x")
+	if !errors.Is(err, ErrOutputTooLarge) || time.Since(start) > 10*time.Second {
+		t.Fatalf("err=%v after %v", err, time.Since(start))
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "pid"))
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	for i := 0; syscall.Kill(pid, 0) != syscall.ESRCH; i++ {
+		if i > 50 {
+			t.Fatalf("process %d still alive", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestRun_StdoutAtCapPasses(t *testing.T) {
+	dir := fake(t)
+	put(t, dir, "run_x.out", strings.Repeat("a", 4<<20))
+	out, err := Run(context.Background(), "run", "x")
+	if err != nil || len(out) != 4<<20 {
+		t.Fatalf("len=%d err=%v", len(out), err)
+	}
+}
+
+func TestRun_StderrTruncatedKeepsStart(t *testing.T) {
+	dir := fake(t)
+	put(t, dir, "container_inspect.err", "Error response from daemon: No such container: nope\n"+strings.Repeat("x", 1<<20))
+	put(t, dir, "container_inspect.rc", "1")
+	c, err := InspectContainer(context.Background(), "nope")
+	if c != nil || err != nil {
+		t.Fatalf("c=%v err=%v", c, err)
+	}
+	if _, err := Run(context.Background(), "container", "inspect", "nope"); err == nil || len(err.Error()) > 65<<10 {
+		t.Fatalf("err len %d", len(err.Error()))
+	}
+}
+
+func TestRun_StillCappedAt60s(t *testing.T) {
+	if defaultTimeout != 60*time.Second {
+		t.Fatalf("defaultTimeout = %v", defaultTimeout)
+	}
+	dir := fake(t)
+	put(t, dir, "slow_x.sleep", "30")
+	old := defaultTimeout
+	defaultTimeout = 200 * time.Millisecond
+	defer func() { defaultTimeout = old }()
+	start := time.Now()
+	_, err := Run(context.Background(), "slow", "x")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+		t.Fatalf("err=%v after %v", err, time.Since(start))
+	}
+}
+
+func TestRun_CappedCallsLeakNothing(t *testing.T) {
+	dir := fake(t)
+	put(t, dir, "run_x.out", strings.Repeat("a", 5<<20))
+	Run(context.Background(), "run", "x") // warm up
+	base := runtime.NumGoroutine()
+	for i := 0; i < 30; i++ {
+		if _, err := Run(context.Background(), "run", "x"); !errors.Is(err, ErrOutputTooLarge) {
+			t.Fatal(err)
+		}
+	}
+	var n int
+	for i := 0; i < 50; i++ {
+		if n = runtime.NumGoroutine(); n <= base {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("goroutines %d -> %d", base, n)
 }
 
 func TestInspect_NeverAbsentOnOtherErrors(t *testing.T) {

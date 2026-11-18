@@ -11,11 +11,12 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-const defaultTimeout = 60 * time.Second
+var defaultTimeout = 60 * time.Second
 
 // Container is the subset of `docker container inspect` the daemon needs.
 type Container struct {
@@ -37,7 +38,9 @@ type Network struct {
 
 // Run executes `docker args...` and returns stdout. The default timeout is
 // 60 s; an earlier deadline on ctx wins. On timeout the child and its
-// process group are killed.
+// process group are killed. Stdout is capped at 4 MiB: a call that writes
+// more is killed the same way and fails with ErrOutputTooLarge. Stderr keeps
+// its first 64 KiB.
 func Run(ctx context.Context, args ...string) (string, error) {
 	return RunInput(ctx, nil, args...)
 }
@@ -47,9 +50,62 @@ func RunInput(ctx context.Context, stdin []byte, args ...string) (string, error)
 	return run(ctx, stdin, args)
 }
 
-// maxStderr bounds the stderr text carried in an error; the tail is kept
-// because docker prints the decisive message last.
-const maxStderr = 64 << 10
+// ErrOutputTooLarge is the cause of a call whose stdout exceeded maxStdout.
+var ErrOutputTooLarge = errors.New("output too large")
+
+// Output bounds. Stdout beyond maxStdout kills the call; stderr keeps its
+// start (all that classification reads) and discards the rest.
+const (
+	maxStdout = 4 << 20
+	maxStderr = 64 << 10
+)
+
+// capBuf is an io.Writer that never holds more than max bytes: excess is
+// discarded and, once, reported through over (if set). Data is kept in chunks
+// of at most 32 KiB so that growing never copies what is already held.
+type capBuf struct {
+	mu     sync.Mutex
+	max, n int
+	chunks [][]byte
+	hit    bool
+	over   func()
+}
+
+func (c *capBuf) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	total := len(p)
+	if total > c.max-c.n {
+		p = p[:c.max-c.n]
+		if !c.hit && c.over != nil {
+			c.over()
+		}
+		c.hit = true
+	}
+	for len(p) > 0 {
+		last := len(c.chunks) - 1
+		if last < 0 || len(c.chunks[last]) == cap(c.chunks[last]) {
+			c.chunks = append(c.chunks, make([]byte, 0, min(32<<10, c.max-c.n)))
+			last++
+		}
+		k := min(len(p), cap(c.chunks[last])-len(c.chunks[last]))
+		c.chunks[last] = append(c.chunks[last], p[:k]...)
+		p = p[k:]
+		c.n += k
+	}
+	return total, nil
+}
+
+func (c *capBuf) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var sb strings.Builder
+	sb.Grow(c.n)
+	for _, ch := range c.chunks {
+		sb.Write(ch)
+	}
+	return sb.String()
+}
 
 var (
 	absentContainer = regexp.MustCompile(`\A(Error response from daemon: |Error: )?No such (container|object): `)
@@ -61,14 +117,11 @@ var (
 type runError struct {
 	verb   string
 	cause  error
-	stderr string // complete stderr, used for classification only
+	stderr string // start of stderr (at most maxStderr), used for classification
 }
 
 func (e *runError) Error() string {
-	s := strings.TrimSpace(e.stderr)
-	if len(s) > maxStderr {
-		s = strings.ToValidUTF8(s[len(s)-maxStderr:], "") // drop a rune cut by the slice
-	}
+	s := strings.ToValidUTF8(strings.TrimSpace(e.stderr), "") // drop a rune cut at the cap
 	return fmt.Sprintf("docker %s: %v: %s", e.verb, e.cause, s)
 }
 
@@ -88,6 +141,8 @@ func isAbsent(err error, re *regexp.Regexp) bool {
 func run(ctx context.Context, stdin []byte, args []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
+	ctx, kill := context.WithCancel(ctx) // cancelled when stdout hits its cap
+	defer kill()
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
@@ -95,19 +150,24 @@ func run(ctx context.Context, stdin []byte, args []string) (string, error) {
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	if err := cmd.Run(); err != nil {
-		verb := ""
-		if len(args) > 0 {
-			verb = args[0]
-		}
-		if ctx.Err() != nil {
-			err = ctx.Err()
-		}
-		return out.String(), &runError{verb: verb, cause: err, stderr: errb.String()}
+	out := &capBuf{max: maxStdout, over: kill}
+	errb := &capBuf{max: maxStderr}
+	cmd.Stdout, cmd.Stderr = out, errb
+	err := cmd.Run()
+	if err == nil && !out.hit {
+		return out.String(), nil
 	}
-	return out.String(), nil
+	verb := ""
+	if len(args) > 0 {
+		verb = args[0]
+	}
+	switch {
+	case out.hit:
+		return "", &runError{verb: verb, cause: ErrOutputTooLarge, stderr: errb.String()}
+	case ctx.Err() != nil:
+		err = ctx.Err()
+	}
+	return out.String(), &runError{verb: verb, cause: err, stderr: errb.String()}
 }
 
 type rawContainer struct {
