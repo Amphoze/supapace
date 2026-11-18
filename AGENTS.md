@@ -669,3 +669,70 @@ patch surface, backup model) were verified against upstream source first.
   `core_pattern` across a reboot, socket activation of Docker, the typed acknowledgement
   from a terminal, and exit code 5 end to end. The script's tests run it against a scratch
   root with stand-ins for `supapaced`, `systemctl`, `sysctl`, `dockerd` and `nft`.
+
+### 2026-11-18 — `internal/adminapi` and `cmd/supapace`
+
+- The node's admin API: JSON over HTTP, to be served by the daemon on its root-only Unix
+  socket. `New(st *store.Store, kek secrets.KEK, ops Ops) http.Handler`; `NewRef()` returns
+  20 characters of `[a-z0-9]` from `crypto/rand`. **This package owns ref generation and
+  the output contract.**
+- Routes: `POST /v1/projects` (the API inserts the project and its `create` operation
+  itself), `GET /v1/projects`, `GET /v1/projects/{ref}`, `GET /v1/projects/{ref}/keys`,
+  `POST /v1/projects/{ref}/check`, `POST /v1/projects/{ref}/restart`,
+  `DELETE /v1/projects/{ref}`, `POST /v1/projects/{ref}/purge`,
+  `POST /v1/projects/{ref}/abort`, `GET /v1/operations[?ref=REF]`,
+  `GET /v1/operations/{id}`, `POST /v1/operations/{id}/retry`, `GET /v1/node/check`. Any
+  other path, or a path that is not clean, answers a JSON `not_found`.
+- A mutation answers 202 `{"ref","operation_id"}`; reads answer 200. Every body is one JSON
+  document and a newline; timestamps are RFC 3339 UTC to the second; lists are `[]`, never
+  `null`. While `Ops.ContainmentOK()` is false every mutation answers 503
+  `containment_failed`; reads, `check` included, are served.
+- Codes: `bad_request` (400; 413 for an oversized body), `bad_ref` (400), `ref_exists`
+  (409), `not_found` (404), `conflict` (409, with the reason), `containment_failed` (503),
+  `internal` (500, always the fixed message `internal error`; the error itself is logged
+  once with `log/slog`, sanitised and capped — the daemon must set the default handler).
+- Requests: at most 128 KiB, decoded strictly (one JSON object, no unknown members, no
+  trailing data); routes that take no body refuse one.
+- Limits: name `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`; issuer key set parsed by
+  `jwtx.ParseJWKS`, 1 to 16 usable keys; user roles at most 16, not
+  `jwtx.ForbiddenUserRole`, default `authenticated`; `disk_quota_mb` 1024 to 16777216,
+  default 8192; cluster memory fixed at 512 MiB. Text from elsewhere is sanitised with
+  `pgsock.Sanitize`: `message` and `last_error` at most 1 KiB, drift and node-check
+  `detail` 256 bytes, at most 64 drift rows.
+- `check` is served only for `active` or `restarting` projects (`conflict` otherwise) and
+  answers `{"ok":true,"drift":[]}` or `{"ok":false,"code":"peer|timeout|internal",
+  "message":…,"drift":[{"name","detail"}]}`.
+- **Operation parameters the worker must honour:**
+  - `create`: `{"issuer_jwks":{"keys":[…]}}` in `jwtx.MarshalJWKS` form, already validated;
+    the project row carries the configuration and the user roles.
+  - `restart`: `{"base_generation": N, "config": {"disk_quota_mb","mem_mb","guc"}}` —
+    `config` is the complete target configuration, validated with `pgconf.Overrides`, and
+    N is the project generation it was merged onto. A restart whose `base_generation` is
+    no longer the project's generation when it is admitted must be refused with a
+    conflict, so two restarts merged from the same base cannot drop each other's settings.
+  - `delete`: no parameters. Purge: the API calls `store.SetPurgeNow` and answers with the
+    id of the ref's single purge operation.
+- `Ops` (implemented by the daemon; a fake in the tests): `Submit(ctx, kind, ref, params)`
+  for `restart` and `delete` — a wrapped `store.ErrConflict` is shown as `conflict` with
+  its reason, anything unexpected as `internal`, so its errors must carry no secrets;
+  `Abort(ctx, ref)` returns the create operation's id and is idempotent while aborting;
+  `VerifyProject(ctx, ref)` returns a code (`""`, `peer`, `timeout`, `internal`), a message
+  and the findings; `NodeCheck(ctx)`; `ContainmentOK()`.
+- `supapace` (the operator's client) parses arguments, makes one call on the admin socket
+  and, for a mutation, polls its operation every 500 ms until it is `done`, `failed` or
+  `aborted`, unless `--no-wait`. Commands: `project create|list|show|keys|check|restart|
+  delete|purge|abort`, `op list|show|retry`, `node check`; flags may come before or after
+  the positional argument; `help`, `-h`, `--help` print the usage (stdout, exit 0).
+  - **stdout holds exactly one JSON document — the body of the last API response received,
+    byte for byte — or nothing.** Progress, summaries and hints go to stderr.
+  - Exit status: 0 success; 1 an API error, an operation that ended `failed` or `aborted`
+    (for `project abort`, `aborted` is the success), a check with `"ok": false`, or an
+    unreachable daemon; 2 usage; 130 interrupted.
+  - Polling tolerates an unreachable daemon for 2 minutes, then prints the last body and
+    says that the operation continues. Mutations handle SIGINT and SIGTERM from their
+    first request on: before the answer, stdout is empty and stderr says the request may
+    already have been accepted; while polling, the newest body is printed. Reads keep the
+    default signal behaviour.
+- Tests in both packages start a throw-away control-plane database with Docker and skip
+  without it. The limits quoted in the usage text and in the API's messages are pinned by
+  tests against `jwtx` and `pgconf`.

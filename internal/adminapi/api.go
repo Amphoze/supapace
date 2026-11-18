@@ -1,0 +1,742 @@
+// Package adminapi is the node's admin API: JSON over HTTP, served by the
+// daemon on its root-only Unix socket (the daemon creates the listener). It
+// owns ref generation and the output contract: every response body is one of
+// the fixed JSON shapes below, and the CLI prints it unchanged.
+//
+// Requests are bounded (maxBody) and decoded strictly: unknown members,
+// trailing data and bodies on routes that take none are refused. Text that
+// reaches a response from elsewhere (store errors, operation errors, check
+// results) passes through pgsock.Sanitize and is capped. An unexpected error
+// answers "internal error"; its text goes to the log (log/slog), never to
+// the response. A path that is not clean is not found, never redirected.
+//
+// Mutations answer 202 with {"ref","operation_id"} and are refused with
+// containment_failed while the node's containment is not verified; reads are
+// always served.
+package adminapi
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Amphoze/supapace/internal/jwtx"
+	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/pgconf"
+	"github.com/Amphoze/supapace/internal/pgsock"
+	"github.com/Amphoze/supapace/internal/secrets"
+	"github.com/Amphoze/supapace/internal/store"
+)
+
+// Ops is what the API needs from the daemon beyond the store: the saga
+// runner's submissions, the agent's checks and the containment flag.
+type Ops interface {
+	// Submit queues a restart or delete; kind is "restart" or "delete".
+	// For a restart, params is
+	// {"base_generation": N, "config": {"disk_quota_mb","mem_mb","guc"}}: the
+	// merged target configuration and the project generation it was merged
+	// onto; Submit refuses with store.ErrConflict when the generation differs.
+	Submit(ctx context.Context, kind, ref string, params json.RawMessage) (int64, error)
+	Abort(ctx context.Context, ref string) (int64, error)
+	// VerifyProject opens one session to the project's cluster. code is ""
+	// when the operational facts hold, else peer, timeout or internal; drift
+	// holds the assertion's findings.
+	VerifyProject(ctx context.Context, ref string) (code, message string, drift []nodecfg.CheckResult)
+	NodeCheck(ctx context.Context) []nodecfg.CheckResult
+	ContainmentOK() bool
+}
+
+// restartParams is what a restart hands to Ops.Submit: the merged target
+// configuration and the generation of the configuration it was merged onto.
+type restartParams struct {
+	BaseGeneration int64               `json:"base_generation"`
+	Config         store.ProjectConfig `json:"config"`
+}
+
+// Drift is one finding of a project check.
+type Drift struct {
+	Name   string `json:"name"`
+	Detail string `json:"detail"`
+}
+
+const (
+	maxBody        = 128 << 10 // a request body; an issuer key set is at most 64 KiB
+	maxIssuerKeys  = 16
+	maxUserRoles   = 16
+	minDiskQuotaMB = 1024
+	maxDiskQuotaMB = 1 << 24 // 16 TiB
+	defaultQuotaMB = 8192
+	clusterMemMB   = 512 // the cluster container's memory limit
+	maxMessage     = 1024
+	maxDetail      = 256
+	maxName        = 64 // a check or drift row's name
+	maxDrift       = 64
+	refAttempts    = 8
+	refLen         = 20
+	refAlphabet    = "abcdefghijklmnopqrstuvwxyz0123456789"
+	refAcceptBelow = 252 // 7 × 36: bytes at or above are redrawn, so no symbol is favoured
+)
+
+var (
+	refRE  = regexp.MustCompile(`^[a-z0-9]{20}$`)
+	idRE   = regexp.MustCompile(`^[1-9][0-9]{0,18}$`)
+	nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`)
+	roleRE = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+)
+
+// NewRef returns a fresh project ref: 20 characters of [a-z0-9] from
+// crypto/rand, by rejection sampling.
+func NewRef() (string, error) {
+	ref := make([]byte, 0, refLen)
+	buf := make([]byte, 32)
+	for len(ref) < refLen {
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		for _, b := range buf {
+			if b < refAcceptBelow && len(ref) < refLen {
+				ref = append(ref, refAlphabet[b%36])
+			}
+		}
+	}
+	return string(ref), nil
+}
+
+// newRef is NewRef; tests replace it to force a collision.
+var newRef = NewRef
+
+type api struct {
+	st  *store.Store
+	kek secrets.KEK
+	ops Ops
+}
+
+// New returns the admin API. It inserts creates itself (store.CreateProject,
+// generating the ref when none is given); restarts and deletes go through
+// ops.Submit, aborts through ops.Abort.
+func New(st *store.Store, kek secrets.KEK, ops Ops) http.Handler {
+	a := &api{st: st, kek: kek, ops: ops}
+	m := http.NewServeMux()
+	m.HandleFunc("POST /v1/projects", a.mutation(a.create))
+	m.HandleFunc("GET /v1/projects", read(a.listProjects))
+	m.HandleFunc("GET /v1/projects/{ref}", read(a.showProject))
+	m.HandleFunc("GET /v1/projects/{ref}/keys", read(a.keys))
+	m.HandleFunc("POST /v1/projects/{ref}/check", read(a.check))
+	m.HandleFunc("POST /v1/projects/{ref}/restart", a.mutation(a.restart))
+	m.HandleFunc("DELETE /v1/projects/{ref}", a.mutation(a.delete))
+	m.HandleFunc("POST /v1/projects/{ref}/purge", a.mutation(a.purge))
+	m.HandleFunc("POST /v1/projects/{ref}/abort", a.mutation(a.abort))
+	m.HandleFunc("GET /v1/operations", read(a.listOperations))
+	m.HandleFunc("GET /v1/operations/{id}", read(a.showOperation))
+	m.HandleFunc("POST /v1/operations/{id}/retry", a.mutation(a.retry))
+	m.HandleFunc("GET /v1/node/check", read(a.nodeCheck))
+	noRoute := read(func(*http.Request) (any, error) { return nil, notFound("no such route") })
+	m.HandleFunc("/", noRoute)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The router would redirect an unclean path, with an HTML body.
+		if r.URL.Path != path.Clean(r.URL.Path) {
+			noRoute(w, r)
+			return
+		}
+		m.ServeHTTP(w, r)
+	})
+}
+
+// ───────── responses ─────────
+
+type apiError struct {
+	status        int
+	Code, Message string
+}
+
+func (e *apiError) Error() string { return e.Code + ": " + e.Message }
+
+func badRequest(format string, args ...any) error {
+	return &apiError{http.StatusBadRequest, "bad_request", fmt.Sprintf(format, args...)}
+}
+
+func notFound(msg string) error { return &apiError{http.StatusNotFound, "not_found", msg} }
+
+func conflict(format string, args ...any) error {
+	return &apiError{http.StatusConflict, "conflict", fmt.Sprintf(format, args...)}
+}
+
+// toError maps an error to its status and synchronous error body. An
+// internal error answers with a fixed message; the error itself is logged.
+func toError(r *http.Request, err error) (int, errorJSON) {
+	var ae *apiError
+	switch {
+	case errors.As(err, &ae):
+		return ae.status, errorJSON{ae.Code, clean(ae.Message, maxMessage, ae.Code)}
+	case errors.Is(err, store.ErrBadRef):
+		return http.StatusBadRequest, errorJSON{"bad_ref", "a ref is 20 characters of a-z and 0-9"}
+	case errors.Is(err, store.ErrDestroyed):
+		return http.StatusNotFound, errorJSON{"not_found", "the project's keys were destroyed when it was purged or aborted"}
+	case errors.Is(err, store.ErrNotFound):
+		if r.PathValue("id") != "" {
+			return http.StatusNotFound, errorJSON{"not_found", "no such operation"}
+		}
+		return http.StatusNotFound, errorJSON{"not_found", "no such project"}
+	case errors.Is(err, store.ErrConflict):
+		msg := strings.TrimPrefix(err.Error(), store.ErrConflict.Error())
+		msg = strings.TrimSpace(strings.TrimPrefix(msg, ":"))
+		return http.StatusConflict, errorJSON{"conflict", clean(msg, maxMessage, "the project's state does not allow this")}
+	}
+	slog.Error("admin API: internal error", "method", r.Method, "route", r.Pattern,
+		"error", pgsock.Sanitize(err.Error(), maxMessage))
+	return http.StatusInternalServerError, errorJSON{"internal", "internal error"}
+}
+
+// clean sanitises outside text; an empty result becomes fallback.
+func clean(s string, max int, fallback string) string {
+	if s = pgsock.Sanitize(s, max); s == "" {
+		return fallback
+	}
+	return s
+}
+
+type handler func(r *http.Request) (any, error)
+
+func read(h handler) http.HandlerFunc { return serve(http.StatusOK, h) }
+
+func (a *api) mutation(h handler) http.HandlerFunc {
+	return serve(http.StatusAccepted, func(r *http.Request) (any, error) {
+		if !a.ops.ContainmentOK() {
+			return nil, &apiError{http.StatusServiceUnavailable, "containment_failed",
+				"the node's containment is not verified; mutations are refused until it is (see 'supapace node check')"}
+		}
+		return h(r)
+	})
+}
+
+func serve(ok int, h handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		status := ok
+		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+		v, err := h(r)
+		if err != nil {
+			status, v = toError(r, err)
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			status, v = toError(r, err)
+			b, _ = json.Marshal(v)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write(append(b, '\n'))
+	}
+}
+
+// ───────── requests ─────────
+
+// decode reads exactly one JSON object into v, refusing unknown members and
+// trailing data.
+func decode(r *http.Request, v any) error {
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		return bodyError(err)
+	}
+	if !bytes.HasPrefix(bytes.TrimLeft(b, " \t\r\n"), []byte("{")) {
+		return badRequest("request body must be a JSON object")
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return bodyError(err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err != nil {
+			return bodyError(err)
+		}
+		return badRequest("request body: trailing data")
+	}
+	return nil
+}
+
+// noBody refuses a request that carries a body.
+func noBody(r *http.Request) error {
+	if n, err := r.Body.Read(make([]byte, 1)); n > 0 || err != nil && err != io.EOF {
+		return badRequest("this request takes no body")
+	}
+	return nil
+}
+
+func bodyError(err error) error {
+	var mb *http.MaxBytesError
+	if errors.As(err, &mb) {
+		return &apiError{http.StatusRequestEntityTooLarge, "bad_request", fmt.Sprintf("request body over %d bytes", maxBody)}
+	}
+	return badRequest("request body: %v", err)
+}
+
+func pathRef(r *http.Request) (string, error) {
+	ref := r.PathValue("ref")
+	if !refRE.MatchString(ref) {
+		return "", store.ErrBadRef
+	}
+	return ref, nil
+}
+
+func pathID(r *http.Request) (int64, error) {
+	s := r.PathValue("id")
+	id, err := strconv.ParseInt(s, 10, 64)
+	if !idRE.MatchString(s) || err != nil {
+		return 0, badRequest("operation id must be a positive integer")
+	}
+	return id, nil
+}
+
+func diskQuota(v *int) (int, error) {
+	if v == nil {
+		return defaultQuotaMB, nil
+	}
+	if *v < minDiskQuotaMB || *v > maxDiskQuotaMB {
+		return 0, badRequest("disk_quota_mb must be %d to %d", minDiskQuotaMB, maxDiskQuotaMB)
+	}
+	return *v, nil
+}
+
+// ───────── shapes ─────────
+
+type errorJSON struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type mutationJSON struct {
+	Ref         string `json:"ref"`
+	OperationID int64  `json:"operation_id"`
+}
+
+type operationJSON struct {
+	ID         int64  `json:"id"`
+	Ref        string `json:"ref"`
+	Kind       string `json:"kind"`
+	State      string `json:"state"`
+	Step       string `json:"step"`
+	Attempts   int    `json:"attempts"`
+	Epoch      int64  `json:"epoch"`
+	Generation int64  `json:"generation"`
+	LastError  string `json:"last_error"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+type projectJSON struct {
+	Ref         string              `json:"ref"`
+	Name        string              `json:"name"`
+	State       string              `json:"state"`
+	Generation  int64               `json:"generation"`
+	AppliedGen  int64               `json:"applied_gen"`
+	UID         *int                `json:"uid"`
+	SubnetIndex *int                `json:"subnet_index"`
+	Config      store.ProjectConfig `json:"config"`
+	UserRoles   []string            `json:"user_roles"`
+	CreatedAt   string              `json:"created_at"`
+	DeletedAt   *string             `json:"deleted_at"`
+	PurgeAfter  *string             `json:"purge_after"`
+}
+
+type keysJSON struct {
+	Ref              string `json:"ref"`
+	AnonKey          string `json:"anon_key"`
+	ServiceRoleKey   string `json:"service_role_key"`
+	PostgresPassword string `json:"postgres_password"`
+}
+
+type checkJSON struct {
+	OK      bool    `json:"ok"`
+	Code    string  `json:"code,omitempty"`
+	Message string  `json:"message,omitempty"`
+	Drift   []Drift `json:"drift"`
+}
+
+type nodeCheckJSON struct {
+	OK                bool                  `json:"ok"`
+	ContainmentFailed bool                  `json:"containment_failed"`
+	Checks            []nodecfg.CheckResult `json:"checks"`
+}
+
+func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339) }
+
+func optStamp(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := stamp(*t)
+	return &s
+}
+
+func toOperation(o store.Operation) operationJSON {
+	return operationJSON{ID: o.ID, Ref: o.Ref, Kind: o.Kind, State: o.State, Step: o.Step, Attempts: o.Attempts,
+		Epoch: o.Epoch, Generation: o.Generation, LastError: pgsock.Sanitize(o.LastError, maxMessage),
+		CreatedAt: stamp(o.CreatedAt), UpdatedAt: stamp(o.UpdatedAt)}
+}
+
+func toProject(p store.Project) projectJSON {
+	cfg := p.Config
+	if cfg.GUC == nil {
+		cfg.GUC = map[string]string{}
+	}
+	roles := p.UserRoles
+	if roles == nil {
+		roles = []string{}
+	}
+	return projectJSON{Ref: p.Ref, Name: pgsock.Sanitize(p.Name, maxMessage), State: p.State, Generation: p.Generation,
+		AppliedGen: p.AppliedGen, UID: p.UID, SubnetIndex: p.SubnetIndex, Config: cfg, UserRoles: roles,
+		CreatedAt: stamp(p.CreatedAt), DeletedAt: optStamp(p.DeletedAt), PurgeAfter: optStamp(p.PurgeAfter)}
+}
+
+// ───────── projects ─────────
+
+func (a *api) create(r *http.Request) (any, error) {
+	var req struct {
+		Name        string          `json:"name"`
+		Ref         string          `json:"ref"`
+		IssuerJWKS  json.RawMessage `json:"issuer_jwks"`
+		UserRoles   []string        `json:"user_roles"`
+		DiskQuotaMB *int            `json:"disk_quota_mb"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	if !nameRE.MatchString(req.Name) {
+		return nil, badRequest("name must be 1 to 64 characters of letters, digits, space, '.', '_' or '-', starting with a letter or digit")
+	}
+	keys, err := jwtx.ParseJWKS(req.IssuerJWKS, "issuer")
+	if err != nil {
+		return nil, badRequest("issuer_jwks: %v; it must be a JSON Web Key Set of 1 to %d RSA signing keys "+
+			"(RS256, 2048 to 4096 bits, exponent 65537), each with a kid and without private members", err, maxIssuerKeys)
+	}
+	if len(keys) > maxIssuerKeys {
+		return nil, badRequest("issuer_jwks: %d usable keys; at most %d", len(keys), maxIssuerKeys)
+	}
+	if len(req.UserRoles) > maxUserRoles {
+		return nil, badRequest("at most %d user roles", maxUserRoles)
+	}
+	for i, role := range req.UserRoles {
+		switch {
+		case !roleRE.MatchString(role):
+			return nil, badRequest("user role %d is not a lower-case identifier of at most 63 characters", i+1)
+		case jwtx.ForbiddenUserRole(role):
+			return nil, badRequest("user role %q is reserved", role)
+		case slices.Contains(req.UserRoles[:i], role):
+			return nil, badRequest("user role %q is listed twice", role)
+		}
+	}
+	quota, err := diskQuota(req.DiskQuotaMB)
+	if err != nil {
+		return nil, err
+	}
+	set, err := jwtx.MarshalJWKS(keys)
+	if err != nil {
+		return nil, err
+	}
+	params, err := json.Marshal(struct {
+		IssuerJWKS json.RawMessage `json:"issuer_jwks"`
+	}{set})
+	if err != nil {
+		return nil, err
+	}
+	np := store.NewProject{Ref: req.Ref, Name: req.Name, UserRoles: req.UserRoles, Params: params,
+		Config: store.ProjectConfig{DiskQuotaMB: quota, MemMB: clusterMemMB, GUC: map[string]string{}}}
+	for range refAttempts {
+		if req.Ref == "" {
+			if np.Ref, err = newRef(); err != nil {
+				return nil, err
+			}
+		}
+		id, err := a.st.CreateProject(r.Context(), np)
+		if errors.Is(err, store.ErrRefExists) && req.Ref == "" {
+			continue // a generated ref collided: draw again
+		}
+		if errors.Is(err, store.ErrRefExists) {
+			return nil, &apiError{http.StatusConflict, "ref_exists", "ref " + np.Ref + " exists or existed; refs are never reused"}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return mutationJSON{np.Ref, id}, nil
+	}
+	return nil, errors.New("no free ref after repeated draws")
+}
+
+func (a *api) listProjects(r *http.Request) (any, error) {
+	ps, err := a.st.ListProjects(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	out := struct {
+		Projects []projectJSON `json:"projects"`
+	}{[]projectJSON{}}
+	for _, p := range ps {
+		out.Projects = append(out.Projects, toProject(p))
+	}
+	return out, nil
+}
+
+func (a *api) showProject(r *http.Request) (any, error) {
+	ref, err := pathRef(r)
+	if err != nil {
+		return nil, err
+	}
+	p, err := a.st.GetProject(r.Context(), ref)
+	if err != nil {
+		return nil, err
+	}
+	return toProject(p), nil
+}
+
+// keys returns the project's own credentials, unsealed with its DEK.
+func (a *api) keys(r *http.Request) (any, error) {
+	ref, err := pathRef(r)
+	if err != nil {
+		return nil, err
+	}
+	ctx := r.Context()
+	if _, err := a.st.GetProject(ctx, ref); err != nil {
+		return nil, err
+	}
+	nonce, wrapped, err := a.st.GetDEK(ctx, ref)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, notFound("the project's credentials are not issued yet")
+	}
+	if err != nil {
+		return nil, err
+	}
+	dek, err := secrets.UnwrapDEK(a.kek, ref, nonce, wrapped)
+	if err != nil {
+		return nil, err
+	}
+	var v [3]string
+	for i, name := range []string{"token.anon", "token.service_role", "pg.postgres.password"} {
+		n, ct, err := a.st.GetSecret(ctx, ref, name)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, notFound("the project's credentials are not issued yet")
+		}
+		if err != nil {
+			return nil, err
+		}
+		plain, err := secrets.Open(dek, ref, name, n, ct)
+		if err != nil {
+			return nil, err
+		}
+		v[i] = string(plain)
+	}
+	return keysJSON{ref, v[0], v[1], v[2]}, nil
+}
+
+func (a *api) check(r *http.Request) (any, error) {
+	ref, err := pathRef(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := noBody(r); err != nil {
+		return nil, err
+	}
+	p, err := a.st.GetProject(r.Context(), ref)
+	if err != nil {
+		return nil, err
+	}
+	if p.State != "active" && p.State != "restarting" {
+		return nil, conflict("project is %s; a check needs an active or restarting project", p.State)
+	}
+	code, msg, drift := a.ops.VerifyProject(r.Context(), ref)
+	out := checkJSON{OK: code == "", Drift: []Drift{}}
+	if !out.OK {
+		if code != "peer" && code != "timeout" {
+			code = "internal"
+		}
+		out.Code, out.Message = code, clean(msg, maxMessage, code)
+	}
+	for _, d := range drift {
+		if !d.OK && len(out.Drift) < maxDrift {
+			out.Drift = append(out.Drift, Drift{pgsock.Sanitize(d.Name, maxName), pgsock.Sanitize(d.Detail, maxDetail)})
+		}
+	}
+	return out, nil
+}
+
+func (a *api) restart(r *http.Request) (any, error) {
+	ref, err := pathRef(r)
+	if err != nil {
+		return nil, err
+	}
+	var req struct {
+		Set         map[string]string `json:"set"`
+		DiskQuotaMB *int              `json:"disk_quota_mb"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	p, err := a.st.GetProject(r.Context(), ref)
+	if err != nil {
+		return nil, err
+	}
+	next := p.Config
+	next.GUC = maps.Clone(p.Config.GUC)
+	if next.GUC == nil {
+		next.GUC = map[string]string{}
+	}
+	maps.Copy(next.GUC, req.Set)
+	if req.DiskQuotaMB != nil {
+		if next.DiskQuotaMB, err = diskQuota(req.DiskQuotaMB); err != nil {
+			return nil, err
+		}
+	}
+	// The merged result, against the cluster container's memory.
+	if _, err := pgconf.Overrides(next.GUC, next.MemMB); err != nil {
+		return nil, badRequest("set: %v", err)
+	}
+	// The worker refuses the restart when the project's generation is no
+	// longer the one this merge was based on.
+	params, err := json.Marshal(restartParams{BaseGeneration: p.Generation, Config: next})
+	if err != nil {
+		return nil, err
+	}
+	id, err := a.ops.Submit(r.Context(), "restart", ref, params)
+	if err != nil {
+		return nil, err
+	}
+	return mutationJSON{ref, id}, nil
+}
+
+func (a *api) delete(r *http.Request) (any, error) {
+	ref, err := pathRef(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := noBody(r); err != nil {
+		return nil, err
+	}
+	id, err := a.ops.Submit(r.Context(), "delete", ref, nil)
+	if err != nil {
+		return nil, err
+	}
+	return mutationJSON{ref, id}, nil
+}
+
+func (a *api) purge(r *http.Request) (any, error) {
+	ref, err := pathRef(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := noBody(r); err != nil {
+		return nil, err
+	}
+	if err := a.st.SetPurgeNow(r.Context(), ref); err != nil {
+		return nil, err
+	}
+	// ponytail: SetPurgeNow does not return the id; the ref has one purge, so read it back.
+	ops, err := a.st.ListOperations(r.Context(), ref)
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range ops {
+		if o.Kind == "purge" {
+			return mutationJSON{ref, o.ID}, nil
+		}
+	}
+	return nil, errors.New("purge operation not found after scheduling it")
+}
+
+func (a *api) abort(r *http.Request) (any, error) {
+	ref, err := pathRef(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := noBody(r); err != nil {
+		return nil, err
+	}
+	id, err := a.ops.Abort(r.Context(), ref)
+	if err != nil {
+		return nil, err
+	}
+	return mutationJSON{ref, id}, nil
+}
+
+// ───────── operations and node ─────────
+
+func (a *api) listOperations(r *http.Request) (any, error) {
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return nil, badRequest("query: %v", err)
+	}
+	ref := ""
+	for k, v := range q {
+		if k != "ref" || len(v) != 1 {
+			return nil, badRequest("the only query parameter is one ref")
+		}
+		ref = v[0]
+	}
+	if ref != "" && !refRE.MatchString(ref) {
+		return nil, store.ErrBadRef
+	}
+	ops, err := a.st.ListOperations(r.Context(), ref)
+	if err != nil {
+		return nil, err
+	}
+	out := struct {
+		Operations []operationJSON `json:"operations"`
+	}{[]operationJSON{}}
+	for _, o := range ops {
+		out.Operations = append(out.Operations, toOperation(o))
+	}
+	return out, nil
+}
+
+func (a *api) showOperation(r *http.Request) (any, error) {
+	id, err := pathID(r)
+	if err != nil {
+		return nil, err
+	}
+	o, err := a.st.GetOperation(r.Context(), id)
+	if err != nil {
+		return nil, err
+	}
+	return toOperation(o), nil
+}
+
+func (a *api) retry(r *http.Request) (any, error) {
+	id, err := pathID(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := noBody(r); err != nil {
+		return nil, err
+	}
+	o, err := a.st.GetOperation(r.Context(), id)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.st.RetryOperation(r.Context(), id); err != nil {
+		return nil, err
+	}
+	return mutationJSON{o.Ref, id}, nil
+}
+
+func (a *api) nodeCheck(r *http.Request) (any, error) {
+	out := nodeCheckJSON{OK: true, ContainmentFailed: !a.ops.ContainmentOK(), Checks: []nodecfg.CheckResult{}}
+	for _, c := range a.ops.NodeCheck(r.Context()) {
+		out.Checks = append(out.Checks, nodecfg.CheckResult{Name: pgsock.Sanitize(c.Name, maxName), OK: c.OK,
+			Detail: pgsock.Sanitize(c.Detail, maxDetail)})
+		out.OK = out.OK && c.OK
+	}
+	out.OK = out.OK && !out.ContainmentFailed && len(out.Checks) > 0
+	return out, nil
+}
