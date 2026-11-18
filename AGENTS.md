@@ -981,3 +981,80 @@ patch surface, backup model) were verified against upstream source first.
   gateway is re-created with `rm -f` (in-flight requests are cut); a re-creation that fails
   leaves the platform container absent until the next ensure, with the control-plane data
   intact.
+
+### 2026-11-18 — `internal/agent`: PostgREST container and route file
+
+- PostgREST and the route file (`postgrest.go`, `route.go`):
+  - API: `EnsurePostgREST(ctx, spec)`, `StopPostgREST(ctx, ref)` (stop -t 10, rm; nil when
+    absent), `RouteFor(spec, state)`, `SetRoute(ctx, ref, *routes.Project) (generation)` (nil
+    removes), `DrainAllRoutes(ctx) (generation)`, `GatewayGeneration(ctx)`,
+    `ProbeREST(ctx, ref, anonToken)`.
+  - Rendered files in `platform/projects/<ref>/postgrest/` (root 0755): `jwks.json` (root 0444;
+    only keys `jwtx.KeyFromJWK` accepts, a nil key or modulus refused; serialised with
+    `MarshalJWKS`, parsed back and compared key by key and byte for byte before the rename) and
+    `postgrest.conf` (0400, uid 65532; the only place the authenticator password is written).
+    Both are replaced by rename inside a directory mount, so a running container sees each new
+    file at its next reload; every file is valid the instant it is renamed.
+  - Container: `docker create --name postgrest-<ref> --user 65532:65532 --cap-drop ALL
+    --security-opt no-new-privileges --security-opt seccomp=<platform>/seccomp.json --read-only
+    --memory 256m --memory-swap 256m --pids-limit 64 --ulimit core=0 --ulimit nofile=65536:65536
+    --no-healthcheck --ipc private --sysctl net.ipv4.ping_group_range="1 0"
+    --sysctl net.ipv6.conf.all.disable_ipv6=1 -e GHCRTS=-N2 --network proj-<ref>
+    --ip <slice base+3> -v <render>/postgrest:/etc/postgrest:ro <labels> -- <image>
+    /bin/postgrest /etc/postgrest/postgrest.conf`, then `docker network connect --ip
+    <PlatformAddr(index)> -- platform postgrest-<ref>`, the start gate, `docker start`. No restart
+    policy; nothing secret in argv or environment. The pids limit must stay at least `db-pool` + 15.
+  - When the gate refuses after create and connect, or the start fails with Docker's `Address
+    already in use` (`ErrContainment`, never a transient error), the created container is removed
+    with `rm -f` on a fresh bounded context; a removal error is joined to the refusal, which stays
+    matchable.
+  - Labels: `supapace.role=postgrest`, `.ref`, `.generation`, `.epoch`, `.image` (the configured
+    image reference, `name@sha256:<digest>`) and `supapace.config`: the platform containers' hash
+    over the create arguments (without this label), `--`, image and command, then
+    `postgrest.conf sha256=<hash of postgrest.conf as written>` and the digest of the seccomp
+    profile as on disk. `jwks.json` is not covered. An unreadable profile is an error before any
+    Docker change.
+  - Adoption: a running container whose labels all equal the desired values, attached to exactly
+    two networks, at `PlatformAddr(index)` on `platform` and base+3 on its project network, is
+    adopted after `CheckAdopted`; when that fails it is stopped and removed. Anything else under
+    the name (stopped, created only, other labels, arguments, configuration, profile, addresses,
+    networks, or another generation older or newer) is removed with `rm -f` and created again.
+  - Addresses are computed from the subnet index (`nodecfg.PlatformAddr`), never read from Docker.
+  - Route file `platform/gateway/routes.json` (root 0444), written by `nodefs.WriteFile` under an
+    in-process lock shared by `SetRoute` and `DrainAllRoutes`. Every write increments the
+    generation. When there is no parsable previous file the counter starts from the larger of the
+    wall clock in milliseconds and the last generation this process wrote, so it stays above
+    values handed out before a loss, also when the clock stepped back or the file was lost twice
+    within a millisecond. `SetRoute` refuses a state other than active/draining, an upstream that
+    is not `http://<a platform address>:3000` or that another entry already uses, a key
+    `KeyFromJWK` refuses or whose kty is not RSA, a duplicate kid within the entry, and anything
+    `routes.Marshal` refuses; a refused call leaves the file as it was. A file that does not parse
+    is never overwritten by `SetRoute`; `DrainAllRoutes` replaces such a file with an empty table
+    (every entry is rebuilt from the store). A route file that exists but cannot be read for
+    another reason (not a regular file, an I/O error) fails both.
+  - Activation: before taking the lock, `SetRoute` with state `active` reads `proj-<ref>` from
+    Docker, takes the slice index from its bridge name, checks the network's options and subnet,
+    and requires `rest` to be exactly `http://<PlatformAddr(index)>:3000`; a failed read or a
+    mismatch is a plain error. Draining and removal read nothing. Under the lock, an `active`
+    entry is refused with `ErrContainment` while the node is containment_failed; the flag is read
+    under the same lock as the drain, so "set the flag, then drain" cannot be undone by a
+    concurrent activation.
+  - Probes dial only `gateway_ingress_ip:8443` and trust exactly the leaf certificate in
+    `gateway/tls/cert.pem` (byte comparison, no chain check); the gateway is re-created when that
+    certificate changes, so the pinned file and the served certificate agree. No redirects,
+    response headers at most 64 KiB, 10 s per probe, no connection reuse. `ProbeREST` sends
+    `GET /rest/v1/` with host and TLS server name `<ref>.<domain>` and the token as `apikey`, and
+    reads the status line only (200 is success). `GatewayGeneration` reads `/-/health` (200, at
+    most 4 KiB, strict JSON with a generation).
+  - Caller rules: give `SetRoute` `RouteFor(spec, state)`; set the containment flag before
+    `DrainAllRoutes`; run `EnsureCluster` (which refuses a stale generation) before
+    `EnsurePostgREST`; never run two ensures for the same ref at once (the worker is single and
+    boot try-locks each ref); after a write, wait until `GatewayGeneration` reaches the returned
+    value.
+  - Known limits: after a daemon restart the generation seed is the wall clock alone, so a clock
+    stepped back across a restart and a file loss can make it go down; a crash can leave
+    `.<name>.tmp-*` files behind; a stopped container keeps its configured platform address but is
+    invisible to another project's gate (two projects never share a slice: Docker refuses a second
+    network with the same bridge name or an overlapping subnet); the lock and the last generation
+    are per process and the flag per `Agent` (one `Agent` per daemon); a key change within one
+    generation is not signalled to a running PostgREST.
