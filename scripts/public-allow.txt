@@ -14,3 +14,4 @@ example.com       # reserved documentation domain: the external name a tenant mu
 172.16.0.1        # private-range probe target a tenant must not reach (reach test 3)
 192.168.0.1       # private-range probe target a tenant must not reach (reach test 3)
 100.64.0.1        # shared-address-space (CGNAT) probe target a tenant must not reach (reach test 3)
+www.docker.com    # attribution line of the upstream NOTICE file, required with the vendored seccomp profile

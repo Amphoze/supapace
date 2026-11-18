@@ -867,3 +867,117 @@ patch surface, backup model) were verified against upstream source first.
   path and cannot remove a tree nested deeper than a path can name. The purge and wipe
   tasks therefore must not rely on them; the test stays red until they remove by
   descriptor.
+
+### 2026-11-18 — `internal/agent`: core, start gate, platform objects, node check
+
+- `Spec` is a project's desired state as the agent applies it: ref, epoch, generation, uid/gid,
+  subnet index, quota, memory, pids, settings, user roles, secrets, keys and `HealthWait` (zero:
+  120 s; negative: do not wait). Its `String` prints no secrets.
+- `State` is `state.json`: root 0600, written atomically. It must be exactly one state with
+  phase `A-done` or `B` in at most 4096 bytes; null, an unknown field or phase, trailing data, a
+  larger file or a link is an error, and an unknown phase is refused on write. `checkState`
+  returns `ErrEpochDivergence` for another epoch and `ErrStaleGeneration` for an older
+  generation in the same epoch.
+- `Agent`: `New`, `SetContainmentFailed`/`ContainmentFailed`, `EnsureImageFiles`,
+  `EnsurePlatformNetworks`, `EnsureControlPlaneDB`, `EnsureGateway`, `NodeCheck`, `EnsureDir`,
+  `SetQuota`, `EnsureNetwork`, `RemoveNetwork`, `RemoveRender`, `CheckContainment`,
+  `CheckAdopted`, `StopAllTenants`. Errors: `ErrContainment`, `ErrStaleGeneration`,
+  `ErrEpochDivergence`. All idempotent.
+- Every Docker, `ip`, nft and root-side file call goes through a package-level function value in
+  `agent.go`: `dockerRun`, `dockerRunInput`, `dockerInspectContainer`, `dockerInspectNetwork`,
+  `dockerListContainers`, `dockerServerVersion`, `nftCheck`, `ensureBridgeNF`, `runIP`,
+  `createProjectDir`, `setQuota`, `writeFile`, `chown`.
+  - `agent_test.go` replaces them all with the recording fake `fakeDocker(t)`. It logs every
+    call and keeps a small model of containers (network mode included, `container:<x>` recorded
+    by full id), networks (IPv6 flag included) and images.
+  - Like Docker, it resolves a full id before a name and refuses: removing a running container
+    without `-f`, removing a network with running members, connecting twice or to an absent
+    network, killing a stopped container, starting a second running holder of an address.
+  - Unmodelled verbs and formats are test errors; script them with `onRun`. Fail a call with
+    `failVerb`/`failInspect`; read the log with `calls`/`argv`/`mutations`.
+  - Fixtures: `newTestAgent`, `healthy`, `tenants`, `gateRefuses`, `goodNode`, `rows`,
+    `writeTLS`, `writeSeccomp`.
+  - `TestMain` (umask 0077) lives there; no other test file may define one.
+- **Start gate** (`CheckContainment`, called immediately before every run or start of a tenant
+  container). It refuses with `ErrContainment` unless:
+  1. the bridge-nf switches are off and `nft.Check` passes;
+  2. `proj-<ref>` is internal, has IPv6 off, sits on bridge `spp<i>` with the slice as subnet
+     and isolated gateway mode, and the interface itself is a bridge holding no address but IPv6
+     link-local ones;
+  3. `platform` is internal, has IPv6 off, sits on `spl0`, isolated, with its interface as in 2;
+     and no running container but `postgrest-<ref>` holds `PlatformAddr(i)`, which that
+     container, if attached, holds exactly;
+  4. neither tenant container has a restart policy or uses the host's or another container's
+     network namespace;
+  5. the node is not containment-failed;
+  6. every member of the project, platform and ingress networks, both tenant containers, and
+     every container sharing the network namespace of one of them (in turn) or of the host is
+     unprivileged, drops every capability and adds none.
+
+  Members are read by their endpoint ids and every configuration by id, never by name. Only
+  host-side facts are read: Docker's record of container configuration (`docker container
+  inspect --format`, bounded and strictly parsed), network membership, interfaces and the
+  firewall state; never a tenant process or a database answer. Every error is a refusal. A
+  member that disappears between listing and reading is skipped. `CheckAdopted` is conditions 2
+  to 6, for a running container being adopted.
+- A container start that fails with "Address already in use" is a containment refusal, never a
+  transient error. Docker frees a stopped holder's address and refuses a second running holder,
+  so the gate judges running holders.
+- **Node requirements:**
+  - no container on the node runs in host network mode, or shares another container's network
+    namespace, unless it drops every capability and adds none; otherwise every tenant start is
+    refused, even while that container is stopped;
+  - the projects file system is XFS with user-quota enforcement and project-quota accounting;
+  - `br_netfilter` is blocked from loading.
+- **Node check rows** (blocking unless marked):
+  - `nft`;
+  - `docker-version` ≥ 26.1.3;
+  - `daemon.json`: our address pool, `ipv6:false`, the `local` log driver with size limits, no
+    `userland-proxy` or `icc` key, no network with inter-container traffic off;
+  - `live-restore` off;
+  - `docker-seccomp`;
+  - `docker-networks`: only the platform's networks and Docker's defaults; drivers bridge, host
+    or null; no macvlan or ipvlan interface besides the uplinks;
+  - `uplinks`: exist and are not bridges;
+  - `quota-accounting`;
+  - `quota-enforcement`: live XFS state of the projects mount;
+  - `ptrace_scope` ≥ 1;
+  - `kek`: root, 0400, 32 bytes;
+  - `platform-members`: members read by id; only the gateway at its address and each project's
+    PostgREST at its own platform address, each dropping every capability and adding none;
+  - `core_pattern`, `br_netfilter`, `file-max` ≥ 2^30: informational on a node carrying the
+    development marker;
+  - informational always: `docker-firewall-backend` and `drift-hold` (with its age).
+- **Platform objects:**
+  - `platform` (internal, isolated, Docker allocating only from the platform range) and
+    `ingress`, both with IPv6 off; an existing network with other options is a refusal;
+  - `sp-cp-db`: no network, uid 70, read-only, peer authentication over the mounted socket,
+    access files rendered root 0444 through the shared atomic writer;
+  - `sp-gateway`: uid 65531, read-only, 768 MiB, 256 pids, explicit IPv4 publications, fixed
+    addresses on both networks, TLS key copy 0400 owned by 65531, the development CA never
+    copied;
+  - both run with `--cap-drop ALL`, no-new-privileges, `core=0` and the embedded seccomp profile
+    (Docker's default profile for the pinned release, with its NOTICE; written 0444 at every
+    `EnsureImageFiles`, which must run first);
+  - **configuration label.** Each carries `supapace.config`, a SHA-256 over its arguments and
+    what it takes at create or start, as now on disk or in the image store: the seccomp profile
+    (both), the control-plane access files, and the gateway's certificate (never the key) and
+    the image id its tag names. No secret is included.
+    - A missing or different label means re-creation: a running control-plane database is first
+      stopped with the server's grace period, and its data stays in the mounted directory.
+    - An unreadable input is an error, never an adoption;
+  - the cluster image's `passwd`, `group`, `supautils.conf`, `conf.d` and `postgresql.conf` are
+    taken once per image digest, through a container that is created, never started: regular
+    files only, 1 MiB each, no duplicates.
+- `StopAllTenants` disconnects every running cluster and PostgREST container from its networks
+  and kills it, all in parallel, waiting on no tenant.
+- `ip` output is bounded (16 MiB; a larger answer is killed and refused).
+- **Caller rules:**
+  - no Docker call between the gate and the start it guards;
+  - map "Address already in use" at start to a containment refusal;
+  - run `EnsureImageFiles` before `EnsureControlPlaneDB` and `EnsureGateway`.
+
+- Known limits: a platform container that is found stopped is removed with `rm -f`, and the
+  gateway is re-created with `rm -f` (in-flight requests are cut); a re-creation that fails
+  leaves the platform container absent until the next ensure, with the control-plane data
+  intact.

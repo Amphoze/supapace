@@ -1,0 +1,14 @@
+default.json in this directory is Docker's default seccomp profile, unmodified.
+
+Source:  https://github.com/moby/moby, tag docker-v29.10.0,
+         file vendor/github.com/moby/profiles/seccomp/default.json
+SHA-256: 6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6
+Licence: Apache License, Version 2.0 (the licence of this repository; see
+         LICENSE at the repository root)
+
+The upstream NOTICE file reads, in part:
+
+Docker
+Copyright 2012-2017 Docker, Inc.
+
+This product includes software developed at Docker, Inc. (https://www.docker.com).

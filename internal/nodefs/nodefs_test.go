@@ -216,6 +216,31 @@ func TestWriteFile_UnderTempRoot(t *testing.T) {
 	}
 }
 
+// The control-plane database's directory is a render root (its access files
+// are rendered there); its neighbours stay outside every root.
+func TestWriteFile_UnderControlPlaneDir(t *testing.T) {
+	root := t.TempDir()
+	p := nodecfg.Paths{Root: root}
+	uid, gid := me()
+	etc := filepath.Join(p.CPDir(), "etc")
+	if err := os.MkdirAll(etc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{filepath.Dir(p.CPDir()), p.CPDir(), etc} {
+		os.Chmod(d, 0o755)
+	}
+	for _, dir := range []string{p.CPDir(), etc} {
+		if err := WriteFile(p, dir, "pg_hba.conf", []byte("x"), 0o444, uid, gid); err != nil {
+			t.Fatalf("%s: %v", dir, err)
+		}
+	}
+	for _, dir := range []string{filepath.Dir(p.CPDir()), p.CPDir() + "x", p.ProjectsDir()} {
+		if err := WriteFile(p, dir, "f", []byte("x"), 0o444, uid, gid); !errors.Is(err, ErrOutsideRenderRoot) {
+			t.Errorf("%s: got %v, want ErrOutsideRenderRoot", dir, err)
+		}
+	}
+}
+
 func TestWriteFile_RefusesWeakDirAndBadName(t *testing.T) {
 	p := nodecfg.Paths{Root: t.TempDir()}
 	dir := mkRenderDir(t, p)

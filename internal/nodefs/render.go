@@ -33,10 +33,11 @@ const (
 var ErrOutsideRenderRoot = errors.New("nodefs: directory outside the render roots")
 
 // renderRoots are the trees root renders platform files into: the platform
-// tree (which holds the gateway directory) and the node configuration
-// directory. None of them is ever writable by a tenant.
+// tree (which holds the gateway directory), the node configuration
+// directory and the control-plane database's directory. None of them is ever
+// writable by a tenant.
 func renderRoots(p nodecfg.Paths) []string {
-	return []string{p.PlatformDir(), filepath.Dir(p.NodeJSON())}
+	return []string{p.PlatformDir(), filepath.Dir(p.NodeJSON()), p.CPDir()}
 }
 
 // WriteFile atomically replaces dir/name with data, owned by uid:gid with the
