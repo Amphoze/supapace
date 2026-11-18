@@ -90,8 +90,9 @@ start() { # supautils file
 start "$REND/supautils.conf"
 
 # The startup-packet parameters a platform session sends, one name=value per line;
-# superuser sessions add event_triggers=off. This is the single definition: the raw
-# sessions get them as startup keys, the psql bookkeeping sessions as PGOPTIONS.
+# superuser sessions add event_triggers=off. The definition is pgsock.StartupParams
+# (a test keeps this copy equal to it): the raw sessions get them as startup keys,
+# the psql bookkeeping sessions as PGOPTIONS.
 LIST='search_path=pg_catalog,pg_temp
 role=none
 default_transaction_read_only=off

@@ -432,3 +432,57 @@ patch surface, backup model) were verified against upstream source first.
   networks, `rp_filter`); recreate the node rather than rerun.
 - A caller that restarts with a newer binary must render again and compare with the
   installed file: `Load` loads the file as it is.
+
+### 2026-11-18 — `internal/pgsock`
+
+- The only way the daemon talks to a project's database server: the cluster container's
+  Unix socket, opened by descriptor without following links, after checking that the peer
+  is the container's init process the platform recorded (uid, pid and start time).
+  **The database server is treated as untrusted.**
+- API: `Dial(ctx, Target) (*pgx.Conn, error)`; `Target` (project directory, ref, uid,
+  recorded process, role, password, `ScramSalt`, `AllowTrust`, `Superuser`, `Budget`);
+  `Budget`/`DefaultBudget` (connect 5 s, statement 10 s, session 60 s, 4 MiB read in total,
+  1 MiB per message, 64 parameter-status and 256 notice messages); `Stmt(ctx, budget)`;
+  `IsBudget(err)`; `Clean(err)` and `*ServerError{Code, Message}`; `Sanitize`;
+  `CheckEnv()`; `StartupParams(superuser)`; `ProcStart(pid)`; `ScramSalt(dek, ref, role)`
+  and `ScramVerifier(password, salt)`. Sentinels: `ErrNotSocket`, `ErrPeer`,
+  `ErrCleartextRequested`, `ErrNotScram`, `ErrScramParams`, `ErrBudget`, `ErrEnvironment`.
+- Authentication: only SCRAM-SHA-256 with the salt and iteration count the platform fixed
+  for that role (`ScramSalt` derives the salt; roles are created with `ScramVerifier`).
+  A server that asks for a cleartext or MD5 password, or presents other SCRAM parameters,
+  receives nothing derived from the password. `AllowTrust` is for the first boot only.
+- Every session sends the fixed startup parameters of `StartupParams` (search path, role,
+  timeouts, encodings and so on) — the single definition of that list.
+- Bounds are enforced below the client library, on the 5-byte message header: a message
+  over the cap is refused before its body is read. A statement is bounded in pipeline
+  mode too.
+- **Callers must**
+  - build every `Target` with the role's salt from `ScramSalt` and handle its error;
+  - start the daemon with no `PG*` variable in its environment and call `CheckEnv()` at
+    start-up — `Dial` refuses to run while any is set;
+  - run each statement under a context from `Stmt`, and test errors with `IsBudget`; after
+    a budget error the session is finished: close it and retry the step with a new `Dial`;
+  - pass every error from a statement, a rows iteration or a scan through `Clean` before
+    logging, storing or returning it; the text of a `*ServerError` (`errors.As`) is the
+    only server text available;
+  - close the connection when the step ends, and after any error;
+  - send plain, schema-qualified SQL, pass values as parameters, and treat every result
+    (values, column names, command tags) as untrusted input.
+- **Callers must not**
+  - log, format or encode `conn.Config()` — it holds the password;
+  - encode a `Target` with `encoding/gob` or `encoding/xml`, read its `Password` or
+    `ScramSalt` in a template or log line, embed it in another struct, or hold it in an
+    unexported field of a value that is formatted or logged (only fmt, slog and
+    `encoding/json` are redacted);
+  - keep, pool or reuse a connection across steps, share it between goroutines, hold it
+    past the session budget, or rely on `IsClosed()` (it can stay false after a budget
+    error);
+  - use COPY, replication, function calls or `WaitForNotification`;
+  - open any other connection to the cluster (`pgconn.Connect`, a pool,
+    `pgx.ConnectConfig(conn.Config())`, a cancel request) or write through
+    `PgConn().Conn()`;
+  - take a successful `Exec` as proof that the statement ran: confirm effects with a typed
+    read where it matters.
+- Tests: `go test ./internal/pgsock/` runs without root; two tests need root and two need
+  Docker (they start the pinned cluster image) and skip otherwise. A full pass takes about
+  16 s, about 55 s with `-race`.
