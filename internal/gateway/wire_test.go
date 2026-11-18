@@ -24,7 +24,10 @@ type h2f struct {
 	p          []byte
 }
 
-// h2raw is a client HTTP/2 connection driven frame by frame.
+// h2raw is a client HTTP/2 connection driven frame by frame. Only the test
+// writes to it: a frame written from another goroutine could land between a
+// HEADERS frame and its CONTINUATION, which the server must treat as a
+// connection error (PROTOCOL_ERROR).
 type h2raw struct {
 	c      *tls.Conn
 	frames chan h2f
@@ -41,21 +44,34 @@ func h2open(t *testing.T, addr string) *h2raw {
 	h := &h2raw{c: c, frames: make(chan h2f, 1024)}
 	io.WriteString(c, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 	h.frame(4, 0, 0, nil)
+	br := bufio.NewReader(c)
+	read := func() (h2f, error) {
+		hd := make([]byte, 9)
+		if _, err := io.ReadFull(br, hd); err != nil {
+			return h2f{}, err
+		}
+		p := make([]byte, int(hd[0])<<16|int(hd[1])<<8|int(hd[2]))
+		if _, err := io.ReadFull(br, p); err != nil {
+			return h2f{}, err
+		}
+		return h2f{hd[3], hd[4], binary.BigEndian.Uint32(hd[5:]) & 0x7fffffff, p}, nil
+	}
+	// The server's SETTINGS come first and only once; acknowledge them here,
+	// before the test writes anything else.
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	f, err := read()
+	if err != nil || f.typ != 4 || f.flags&1 != 0 {
+		t.Fatalf("server preface: type %d flags %d: %v", f.typ, f.flags, err)
+	}
+	c.SetReadDeadline(time.Time{})
+	h.frame(4, 1, 0, nil)
+	h.frames <- f
 	go func() {
 		defer close(h.frames)
-		br := bufio.NewReader(c)
 		for {
-			hd := make([]byte, 9)
-			if _, err := io.ReadFull(br, hd); err != nil {
+			f, err := read()
+			if err != nil {
 				return
-			}
-			p := make([]byte, int(hd[0])<<16|int(hd[1])<<8|int(hd[2]))
-			if _, err := io.ReadFull(br, p); err != nil {
-				return
-			}
-			f := h2f{hd[3], hd[4], binary.BigEndian.Uint32(hd[5:]) & 0x7fffffff, p}
-			if f.typ == 4 && f.flags&1 == 0 {
-				h.frame(4, 1, 0, nil)
 			}
 			h.frames <- f
 		}

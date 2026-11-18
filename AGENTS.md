@@ -1093,3 +1093,13 @@ patch surface, backup model) were verified against upstream source first.
   container at the project's uid). Every PATH is checked (absolute, clean, not `/`) before the
   first is touched. Exit 0 with no output; 1 on the first failure or as uid 0; 2 on a usage
   error. Errors are one line on stderr, names quoted and shortened.
+
+### 2026-11-18 — gateway tests: the raw HTTP/2 client has one writer
+
+- `h2open` (`internal/gateway/wire_test.go`) reads the server's first SETTINGS and
+  acknowledges them before it returns; its reader goroutine never writes. A frame written
+  from a second goroutine could land between HEADERS and its CONTINUATION, which the server
+  rightly answers with GOAWAY PROTOCOL_ERROR; under CPU load that made
+  `TestHTTP2_HeaderBlockAcrossContinuation` fail about once in a few hundred runs and could
+  let its over-limit steps pass for the wrong reason. The gateway is unchanged.
+- Rule for tests that drive a connection frame by frame: one goroutine writes.
