@@ -296,3 +296,42 @@ patch surface, backup model) were verified against upstream source first.
 - `internal/pgconf/testdata/image/postgresql.conf` is the pinned cluster image's main
   configuration file, unmodified (its preload lists and `include` lines are what the
   command-line pins and the restart check are built from).
+
+### 2026-11-18 — gateway (`internal/gateway`, `cmd/gateway`, `deploy/gateway`)
+
+- The node's public entry point. Per request: health (`/-/health`, any host) → route table →
+  host → TLS server name must equal the host → draining → upgrade refusal → `apikey` (header
+  or query, they must agree) verified with the project's anon or service key → optional
+  bearer verified with the project's keys → key class bound to the claimed role
+  (`jwtx.CheckRole` after every `Verify`) → in-flight caps → body cap → proxy to the
+  project's PostgREST with exactly one `Authorization` header set by the gateway and
+  client-supplied forwarding headers replaced.
+- Refusals are JSON `{"code": …}`: `no_apikey`, `invalid_apikey`, `invalid_token` (401),
+  `not_found` (404), `body_too_large` (413), `misdirected` (421), `too_many_requests` (429,
+  per project), `unavailable` (503, gateway-wide or draining), `upstream_unavailable` (502),
+  `upstream_timeout` (504). The gateway — not the upstream — refuses tokens without `kid`,
+  `exp` or `role`, with an unknown `crit`, a duplicate `role`, or `role = authenticator`.
+- Limits (constants next to each other in `server.go` / `limit.go`, pinned by tests):
+  2,048 connections and 64 per source (an IPv6 /64 is one source); 2,048 proxied requests in
+  flight and 128 per project (also the upstream connections per project); request headers
+  32 KiB, body 8 MiB; upstream response headers 32 KiB; HTTP/2: 8 streams per connection,
+  16 KiB frames, 128 KiB receive windows; kernel socket buffers fixed at 32 KiB on client
+  and upstream sockets; timeouts header 10 s, read 60 s, write 60 s, idle 120 s, upstream
+  dial 5 s and response header 30 s; at most 8 informational responses relayed per request.
+  The request header is released when the handler returns.
+- Memory: the image sets `GOMEMLIMIT=460MiB` and is sized for a **768 MiB** container; at
+  the limits above the measured peak is about 630 MiB. Socket buffers are outside the Go
+  heap, which is why they are fixed in code. With 32 KiB buffers an 8 MiB upload takes about
+  20 s at 100 ms round trip and about 45 s at 200 ms.
+- Upstream responses are filtered on the final header, on 1xx responses and on trailers:
+  `Server`, `Set-Cookie2`, `Clear-Site-Data` and every `Set-Cookie` with a `Domain`
+  attribute are dropped; `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox` are set on every upstream response and on the
+  gateway's own refusals. Projects are sibling hosts under one parent domain: nothing one
+  project answers may act on another project's host in a browser.
+- The route file is re-read on a changed inode, size or mtime; a bad file keeps the last
+  good table; an empty or draining table answers 503, never another project's upstream. It
+  must be replaced by rename and must hold only keys the token package accepts.
+- The image is `scratch` with the static binary, numeric user 65531; without TLS files the
+  process exits 1; a second termination signal ends the 10 s grace period at once. Publish
+  its ports with an explicit IPv4 bind.
