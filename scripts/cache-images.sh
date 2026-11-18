@@ -9,10 +9,28 @@
 # "<repository>@<digest>" is written into the archive's index.json as the
 # annotation io.containerd.image.name, which docker load (containerd image store)
 # takes as the image name; the archive is unpacked and packed again around that edit.
+# That needs Docker's containerd image store on this machine too: the classic store
+# saves a re-made manifest, whose digest is not the pinned one.
+#
+# cache-images.sh --pull-only — pull every image by digest and save nothing: enough
+# where this machine's own Docker is the node's (a host install), with either store.
 set -euo pipefail
-dir=${1:?usage: cache-images.sh DIR}
+pull_only=''
+if [[ ${1:-} == --pull-only ]]; then
+	pull_only=1
+	shift
+fi
+dir=${1:-}
+if [[ -z $pull_only ]]; then
+	: "${dir:?usage: cache-images.sh [--pull-only] DIR}"
+	if ! docker info -f '{{.DriverStatus}}' | grep -q io.containerd.snapshotter; then
+		echo "cache-images: Docker's containerd image store is needed to save images by digest;" >&2
+		echo "  set {\"features\": {\"containerd-snapshotter\": true}} in /etc/docker/daemon.json and restart Docker" >&2
+		exit 1
+	fi
+fi
 lock=$(dirname "$0")/../internal/nodecfg/images.lock
-mkdir -p "$dir"
+[[ -n $pull_only ]] || mkdir -p "$dir"
 # A failed run leaves neither a partial archive nor its unpacked copy behind.
 tar='' tmp=''
 trap '[[ -z $tar ]] || rm -f "$tar.tmp"; [[ -z $tmp ]] || rm -rf "$tmp"' EXIT
@@ -28,6 +46,11 @@ while read -r key tag digest; do
 	repo=$tag
 	[[ ${tag##*/} == *:* ]] && repo=${tag%:*}
 	ref=$repo@$digest
+	if [[ -n $pull_only ]]; then
+		docker pull -q "$ref" >/dev/null
+		echo "pulled   $ref"
+		continue
+	fi
 	tar=$dir/$key-${digest:7:12}.tar
 	if [[ -s $tar ]] && tar -xOf "$tar" index.json | grep -q "\"io.containerd.image.name\":\"[^\"]*@$digest\""; then
 		echo "cached   $ref"

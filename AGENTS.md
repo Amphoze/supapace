@@ -1617,3 +1617,16 @@ Known limits
   /run/sp-measure.pid.
 - Known limits: no gateway capacity script yet (docs/measurements.md lists the method). Merge by
   local fast-forward push: GitHub's merge buttons commit as an address the gate refuses.
+
+### 2026-11-19 — Image cache: store check and pull-only mode; CI on a hosted runner
+
+- `scripts/cache-images.sh DIR` refuses to run unless Docker on this machine uses the
+  containerd image store, and says how to enable it: the classic store saves a re-made
+  manifest whose digest is not the pinned one, so the archive could not be named by digest.
+- `scripts/cache-images.sh --pull-only` (`make images PULL_ONLY=1`) pulls every pinned image
+  by digest and saves no archive: for a host install, where this machine's Docker is the
+  node's; it works with either store. `make images` creates the cache directory itself.
+- CI: the `reach` job switches the runner's Docker to the containerd image store before
+  `make images`; the `reach-host` job uses `PULL_ONLY=1`.
+- `internal/pgsock` test `TestBudget_EndlessRows`: the byte budget ends the session; its time
+  bound is now 30 s, wide enough for the race detector on a slow machine.

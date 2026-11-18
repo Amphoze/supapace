@@ -49,8 +49,11 @@ build:
 	@if ls cmd/*/*.go >/dev/null 2>&1; then CGO_ENABLED=0 $(GO) build -buildvcs=false -trimpath -o $(BIN)/ ./cmd/...; fi
 	@if [ -d test/reach ]; then CGO_ENABLED=0 $(GO) test -c -tags reach -o $(BIN)/reach.test ./test/reach; fi
 
+# PULL_ONLY=1 pulls the pinned images without saving archives (a host install, where this
+# machine's Docker is the node's).
 images: build
-	scripts/cache-images.sh "$(IMAGE_CACHE)"
+	@mkdir -p "$(IMAGE_CACHE)"
+	scripts/cache-images.sh $(if $(PULL_ONLY),--pull-only) "$(IMAGE_CACHE)"
 	@if [ -f deploy/gateway/Dockerfile ]; then \
 		docker build -t $(GATEWAY_IMAGE) -f deploy/gateway/Dockerfile . && \
 		docker save -o "$(IMAGE_CACHE)/supapace-gateway.tar" $(GATEWAY_IMAGE); \

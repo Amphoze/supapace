@@ -145,6 +145,15 @@ jobs:
           grep -w xfs /proc/filesystems
           # ct state in the bridge table needs bridge connection tracking.
           sudo modprobe nf_conntrack_bridge && echo "nf_conntrack_bridge: available"
+      # Archives by digest need the containerd image store (scripts/cache-images.sh).
+      - name: Containerd image store
+        run: |
+          f=/etc/docker/daemon.json
+          sudo test -s "$f" || echo '{}' | sudo tee "$f" >/dev/null
+          sudo jq '.features["containerd-snapshotter"] = true' "$f" | sudo tee "$f.new" >/dev/null
+          sudo mv "$f.new" "$f"
+          sudo systemctl restart docker
+          docker info -f '{{.Driver}} {{.DriverStatus}}'
       # Upstream images by digest (images.lock); make images skips archives already cached.
       - uses: actions/cache@v4
         with:
@@ -178,8 +187,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      # Pulls every pinned image into the runner's Docker and builds the gateway image.
-      - run: make images IMAGE_CACHE="$RUNNER_TEMP/images"
+      # Pulls every pinned image into the runner's Docker (it is the node's) and builds the
+      # gateway image; no archives.
+      - run: make images PULL_ONLY=1 IMAGE_CACHE="$RUNNER_TEMP/images"
       - name: Prepare the host
         run: |
           sudo apt-get update -q

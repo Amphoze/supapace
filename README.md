@@ -64,6 +64,8 @@ The test node is a privileged Docker-in-Docker container with loop-backed XFS; i
 real daemon in development mode (domain `sp.test`, its own CA). You need Linux, Docker,
 Go 1.25, GNU make, and for the requests below `openssl`, `xxd`, `basenc` (coreutils), `curl`
 and `jq`. The node loads the `xfs` kernel module on the host and uses one loop device.
+Docker on the workstation must use the containerd image store (`make images` says how to
+switch it on): the pinned images are saved by digest and loaded into the node.
 
 ```sh
 make setup                   # commit hooks (needed only to commit)
