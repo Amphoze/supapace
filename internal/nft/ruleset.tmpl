@@ -1,0 +1,53 @@
+# supapace node tables, loaded as one transaction before Docker starts. Only the
+# two tables below are replaced; every other table is left as it is. Both base
+# chains hook at priority filter - 10, ahead of Docker's own chains: a drop here
+# is final, an accept only hands the packet on. Every rule carries its label as
+# its comment.
+table inet supapace
+delete table inet supapace
+table bridge supapace
+delete table bridge supapace
+
+define GATEWAY_IP = {{.GatewayIP}}
+
+table inet supapace {
+	# traffic addressed to the host itself, IPv4 and IPv6
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		# replies to connections the host opened to the gateway
+		iifname "spi0" ct state established,related accept comment "I1"
+		# every bridge, named or not: no member opens anything on the host
+		meta iifkind "bridge" drop comment "I2"
+	}
+	# routed traffic
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		# the gateway's replies to clients of its published ports
+		iifname "spi0" ct state established,related accept comment "F1"
+		# nothing is routed out of any bridge
+		meta iifkind "bridge" drop comment "F2"
+		# clients to the gateway's published ports
+		oifname "spi0" accept comment "F3"
+		# nothing is routed into any other bridge
+		meta oifkind "bridge" drop comment "F4"
+	}
+}
+
+table bridge supapace {
+	# frames between members of one bridge. Bridges named nowhere below (other
+	# software's, Docker's default) get nothing: their members cannot reach each
+	# other while these tables are loaded
+	chain forward {
+		type filter hook forward priority filter - 10; policy drop;
+		# project bridges: ARP, replies, and new connections to the cluster's port only
+		meta ibrname "spp*" ether type arp accept comment "B1"
+		meta ibrname "spp*" ether type ip ct state established,related accept comment "B2"
+		meta ibrname "spp*" ether type ip ip daddr & 0.0.0.63 == 0.0.0.2 tcp dport 5432 ct state new accept comment "B3"
+		# platform bridge: only the gateway opens connections
+		meta ibrname "spl0" ether type arp accept comment "B4"
+		meta ibrname "spl0" ether type ip ip saddr != $GATEWAY_IP ct state != { established, related } drop comment "B8"
+		meta ibrname "spl0" ether type ip accept comment "B6"
+		# everything else, including while a reload installs this chain before its policy
+		drop comment "B9"
+	}
+}

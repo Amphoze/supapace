@@ -1,0 +1,14 @@
+[Unit]
+Description=supapace daemon
+After=docker.service supapace-nft.service
+PartOf=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/supapaced serve
+Restart=always
+RestartSec=1
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

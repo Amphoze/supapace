@@ -1,0 +1,17 @@
+[Unit]
+Description=supapace nftables tables
+# Before Docker creates any bridge; after, and restarted and reloaded with, any
+# service that replaces the whole ruleset. No ExecStop: stopping leaves the tables.
+Before=docker.service
+After=nftables.service firewalld.service
+PartOf=docker.service nftables.service
+ReloadPropagatedFrom=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/supapaced nft load
+ExecReload=/usr/local/bin/supapaced nft load
+
+[Install]
+WantedBy=multi-user.target

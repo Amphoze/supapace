@@ -389,3 +389,46 @@ patch surface, backup model) were verified against upstream source first.
   preloaded libraries.
 - The PostgREST container's command is `/bin/postgrest <config file>` (the image has no
   entrypoint).
+
+### 2026-11-18 — `internal/nft`
+
+- Renders, loads and checks the node's two nftables tables, keeps the bridge-netfilter
+  switches off, and carries the systemd units.
+  - `Render(cfg)` — the ruleset file; its only input is the gateway's platform address.
+  - `Load(ctx, paths)` — one `nft -f` transaction that replaces only `inet supapace` and
+    `bridge supapace`, then writes the checksum file, then turns the bridge-netfilter
+    switches off (an error there is returned after the tables are in).
+  - `Check(ctx, paths)` — `ErrAbsent` (a table is missing), `ErrDrift` (file or loaded
+    tables differ from what was loaded), `ErrBridgeNF` (a switch is on), `ErrUnverified`
+    (`nft` could not be run, failed or timed out). **Any non-nil error means the node is
+    not verified.**
+  - `EnsureBridgeNF()`, `Units()`.
+- Rules, each findable by its comment (the label):
+  - `inet` input: I1 replies to the host from the ingress bridge; I2 drop everything a
+    bridge member sends to the host.
+  - `inet` forward: F1 gateway replies; F2 drop everything routed out of a bridge; F3
+    clients to the gateway's published ports; F4 drop everything routed into a bridge.
+  - `bridge` forward (policy drop): B1, B2, B3 project bridges (ARP, replies, new
+    connections to the cluster's port only); B4 platform ARP; B8 on the platform bridge
+    only the gateway opens connections; B6 the rest of the platform bridge; **B9 a final
+    explicit `drop`**.
+  - B9 is not redundant with the policy: while a reload installs the chain, a few packets
+    were seen to pass on the policy alone (1–4 of 50,000 connects under continuous
+    reloads; none with B9). The `inet` table has no such window (its denials are rules).
+  - There is no B5 or B7.
+- The bridge chain drops on **every** bridge in the network namespace, also ones the
+  ruleset does not name (other software's, Docker's default bridge): their members cannot
+  reach each other while the tables are loaded.
+- I2 alone keeps a bridge member off the host: a socket bound to the member's interface
+  needs no route. Tests of host-input drops set `rp_filter` to 0 for their duration.
+- Units: the tables unit runs before Docker, is reloaded with the distribution's nftables
+  service and has no stop action (stopping leaves the tables); the daemon unit is tied to
+  Docker's lifecycle and runs with `UMask=0077`, so **every file the daemon creates for a
+  container needs an explicit mode**. The binary path `/usr/local/bin/supapaced` is fixed.
+  The units are checked statically here; a node with systemd exercises them later.
+- `internal/nft` tests tagged `reach` need a bare node and root
+  (`go test -c -tags reach ./internal/nft`, copy the binary into the node). They take about
+  6 minutes. **A killed run leaves the node dirty** (tables, scratch containers and
+  networks, `rp_filter`); recreate the node rather than rerun.
+- A caller that restarts with a newer binary must render again and compare with the
+  installed file: `Load` loads the file as it is.
