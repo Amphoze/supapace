@@ -612,7 +612,7 @@ func TestPostgREST_SecretOnlyInFile(t *testing.T) {
 // The package renders bytes only: nothing outside this list may be imported by
 // its non-test files (no filesystem, network or process access).
 func TestImports_PureOnly(t *testing.T) {
-	allowed := []string{"bytes", "errors", "fmt", "maps", "net/netip", "slices", "strconv", "strings"}
+	allowed := []string{"bytes", "errors", "fmt", "maps", "net/netip", "slices", "strconv", "strings", "time"}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)

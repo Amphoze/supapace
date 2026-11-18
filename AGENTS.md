@@ -1727,3 +1727,36 @@ Known limits
   `ep-` key on `platform` blocks the node until an operator removes the endpoint
   (`docker network disconnect -f platform <endpoint name>`). A read that fails on every round
   keeps a running project unverified and unrouted, logged at each round.
+
+### 2026-11-19 — pgconf: pinned settings and recovery settings
+Provides (internal/pgconf/pins.go; Overrides and CommandLine are unchanged, so a layout-1
+project is not affected in argv, files or label):
+- ArchiveCommand, RestoreCommand: the archive and restore commands of every project cluster
+  (the archive command keeps its trailing "# pgbackrest" marker word, which is part of the value).
+- OverridesPinned(gucs, memMB): Overrides without archive_mode, archive_command, max_connections,
+  superuser_reserved_connections, reserved_connections; same checks as Overrides.
+- Pins(gucs): -c flags for those names plus restore_command, in this order: archive_mode,
+  archive_command, restore_command, max_connections (default merged with gucs), the two
+  reserved settings. Each "-c" and each "name=value" is its own element. Checks are those of
+  Overrides that do not depend on memory; OverridesPinned checks the memory bounds, so render
+  OverridesPinned (not Overrides) in the same start.
+- PinnedNames(layout): layout 1 the two preload names, layout 2 those plus the six names of Pins;
+  any other layout nil.
+- RecoveryTarget{Time, LSN, Timeline} and RecoveryPins(t): flags of a recovery start.
+- RecoveryExtensionPins(): pgtle.enable_clientauth=off, pgtle.enable_password_check=off,
+  cron.launch_active_jobs=off, for the project recovery start only.
+Order contract for the recovery start: CommandLine, Pins, RecoveryExtensionPins, RecoveryPins,
+with nothing appended after RecoveryPins. The server refuses a start in which any recovery
+target setting, an empty one too, follows a set one. RecoveryPins therefore empties every unused
+target first, then sets inclusive=on, action=promote, the timeline, min_apply_delay=0 and empty
+end and cleanup commands, and puts the chosen target last. Call RecoveryPins before any step that
+destroys data: a refusal after it would leave a project without its data.
+Target rules: at most one of Time and LSN; no target needs timeline "latest"; a target needs
+"current" or a decimal id 1 to 4294967295 (no sign, no leading zero); Time is rendered in UTC,
+truncated to microseconds, and its UTC year must be 1 to 9999; LSN is 1 to 8 hex digits, a slash,
+1 to 8 hex digits, not all zero, passed through as given.
+Errors: every refusal wraps ErrGUCValue (errors.Is); the text quotes each field and cuts it to
+40 characters, so operator input cannot forge log lines. The package stays pure: it reads no
+clock, zone database or environment (the time import is for the type only; a test enforces it).
+Known limits: Pins cannot check memory-relative bounds; the end-of-archive restore takes no target;
+the order contract is enforced by the callers, not by this package.
