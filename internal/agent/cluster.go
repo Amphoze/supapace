@@ -74,9 +74,11 @@ func (a *Agent) clusterSpec(s Spec) error {
 //   - "B": a running container is adopted, untouched, only when its labels
 //     (generation, epoch, phase, image, configuration hash recomputed from the
 //     files on disk), state.json, its pid and that pid's start time all agree
-//     (then CheckAdopted; on failure it is removed at once); anything else is
-//     removed (a running networked container stopped with its grace period)
-//     and started again, with no bootstrap and no assertion.
+//     (then CheckAdopted: a refusal removes it at once; a check still
+//     incomplete after one repeat, ErrCheckIncomplete, is returned and
+//     leaves it running); anything else is removed (a running networked
+//     container stopped with its grace period) and started again, with no
+//     bootstrap and no assertion.
 //
 // Every start is create, the start gate, start (startCluster).
 //
@@ -149,14 +151,18 @@ func (a *Agent) clusterPhaseB(ctx context.Context, s Spec, st State) error {
 	if c != nil {
 		if !first && a.clusterAdoptable(s, st, c) {
 			err := a.CheckAdopted(ctx, s)
-			if err != nil && readFailed(err) && !a.ContainmentFailed() {
-				// A fact could not be read (a Docker hiccup): read once more
-				// before removing a running cluster. A refusal is final.
+			if errors.Is(err, ErrCheckIncomplete) && !a.ContainmentFailed() {
+				// A fact could not be read (a Docker hiccup): read once more.
+				// Still incomplete, it is not a finding: the running cluster
+				// is left as it is. A refusal is final.
 				select {
 				case <-ctx.Done():
 				case <-time.After(adoptRetry):
 				}
 				err = a.CheckAdopted(ctx, s)
+				if errors.Is(err, ErrCheckIncomplete) && !a.ContainmentFailed() {
+					return err
+				}
 			}
 			if err != nil {
 				// Off its networks at once, no grace period: it just failed a
@@ -734,15 +740,4 @@ func labelValue(args []string, key string) string {
 		}
 	}
 	return ""
-}
-
-// readFailed: the adoption check failed because a fact could not be read
-// (an error not of the gate, or a refusal carrying the read's own error),
-// not because a fact it read refused the container.
-func readFailed(err error) bool {
-	if !errors.Is(err, ErrContainment) {
-		return true
-	}
-	m, ok := err.(interface{ Unwrap() []error })
-	return ok && len(m.Unwrap()) > 1
 }

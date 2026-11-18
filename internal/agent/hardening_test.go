@@ -7,6 +7,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -878,5 +879,264 @@ func TestEnsureGateway_ImageIDStrict(t *testing.T) {
 		if err := a.EnsureGateway(context.Background()); err == nil || len(f.mutations()) != 0 {
 			t.Errorf("image id %q: %v %q", id, err, f.mutations())
 		}
+	}
+}
+
+// listedAsEndpoint makes Docker list the container name on platform under
+// "ep-<endpoint id>" for the first reads member reads of platform, as while
+// it starts or stops, and under its id from then on. It returns the count of
+// platform member reads so far.
+func listedAsEndpoint(f *fakeHost, name string, reads int) (platformReads func() int) {
+	f.mu.Lock()
+	c := f.ctrs[name]
+	id := c.ID
+	c.ID = "ep-" + strings.Repeat("7e", 32)
+	f.mu.Unlock()
+	n := 0
+	f.before = func(args []string) {
+		if flagValue(args, "--format") == "{{json .Containers}}" && args[len(args)-1] == platformNet {
+			f.mu.Lock()
+			if n++; n > reads {
+				c.ID = id
+			}
+			f.mu.Unlock()
+		}
+	}
+	return func() int {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return n
+	}
+}
+
+// fastReread makes the re-reads of a member listing immediate for one test.
+func fastReread(t *testing.T) {
+	old := memberReread
+	memberReread = time.Millisecond
+	t.Cleanup(func() { memberReread = old })
+}
+
+// A healthy adoption costs exactly the Docker calls it cost before
+// endpoint keys were re-read: one member read per network.
+func TestCheckAdopted_HealthyCost(t *testing.T) {
+	a, f, s := prAgent(t, 14)
+	prRunning(t, a, f, s)
+	if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	log := f.calls()
+	if n := len(log); n != 19 {
+		t.Fatalf("healthy adoption made %d calls, want 19:\n%s", n, strings.Join(log, "\n"))
+	}
+	if n := strings.Count(strings.Join(log, "\n"), "{{json .Containers}}"); n != 3 {
+		t.Fatalf("healthy adoption read members %d times, want 3", n)
+	}
+}
+
+// A container that starts on platform while a running PostgREST is adopted
+// is listed under its endpoint key for a moment: the listing is read again,
+// the member is judged by its id, nothing is stopped.
+func TestMemberIDs_TransientEndpointResolves(t *testing.T) {
+	fastReread(t)
+	for _, reads := range []int{1, memberRereads} {
+		a, f, s := prAgent(t, 14)
+		prRunning(t, a, f, s)
+		f.ctr(fakeCtr{Name: "postgrest-otherref0123456789ab", Running: true, CapDrop: []string{"ALL"},
+			Nets: map[string]string{platformNet: "10.212.0.250"}})
+		platformReads := listedAsEndpoint(f, "postgrest-otherref0123456789ab", reads)
+		f.resetLog()
+		if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+			t.Fatalf("reads=%d: %v", reads, err)
+		}
+		if m := f.mutations(); len(m) != 0 {
+			t.Fatalf("reads=%d: mutations %q", reads, m)
+		}
+		if n := platformReads(); n != reads+1 {
+			t.Fatalf("reads=%d: platform members read %d times, want %d", reads, n, reads+1)
+		}
+	}
+	// Once resolved, the member is judged by its id like any other.
+	a, f, s := prAgent(t, 14)
+	prRunning(t, a, f, s)
+	f.ctr(fakeCtr{Name: "starting", Running: true, CapDrop: []string{"ALL"}, CapAdd: []string{"NET_RAW"},
+		Nets: map[string]string{platformNet: "10.212.0.250"}})
+	listedAsEndpoint(f, "starting", 1)
+	err := a.EnsurePostgREST(context.Background(), s)
+	wantContainment(t, err, "a resolved member that adds a capability")
+	if errors.Is(err, ErrCheckIncomplete) || !strings.Contains(err.Error(), "adds capabilities NET_RAW") {
+		t.Fatalf("got %v, want the member's own violation", err)
+	}
+	// The node check's platform-members row reads the same way.
+	a, f = goodNode(t)
+	listedAsEndpoint(f, "sp-gateway", 1)
+	if r := rows(t, a)["platform-members"]; !r.OK {
+		t.Fatalf("platform-members fails on a transient endpoint: %+v", r)
+	}
+}
+
+// An endpoint key that outlives every re-read is an unidentified member: a
+// completed check that refuses (the adopted container is stopped). Any other
+// key that is not a container id, and a foreign member, are refused at once.
+func TestMemberIDs_PersistentEndpointRefused(t *testing.T) {
+	fastReread(t)
+	a, f, s := prAgent(t, 14)
+	prRunning(t, a, f, s)
+	f.ctr(fakeCtr{Name: "stuck", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{platformNet: "10.212.0.250"}})
+	platformReads := listedAsEndpoint(f, "stuck", 1<<30)
+	f.resetLog()
+	err := a.EnsurePostgREST(context.Background(), s)
+	wantContainment(t, err, "persistent endpoint")
+	if errors.Is(err, ErrCheckIncomplete) {
+		t.Fatalf("a persistent endpoint reads as an incomplete check: %v", err)
+	}
+	for _, w := range []string{`member key "ep-7e7e`, "endpoint without a container", `"stuck"`} {
+		if !strings.Contains(err.Error(), w) {
+			t.Fatalf("message %q lacks %q", err, w)
+		}
+	}
+	if n := platformReads(); n != 1+memberRereads {
+		t.Fatalf("platform members read %d times, want %d", n, 1+memberRereads)
+	}
+	prOrder(t, f.calls(), "docker stop -t 10 -- postgrest-"+s.Ref, "docker rm -- postgrest-"+s.Ref)
+
+	a, f = goodNode(t)
+	listedAsEndpoint(f, "sp-gateway", 1<<30)
+	if r := rows(t, a)["platform-members"]; r.OK || !strings.Contains(r.Detail, "endpoint without a container") {
+		t.Fatalf("platform-members on a persistent endpoint: %+v", r)
+	}
+
+	// No re-read for anything else.
+	for name, arrange := range map[string]func(a *Agent, f *fakeHost){
+		"foreign member": func(a *Agent, f *fakeHost) {
+			f.ctr(fakeCtr{Name: "intruder", Running: true, Nets: map[string]string{platformNet: "10.212.0.250"}})
+		},
+		"other key": func(a *Agent, f *fakeHost) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return `{"lb-platform":{"Name":"x"}}` + "\n", nil,
+					flagValue(args, "--format") == "{{json .Containers}}" && args[len(args)-1] == platformNet
+			}
+		},
+		"endpoint key not hex": func(a *Agent, f *fakeHost) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return `{"ep-xyz":{"Name":"x"}}` + "\n", nil,
+					flagValue(args, "--format") == "{{json .Containers}}" && args[len(args)-1] == platformNet
+			}
+		},
+	} {
+		a, f, s := prAgent(t, 14)
+		prRunning(t, a, f, s)
+		arrange(a, f)
+		err := a.EnsurePostgREST(context.Background(), s)
+		wantContainment(t, err, name)
+		if errors.Is(err, ErrCheckIncomplete) {
+			t.Fatalf("%s reads as an incomplete check: %v", name, err)
+		}
+		if n := strings.Count(strings.Join(f.calls(), "\n"), "{{json .Containers}} -- "+platformNet); n != 1 {
+			t.Fatalf("%s: platform members read %d times, want 1", name, n)
+		}
+	}
+}
+
+// The re-reads end with the caller's context: the check is then incomplete,
+// and the adopted container is left as it is.
+func TestMemberIDs_RereadBoundedByContext(t *testing.T) {
+	old := memberReread
+	memberReread = time.Hour
+	t.Cleanup(func() { memberReread = old })
+	a, f, s := prAgent(t, 14)
+	prRunning(t, a, f, s)
+	f.ctr(fakeCtr{Name: "starting", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{platformNet: "10.212.0.250"}})
+	listedAsEndpoint(f, "starting", 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := a.EnsurePostgREST(ctx, s)
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("took %v after its context ended", d)
+	}
+	if !errors.Is(err, ErrCheckIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want an incomplete check carrying the deadline", err)
+	}
+	if m := f.mutations(); len(m) != 0 {
+		t.Fatalf("mutations %q after an incomplete check", m)
+	}
+}
+
+// Every fact of the adoption check that could not be read gives an incomplete
+// check: the error is returned, the running PostgREST is left as it is. The
+// `ip` case stays red until a failed `ip` call is marked as a fact not read.
+func TestCheckAdopted_EveryUnreadFactIncomplete(t *testing.T) {
+	boom := errors.New("Cannot connect to the Docker daemon")
+	members := func(f *fakeHost, out string) {
+		f.onRun = func(args []string, _ []byte) (string, error, bool) {
+			return out, nil, flagValue(args, "--format") == "{{json .Containers}}"
+		}
+	}
+	for name, fault := range map[string]func(f *fakeHost, s Spec){
+		"project network": func(f *fakeHost, s Spec) { f.failInspect[networkName(s.Ref)] = boom },
+		"ingress network": func(f *fakeHost, s Spec) { f.failInspect[ingressNet] = boom },
+		"cluster":         func(f *fakeHost, s Spec) { f.failInspect[clusterName(s.Ref)] = boom },
+		"member parse":    func(f *fakeHost, s Spec) { members(f, "{\n") },
+		"member trailing": func(f *fakeHost, s Spec) { members(f, "{} {}\n") },
+		"endpoint value":  func(f *fakeHost, s Spec) { members(f, `{"ep-`+strings.Repeat("7e", 32)+`":[]}`+"\n") },
+		"IPv6 flag": func(f *fakeHost, s Spec) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return "", boom, flagValue(args, "--format") == "{{json .EnableIPv6}}"
+			}
+		},
+		"member configuration": func(f *fakeHost, s Spec) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return "", boom, flagValue(args, "--format") == confFormat && len(args) > 6
+			}
+		},
+		"ip": func(f *fakeHost, s Spec) {
+			inner := runIP
+			runIP = func(context.Context, ...string) ([]byte, error) { return nil, errors.New("ip: signal: killed") }
+			t.Cleanup(func() { runIP = inner })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, f, s := prAgent(t, 14)
+			prRunning(t, a, f, s)
+			id := f.ctrs[postgrestName(s.Ref)].ID
+			fault(f, s)
+			err := a.EnsurePostgREST(context.Background(), s)
+			if !errors.Is(err, ErrCheckIncomplete) {
+				t.Fatalf("got %v, want an incomplete check", err)
+			}
+			if m := f.mutations(); len(m) != 0 {
+				t.Fatalf("mutations %q after an incomplete check", m)
+			}
+			if c := f.ctrs[postgrestName(s.Ref)]; c.ID != id || !c.Running {
+				t.Fatal("container not left as it was")
+			}
+		})
+	}
+}
+
+// Containers starting one after another keep some endpoint key in every
+// listing, each for one read only: the check waits for the keys of its first
+// read, not for a listing without any, and adopts.
+func TestMemberIDs_StaggeredEndpointsResolve(t *testing.T) {
+	fastReread(t)
+	a, f, s := prAgent(t, 14)
+	prRunning(t, a, f, s)
+	f.ctr(fakeCtr{Name: "starting", Running: true, CapDrop: []string{"ALL"},
+		Nets: map[string]string{platformNet: "10.212.0.250"}})
+	c := f.ctrs["starting"]
+	n := 0
+	f.before = func(args []string) {
+		if flagValue(args, "--format") == "{{json .Containers}}" && args[len(args)-1] == platformNet {
+			f.mu.Lock()
+			n++
+			c.ID = fmt.Sprintf("ep-%064x", n) // a new endpoint in every read
+			f.mu.Unlock()
+		}
+	}
+	if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+		t.Fatalf("staggered endpoint keys: %v", err)
+	}
+	if m := f.mutations(); len(m) != 0 {
+		t.Fatalf("mutations %q", m)
 	}
 }

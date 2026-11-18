@@ -3,12 +3,15 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
@@ -65,7 +68,9 @@ func (a *Agent) CheckContainment(ctx context.Context, s Spec) error {
 }
 
 // CheckAdopted evaluates conditions 2 to 6 for a running tenant being
-// adopted; condition 1 is the caller's, established for the whole node.
+// adopted; condition 1 is the caller's, established for the whole node. A
+// fact that could not be read gives a refusal that also matches
+// ErrCheckIncomplete; any other refusal is a completed check's finding.
 func (a *Agent) CheckAdopted(ctx context.Context, s Spec) error {
 	if err := s.valid(a.cfg); err != nil {
 		return err
@@ -82,7 +87,7 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 	// 2: the project network, from Docker and from the interface itself.
 	pn, err := dockerInspectNetwork(ctx, networkName(s.Ref))
 	if err != nil {
-		return refuse(err, "inspect %s", networkName(s.Ref))
+		return refuse(incomplete{err}, "inspect %s", networkName(s.Ref))
 	}
 	if pn == nil {
 		return refuse(nil, "%s absent", networkName(s.Ref))
@@ -99,7 +104,7 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 	// 3: the platform network.
 	plat, err := dockerInspectNetwork(ctx, platformNet)
 	if err != nil {
-		return refuse(err, "inspect %s", platformNet)
+		return refuse(incomplete{err}, "inspect %s", platformNet)
 	}
 	if plat == nil {
 		return refuse(nil, "%s absent", platformNet)
@@ -115,7 +120,7 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 	}
 	ing, err := dockerInspectNetwork(ctx, ingressNet)
 	if err != nil {
-		return refuse(err, "inspect %s", ingressNet)
+		return refuse(incomplete{err}, "inspect %s", ingressNet)
 	}
 	// The tenant containers, running or not, and every member, all read by
 	// id: Docker resolves a full id before a name, so a member named like
@@ -136,7 +141,7 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 	for _, n := range tenantNames {
 		c, err := dockerInspectContainer(ctx, n)
 		if err != nil {
-			return refuse(err, "inspect %s", n)
+			return refuse(incomplete{err}, "inspect %s", n)
 		}
 		if c != nil {
 			ids = append(ids, c.ID)
@@ -145,7 +150,7 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 	slices.Sort(ids)
 	confs, err := inspectConfigs(ctx, slices.Compact(ids))
 	if err != nil {
-		return refuse(err, "read container configuration")
+		return refuse(incomplete{err}, "read container configuration")
 	}
 	addr := a.cfg.PlatformAddr(i).String()
 	for _, c := range confs {
@@ -177,11 +182,11 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 	// network namespace of a container judged above, or the host's.
 	sharers, err := namespaceSharers(ctx, confs)
 	if err != nil {
-		return refuse(err, "list containers sharing a network namespace")
+		return refuse(incomplete{err}, "list containers sharing a network namespace")
 	}
 	more, err := inspectConfigs(ctx, sharers)
 	if err != nil {
-		return refuse(err, "read container configuration")
+		return refuse(incomplete{err}, "read container configuration")
 	}
 	for _, c := range more {
 		if why := c.capViolation(); why != "" {
@@ -196,11 +201,11 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 func refuseIPv6(ctx context.Context, name string) error {
 	out, err := dockerRun(ctx, "network", "inspect", "--format", "{{json .EnableIPv6}}", "--", name)
 	if err != nil {
-		return refuse(err, "inspect %s", name)
+		return refuse(incomplete{err}, "inspect %s", name)
 	}
 	var on bool
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &on); err != nil {
-		return refuse(err, "%s: IPv6 flag unreadable", name)
+		return refuse(incomplete{err}, "%s: IPv6 flag unreadable", name)
 	}
 	if on {
 		return refuse(nil, "%s has IPv6 enabled", name)
@@ -245,32 +250,105 @@ func namespaceSharers(ctx context.Context, members []ctrConf) ([]string, error) 
 }
 
 // memberIDs returns the ids of the containers attached to network name, as
-// Docker's own endpoint keys (a full id each; anything else is an error).
+// Docker's own endpoint keys. While a container's endpoint is not joined to
+// it (as it starts, or is connected while running), Docker lists the
+// endpoint under "ep-<endpoint id>" for a moment. The listing is then read
+// again, at most memberRereads times memberReread apart, until every such
+// key of the first read is gone, and the ids of all reads are returned (one
+// that left meanwhile is skipped where its configuration is read). The
+// decision rests on Docker's keys alone: an endpoint key still listed after
+// the last read is an unidentified member and refused, any other key that is
+// not a full id at once. A failed read, or a context that ends while
+// waiting, is ErrCheckIncomplete.
 func memberIDs(ctx context.Context, name string) ([]string, error) {
-	out, err := dockerRun(ctx, "network", "inspect", "--format", "{{json .Containers}}", "--", name)
+	ids, eps, err := readMembers(ctx, name)
+	for try := 0; err == nil && len(eps) > 0; try++ {
+		if try == memberRereads {
+			k := slices.Sorted(maps.Keys(eps))[0]
+			return nil, fmt.Errorf("docker network inspect %s: member key %q (endpoint name %q) is an endpoint without a container, still listed after %d re-reads %v apart: unidentified member",
+				name, k, eps[k], memberRereads, memberReread)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, incomplete{fmt.Errorf("docker network inspect: re-reading endpoint keys: %w", ctx.Err())}
+		case <-time.After(memberReread):
+		}
+		var more []string
+		var again map[string]string
+		more, again, err = readMembers(ctx, name)
+		ids = append(ids, more...)
+		for k := range eps {
+			if _, still := again[k]; !still {
+				delete(eps, k)
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids), nil
+}
+
+// readMembers reads network name's member keys once: the full ids, and the
+// endpoint keys with the endpoint name Docker lists for each.
+func readMembers(ctx context.Context, name string) (ids []string, eps map[string]string, err error) {
+	out, err := dockerRun(ctx, "network", "inspect", "--format", "{{json .Containers}}", "--", name)
+	if err != nil {
+		return nil, nil, incomplete{err}
 	}
 	var m map[string]json.RawMessage
 	dec := json.NewDecoder(strings.NewReader(out))
 	if err := dec.Decode(&m); err != nil {
-		return nil, fmt.Errorf("docker network inspect: parse: %w", err)
+		return nil, nil, incomplete{fmt.Errorf("docker network inspect: parse: %w", err)}
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return nil, fmt.Errorf("docker network inspect: trailing data")
+		return nil, nil, incomplete{fmt.Errorf("docker network inspect: trailing data")}
 	}
-	ids := make([]string, 0, len(m))
-	for id := range m {
-		if !fullID.MatchString(id) {
-			return nil, fmt.Errorf("docker network inspect: member key %q is not a container id", id)
+	eps = map[string]string{}
+	for k, v := range m {
+		switch {
+		case fullID.MatchString(k):
+			ids = append(ids, k)
+		case endpointKey.MatchString(k):
+			var e struct{ Name string }
+			if err := json.Unmarshal(v, &e); err != nil {
+				return nil, nil, incomplete{fmt.Errorf("docker network inspect: parse %q: %w", k, err)}
+			}
+			eps[k] = e.Name
+		default:
+			return nil, nil, fmt.Errorf("docker network inspect: member key %q is not a container id", k)
 		}
-		ids = append(ids, id)
 	}
-	slices.Sort(ids)
-	return ids, nil
+	return ids, eps, nil
 }
 
-var fullID = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var (
+	fullID      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	endpointKey = regexp.MustCompile(`^ep-[0-9a-f]{64}$`) // Docker's key for an endpoint not joined to a container
+)
+
+// The re-reads of a member listing that holds endpoint keys. Measured on
+// Docker 29: such a key lasts under 0.4 s per container while up to 64
+// containers start at once, and under 0.9 s with every core busy; one to
+// three of the 5 re-reads 200 ms apart were needed. A slow daemon stretches
+// the window with it, since the bound counts re-reads.
+const memberRereads = 5
+
+var memberReread = 200 * time.Millisecond
+
+// ErrCheckIncomplete marks a containment check that could not be completed:
+// a fact it needed could not be read (Docker did not answer, an answer did
+// not parse, the context ended). It is not a finding. A gate refusal
+// carrying it still matches ErrContainment: nothing is started on it.
+var ErrCheckIncomplete = errors.New("agent: containment check incomplete")
+
+// incomplete marks err as a fact that could not be read (ErrCheckIncomplete);
+// its text is err's.
+type incomplete struct{ error }
+
+func (e incomplete) Unwrap() error      { return e.error }
+func (incomplete) Is(target error) bool { return target == ErrCheckIncomplete }
 
 // networkModes lists every container (running or not) with its network mode.
 func networkModes(ctx context.Context) ([]netMode, error) {
@@ -351,8 +429,8 @@ func samePrefix(s string, want netip.Prefix) bool {
 // ones. `ip link` would show no addresses at all, so it would prove nothing.
 func (a *Agent) checkBridgeIface(ctx context.Context, name string) error {
 	out, err := runIP(ctx, "-j", "-d", "addr", "show", "dev", name)
-	if err != nil {
-		return refuse(err, "interface %s", name)
+	if err != nil { // the interface could not be read: not a finding about it
+		return refuse(incomplete{err}, "interface %s", name)
 	}
 	var ifs []struct {
 		IfName   string `json:"ifname"`

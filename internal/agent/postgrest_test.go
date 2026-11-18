@@ -439,7 +439,11 @@ func TestEnsurePostgREST_AdoptedFailsGate_Stops(t *testing.T) {
 			prRunning(t, a, f, s)
 			fault(a, f, s)
 			f.resetLog()
-			wantContainment(t, a.EnsurePostgREST(context.Background(), s), name)
+			err := a.EnsurePostgREST(context.Background(), s)
+			wantContainment(t, err, name)
+			if errors.Is(err, ErrCheckIncomplete) {
+				t.Fatalf("a completed refusal reads as an incomplete check: %v", err)
+			}
 			prOrder(t, f.calls(), "docker stop -t 10 -- postgrest-"+s.Ref, "docker rm -- postgrest-"+s.Ref)
 			if f.argv("start") != nil || f.argv("create") != nil {
 				t.Fatal("started or created after a failed adoption")
@@ -1874,5 +1878,43 @@ func TestEnsurePostgREST_OpenAPIURLRecreatesOnce(t *testing.T) {
 	}
 	if m := f.mutations(); len(m) != 0 {
 		t.Fatalf("re-created a second time: %q", m)
+	}
+}
+
+// An adoption check that could not be completed (a fact was not read) is
+// returned, and the running container is left as it is: only a completed
+// check that refuses stops it.
+func TestEnsurePostgREST_AdoptionIncomplete_LeftRunning(t *testing.T) {
+	boom := errors.New("Cannot connect to the Docker daemon")
+	faults := map[string]func(f *fakeHost){
+		"member read": func(f *fakeHost) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return "", boom, flagValue(args, "--format") == "{{json .Containers}}"
+			}
+		},
+		"network inspect": func(f *fakeHost) { f.failInspect[platformNet] = boom },
+		"container listing": func(f *fakeHost) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return "", boom, args[0] == "ps"
+			}
+		},
+	}
+	for name, fault := range faults {
+		t.Run(name, func(t *testing.T) {
+			a, f, s := prAgent(t, 14)
+			prRunning(t, a, f, s)
+			id := f.ctrs["postgrest-"+s.Ref].ID
+			fault(f)
+			err := a.EnsurePostgREST(context.Background(), s)
+			if !errors.Is(err, ErrCheckIncomplete) || !errors.Is(err, boom) {
+				t.Fatalf("got %v, want an incomplete check carrying the read's error", err)
+			}
+			if m := f.mutations(); len(m) != 0 {
+				t.Fatalf("mutations %q after an incomplete check", m)
+			}
+			if c := f.ctrs["postgrest-"+s.Ref]; c.ID != id || !c.Running {
+				t.Fatal("container not left as it was")
+			}
+		})
 	}
 }

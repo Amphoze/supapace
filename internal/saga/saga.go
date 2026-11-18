@@ -339,7 +339,7 @@ func code(err error) string {
 		return f.code
 	case errors.Is(err, store.ErrNodeFull):
 		return "node_full"
-	case errors.Is(err, agent.ErrContainment):
+	case errors.Is(err, agent.ErrContainment) && !errors.Is(err, agent.ErrCheckIncomplete):
 		return "containment_failed"
 	case errors.Is(err, agent.ErrStaleGeneration):
 		return "stale_generation"
@@ -425,7 +425,7 @@ func (x *job) afterError(ctx context.Context, err error) {
 		if werr = r.patchParams(ctx, &cur, "requeued", requeued+1); werr == nil {
 			werr = r.st.FailAttempt(ctx, op.ID, msg, time.Now().Add(r.containmentRetry))
 		}
-	case errors.Is(err, agent.ErrContainment), errors.Is(err, bootstrap.ErrAssertion), errors.Is(err, agent.ErrEpochDivergence),
+	case errors.Is(err, agent.ErrContainment) && !errors.Is(err, agent.ErrCheckIncomplete), errors.Is(err, bootstrap.ErrAssertion), errors.Is(err, agent.ErrEpochDivergence),
 		errors.As(err, &f) && f.final, cur.Attempts-requeued >= maxAttempts:
 		if werr = r.st.FinishOperation(ctx, op.ID, "failed", msg); werr == nil {
 			r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,

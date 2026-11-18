@@ -2381,7 +2381,8 @@ func TestPurgeDir_GuardBeforeAbsentDirectory(t *testing.T) {
 }
 
 // A failed read during the adoption check (Docker did not answer) is read
-// once more before a running cluster is removed; a refusal is not.
+// once more; a check still incomplete then leaves the running cluster as it
+// is. A refusal is not read again and removes it.
 func TestEnsureCluster_AdoptionReadFailureRetriedOnce(t *testing.T) {
 	old := adoptRetry
 	adoptRetry = 0
@@ -2410,9 +2411,10 @@ func TestEnsureCluster_AdoptionReadFailureRetriedOnce(t *testing.T) {
 				}
 				return
 			}
-			wantContainment(t, err, "two failed reads")
-			if !slices.Equal(m, []string{"docker rm -f -v -- pg-" + s.Ref}) {
-				t.Fatalf("two failed reads: mutations %q, want the forced removal", m)
+			// Still not read: the check is incomplete, the running cluster
+			// is left as it is.
+			if !errors.Is(err, ErrCheckIncomplete) || len(m) != 0 {
+				t.Fatalf("two failed reads: err %v, mutations %q; want an incomplete check and the cluster left running", err, m)
 			}
 		})
 	}
@@ -2421,8 +2423,39 @@ func TestEnsureCluster_AdoptionReadFailureRetriedOnce(t *testing.T) {
 	clToPhaseB(t, a, f, s)
 	f.ip["-j -d addr show dev spp14"] = bridgeIface("spp14", true)
 	f.resetLog()
-	wantContainment(t, a.EnsureCluster(context.Background(), s), "refusal")
+	err := a.EnsureCluster(context.Background(), s)
+	wantContainment(t, err, "refusal")
+	if errors.Is(err, ErrCheckIncomplete) || !slices.Equal(f.mutations(), []string{"docker rm -f -v -- pg-" + s.Ref}) {
+		t.Fatalf("refusal: err %v, mutations %q; want a completed refusal and the forced removal", err, f.mutations())
+	}
 	if n := strings.Count(strings.Join(f.calls(), "\n"), "inspect network proj-"+s.Ref); n != 1 {
 		t.Fatalf("refusal read the project network %d times, want 1", n)
+	}
+}
+
+// An `ip` call that fails once during the adoption check (the command could
+// not run, or ran out of time) is a fact not read, like a Docker read: the
+// running cluster is checked once more and adopted, not removed.
+func TestEnsureCluster_AdoptionIPFailureRetried(t *testing.T) {
+	old := adoptRetry
+	adoptRetry = 0
+	t.Cleanup(func() { adoptRetry = old })
+	a, f, s, _ := clSetup(t)
+	clToPhaseB(t, a, f, s)
+	s.HealthWait = -1
+	inner := runIP
+	n := 0
+	runIP = func(ctx context.Context, args ...string) ([]byte, error) {
+		if n == 0 {
+			n++
+			return nil, errors.New("ip -j -d addr show dev spp14: signal: killed")
+		}
+		return inner(ctx, args...)
+	}
+	t.Cleanup(func() { runIP = inner })
+	f.resetLog()
+	err := a.EnsureCluster(context.Background(), s)
+	if m := f.mutations(); err != nil || len(m) != 0 {
+		t.Fatalf("one failed ip call: err %v, mutations %q; want the running cluster adopted", err, m)
 	}
 }

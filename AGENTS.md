@@ -1673,3 +1673,57 @@ Known limits
 - Host tests: `recoverHost` clears the Docker unit's start counter (`systemctl reset-failed`)
   before it starts Docker, so that several Docker starts within a minute do not run into the
   unit's start rate limit.
+
+### 2026-11-19 — `internal/agent`: transient endpoint keys; incomplete adoption checks
+
+- Before: while a container's endpoint is not yet joined to it (a start, a restart, a
+  `network connect` of a running container, rarely a stop), `docker network inspect` lists it
+  under `ep-<endpoint id>` instead of the container id, and the member read refused that key.
+  A container starting on `platform` then failed every concurrent start gate and adoption
+  check and the blocking `platform-members` row: at boot the node was marked
+  containment-failed and every tenant stopped; an adoption stopped a healthy PostgREST or
+  removed a healthy cluster; an operation failed as final.
+- After: a member read that holds `ep-<64 hex>` keys reads the listing again, at most 5 times
+  200 ms apart, until every such key of its first read is gone, and judges the container ids
+  of all its reads. A key of the first read still listed after the 5th re-read is refused as
+  an unidentified member (`... member key "ep-..." (endpoint name "...") is an endpoint
+  without a container, still listed after 5 re-reads 200ms apart: unidentified member`); any
+  other key that is not a full container id is refused at once, without a re-read. The
+  decision rests on Docker's keys alone; the endpoint name is printed, never used to accept or
+  resolve. A healthy listing costs one read, as before. Added per network only while keys are
+  listed: at most 1 s of waiting plus 5 reads (3 networks per project check).
+- `ErrCheckIncomplete` (new): a refusal whose cause is a fact that could not be read (a failed
+  Docker or `ip` read, an answer that does not parse, a context that ended during the
+  re-reads). It still matches `ErrContainment`: the start gate refuses on it as before. A
+  completed check's findings (absent or mismatched network, foreign or capable member,
+  persistent endpoint key, the node flag) never match it.
+- Adoption: `EnsurePostgREST` stops and removes a running PostgREST on a refusal, and returns
+  an incomplete check leaving it running. `EnsureCluster` repeats an incomplete check once
+  after 1 s; still incomplete, it returns the error and leaves the cluster running; a refusal,
+  or a node marked containment-failed, still removes it at once (no grace period).
+- Supersedes, in the entries above:
+  - core, start gate: "Members are read by their endpoint ids" -> members are read by
+    Docker's member keys (full container ids), `ep-` keys re-read as above; every
+    configuration by id, never by name. "Every error is a refusal" holds; a refusal from a
+    fact not read also matches `ErrCheckIncomplete`.
+  - PostgREST, Adoption: "when that fails it is stopped and removed" -> a refusal stops and
+    removes it; an incomplete check is returned and leaves it running.
+  - cluster, Adoption: "on failure it is removed at once" -> a refusal removes it at once; a
+    check still incomplete after its one repeat is returned and leaves it running.
+  - cluster, caller rules: "treat an adoption's `ErrContainment` as 'container removed'" ->
+    ... unless it also matches `ErrCheckIncomplete` (container left as it was).
+  - `supapaced serve`, related changes: "a refusal, a second failure or a node already marked
+    not contained still removes the cluster at once" -> a refusal or a node already marked
+    not contained removes it at once; a second failure to read leaves it running, its route
+    draining, retried at the next round.
+- Callers: boot adoption and the repair round log an incomplete check as a failed step; the
+  route stays draining and the project is retried at the next round. No route is activated
+  without a completed check. The node check's `platform-members` row still fails (and blocks
+  at boot) on any error, a read failure included.
+- `internal/saga`: an operation step that fails with `agent.ErrCheckIncomplete` is retried
+  with the worker's usual backoff and attempt bound; only a completed containment refusal ends
+  the operation as final with code `containment_failed`.
+- Known limits: a persistent
+  `ep-` key on `platform` blocks the node until an operator removes the endpoint
+  (`docker network disconnect -f platform <endpoint name>`). A read that fails on every round
+  keeps a running project unverified and unrouted, logged at each round.

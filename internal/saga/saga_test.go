@@ -3329,3 +3329,28 @@ func TestQueueErrors_RateLimited(t *testing.T) {
 		t.Fatalf("log:\n%s", out)
 	}
 }
+
+// A containment check that could not be completed (a fact not read) is not a
+// finding: the step is retried with the default backoff, not failed as final.
+// Red until the failure switch and code() exclude agent.ErrCheckIncomplete.
+func TestCreate_IncompleteCheckRetried(t *testing.T) {
+	e := newEnv(t)
+	ref, id := e.create()
+	e.failpoint("create:4")
+	<-e.run(e.runner())
+	e.ag.reset()
+	var once sync.Once
+	e.ag.setErr(func(c call) error {
+		var err error
+		if c.Method == "EnsureCluster" {
+			once.Do(func() {
+				err = fmt.Errorf("%w: inspect proj-%s: %w", agent.ErrContainment, ref, agent.ErrCheckIncomplete)
+			})
+		}
+		return err
+	})
+	e.start(e.runner())
+	if op := e.waitState(id, "done"); op.Attempts < 2 {
+		t.Fatalf("op = %+v", op)
+	}
+}

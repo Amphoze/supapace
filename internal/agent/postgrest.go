@@ -43,10 +43,11 @@ func (a *Agent) postgrestDir(ref string) string {
 // PlatformAddr(SubnetIndex) — an address computed from the subnet index,
 // never learned from Docker. A running container with the desired labels
 // (generation, epoch, image, configuration hash of postgrest.conf as on
-// disk) at both addresses is adopted after CheckAdopted, which on failure
-// stops it. Any other postgrest-<ref> is removed, and a new one created,
-// connected, passed through the start gate and started. It has no restart
-// policy, and no secret is in its argv or environment.
+// disk) at both addresses is adopted after CheckAdopted: a refusal stops
+// it; a check that could not be completed (ErrCheckIncomplete) is returned
+// and leaves it running. Any other postgrest-<ref> is removed, and a new
+// one created, connected, passed through the start gate and started. It has
+// no restart policy, and no secret is in its argv or environment.
 func (a *Agent) EnsurePostgREST(ctx context.Context, s Spec) error {
 	if err := s.valid(a.cfg); err != nil {
 		return err
@@ -70,6 +71,9 @@ func (a *Agent) EnsurePostgREST(ctx context.Context, s Spec) error {
 	if len(confs) == 1 {
 		if a.adoptable(confs[0], s, label) {
 			if err := a.CheckAdopted(ctx, s); err != nil {
+				if errors.Is(err, ErrCheckIncomplete) && !a.ContainmentFailed() {
+					return err // not a finding: the running container is left as it is
+				}
 				return errors.Join(err, a.StopPostgREST(context.WithoutCancel(ctx), s.Ref))
 			}
 			return nil
