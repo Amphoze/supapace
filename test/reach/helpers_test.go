@@ -1179,7 +1179,7 @@ func gatewayRoundTrip(t testing.TB, p Project, method, path string, h http.Heade
 	t.Helper()
 	conf, dst := gatewayTLS(t, p)
 	tr := &http.Transport{TLSClientConfig: conf, DisableKeepAlives: true, DialContext: dialer(local).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second}
+		TLSHandshakeTimeout: 10 * time.Second, ExpectContinueTimeout: 10 * time.Second}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: httpTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}

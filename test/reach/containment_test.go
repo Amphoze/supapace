@@ -872,9 +872,11 @@ func ourTables(t testing.TB) (inet, bridge bool) {
 
 // recoverHost brings Docker and the daemon back and waits until A and B are
 // served: stopping Docker or flushing its rules stops or cuts every tenant, and
-// only a daemon start brings them back.
+// only a daemon start brings them back. The host tests start Docker several
+// times within a minute; clearing the unit's start counter first keeps its
+// start rate limit from refusing the last of them.
 func recoverHost(t testing.TB, A, B Project) {
-	for _, argv := range [][]string{{"systemctl", "start", "docker"}, {"systemctl", "restart", "docker"}, {"systemctl", "restart", "supapaced"}} {
+	for _, argv := range [][]string{{"systemctl", "reset-failed", "docker.service"}, {"systemctl", "start", "docker"}, {"systemctl", "restart", "docker"}, {"systemctl", "restart", "supapaced"}} {
 		if r, err := run(cmdTimeout, nil, argv...); err != nil || r.code != 0 {
 			t.Errorf("%s: %v exit %d %s", strings.Join(argv, " "), err, r.code, brief(r.stderr))
 		}

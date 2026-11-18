@@ -296,7 +296,8 @@ func TestReach12_GatewayHeaders(t *testing.T) {
 // TestReach15_GraphQL: A's GraphQL route answers under the caller's role: a
 // table granted to authenticated only is visible to a user and, while anon sees
 // its own table on the same path, not to anon. B, without pg_graphql, fails
-// cleanly with a 4xx from PostgREST.
+// cleanly: the image's stub answers 200 with its one "not enabled" error and
+// no data.
 func TestReach15_GraphQL(t *testing.T) {
 	A, B := fixtureAB(t)
 	const drop = "drop table if exists public.reach_t15, public.reach_t15_pub;"
@@ -348,13 +349,22 @@ grant select on public.reach_t15_pub to anon;`); err != nil {
 
 	query := []byte(`{"query":"{ reach_t15Collection { edges { node { id } } } }"}`)
 	wantRole(t, "control: B serves REST", gatewayDo(t, B, "GET", whoamiPath, hdr("apikey", B.AnonKey), nil), "anon")
+	// The route reaches B's PostgREST and its graphql_public.graphql, which in
+	// the pinned image without the extension is a stub answering one fixed
+	// error and no data; A's answers above are the control on the same path.
 	resp := gatewayDo(t, B, "POST", "/graphql/v1", hdr("apikey", B.AnonKey, "Content-Type", "application/json"), query)
-	var e struct {
-		Code string `json:"code"`
+	var g struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
 	}
-	json.Unmarshal(bodyOf(resp), &e)
-	if resp.StatusCode < 400 || resp.StatusCode > 499 || resp.StatusCode == 401 || !strings.HasPrefix(e.Code, "PGRST") {
-		t.Fatalf("B without pg_graphql: want a 4xx from PostgREST (code PGRST…), got %s", describe(resp))
+	const stub = "pg_graphql extension is not enabled."
+	body := bodyOf(resp)
+	if resp.StatusCode != 200 || json.Unmarshal(body, &g) != nil || (len(g.Data) != 0 && string(g.Data) != "null") ||
+		len(g.Errors) != 1 || g.Errors[0].Message != stub {
+		t.Fatalf("B without pg_graphql: want 200 with the one error %q and no data, got status %d: %s",
+			stub, resp.StatusCode, redact(brief(string(body[:min(len(body), 512)]))))
 	}
 }
 
@@ -382,11 +392,11 @@ func TestReach17_GatewayLimits(t *testing.T) {
 			after  time.Duration
 		}
 		ended := make(chan end, 1)
-		// The request line is written as soon as the handshake ends, and the
-		// window is measured from that write.
+		// The window is measured from before the connection is made, so the
+		// gateway's read timer cannot have started earlier.
+		start := time.Now()
 		c := gatewayConn(t, A, src1)
 		c.SetReadDeadline(time.Now().Add(80 * time.Second))
-		start := time.Now()
 		if _, err := io.WriteString(c, head); err != nil {
 			t.Fatal(err)
 		}
@@ -412,19 +422,22 @@ func TestReach17_GatewayLimits(t *testing.T) {
 				c.Write(body[i : i+1]) // fails once the gateway has closed; the reader reports when
 			}
 		}
-		if e.status != 0 && e.status != 400 {
-			t.Fatalf("slow body: answered %d, want the connection closed (a 400 at most)", e.status)
+		if e.status != 0 {
+			t.Fatalf("slow body: answered %d, want the connection closed without a response", e.status)
 		}
 		if e.after < 60*time.Second || e.after > 70*time.Second {
-			t.Fatalf("slow body: connection closed %v after the request line, want 60–70 s", e.after.Round(time.Millisecond))
+			t.Fatalf("slow body: connection closed %v after the connect, want 60–70 s", e.after.Round(time.Millisecond))
 		}
 	})
 
 	t.Run("b_body_cap", func(t *testing.T) {
-		if resp := gatewayDo(t, A, "POST", whoamiPath, anon, jsonPad(1<<20)); resp.StatusCode == 413 {
-			t.Fatalf("control: a 1 MiB body was refused: %s", describe(resp))
-		}
-		wantGatewayRefusal(t, "8 MiB + 1 byte", gatewayDo(t, A, "POST", whoamiPath, anon, jsonPad(8<<20+1)), 413, "body_too_large")
+		// Expect: 100-continue: a declared-oversize body is refused unread and
+		// the connection closed, so a client already sending it can lose the
+		// 413 to a reset; waiting for 100 Continue sends no body before it.
+		ask := anon.Clone()
+		ask.Set("Expect", "100-continue")
+		wantRole(t, "control: a body of 8 MiB", gatewayDo(t, A, "POST", whoamiPath, ask, jsonPad(8<<20)), "anon")
+		wantGatewayRefusal(t, "8 MiB + 1 byte", gatewayDo(t, A, "POST", whoamiPath, ask, jsonPad(8<<20+1)), 413, "body_too_large")
 	})
 
 	t.Run("c_per_source_cap", func(t *testing.T) {

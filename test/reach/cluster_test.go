@@ -676,9 +676,14 @@ func hostileInits(t *testing.T, S, B Project, check func() (checkJSON, time.Dura
 		t.Fatal(err)
 	}
 	normal := restartWait(t, B.Ref) // B's normal restart time, the control for "in its normal time"
+	// Hold the daemon's project repairs while the cluster is replaced by a
+	// stand-in: taken before the stand-in exists, released after it is gone,
+	// refreshed by every mode so it never ages past its limit.
+	driftHold(t)
 	h := replaceInit(t, S, platformSecret(t, S, "pg.supabase_admin.password"))
 	for _, m := range hostileModes {
 		t.Run(m.mode, func(t *testing.T) {
+			driftHold(t) // refresh: the stand-in is removed and run again below
 			pid := h.start(t, m, hex.EncodeToString(salt))
 			if err := setStatePeer(filepath.Join(paths.RenderDir(S.Ref), "state.json"), pid, procStartOf(t, pid)); err != nil {
 				t.Fatalf("recording the fake as the postmaster: %v", err)
@@ -993,11 +998,7 @@ func TestReach13_Quota(t *testing.T) {
 	stopB := writesThroughout(t, B)
 
 	t.Run("inode_limit", func(t *testing.T) { inodeLimit(t, S, quotaMB) })
-	t.Run("log_flood", func(t *testing.T) {
-		stopCP := repeatWhile(t, "writes into the control-plane database", time.Second, cpWrite)
-		logFlood(t, S)
-		stopCP()
-	})
+	t.Run("log_flood", func(t *testing.T) { logFlood(t, S, B) })
 	t.Run("block_limit_and_runbook", func(t *testing.T) {
 		blockLimit(t, S, quotaMB)
 		restartWait(t, S.Ref, fmt.Sprintf("disk_quota_mb=%d", 2*quotaMB))
@@ -1067,11 +1068,13 @@ echo $i`, dir, strconv.FormatInt(most, 10))
 // logFlood: as the administrative role the scratch project emits at least
 // 100 MiB of log lines (counted: 1,700 lines of 64 KiB); the container's
 // stored log stays within its log driver's configured bound and under 31
-// MiB. Control: a marker logged after the flood is in the container's log
-// within a tail window of that bound, with flood lines before it (the flood
-// reached the log). Fails if the log grows past either bound or if the
-// control fails.
-func logFlood(t *testing.T, S Project) {
+// MiB, and three writes each into the control-plane database and into B
+// (whose writer table writesThroughout made) succeed while the flood runs.
+// Control: a marker logged after the flood is in the container's log within
+// a tail window of that bound, with flood lines before it (the flood reached
+// the log). Fails if the log grows past either bound, if a write during the
+// flood fails, or if the control fails.
+func logFlood(t *testing.T, S, B Project) {
 	const line, lines = 64 << 10, 1700
 	if lines*line < 100<<20 {
 		t.Fatal("the flood is smaller than 100 MiB")
@@ -1092,9 +1095,52 @@ func logFlood(t *testing.T, S Project) {
 	if bound >= 31<<20 {
 		t.Errorf("%s: configured log bound %d bytes, want under 31 MiB", pgName(S), bound)
 	}
-	mustSQL(t, S, "supabase_admin", fmt.Sprintf(`set log_min_messages = debug5;
-do $$ begin for i in 1..%d loop raise log '%%', repeat('f', %d); end loop; end $$;
-do $$ begin raise log 'reach-flood-marker'; end $$;`, lines, line))
+	// The flood runs until the control below has finished, so the control
+	// overlaps it whatever the machine's speed: the flood's first nextval says
+	// it has begun, and it ends only after its counted lines and the setval
+	// that follows the control (or fails 30 s after it began: a bound in time,
+	// not in lines, so a fast log and slow commands cannot end it early).
+	const seq = "public.reach_flood_seq"
+	mustSQL(t, S, "supabase_admin", "drop sequence if exists "+seq+"; create sequence "+seq)
+	t.Cleanup(func() { sqlAs(t, S, "supabase_admin", "drop sequence if exists "+seq) })
+	pw := string(platformSecret(t, S, "pg.supabase_admin.password"))
+	flood := fmt.Sprintf(`set log_min_messages = debug5;
+do $$ declare i int := 0; begin
+  perform nextval('%[1]s');
+  loop
+    raise log '%%', repeat('f', %[3]d);
+    i := i + 1;
+    exit when i >= %[2]d and (select last_value from %[1]s) >= 2;
+    if clock_timestamp() > statement_timestamp() + interval '30 s' then raise exception 'reach-flood: not released'; end if;
+  end loop;
+end $$;
+do $$ begin raise log 'reach-flood-marker'; end $$;`, seq, lines, line)
+	flooded := inBackground(t, func() error {
+		r, err := run(cmdTimeout, []string{"PGPASSWORD=" + pw}, psqlArgv(S.Ref, "supabase_admin", flood)...)
+		if err == nil && r.code != 0 {
+			err = fmt.Errorf("psql exit %d: %s", r.code, redact(brief(r.stderr)))
+		}
+		return err
+	})
+	for deadline := time.Now().Add(time.Minute); mustSQL(t, S, "supabase_admin", "select is_called from "+seq) != "t"; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the flood did not begin within a minute")
+		}
+	}
+	writeB := commandOK([]string{"PGPASSWORD=" + B.PostgresPassword},
+		psqlArgv(B.Ref, "postgres", "insert into public.reach_writes(pad) values ('flood')")...)
+	for i := range 3 {
+		if err := cpWrite(); err != nil {
+			t.Errorf("write %d into the control-plane database during the flood: %s", i+1, redact(brief(err.Error())))
+		}
+		if err := writeB(); err != nil {
+			t.Errorf("write %d into %s during the flood: %s", i+1, B.Ref, redact(brief(err.Error())))
+		}
+	}
+	mustSQL(t, S, "supabase_admin", "select setval('"+seq+"', 2)")
+	if err, ok := flooded(cmdTimeout + time.Minute); !ok || err != nil {
+		t.Fatalf("flood: ended %v: %v", ok, err)
+	}
 	t.Logf("flood: %d MiB of log lines; %s's log bound %d MiB (%s)", lines*line>>20, pgName(S), bound>>20, lc.Type)
 	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(time.Second) {
 		found, after, long := containerLogTail(t, pgName(S), "reach-flood-marker", line/4, 2*bound)
@@ -1189,10 +1235,12 @@ var createSteps = []string{"2", "3", "4a", "4", "6", "7", "9", "11", "12"}
 // create comes back and the create ends done with exactly one of each object;
 // throughout, A's and B's containers are adopted, never restarted; a second
 // create waits for the single worker; delete keeps uid and slice; a create in
-// the retention window gets neither; purge frees the slice only; uids only
-// grow, across daemon restarts too; a purge clears a hostile tree without
-// touching B; a restart against an include of a FIFO fails cleanly. Each
-// sub-test says what makes it fail.
+// the retention window gets neither; a create on a full node is refused at
+// once with node_full and leaves no row; purge frees the slice only; uids
+// only grow, across daemon restarts too; a purge clears a hostile tree
+// without touching B; a restart against an include of a FIFO fails cleanly
+// and its retry, once the include is gone, rolls back. Each sub-test says
+// what makes it fail.
 func TestReach14_SagaAndIdentity(t *testing.T) {
 	A, B := fixtureAB(t)
 	before := tenants(t, A, B)
@@ -1291,7 +1339,27 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 		if g := showPlacement(t, S1.Ref); g.State != "purged" || g.UID == nil || *g.UID != *p1.UID || g.SubnetIndex != nil {
 			t.Fatalf("purged S1: %+v, want uid %d kept and no slice", g, *p1.UID)
 		}
-		// Admission: delete S3 so a fourth project fits; its slice stays held.
+		// Admission: A, B, S2 and S3 fill the node's memory ceiling, so a
+		// create is refused at once with node_full and writes no row (no
+		// tombstone, no ref burned). Control: after S3 is deleted a fourth
+		// project fits (S4 below); S3's slice stays held.
+		rows := len(listPlacements(t))
+		_, _, jwks := newIssuer(t)
+		out, code = cli(t, "project", "create", "--name", scratchName, "--issuer-jwks", jwks, "--no-wait")
+		var full errorJSON
+		json.Unmarshal([]byte(out), &full)
+		if code == 0 {
+			var m mutationJSON
+			if json.Unmarshal([]byte(out), &m) == nil && m.Ref != "" {
+				t.Cleanup(func() { removeProject(t, m.Ref) })
+			}
+		}
+		if code != 1 || full.Code != "node_full" {
+			t.Fatalf("a create on a full node: exit %d code %q, want exit 1 and node_full", code, full.Code)
+		}
+		if n := len(listPlacements(t)); n != rows {
+			t.Fatalf("a create refused with node_full changed the project list from %d to %d rows", rows, n)
+		}
 		out, code = cli(t, "project", "delete", S3.Ref)
 		decode(t, "project delete", out, &op)
 		if code != 0 || op.State != "done" {
@@ -1443,19 +1511,20 @@ k=1; while [ $k -lt 10 ]; do mkdir -p "n/$c" && mv deep "n/$c/" && mv n/deep dee
 // postgresql.auto.conf; a restart passes its pre-validation within 60 s
 // (which reads no tenant data), ends failed within 10 minutes with the
 // project restarting, leaves no task container, and B is served throughout.
-// Cleanup removes the line through a scratch container at the project's uid,
-// retries the operation and lets the scratch cleanup delete and purge. Fails
-// if pre-validation reads the FIFO (hangs) or the worker never finishes.
+// Then the include is removed through a scratch container at the project's
+// uid and the operation retried: the rollback completes, the operation ends
+// aborted with a rolled_back error and exit 1, and the project is active on
+// its previous setting at a newer generation. Fails if pre-validation reads
+// the FIFO (hangs), the worker never finishes, or the retry reports anything
+// but the rollback.
 func fifoInclude(t *testing.T, B Project) {
 	S := fixtureScratch(t)
 	restartWait(t, S.Ref, "max_connections=125")
+	gen0 := showProject(t, S.Ref).Generation
+	// Idempotent; the scratch cleanup then retries whatever is left and removes the project.
 	t.Cleanup(func() {
 		if err := dropFifoInclude(t, S.Ref, S.UID); err != nil {
 			t.Error(err)
-		}
-		if st := projectState(t, S.Ref); st == "restarting" {
-			id := newestOp(t, S.Ref).ID
-			cli(t, "op", "retry", strconv.FormatInt(id, 10))
 		}
 	})
 	mustUID(t, S, `mkfifo `+dataInPG+`/reach-fifo && printf "include '`+dataInPG+`/reach-fifo'\n" >> `+dataInPG+`/postgresql.auto.conf`)
@@ -1492,6 +1561,37 @@ func fifoInclude(t *testing.T, B Project) {
 		t.Errorf("%d task containers of %s remain", n, S.Ref)
 	}
 	stopB()
+
+	if err := dropFifoInclude(t, S.Ref, S.UID); err != nil {
+		t.Fatal(err)
+	}
+	out, code = cli(t, "op", "retry", strconv.FormatInt(m.OperationID, 10))
+	var r Op
+	decode(t, "op retry", out, &r)
+	if code != 1 || r.ID != m.OperationID || r.State != "aborted" || !strings.HasPrefix(r.LastError, "rolled_back:") {
+		t.Fatalf("op retry after the include was removed: exit %d, operation %d %s at step %q (%s); want exit 1, aborted, rolled_back",
+			code, r.ID, r.State, r.Step, redact(brief(r.LastError)))
+	}
+	pj := showProject(t, S.Ref)
+	if pj.State != "active" || pj.Generation <= gen0 || pj.Generation == r.Generation || pj.AppliedGen != pj.Generation {
+		t.Fatalf("after the rollback: project %s at generation %d (applied %d); before the restart %d, its target %d; want active at a newer generation than before, not the target",
+			pj.State, pj.Generation, pj.AppliedGen, gen0, r.Generation)
+	}
+	if v := mustSQL(t, S, "postgres", "show max_connections"); v != "125" {
+		t.Fatalf("after the rollback max_connections is %s, want the previous 125", v)
+	}
+}
+
+// showProject is `project show REF`, which must exit 0.
+func showProject(t testing.TB, ref string) projectJSON {
+	t.Helper()
+	out, code := cli(t, "project", "show", ref)
+	var pj projectJSON
+	decode(t, "project show", out, &pj)
+	if code != 0 || pj.Ref != ref {
+		t.Fatalf("project show %s: exit %d", ref, code)
+	}
+	return pj
 }
 
 // dropFifoInclude removes the FIFO include of fifoInclude from a project's
@@ -1527,8 +1627,8 @@ func clusterImage(t testing.TB) string {
 
 // TestReach16_RouteAddressAndAdoption: each PostgREST holds its deterministic
 // platform address across restart and daemon restart and idles at no more
-// than 12 threads; while A's PostgREST is down A's host never serves B's
-// data; a daemon restart adopts running tenants (same id, start time and
+// than 12 threads; while A's PostgREST is down and B restarts, neither host
+// serves the other's data; a daemon restart adopts running tenants (same id, start time and
 // postmaster start) and starts a stopped one; a tenant's pgrst.* setting
 // changes nothing PostgREST enforces; and with one cluster stalling every
 // platform session, the node answers and routes every project after a daemon
@@ -1560,12 +1660,21 @@ func TestReach16_RouteAddressAndAdoption(t *testing.T) {
 	})
 
 	t.Run("down_never_serves_other", func(t *testing.T) {
+		// Hold the daemon's project repairs while postgrest-A is stopped on
+		// purpose; released after A is restarted.
+		driftHold(t)
 		markers(t, A, B)
 		t.Cleanup(func() { restAgain(t, A) })
 		docker(t, "stop", "-t", "10", restName(A))
-		stop := pollHost(t, A, markerPath, hdr("apikey", A.AnonKey))
+		// Each request to A's host waits for the gateway's upstream dial
+		// timeout, so several pollers keep requests in flight through B's
+		// restart. B's host is polled as well: it must never serve A's
+		// marker, and serving its own marker is the poll's control.
+		stopA := pollHost(t, A, markerPath, hdr("apikey", A.AnonKey), 8)
+		stopB := pollHost(t, B, markerPath, hdr("apikey", B.AnonKey), 1)
 		restartWait(t, B.Ref)
-		got := stop()
+		got, gotB := stopA(), stopB()
+		t.Logf("%d requests to A's host and %d to B's during B's restart", len(got), len(gotB))
 		if len(got) < 5 {
 			t.Fatalf("only %d requests to A's host during the window", len(got))
 		}
@@ -1573,9 +1682,25 @@ func TestReach16_RouteAddressAndAdoption(t *testing.T) {
 			if strings.Contains(g.body, B.Ref) {
 				t.Fatalf("A's host served B's marker while postgrest-A was down")
 			}
-			if g.status != 502 && g.status != 503 {
-				t.Errorf("A's host answered %d while postgrest-A was down, want 502 or 503", g.status)
+			var e struct {
+				Code string `json:"code"`
 			}
+			json.Unmarshal([]byte(g.body), &e)
+			if want := map[int]string{502: "upstream_unavailable", 503: "project_restarting", 504: "upstream_timeout"}[g.status]; want == "" || e.Code != want {
+				t.Errorf("A's host answered %d %q while postgrest-A was down, want the gateway's 502, 503 or 504", g.status, e.Code)
+			}
+		}
+		served := 0
+		for _, g := range gotB {
+			if strings.Contains(g.body, A.Ref) {
+				t.Fatalf("B's host served A's marker during its restart")
+			}
+			if g.status == 200 && strings.Contains(g.body, B.Ref) {
+				served++
+			}
+		}
+		if served == 0 {
+			t.Fatalf("control: B's host never served its own marker in %d requests during the window", len(gotB))
 		}
 		restartWait(t, A.Ref)
 		wantMarker(t, A)
@@ -1605,6 +1730,9 @@ func TestReach16_RouteAddressAndAdoption(t *testing.T) {
 		wantAddr("after the daemon restart")
 		// Control: a stopped tenant is started by the daemon's return, so the
 		// unchanged ones above were adopted, not ignored.
+		// Hold the daemon's project repairs between the stop and the kill, so
+		// only the daemon's return can start pg-B (its boot drops the hold).
+		driftHold(t)
 		t.Cleanup(func() { restAgain(t, B) })
 		docker(t, "stop", "-t", "30", pgName(B))
 		waitDaemonBack(t, killDaemon(t), 2*time.Minute)
@@ -1668,42 +1796,48 @@ type polled struct {
 	body   string
 }
 
-// pollHost requests path on p's host every 200 ms until the returned function
-// is called, which returns every answer (transport errors as status 0).
-func pollHost(t testing.TB, p Project, path string, h http.Header) func() []polled {
+// pollHost requests path on p's host from workers pollers, started 200 ms
+// apart, each sending its next request 200 ms after its last answer, until the
+// returned function is called; that function waits for the requests in flight
+// and returns every answer (transport errors as status 0). Several pollers keep
+// requests in flight through a window even when each answer takes the
+// gateway's upstream dial timeout.
+func pollHost(t testing.TB, p Project, path string, h http.Header, workers int) func() []polled {
 	t.Helper()
 	conf, dst := gatewayTLS(t, p)
 	tr := &http.Transport{TLSClientConfig: conf, DisableKeepAlives: true, DialContext: dialer(netip.Addr{}).DialContext}
 	client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 	var mu sync.Mutex
 	var got []polled
-	quit, done := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			req, _ := http.NewRequest("GET", "https://"+dst.String()+path, nil)
-			req.Host = conf.ServerName
-			req.Header = h.Clone()
-			resp, err := client.Do(req)
-			g := polled{}
-			if err == nil {
-				b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-				resp.Body.Close()
-				g = polled{resp.StatusCode, string(b)}
+	var wg sync.WaitGroup
+	quit := make(chan struct{})
+	for w := range workers {
+		wg.Go(func() {
+			for wait := time.Duration(w) * 200 * time.Millisecond; ; wait = 200 * time.Millisecond {
+				select {
+				case <-quit:
+					return
+				case <-time.After(wait):
+				}
+				req, _ := http.NewRequest("GET", "https://"+dst.String()+path, nil)
+				req.Host = conf.ServerName
+				req.Header = h.Clone()
+				resp, err := client.Do(req)
+				g := polled{}
+				if err == nil {
+					b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					resp.Body.Close()
+					g = polled{resp.StatusCode, string(b)}
+				}
+				mu.Lock()
+				got = append(got, g)
+				mu.Unlock()
 			}
-			mu.Lock()
-			got = append(got, g)
-			mu.Unlock()
-			select {
-			case <-quit:
-				return
-			case <-time.After(200 * time.Millisecond):
-			}
-		}
-	}()
+		})
+	}
 	var once sync.Once
 	stop := func() []polled {
-		once.Do(func() { close(quit); <-done; tr.CloseIdleConnections() })
+		once.Do(func() { close(quit); wg.Wait(); tr.CloseIdleConnections() })
 		mu.Lock()
 		defer mu.Unlock()
 		return slices.Clone(got)

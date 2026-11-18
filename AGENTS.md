@@ -1630,3 +1630,46 @@ Known limits
   `make images`; the `reach-host` job uses `PULL_ONLY=1`.
 - `internal/pgsock` test `TestBudget_EndlessRows`: the byte budget ends the session; its time
   bound is now 30 s, wide enough for the race detector on a slow machine.
+
+### 2026-11-19 — reach suite: deterministic overlaps, drift holds around stops, exact answers
+
+- A test that stops, kills, removes or replaces a tenant container (`pg-<ref>`,
+  `postgrest-<ref>`) on purpose takes `driftHold(t)` before the stop and keeps it until the
+  container is back or gone; the daemon's repair round then leaves the project alone. A hold
+  is honoured for 15 minutes from its last write: a long section refreshes it (the
+  hostile-init test calls `driftHold` again at the top of every mode). Every daemon start
+  removes the hold. Platform containers are not covered: the round always repairs them.
+- Never hold across a section that needs the drift check or the repair round to act;
+  release first (cleanups run last-in, first-out, so register the hold before the cleanup
+  that restores the container).
+- After a node boot the daemon serves its socket before its first round has started the
+  tenants: the fixture setup waits until a kept project is served (`waitServed`) before
+  running SQL in it.
+- A control that must overlap a load runs while the load is held open, not beside it on a
+  timer: the log flood marks its start with a sequence and ends only after its counted lines
+  and a `setval` the test issues once the control-plane and B writes have finished. Its
+  fail-safe is a bound in time (30 s), not in lines.
+- Windows shorter than the gateway's 5 s upstream dial timeout are sampled by several
+  pollers (`pollHost(..., workers)`); every request in flight is collected. Answers from a
+  host whose PostgREST is stopped must be the gateway's own 502 `upstream_unavailable`,
+  503 `project_restarting` or 504 `upstream_timeout`; the other host is polled as well.
+- A request the gateway refuses by its declared length is sent with
+  `Expect: 100-continue` (no body before the answer, so no reset can hide the 413); the
+  control is a body exactly at the 8 MiB cap answered by whoami(). A stalled body gets no
+  response at all within 60–70 s, measured from before the connection is made.
+- In a project without pg_graphql, `/graphql/v1` answers 200 with exactly one error
+  "pg_graphql extension is not enabled." and no data (the image's stub); a project with the
+  extension is the control.
+- The retry of a restart that rolled back ends `aborted`, `last_error` starting
+  `rolled_back:`, CLI exit 1; the project is `active` on its previous setting at a newer
+  generation than before the restart.
+- A create on a full node is refused at once: exit 1, `code` `node_full`, no new row in
+  `project list` (which lists tombstones).
+- Known sensitivity until the agent fix is merged: while a container on the platform network
+  is starting, Docker can list it under an `ep-…` key; the agent's membership check refuses
+  that and removes a healthy PostgREST being adopted. Test 14's failpoints then report a
+  replaced or missing PostgREST of A or B (seen in about one full run in three on a reused
+  node).
+- Host tests: `recoverHost` clears the Docker unit's start counter (`systemctl reset-failed`)
+  before it starts Docker, so that several Docker starts within a minute do not run into the
+  unit's start rate limit.

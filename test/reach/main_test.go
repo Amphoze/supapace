@@ -209,6 +209,10 @@ func suiteProject(t testing.TB, existing []listedProject, name string, graphql, 
 		if reuse && e.State == "active" && p == nil {
 			if priv, err := loadIssuer(e.Ref); err == nil {
 				lp := loadProject(t, e.Ref, priv, jwtx.KID(&priv.PublicKey))
+				// Just after a boot the daemon serves before its first round has
+				// started the tenants; a kept project already has its fixture
+				// functions, so it is served once it can take them again.
+				waitServed(t, lp)
 				p = &lp
 				continue
 			}

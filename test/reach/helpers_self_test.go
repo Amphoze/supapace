@@ -433,9 +433,11 @@ func TestHelpers_RefusalMustComeFromGateway(t *testing.T) {
 		buffer(resp)
 		w.Write(bodyOf(resp))
 	})
+	// The gateway's credential refusals carry a message beside the code;
+	// only the code is matched.
 	refusing := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)
-		w.Write([]byte(`{"code":"invalid_token"}`))
+		w.Write([]byte(`{"code":"invalid_token","message":"token signature is invalid"}`))
 	})
 	p := Project{Ref: selfRef}
 	check := func(tb testing.TB) {
