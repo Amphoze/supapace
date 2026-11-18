@@ -1,11 +1,3 @@
-      - name: Daemon log
-        if: failure()
-        run: sudo journalctl -u supapaced --no-pager -n 300 || true
-      - name: Docker unit state
-        if: failure()
-        run: |
-          sudo systemctl status docker.service --no-pager -l || true
-          sudo journalctl -u docker.service --no-pager -n 80 || true
 # Continuous integration. Actions are pinned by major tag, not by commit.
 #
 #   public      the content gate over the tree and over the pushed or proposed commits
@@ -230,3 +222,8 @@ jobs:
       - name: Daemon log
         if: failure()
         run: sudo journalctl -u supapaced --no-pager -n 300 || true
+      - name: Docker unit state
+        if: failure()
+        run: |
+          sudo systemctl status docker.service --no-pager -l || true
+          sudo journalctl -u docker.service --no-pager -n 80 || true
