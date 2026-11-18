@@ -1760,3 +1760,70 @@ Errors: every refusal wraps ErrGUCValue (errors.Is); the text quotes each field 
 clock, zone database or environment (the time import is for the type only; a test enforces it).
 Known limits: Pins cannot check memory-relative bounds; the end-of-archive restore takes no target;
 the order contract is enforced by the callers, not by this package.
+
+### 2026-11-19 — WAL names and the archive binary
+internal/walname (standard library only): the one definition of names.
+- Kind: None, Segment, History, Label (spool and archive names); Info, SetManifest,
+  SetManifestCopy, SetFile, HistoryManifest (repository paths only).
+- Spool(name) (Kind, tli, ok): admits <24HEX> (Segment), <8HEX>.history (History) and
+  <24HEX>.<8HEX>.backup (Label); upper-case hex only, anchored at both ends, so a trailing
+  newline, white space, a leading "-" or any separator is refused. tli = first 8 digits.
+- Request(name): Segment or History only - what recovery may ask for.
+- SegmentOf(name): the 24 digits of a Segment or Label name, else "".
+- Admitted(tli, list): list == nil admits every timeline (the control plane); an empty list
+  admits none. Project callers must pass a non-nil slice: zero rows read into a nil slice, or a
+  JSON null, would admit everything.
+- Partial(name): exactly <24HEX>.partial. Spool, Request and RepoPath refuse it.
+- RepoPath(stanza, rel) (Kind, tli, label, ok) admits only, with S = stanza (exact component),
+  A = [0-9]{2}-[0-9]{1,3}, L = [0-9]{8}-[0-9]{6}F:
+    archive/S/archive.info[.copy], backup/S/backup.info[.copy]          Info
+    archive/S/A/<8HEX>.history                                         History
+    archive/S/A/<16HEX>/<24HEX>-<40 hex>.zst                           Segment
+    archive/S/A/<16HEX>/<24HEX>.<8HEX>.backup                          Label
+    backup/S/backup.history/<yyyy>/L.manifest.gz  (yyyy = L's year)    HistoryManifest
+    backup/S/L/backup.manifest, backup/S/L/backup.manifest.copy        SetManifest(Copy)
+    backup/S/L/pg_data/<p>                                             SetFile
+  The 16-digit directory must equal the name's first 16 digits; <p> is 1-512 bytes of
+  [A-Za-z0-9_.+/-] with no empty, "." or ".." component. tli is 0 for kinds without one;
+  label is set for the set kinds and HistoryManifest. latest, .partial, differential and
+  incremental sets and tablespaces are refused. The stanza must be non-empty, not "." or "..",
+  without "/" or NUL.
+
+internal/arch exports Main(args, stderr) int and GetTimeout (120 s). cmd/supapace-arch is
+os.Exit(arch.Main(os.Args, os.Stderr)); it imports nothing of the platform but walname (a test
+checks the dependency list) and reads no environment. Fixed paths inside the cluster: spool
+/opt/supapace/spool, restore spool /opt/supapace/rspool. Built static (CGO_ENABLED=0) by
+make build as bin/supapace-arch, installed read-only, run by the server as
+archive_command "…/supapace-arch push %p %f" and restore_command "…/supapace-arch get %f %p".
+
+push <path> <name> - exit 0 archived or discarded, 1 refused or failed (one stderr line), 2 usage.
+- Partial(name): exit 0 before anything is opened or written. The server archives such a file
+  when a recovery ends inside a segment with no archive status yet (a cluster that promotes
+  itself); no restore uses it, and refusing it would stop that cluster's archiving for good.
+  Nothing is kept, so the spool never shows it; the discard is silent like a success.
+- Otherwise the name must pass Spool. The source is opened non-blocking and must be a regular
+  file. Copy to .tmp-<name>-<16 hex> (O_CREAT|O_EXCL|O_NOFOLLOW, 0600; a taken name draws
+  again, at most 8 draws), fsync, hard-link to <name> (never replaces), unlink the temporary,
+  fsync the directory. If <name> exists: opened without following or blocking; a regular file
+  with identical bytes is fsynced through that descriptor and is success; anything else exits 1.
+  A failed write or fsync (a full quota) leaves no final name and no temporary.
+
+get <name> <dest> - exit 0 served, 1 not in the archive, 200 timeout, 201 any other error.
+- The name must pass Request, else 201. Creates req/<name> exclusively without following a link
+  (an existing entry is fine), then polls every 100 ms:
+  out/<name>.none present -> remove the request and the marker, exit 1;
+  out/<name> a regular file (not a link, opened non-blocking, at most 16 MiB + 1 KiB) -> copy to
+  .<dest>.tmp-<16 hex> beside dest, fsync, rename onto dest, remove the request then the answer,
+  exit 0 (a failed removal still exits 0). A link, FIFO or directory at out/<name> is not an
+  answer. After GetTimeout exit 200; a usage error, an oversize answer and every other failure
+  exit 201.
+- Only the explicit marker gives an exit at or below 125: the server reads such an exit as the
+  end of the archive and may end recovery and promote; above 125 it stops instead.
+
+Never: follows a link at a name it creates or answers from, blocks on a FIFO, replaces an existing
+spool entry, writes outside the spool or dest's directory, reads the environment.
+
+Known limits: temporaries left by a killed process stay in the spool and beside dest (the spool's
+consumer must ignore and expire .tmp-* entries); a Go runtime fatal error, or a shell that cannot
+fork, exits 2, which the server reads as "not in the archive"; whatever the cluster writes to the
+spool or the restore spool is its own and is checked again by the platform's jobs.
