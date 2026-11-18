@@ -1,0 +1,68 @@
+{
+  "image": "supabase/postgres:17.6.1.166",
+  "digest": "sha256:b3bfedb107413abb3b8cb0d0874b0414a1dceb3d55bc0c778de6ad22d1f7dc86",
+  "pg_version": "17.6",
+  "roles": [
+    {"name": "anon", "super": false, "createrole": false, "createdb": false, "replication": false, "bypassrls": false, "login": false, "connlimit": -1},
+    {"name": "authenticated", "super": false, "createrole": false, "createdb": false, "replication": false, "bypassrls": false, "login": false, "connlimit": -1},
+    {"name": "authenticator", "super": false, "createrole": false, "createdb": false, "replication": false, "bypassrls": false, "login": true, "connlimit": -1},
+    {"name": "dashboard_user", "super": false, "createrole": true, "createdb": true, "replication": true, "bypassrls": false, "login": false, "connlimit": -1},
+    {"name": "pgbouncer", "super": false, "createrole": false, "createdb": false, "replication": false, "bypassrls": false, "login": true, "connlimit": -1},
+    {"name": "postgres", "super": false, "createrole": true, "createdb": true, "replication": true, "bypassrls": true, "login": true, "connlimit": -1},
+    {"name": "service_role", "super": false, "createrole": false, "createdb": false, "replication": false, "bypassrls": true, "login": false, "connlimit": -1},
+    {"name": "supabase_admin", "super": true, "createrole": true, "createdb": true, "replication": true, "bypassrls": true, "login": true, "connlimit": -1},
+    {"name": "supabase_auth_admin", "super": false, "createrole": true, "createdb": false, "replication": false, "bypassrls": false, "login": true, "connlimit": -1},
+    {"name": "supabase_etl_admin", "super": false, "createrole": false, "createdb": false, "replication": true, "bypassrls": true, "login": true, "connlimit": -1},
+    {"name": "supabase_privileged_role", "super": false, "createrole": false, "createdb": false, "replication": false, "bypassrls": false, "login": false, "connlimit": -1},
+    {"name": "supabase_read_only_user", "super": false, "createrole": false, "createdb": false, "replication": false, "bypassrls": true, "login": true, "connlimit": -1},
+    {"name": "supabase_replication_admin", "super": false, "createrole": false, "createdb": false, "replication": true, "bypassrls": false, "login": true, "connlimit": -1},
+    {"name": "supabase_storage_admin", "super": false, "createrole": true, "createdb": false, "replication": false, "bypassrls": false, "login": true, "connlimit": -1}
+  ],
+  "memberships": [
+    {"member": "authenticator", "role": "anon"},
+    {"member": "authenticator", "role": "authenticated"},
+    {"member": "authenticator", "role": "service_role"},
+    {"member": "postgres", "role": "anon"},
+    {"member": "postgres", "role": "authenticated"},
+    {"member": "postgres", "role": "authenticator"},
+    {"member": "postgres", "role": "pg_create_subscription"},
+    {"member": "postgres", "role": "pg_monitor"},
+    {"member": "postgres", "role": "pg_read_all_data"},
+    {"member": "postgres", "role": "pg_signal_backend"},
+    {"member": "postgres", "role": "service_role"},
+    {"member": "postgres", "role": "supabase_privileged_role"},
+    {"member": "supabase_etl_admin", "role": "pg_monitor"},
+    {"member": "supabase_etl_admin", "role": "pg_read_all_data"},
+    {"member": "supabase_etl_admin", "role": "supabase_privileged_role"},
+    {"member": "supabase_read_only_user", "role": "pg_monitor"},
+    {"member": "supabase_read_only_user", "role": "pg_read_all_data"},
+    {"member": "supabase_storage_admin", "role": "authenticator"}
+  ],
+  "role_settings": [
+    {"role": "anon", "settings": ["statement_timeout=3s"]},
+    {"role": "authenticated", "settings": ["statement_timeout=8s"]},
+    {"role": "authenticator", "settings": ["session_preload_libraries=supautils, safeupdate", "statement_timeout=8s", "lock_timeout=8s"]},
+    {"role": "postgres", "settings": ["search_path=\"\\$user\", public, extensions"]},
+    {"role": "supabase_admin", "settings": ["search_path=\"\\$user\", public, auth, extensions", "log_statement=none"]},
+    {"role": "supabase_auth_admin", "settings": ["search_path=auth", "idle_in_transaction_session_timeout=60000", "log_statement=none"]},
+    {"role": "supabase_read_only_user", "settings": ["default_transaction_read_only=on"]},
+    {"role": "supabase_storage_admin", "settings": ["search_path=storage", "log_statement=none"]}
+  ],
+  "schemas": [
+    {"name": "auth", "owner": "supabase_admin", "acl": ["supabase_admin=UC/supabase_admin", "anon=U/supabase_admin", "authenticated=U/supabase_admin", "service_role=U/supabase_admin", "supabase_auth_admin=UC/supabase_admin", "dashboard_user=UC/supabase_admin", "postgres=U/supabase_admin"]},
+    {"name": "extensions", "owner": "postgres", "acl": ["postgres=UC/postgres", "anon=U/postgres", "authenticated=U/postgres", "service_role=U/postgres", "dashboard_user=UC/postgres"]},
+    {"name": "realtime", "owner": "supabase_admin", "acl": ["supabase_admin=UC/supabase_admin", "postgres=U/supabase_admin"]},
+    {"name": "storage", "owner": "supabase_admin", "acl": ["supabase_admin=UC/supabase_admin", "postgres=U*/supabase_admin", "anon=U/supabase_admin", "authenticated=U/supabase_admin", "service_role=U/supabase_admin", "supabase_storage_admin=U*C*/supabase_admin", "dashboard_user=UC/supabase_admin"]}
+  ],
+  "event_triggers": [
+    {"name": "issue_graphql_placeholder", "event": "sql_drop", "owner": "supabase_admin", "function": "extensions.set_graphql_placeholder"},
+    {"name": "issue_pg_cron_access", "event": "ddl_command_end", "owner": "supabase_admin", "function": "extensions.grant_pg_cron_access"},
+    {"name": "issue_pg_graphql_access", "event": "ddl_command_end", "owner": "supabase_admin", "function": "extensions.grant_pg_graphql_access"},
+    {"name": "issue_pg_net_access", "event": "ddl_command_end", "owner": "supabase_admin", "function": "extensions.grant_pg_net_access"},
+    {"name": "pgrst_ddl_watch", "event": "ddl_command_end", "owner": "supabase_admin", "function": "extensions.pgrst_ddl_watch"},
+    {"name": "pgrst_drop_watch", "event": "sql_drop", "owner": "supabase_admin", "function": "extensions.pgrst_drop_watch"}
+  ],
+  "files": {"include_dir": "/etc/postgresql-custom/conf.d", "hba_file": "/etc/postgresql/pg_hba.conf", "ident_file": "/etc/postgresql/pg_ident.conf", "supautils_conf": "/etc/postgresql-custom/supautils.conf", "pgsodium_key": "/etc/postgresql-custom/pgsodium_root.key"},
+  "auto_conf": [],
+  "fresh_cluster_mb": 60
+}

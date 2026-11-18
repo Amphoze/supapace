@@ -234,3 +234,29 @@ patch surface, backup model) were verified against upstream source first.
     with one ARP frame; with all capabilities dropped it cannot.
 - `e10.sh` loads no kernel module in its default run; the proxy-off demonstration needs
   `E10_LOAD_MODULE=1` and leaves `br_netfilter` loaded until reboot.
+
+### 2026-11-18 — cluster-image experiments, fixtures and baseline
+
+- `test/harness/experiments/e06, e07, e12, e13, e15`: scripts for a bare node about the
+  pinned Postgres images. Facts established:
+  - the two-phase first boot of the cluster image works at an arbitrary project uid under
+    the full hardening (read-only root, no capabilities, no-new-privileges): phase A with the
+    platform's `conf.d`, phase B with the platform's `pg_hba`; the entrypoint neither
+    re-initialises nor rewrites mounted files; the image needs a rendered `passwd` entry for
+    the uid;
+  - the control-plane database starts read-only at uid 70 with no network, peer
+    authentication over the mounted socket for root and uid 70 only;
+  - `postgres -C <setting>` in a throw-away container validates a candidate configuration
+    without touching the running cluster, but checks syntax and range only — it does not
+    validate settings of preloaded libraries, nor cross-setting rules;
+  - the database-level session defaults of a project database apply to every role's
+    sessions. `e15.sh` holds the list of settings a platform session sends as startup
+    parameters, shows for each entry that it wins over a database-level value, and prints
+    the **residual** — the settings a database owner can still change for such a session.
+    Re-run it when the image pin changes. `event_triggers=off` is accepted only from a
+    superuser session.
+- `internal/bootstrap/baseline_17.6.1.166.json`: roles, memberships, role settings, schemas
+  and event triggers of a fresh, un-bootstrapped cluster of the pinned image.
+- `internal/pgconf/testdata/image/`: `passwd`, `group`, `supautils.conf` and `conf.d/*`
+  copied unmodified out of the pinned image (the allow file carries four exact tokens for
+  the `passwd` fixture).
