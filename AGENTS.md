@@ -1058,3 +1058,38 @@ patch surface, backup model) were verified against upstream source first.
     network with the same bridge name or an overlapping subnet); the lock and the last generation
     are per process and the flag per `Agent` (one `Agent` per daemon); a key change within one
     generation is not signalled to a running PostgREST.
+
+### 2026-11-18 — `internal/rmtree` and `supapaced rmtree`
+
+- `rmtree.Remove(root string) error` removes a directory tree; `rmtree.Empty(root string) error`
+  removes everything below root and keeps root (inode, owner, attributes; a mode without owner
+  rwx is left 0700). root must be absolute, clean and not `/`; uid 0 is refused. An absent root
+  is success for `Remove` and an error for `Empty`; a root that is not a directory (a symbolic
+  link to one included) or that is a mount point is refused.
+- Only descriptor-relative calls below the root's parent. Entries are classified with
+  `fstatat(AT_SYMLINK_NOFOLLOW)`; only directories are opened (`O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK`)
+  and checked by device and inode; everything else is unlinked. Links are never followed and
+  another file system inside the tree is an error. A directory without owner access is opened
+  `O_PATH|O_NOFOLLOW`, checked, and given 0700 through `/proc/self/fd/N`, so the helper needs
+  procfs at `/proc` (always present under Docker).
+- The walk keeps a stack of the directories it is in (descriptor, name, read position, 8 KiB
+  buffer) and never opens `..`: it acts only in directories it opened from the root downwards.
+  It enters at most 8 levels below the root (at most 2303 bytes of path below it), because
+  Docker's default AppArmor profile refuses full paths near 8 KiB even for descriptor-relative
+  calls. A deeper directory is renamed into the root as `.rmtree-N` (`renameat2`
+  `RENAME_NOREPLACE`; taken names are skipped and removed like any entry), and the root is read
+  again until a whole read lists nothing. At most 11 descriptors and 72 KiB of buffers, whatever
+  the shape; cost is linear in the number of entries on XFS.
+- Precondition: nothing else changes the tree while it runs (the project's processes are
+  stopped). If something does, the removal may fail (for example a directory that gained an
+  entry after it was read), but it does not act outside the directories it opened.
+- Callers: clear the owner's quota limits before running it. Each move into the root may need a
+  free directory block, so at a full block quota (or a full file system) a tree deeper than 8
+  levels fails on every attempt. A directory the caller cannot regain access to (not its own) or
+  an entry under a sticky bit makes the removal fail. Moves need `RENAME_NOREPLACE` (XFS, ext4,
+  tmpfs).
+- `supapaced rmtree [--keep-root] PATH...`: each PATH in order with `Remove`, or `Empty` under
+  `--keep-root`; reads no configuration (it runs as the only platform file inside a task
+  container at the project's uid). Every PATH is checked (absolute, clean, not `/`) before the
+  first is touched. Exit 0 with no output; 1 on the first failure or as uid 0; 2 on a usage
+  error. Errors are one line on stderr, names quoted and shortened.
