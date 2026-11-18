@@ -57,14 +57,14 @@ func TestAPI_StateMatrix(t *testing.T) {
 	r = ref()
 	op = e.create(t, r).OperationID
 	e.activate(t, r, op)
-	rop, err := e.st.SubmitOperation(ctx, r, "restart", nil, time.Now())
+	rop, err := e.st.SubmitOperation(ctx, r, "restart", nil, 1, time.Now())
 	must(t, err)
 	rows["active/open-restart"] = row{r, rop, map[string]string{"restart": conflict, "delete": conflict, "purge": conflict, "abort": conflict, "retry": conflict}}
 	// restarting, restart failed
 	r = ref()
 	op = e.create(t, r).OperationID
 	e.activate(t, r, op)
-	rop, err = e.st.SubmitOperation(ctx, r, "restart", nil, time.Now())
+	rop, err = e.st.SubmitOperation(ctx, r, "restart", nil, 1, time.Now())
 	must(t, err)
 	must(t, e.st.SetProjectState(ctx, r, "restarting"))
 	e.failed(t, rop, "timeout: x")
@@ -73,7 +73,7 @@ func TestAPI_StateMatrix(t *testing.T) {
 	r = ref()
 	op = e.create(t, r).OperationID
 	e.activate(t, r, op)
-	dop, err := e.st.SubmitOperation(ctx, r, "delete", nil, time.Now())
+	dop, err := e.st.SubmitOperation(ctx, r, "delete", nil, 1, time.Now())
 	must(t, err)
 	must(t, e.st.SetProjectState(ctx, r, "deleting"))
 	e.failed(t, dop, "timeout: x")

@@ -168,21 +168,12 @@ func (s *Store) MarkPurged(ctx context.Context, ref string) error {
 	return s.release(ctx, ref, "purged", func(_ pgx.Tx, state string) (bool, error) { return state == "deleted", nil })
 }
 
-// MarkAborted: provisioning → aborted, or active → aborted when the abort of
-// the create was accepted just before the project became active (the create
-// operation is aborting). Frees the slice, keeps the uid.
+// MarkAborted: provisioning → aborted (an active project never has an
+// aborting create: step 12 and RequestAbort exclude each other). Frees the
+// slice, keeps the uid.
 func (s *Store) MarkAborted(ctx context.Context, ref string) error {
-	return s.release(ctx, ref, "aborted", func(tx pgx.Tx, state string) (bool, error) {
-		switch state {
-		case "provisioning":
-			return true, nil
-		case "active":
-			var aborting bool
-			err := tx.QueryRow(ctx, `select coalesce((select state = 'aborting' from operation
-				where ref = $1 and kind = 'create' order by id desc limit 1 for update), false)`, ref).Scan(&aborting)
-			return aborting, err
-		}
-		return false, nil
+	return s.release(ctx, ref, "aborted", func(_ pgx.Tx, state string) (bool, error) {
+		return state == "provisioning", nil
 	})
 }
 
@@ -251,4 +242,30 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 		return nil
 	})
 	return pl, err
+}
+
+// BeginRestart sets the desired generation and configuration of an active or
+// restarting project and marks it restarting, in one statement, when target
+// is newer than the stored generation. Repeating it once done is a no-op —
+// the same target generation and configuration; another configuration at
+// that generation is another restart's bump. Anything else is ErrConflict.
+func (s *Store) BeginRestart(ctx context.Context, ref string, target int64, cfg ProjectConfig) error {
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `update project set generation = $2, config = $3, state = 'restarting'
+			where ref = $1 and generation < $2 and state in ('active', 'restarting')`, ref, target, normConfig(cfg))
+		if err != nil || tag.RowsAffected() > 0 {
+			return err
+		}
+		var state string
+		var gen int64
+		var same bool
+		if err := tx.QueryRow(ctx, "select state, generation, config = $2 from project where ref = $1", ref, normConfig(cfg)).
+			Scan(&state, &gen, &same); err != nil {
+			return err
+		}
+		if gen == target && state == "restarting" && same {
+			return nil
+		}
+		return fmt.Errorf("%w: project is %s at generation %d", ErrConflict, state, gen)
+	})
 }

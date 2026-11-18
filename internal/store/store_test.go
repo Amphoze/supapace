@@ -528,7 +528,7 @@ func TestNextOperation_QueueOrder(t *testing.T) {
 	opA := mustCreate(t, s, ref(1))
 	mustPlace(t, s, ref(1))
 	activate(t, s, ref(1), opA)
-	del, err := s.SubmitOperation(ctx, ref(1), "delete", nil, time.Now())
+	del, err := s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
 	must(t, err)
 	must(t, s.StartOperation(ctx, del))
 	must(t, s.SetProjectState(ctx, ref(1), "deleting"))
@@ -575,32 +575,32 @@ func TestSubmitOperation_StateRules(t *testing.T) {
 	s := newStore(t, testConfig())
 	ctx := context.Background()
 	op := mustCreate(t, s, ref(1))
-	_, err := s.SubmitOperation(ctx, ref(1), "delete", nil, time.Now())
+	_, err := s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
 	wantErr(t, err, ErrConflict) // provisioning
 	mustPlace(t, s, ref(1))
 	activate(t, s, ref(1), op)
 	must(t, s.SetProjectState(ctx, ref(1), "restarting"))
-	_, err = s.SubmitOperation(ctx, ref(1), "delete", nil, time.Now())
+	_, err = s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
 	wantErr(t, err, ErrConflict)
 	must(t, s.SetProjectState(ctx, ref(1), "active"))
 	markDeleted(t, s, ref(1))
-	_, err = s.SubmitOperation(ctx, ref(1), "restart", nil, time.Now())
+	_, err = s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
 	wantErr(t, err, ErrConflict)
-	_, err = s.SubmitOperation(ctx, ref(9), "delete", nil, time.Now())
+	_, err = s.SubmitOperation(ctx, ref(9), "delete", nil, 1, time.Now())
 	wantErr(t, err, ErrNotFound)
 
 	op2 := mustCreate(t, s, ref(2))
 	activate(t, s, ref(2), op2)
 	for _, k := range []string{"create", "purge", "bogus"} {
-		_, err = s.SubmitOperation(ctx, ref(2), k, nil, time.Now())
+		_, err = s.SubmitOperation(ctx, ref(2), k, nil, 1, time.Now())
 		wantErr(t, err, ErrConflict)
 	}
 	// One open restart or delete at a time: a second would be stamped with the same target.
-	_, err = s.SubmitOperation(ctx, ref(2), "restart", nil, time.Now())
+	_, err = s.SubmitOperation(ctx, ref(2), "restart", nil, 1, time.Now())
 	must(t, err)
-	_, err = s.SubmitOperation(ctx, ref(2), "restart", nil, time.Now())
+	_, err = s.SubmitOperation(ctx, ref(2), "restart", nil, 1, time.Now())
 	wantErr(t, err, ErrConflict)
-	_, err = s.SubmitOperation(ctx, ref(2), "delete", nil, time.Now())
+	_, err = s.SubmitOperation(ctx, ref(2), "delete", nil, 1, time.Now())
 	wantErr(t, err, ErrConflict)
 }
 
@@ -608,18 +608,18 @@ func TestSubmitOperation_RestartOnlyFromActive(t *testing.T) {
 	s := newStore(t, testConfig())
 	ctx := context.Background()
 	op := mustCreate(t, s, ref(1))
-	_, err := s.SubmitOperation(ctx, ref(1), "restart", nil, time.Now())
+	_, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
 	wantErr(t, err, ErrConflict) // provisioning
 	activate(t, s, ref(1), op)
 	for _, st := range []string{"restarting", "provisioning", "deleting", "deleted"} {
 		must(t, s.SetProjectState(ctx, ref(1), st))
-		_, err := s.SubmitOperation(ctx, ref(1), "restart", nil, time.Now())
+		_, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
 		if !errors.Is(err, ErrConflict) {
 			t.Errorf("restart from %s: %v, want ErrConflict", st, err)
 		}
 	}
 	must(t, s.SetProjectState(ctx, ref(1), "active"))
-	id, err := s.SubmitOperation(ctx, ref(1), "restart", json.RawMessage(`{"next":{}}`), time.Now())
+	id, err := s.SubmitOperation(ctx, ref(1), "restart", json.RawMessage(`{"next":{}}`), 1, time.Now())
 	must(t, err)
 	if id == 0 {
 		t.Fatal("no operation id")
@@ -631,7 +631,7 @@ func TestSubmitOperation_StampsGeneration(t *testing.T) {
 	ctx := context.Background()
 	activate(t, s, ref(1), mustCreate(t, s, ref(1)))
 	params := json.RawMessage(`{"next": {"mem_mb": 512}}`)
-	rid, err := s.SubmitOperation(ctx, ref(1), "restart", params, time.Now())
+	rid, err := s.SubmitOperation(ctx, ref(1), "restart", params, 1, time.Now())
 	must(t, err)
 	op, err := s.GetOperation(ctx, rid)
 	must(t, err)
@@ -651,7 +651,7 @@ func TestSubmitOperation_StampsGeneration(t *testing.T) {
 	}
 	must(t, s.StartOperation(ctx, rid))
 	must(t, s.FinishOperation(ctx, rid, "done", ""))
-	did, err := s.SubmitOperation(ctx, ref(1), "delete", nil, time.Now())
+	did, err := s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
 	must(t, err)
 	op, err = s.GetOperation(ctx, did)
 	must(t, err)
@@ -804,7 +804,7 @@ func TestRequestAbort_OnlyCreate(t *testing.T) {
 	activate(t, s, ref(3), id3)
 	_, err = s.RequestAbort(ctx, ref(3))
 	wantErr(t, err, ErrConflict)
-	_, err = s.SubmitOperation(ctx, ref(3), "restart", nil, time.Now())
+	_, err = s.SubmitOperation(ctx, ref(3), "restart", nil, 1, time.Now())
 	must(t, err)
 	must(t, s.SetProjectState(ctx, ref(3), "restarting"))
 	_, err = s.RequestAbort(ctx, ref(3))
@@ -1193,7 +1193,7 @@ func TestRace_SubmitOneOpenOperationPerRef(t *testing.T) {
 			if i%2 == 1 {
 				k = "delete"
 			}
-			_, err := s.SubmitOperation(ctx, r, k, nil, time.Now())
+			_, err := s.SubmitOperation(ctx, r, k, nil, 1, time.Now())
 			return err
 		})
 		ok := 0
@@ -1346,7 +1346,7 @@ func TestNextOperation_LowerIdNotDueBlocksRef(t *testing.T) {
 	s := newStore(t, testConfig())
 	ctx := context.Background()
 	activate(t, s, ref(1), mustCreate(t, s, ref(1)))
-	del, err := s.SubmitOperation(ctx, ref(1), "delete", nil, time.Now())
+	del, err := s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
 	must(t, err)
 	must(t, s.StartOperation(ctx, del))
 	must(t, s.SetProjectState(ctx, ref(1), "deleting"))
@@ -1388,19 +1388,14 @@ func TestOperationWrites_TerminalStatesRefuseEverything(t *testing.T) {
 // An abort accepted after the create's last step but before the project was
 // marked active must still be finishable: the compensation's MarkAborted is
 // accepted from active while the create operation is aborting.
-func TestMarkAborted_FromActiveWhileCreateAborting(t *testing.T) {
+func TestMarkAborted_OnlyFromProvisioning(t *testing.T) {
 	s := newStore(t, testConfig())
 	ctx := context.Background()
 	id := mustCreate(t, s, ref(1))
 	mustPlace(t, s, ref(1))
 	must(t, s.StartOperation(ctx, id))
-	must(t, s.AdvanceStep(ctx, id, "11"))
-	// The worker has passed its last abort check and is about to activate.
 	_, err := s.RequestAbort(ctx, ref(1))
 	must(t, err)
-	must(t, s.SetProjectState(ctx, ref(1), "active"))
-	wantErr(t, s.FinishOperation(ctx, id, "done", ""), ErrConflict)
-	// The worker re-reads the operation, finds it aborting and compensates.
 	must(t, s.MarkAborted(ctx, ref(1)))
 	must(t, s.MarkAborted(ctx, ref(1))) // repeated: no-op
 	must(t, s.FinishOperation(ctx, id, "aborted", ""))
@@ -1409,8 +1404,12 @@ func TestMarkAborted_FromActiveWhileCreateAborting(t *testing.T) {
 	if p.State != "aborted" || p.SubnetIndex != nil || p.UID == nil {
 		t.Fatalf("project = %+v", p)
 	}
-	// Without an aborting create, an active project cannot be aborted.
-	activate(t, s, ref(2), mustCreate(t, s, ref(2)))
+	// An active project is never aborted, not even with an aborting create.
+	id2 := mustCreate(t, s, ref(2))
+	must(t, s.StartOperation(ctx, id2))
+	_, err = s.RequestAbort(ctx, ref(2))
+	must(t, err)
+	must(t, s.SetProjectState(ctx, ref(2), "active"))
 	wantErr(t, s.MarkAborted(ctx, ref(2)), ErrConflict)
 }
 
@@ -1420,11 +1419,11 @@ func TestRetryOperation_RefusesWhileAnotherIsOpen(t *testing.T) {
 	s := newStore(t, testConfig())
 	ctx := context.Background()
 	activate(t, s, ref(1), mustCreate(t, s, ref(1)))
-	r1, err := s.SubmitOperation(ctx, ref(1), "restart", nil, time.Now())
+	r1, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
 	must(t, err)
 	must(t, s.StartOperation(ctx, r1))
 	must(t, s.FinishOperation(ctx, r1, "failed", "internal: prevalidate")) // project still active
-	r2, err := s.SubmitOperation(ctx, ref(1), "restart", nil, time.Now())
+	r2, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
 	must(t, err)
 	wantErr(t, s.RetryOperation(ctx, r1), ErrConflict)
 	// Once the other operation is closed the retry is accepted.
@@ -1557,8 +1556,431 @@ func TestOperation_Timestamps(t *testing.T) {
 
 func TestSubmitOperation_BadKindBeforeLookup(t *testing.T) {
 	s := newStore(t, testConfig())
-	_, err := s.SubmitOperation(context.Background(), ref(9), "bogus", nil, time.Now())
+	_, err := s.SubmitOperation(context.Background(), ref(9), "bogus", nil, 1, time.Now())
 	wantErr(t, err, ErrConflict)
-	_, err = s.SubmitOperation(context.Background(), ref(9), "restart", nil, time.Now())
+	_, err = s.SubmitOperation(context.Background(), ref(9), "restart", nil, 1, time.Now())
 	wantErr(t, err, ErrNotFound)
+}
+
+// A restart or delete is admitted only while the project is still at the
+// generation its submitter read: two restarts merged from the same base
+// cannot drop each other's settings.
+func TestSubmitOperation_ExpectedGeneration(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	activate(t, s, ref(1), mustCreate(t, s, ref(1)))
+	_, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 2, time.Now())
+	wantErr(t, err, ErrConflict)
+	_, err = s.SubmitOperation(ctx, ref(1), "delete", nil, 0, time.Now())
+	wantErr(t, err, ErrConflict)
+	if n := count(t, s, "select count(*) from operation where ref = $1 and kind <> 'create'", ref(1)); n != 0 {
+		t.Fatalf("%d operations inserted by refused submissions", n)
+	}
+	id, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
+	must(t, err)
+	must(t, s.StartOperation(ctx, id))
+	must(t, s.BumpGeneration(ctx, ref(1), 2, defaultConfig))
+	must(t, s.FinishOperation(ctx, id, "done", ""))
+	// A second restart merged onto generation 1 is now stale.
+	_, err = s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
+	wantErr(t, err, ErrConflict)
+	rid, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 2, time.Now())
+	must(t, err)
+	op, err := s.GetOperation(ctx, rid)
+	must(t, err)
+	if op.Generation != 3 {
+		t.Fatalf("restart generation %d, want 3", op.Generation)
+	}
+}
+
+func TestNextOperation_LeastRecentlyRunFirst(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	a := mustCreate(t, s, ref(1))
+	b := mustCreate(t, s, ref(2))
+	op, ok, err := s.NextOperation(ctx)
+	must(t, err)
+	if !ok || op.ID != a {
+		t.Fatalf("first = %+v %v, want %d", op, ok, a)
+	}
+	// a ran an attempt and failed it, due again at once: b was run less recently.
+	must(t, s.StartOperation(ctx, a))
+	must(t, s.FailAttempt(ctx, a, "internal: x", time.Now().Add(-time.Second)))
+	op, ok, err = s.NextOperation(ctx)
+	must(t, err)
+	if !ok || op.ID != b {
+		t.Fatalf("after a's attempt = %+v %v, want %d", op, ok, b)
+	}
+	must(t, s.StartOperation(ctx, b))
+	must(t, s.FailAttempt(ctx, b, "internal: x", time.Now().Add(-time.Second)))
+	op, ok, err = s.NextOperation(ctx)
+	must(t, err)
+	if !ok || op.ID != a {
+		t.Fatalf("after b's attempt = %+v %v, want %d", op, ok, a)
+	}
+}
+
+func TestFailAttempt_AbortingCountsAttempts(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	id := mustCreate(t, s, ref(1))
+	must(t, s.StartOperation(ctx, id))
+	must(t, s.FailAttempt(ctx, id, "internal: x", time.Now())) // running: not counted again
+	op, err := s.GetOperation(ctx, id)
+	must(t, err)
+	if op.Attempts != 1 {
+		t.Fatalf("attempts %d after a running FailAttempt", op.Attempts)
+	}
+	_, err = s.RequestAbort(ctx, ref(1))
+	must(t, err)
+	for i := 1; i <= 3; i++ {
+		must(t, s.FailAttempt(ctx, id, "internal: compensation", time.Now()))
+		op, err := s.GetOperation(ctx, id)
+		must(t, err)
+		if op.State != "aborting" || op.Attempts != i {
+			t.Fatalf("run %d: %+v", i, op)
+		}
+	}
+}
+
+func TestParkAbort_OnlyAbortingAfterEight(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	id := mustCreate(t, s, ref(1))
+	wantErr(t, s.ParkAbort(ctx, id, "internal: x"), ErrConflict) // pending
+	_, err := s.RequestAbort(ctx, ref(1))
+	must(t, err)
+	for i := 1; i < 8; i++ {
+		must(t, s.FailAttempt(ctx, id, "internal: x", time.Now()))
+		wantErr(t, s.ParkAbort(ctx, id, "internal: x"), ErrConflict)
+	}
+	must(t, s.FailAttempt(ctx, id, "internal: eighth", time.Now()))
+	must(t, s.ParkAbort(ctx, id, "internal: parked"))
+	op, err := s.GetOperation(ctx, id)
+	must(t, err)
+	if op.State != "failed" || op.LastError != "internal: parked" {
+		t.Fatalf("op = %+v", op)
+	}
+	wantErr(t, s.ParkAbort(ctx, id, "internal: x"), ErrConflict) // failed
+	wantErr(t, s.ParkAbort(ctx, 999999, "internal: x"), ErrNotFound)
+}
+
+func TestRequestAbort_ResetsAttempts(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	for i, setup := range []func(id int64){
+		func(id int64) {}, // pending
+		func(id int64) { must(t, s.StartOperation(ctx, id)); must(t, s.StartOperation(ctx, id)) },                 // running
+		func(id int64) { must(t, s.StartOperation(ctx, id)); must(t, s.FinishOperation(ctx, id, "failed", "x")) }, // failed
+	} {
+		r := ref(i + 1)
+		id := mustCreate(t, s, r)
+		setup(id)
+		_, err := s.RequestAbort(ctx, r)
+		must(t, err)
+		op, err := s.GetOperation(ctx, id)
+		must(t, err)
+		if op.State != "aborting" || op.Attempts != 0 {
+			t.Fatalf("case %d: %+v", i, op)
+		}
+	}
+}
+
+// An active project cannot be aborted, whatever its create's state; a
+// provisioning project's parked (failed) create is re-armed, and while
+// aborting the abort is idempotent.
+func TestRequestAbort_RefusesActiveRearmsProvisioning(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	for i, opState := range []string{"running", "failed", "aborting", "done"} {
+		r := ref(10 + i)
+		id := mustCreate(t, s, r)
+		must(t, s.StartOperation(ctx, id))
+		switch opState {
+		case "failed":
+			must(t, s.FinishOperation(ctx, id, "failed", "internal: x"))
+		case "aborting":
+			_, err := s.RequestAbort(ctx, r)
+			must(t, err)
+		case "done":
+			must(t, s.FinishOperation(ctx, id, "done", ""))
+		}
+		must(t, s.SetProjectState(ctx, r, "active"))
+		_, err := s.RequestAbort(ctx, r)
+		wantErr(t, err, ErrConflict)
+		op, err := s.GetOperation(ctx, id)
+		must(t, err)
+		if op.State != opState {
+			t.Fatalf("refused abort changed the create: %+v", op)
+		}
+	}
+	id := mustCreate(t, s, ref(1))
+	_, err := s.RequestAbort(ctx, ref(1))
+	must(t, err)
+	got, err := s.RequestAbort(ctx, ref(1))
+	must(t, err)
+	if got != id {
+		t.Fatalf("abort while aborting returned %d, want %d", got, id)
+	}
+	for range 8 {
+		must(t, s.FailAttempt(ctx, id, "internal: x", time.Now()))
+	}
+	must(t, s.ParkAbort(ctx, id, "internal: parked"))
+	got, err = s.RequestAbort(ctx, ref(1))
+	must(t, err)
+	op, err := s.GetOperation(ctx, id)
+	must(t, err)
+	if got != id || op.State != "aborting" || op.Attempts != 0 {
+		t.Fatalf("re-armed op = %+v (id %d)", op, got)
+	}
+}
+
+// Step 12 in one transaction: project active at the operation's generation
+// and the operation done, only while it is running and the project
+// provisioning; otherwise ErrConflict and nothing changes.
+func TestFinishCreate_OneTransaction(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	id := mustCreate(t, s, ref(1))
+	mustPlace(t, s, ref(1))
+	wantErr(t, s.FinishCreate(ctx, id), ErrConflict) // pending
+	must(t, s.StartOperation(ctx, id))
+	must(t, s.FinishCreate(ctx, id))
+	p, err := s.GetProject(ctx, ref(1))
+	must(t, err)
+	op, err := s.GetOperation(ctx, id)
+	must(t, err)
+	if p.State != "active" || p.AppliedGen != 1 || op.State != "done" || op.Step != "12" || op.LastError != "" {
+		t.Fatalf("project %+v, op %+v", p, op)
+	}
+	wantErr(t, s.FinishCreate(ctx, id), ErrConflict) // done
+	// The abort wins: the project stays provisioning, the operation aborting.
+	id2 := mustCreate(t, s, ref(2))
+	must(t, s.StartOperation(ctx, id2))
+	_, err = s.RequestAbort(ctx, ref(2))
+	must(t, err)
+	wantErr(t, s.FinishCreate(ctx, id2), ErrConflict)
+	p, err = s.GetProject(ctx, ref(2))
+	must(t, err)
+	op, err = s.GetOperation(ctx, id2)
+	must(t, err)
+	if p.State != "provisioning" || p.AppliedGen != 0 || op.State != "aborting" {
+		t.Fatalf("after a lost race: project %+v, op %+v", p, op)
+	}
+	// A project not provisioning (here: its row moved on) refuses too.
+	id3 := mustCreate(t, s, ref(3))
+	must(t, s.StartOperation(ctx, id3))
+	must(t, s.SetProjectState(ctx, ref(3), "deleting"))
+	wantErr(t, s.FinishCreate(ctx, id3), ErrConflict)
+	op, err = s.GetOperation(ctx, id3)
+	must(t, err)
+	if op.State != "running" {
+		t.Fatalf("op %+v", op)
+	}
+	// Only a create.
+	activate(t, s, ref(4), mustCreate(t, s, ref(4)))
+	rid, err := s.SubmitOperation(ctx, ref(4), "restart", nil, 1, time.Now())
+	must(t, err)
+	must(t, s.StartOperation(ctx, rid))
+	must(t, s.SetProjectState(ctx, ref(4), "provisioning"))
+	wantErr(t, s.FinishCreate(ctx, rid), ErrConflict)
+	wantErr(t, s.FinishCreate(ctx, 999999), ErrNotFound)
+}
+
+// The lock-held check answers for the session that holds the lock: nil
+// while its connection lives, an error once the connection is gone.
+func TestLockRefChecked_DetectsLostLock(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	unlock, held, err := s.LockRefChecked(ctx, ref(1))
+	must(t, err)
+	defer unlock()
+	must(t, held(ctx))
+	if _, err := s.pool.Exec(ctx, "select pg_terminate_backend(pid) from pg_locks where locktype = 'advisory' and pid <> pg_backend_pid()"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for held(ctx) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("held reports a lock whose connection was terminated")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	u, ok, err := s.TryLockRef(ctx, ref(1))
+	must(t, err)
+	if !ok {
+		t.Fatal("lock not free after its connection died")
+	}
+	u()
+}
+
+func TestBeginRestart_OneTransaction(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	activate(t, s, ref(1), mustCreate(t, s, ref(1)))
+	next := ProjectConfig{DiskQuotaMB: 16384, MemMB: 512, GUC: map[string]string{"max_connections": "200"}}
+	must(t, s.BeginRestart(ctx, ref(1), 2, next))
+	p, err := s.GetProject(ctx, ref(1))
+	must(t, err)
+	if p.Generation != 2 || p.State != "restarting" || p.Config.GUC["max_connections"] != "200" {
+		t.Fatalf("project = %+v", p)
+	}
+	must(t, s.BeginRestart(ctx, ref(1), 2, next)) // resumed R2: no-op
+	// Another configuration at the same target is another restart's bump.
+	wantErr(t, s.BeginRestart(ctx, ref(1), 2, defaultConfig), ErrConflict)
+	p, err = s.GetProject(ctx, ref(1))
+	must(t, err)
+	if p.Generation != 2 || p.Config.DiskQuotaMB != 16384 {
+		t.Fatalf("resumed bump changed %+v", p)
+	}
+	wantErr(t, s.BeginRestart(ctx, ref(1), 1, defaultConfig), ErrConflict) // older target
+	must(t, s.SetProjectState(ctx, ref(1), "deleting"))
+	wantErr(t, s.BeginRestart(ctx, ref(1), 3, defaultConfig), ErrConflict)
+	p, err = s.GetProject(ctx, ref(1))
+	must(t, err)
+	if p.Generation != 2 {
+		t.Fatalf("refused bump changed the generation to %d", p.Generation)
+	}
+	wantErr(t, s.BeginRestart(ctx, ref(9), 2, defaultConfig), ErrNotFound)
+}
+
+func TestBeginRestart_RollForwardFromRestarting(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	activate(t, s, ref(1), mustCreate(t, s, ref(1)))
+	next := ProjectConfig{DiskQuotaMB: 8192, MemMB: 512, GUC: map[string]string{"max_connections": "200"}}
+	must(t, s.BeginRestart(ctx, ref(1), 2, next))
+	must(t, s.BeginRestart(ctx, ref(1), 3, defaultConfig))
+	p, err := s.GetProject(ctx, ref(1))
+	must(t, err)
+	if p.Generation != 3 || p.State != "restarting" || len(p.Config.GUC) != 0 {
+		t.Fatalf("project = %+v", p)
+	}
+}
+
+func TestTryLockRef(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	unlock, ok, err := s.TryLockRef(ctx, ref(1))
+	must(t, err)
+	if !ok {
+		t.Fatal("free lock not acquired")
+	}
+	if _, ok, err := s.TryLockRef(ctx, ref(1)); err != nil || ok {
+		t.Fatalf("held lock acquired again (ok %v, err %v)", ok, err)
+	}
+	u2, ok, err := s.TryLockRef(ctx, ref(2))
+	must(t, err)
+	if !ok {
+		t.Fatal("another ref's lock not acquired")
+	}
+	u2()
+	cctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	_, err = s.LockRef(cctx, ref(1))
+	cancel()
+	if err == nil {
+		t.Fatal("LockRef acquired a lock TryLockRef holds")
+	}
+	unlock()
+	unlock() // idempotent
+	u, err := s.LockRef(ctx, ref(1))
+	must(t, err)
+	if _, ok, err := s.TryLockRef(ctx, ref(1)); err != nil || ok {
+		t.Fatalf("TryLockRef acquired a lock LockRef holds (ok %v, err %v)", ok, err)
+	}
+	u()
+	// Refused tries do not keep connections: far more than the pool size.
+	u, err = s.LockRef(ctx, ref(3))
+	must(t, err)
+	for range 4 * maxConns {
+		if _, ok, err := s.TryLockRef(ctx, ref(3)); err != nil || ok {
+			t.Fatalf("ok %v, err %v", ok, err)
+		}
+	}
+	u()
+}
+
+// A retry and a submission of the same ref racing: at most one of them
+// leaves an open operation.
+func TestRace_RetryVersusSubmit(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	for round := 0; round < 10; round++ {
+		r := ref(round)
+		activate(t, s, r, mustCreate(t, s, r))
+		id, err := s.SubmitOperation(ctx, r, "restart", nil, 1, time.Now())
+		must(t, err)
+		must(t, s.StartOperation(ctx, id))
+		must(t, s.FinishOperation(ctx, id, "failed", "internal: x")) // the project stays active
+		race(2, func(i int) error {
+			if i == 0 {
+				return s.RetryOperation(ctx, id)
+			}
+			_, err := s.SubmitOperation(ctx, r, "delete", nil, 1, time.Now())
+			return err
+		})
+		if n := count(t, s, "select count(*) from operation where ref = $1 and state in "+openStates, r); n != 1 {
+			t.Fatalf("round %d: %d open operations", round, n)
+		}
+	}
+}
+
+// MarkAborted and MarkPurged refuse every state they do not release from,
+// and change nothing then.
+func TestMarkAbortedPurged_RefusedTransitions(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	id := mustCreate(t, s, ref(1))
+	mustPlace(t, s, ref(1))
+	wantErr(t, s.MarkPurged(ctx, ref(1)), ErrConflict) // provisioning
+	activate(t, s, ref(1), id)
+	for _, st := range []string{"active", "restarting", "deleting", "deleted"} {
+		must(t, s.SetProjectState(ctx, ref(1), st))
+		wantErr(t, s.MarkAborted(ctx, ref(1)), ErrConflict)
+		if st != "deleted" {
+			wantErr(t, s.MarkPurged(ctx, ref(1)), ErrConflict)
+		}
+		p, err := s.GetProject(ctx, ref(1))
+		must(t, err)
+		if p.State != st || p.SubnetIndex == nil {
+			t.Fatalf("%s: refused transition changed %+v", st, p)
+		}
+	}
+	must(t, s.MarkPurged(ctx, ref(1)))
+	wantErr(t, s.MarkAborted(ctx, ref(1)), ErrConflict) // purged
+	wantErr(t, s.MarkPurged(ctx, ref(9)), ErrNotFound)
+	wantErr(t, s.MarkAborted(ctx, ref(9)), ErrNotFound)
+}
+
+// FinishCreate and RequestAbort take the project row first and the
+// operation row second: run together they never deadlock; exactly one wins
+// and the other gets ErrConflict.
+func TestRace_FinishCreateVersusRequestAbort(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	for round := 0; round < 40; round++ {
+		r := ref(round)
+		id := mustCreate(t, s, r)
+		mustPlace(t, s, r)
+		must(t, s.StartOperation(ctx, id))
+		errs := race(2, func(i int) error {
+			if i == 0 {
+				return s.FinishCreate(ctx, id)
+			}
+			_, err := s.RequestAbort(ctx, r)
+			return err
+		})
+		ok := 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				ok++
+			case !errors.Is(err, ErrConflict):
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+		if ok != 1 {
+			t.Fatalf("round %d: %d winners (%v)", round, ok, errs)
+		}
+	}
 }

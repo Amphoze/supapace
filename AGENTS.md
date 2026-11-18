@@ -1205,3 +1205,98 @@ patch surface, backup model) were verified against upstream source first.
   - A purge task that fails leaves the uid without quota limits until the purge
     completes (no tenant container exists by then).
   - A failed first boot leaves its network-less container until the next attempt.
+
+### 2026-11-18 — `internal/saga` and store changes
+
+`internal/saga` is the node's operation worker and the only writer of a project's lifecycle. It
+carries create, restart, delete and purge operations through fixed step tables against `store`
+and the node agent, one operation at a time, under the project's ref lock.
+
+API
+- `saga.New(st, ag, kek, cfg, paths)`. `Run(ctx)` is the worker; a second `Run` on the same
+  runner waits for the first.
+- `Submit(ctx, kind, ref, params)` queues a `restart` or `delete` of an `active` project. Creates
+  are inserted by the admin API (`store.CreateProject`) and picked up by `Run`.
+- `Abort(ctx, ref)` marks the ref's create `aborting` and returns its id (the same id while it is
+  aborting). Only a `provisioning` project can be aborted.
+- `ResumeAll(ctx)` logs the operations a previous worker left `running` or `aborting`; it changes
+  nothing (`Run` takes them like pending ones).
+- `SpecFor(ctx, ref)` is the desired state at `project.generation`, secrets and SCRAM salts
+  unwrapped; it never sets `FirstBoot`.
+- `saga.Agent` is the subset of `*agent.Agent` the steps call.
+
+Step ids (`operation.step` is the last step completed)
+- Create: `1` (admin API), then `2 3 4a 4 6 7 9 11 12`. Only steps 4a and 4 set `Spec.FirstBoot`.
+  Step 12 is one store transaction (`FinishCreate`).
+- Restart: `R0` (merge-base check), `R1` pre-validation, `R2` bump and drain, `R3` stop, quota,
+  start, `R4` health, `R5` resume.
+- Delete: `D1`-`D5`; `D5` queues the purge at now + retention. Purge: `P1`-`P5`.
+- Compensation of an aborted create: `C1`-`C7` (route, PostgREST, cluster, keys, render tree,
+  network and project tree, then the slice). Never written to `operation.step`.
+- Keys are destroyed before any tree is removed; the slice is freed last; uids are never reused.
+
+Parameters
+- Restart input: `{"base_generation": N, "config": {...}}`. Stored: `base_generation`, `prev`,
+  `next`, plus `rollback_gen` and `rollback_error` after a failed health check.
+- Create: `{"issuer_jwks": ...}`.
+- Added by the worker: `requeued` (attempts given back for containment refusals) and
+  `compensating: true` once a create's compensation has started. Such a create never runs a
+  forward step again; any pick of it, also after `op retry`, resumes the compensation from `C1`.
+
+Failure policy
+- A failed step is retried with back-off 2 s, 5 s, 15 s, 30 s; the fifth failure ends the
+  operation `failed` at its step, nothing undone (`op retry` continues it; `project abort`
+  compensates a create). Attempts are also counted when started: an operation interrupted five
+  times before finishing a step is failed.
+- Not retried: `node_full` (straight to compensation); `containment_failed` (requeued after 10 s
+  and not counted while the agent's containment flag is set; `Run` takes nothing while it is set);
+  `assertion`; `epoch_divergence`; `bad_request` (issuer kid equal to a platform kid);
+  `conflict`.
+- Restart conflicts: on every pick the project must still be at the merge base, or carry this
+  operation's own bump (target generation, `restarting`, the target configuration; from R5 on
+  also `active` at the target). Anything else - another restart's bump or a newer generation -
+  is `conflict`, before any agent call.
+- The disk quota is applied at R3 with the cluster stopped. A failed health check at R4 rolls
+  forward once to generation g+2 with `prev` (its quota included); a second failure leaves the
+  project `restarting` with its route draining.
+- A probe that fails at 11 or R5 sets the route back to draining.
+- A failing compensation backs off and is parked `failed` after 8 runs; `project abort` re-arms
+  it. A transient error while resuming a compensation backs off.
+- Deadlines: 300 s per step, 900 s per attempt (a roll-forward included); store bookkeeping runs
+  outside them, `FinishCreate` under the step deadline.
+- `last_error` is "<code>: <message>" through `pgsock.Sanitize`, at most 1 KiB. Log lines carry
+  ref and operation id, never secrets or specs.
+
+What `serve` must do
+- At start: `pgsock.CheckEnv()`, `EnsureImageFiles` (the cluster steps need the image files),
+  store `Migrate` and `EnsureNode`, then `ResumeAll` and exactly one `Run` per node, on one
+  runner.
+- `Ops.Submit` and `Ops.Abort` go to the runner. The admin API validates a restart's merged
+  configuration before `Submit` (the runner does not) and passes the generation it read as
+  `base_generation`.
+- Failpoint, for crash tests only: `/run/supapace/failpoint` holding `<kind>:<step>` (compensation
+  entries `create:C<n>`) is honoured only when the `dev-mode` marker is a regular file beside
+  `node.json`. Neither file is followed through a link; on a match the file is removed, then the
+  process exits with status 137.
+
+Store additions
+- `SubmitOperation(ctx, ref, kind, params, base, notBefore)` refuses (`ErrConflict`) unless the
+  project is still at generation `base`.
+- `NextOperation` orders ready operations by `updated_at, id` (least recently run first).
+- `FailAttempt` on an aborting create counts the run. `ParkAbort` ends an aborting create
+  `failed` after 8 runs.
+- `RequestAbort` accepts only a `provisioning` project, resets `attempts` on every move to
+  aborting and re-arms a parked create. `MarkAborted` only from `provisioning`.
+- `FinishCreate(ctx, id)`: the operation `done` at step 12 and the project `active` at its
+  generation in one transaction, only for a running create of a provisioning project; it locks
+  the project row before the operation row, as `RequestAbort` does.
+- `BeginRestart(ctx, ref, target, cfg)`: generation, configuration and `restarting` in one
+  statement, from `active` or `restarting`; repeating it is a no-op only with the same
+  configuration.
+- `TryLockRef`: the ref lock without waiting.
+- `LockRefChecked`: the ref lock plus `held`, one round trip on the lock's connection. The worker
+  calls it before every record and ends an attempt with nothing recorded when the lock is gone.
+
+Known limits
+- Between the lock check and the write it guards there is one round trip in which a dying
+  connection goes unnoticed.

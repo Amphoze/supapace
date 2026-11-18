@@ -120,17 +120,36 @@ func (s *Store) Epoch(ctx context.Context) (int64, error) {
 // holder. An unlock that is never called keeps its connection out of the pool,
 // and Close then blocks.
 func (s *Store) LockRef(ctx context.Context, ref string) (unlock func(), err error) {
+	unlock, _, err = s.LockRefChecked(ctx, ref)
+	return unlock, err
+}
+
+// LockRefChecked is LockRef that also returns held, which reports whether the
+// lock is still held: one round trip on the connection that holds it, an
+// error once that connection is gone (the server then released the lock).
+// held must not be called beside unlock or after it.
+func (s *Store) LockRefChecked(ctx context.Context, ref string) (unlock func(), held func(context.Context) error, err error) {
 	c, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, wrap(err)
+		return nil, nil, wrap(err)
 	}
 	if _, err := c.Exec(ctx, "select pg_advisory_lock($1, hashtext($2))", lockClassRef, ref); err != nil {
 		// A wait cut short by ctx may still have been granted on the server: drop
 		// the connection so the lock cannot outlive this call.
 		c.Conn().Close(context.Background())
 		c.Release()
-		return nil, wrap(err)
+		return nil, nil, wrap(err)
 	}
+	held = func(ctx context.Context) error {
+		_, err := c.Exec(ctx, "select 1")
+		return err
+	}
+	return unlocker(c, ref), held, nil
+}
+
+// unlocker releases the ref lock held on c, then c. It is idempotent; if the
+// unlock statement fails the connection is closed, which releases the lock.
+func unlocker(c *pgxpool.Conn, ref string) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -142,7 +161,25 @@ func (s *Store) LockRef(ctx context.Context, ref string) (unlock func(), err err
 			}
 			c.Release()
 		})
-	}, nil
+	}
+}
+
+// TryLockRef is LockRef without waiting: ok is false, and no connection is
+// kept, when another session holds the lock.
+func (s *Store) TryLockRef(ctx context.Context, ref string) (unlock func(), ok bool, err error) {
+	c, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, wrap(err)
+	}
+	if err := c.QueryRow(ctx, "select pg_try_advisory_lock($1, hashtext($2))", lockClassRef, ref).Scan(&ok); err != nil || !ok {
+		if err != nil {
+			// The answer may have been lost after the server granted it.
+			c.Conn().Close(context.Background())
+		}
+		c.Release()
+		return nil, false, wrap(err)
+	}
+	return unlocker(c, ref), true, nil
 }
 
 func (s *Store) tx(ctx context.Context, f func(pgx.Tx) error) error {

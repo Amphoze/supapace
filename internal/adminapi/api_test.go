@@ -162,24 +162,23 @@ func (f *fakeOps) Submit(ctx context.Context, kind, ref string, params json.RawM
 	if err != nil {
 		return 0, err
 	}
-	// The worker refuses a restart whose merge base is no longer the
-	// project's generation.
+	// The store refuses a restart whose merge base is no longer the
+	// project's generation; a delete is based on the current one.
+	var rp restartShape
 	if kind == "restart" {
-		var rp restartShape
 		dec := json.NewDecoder(bytes.NewReader(params))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&rp); err != nil {
 			return 0, err
 		}
+	} else {
 		p, err := f.st.GetProject(ctx, ref)
 		if err != nil {
 			return 0, err
 		}
-		if p.Generation != rp.BaseGeneration {
-			return 0, fmt.Errorf("%w: the project changed since its configuration was read", store.ErrConflict)
-		}
+		rp.BaseGeneration = p.Generation
 	}
-	return f.st.SubmitOperation(ctx, ref, kind, params, time.Now())
+	return f.st.SubmitOperation(ctx, ref, kind, params, rp.BaseGeneration, time.Now())
 }
 
 func (f *fakeOps) Abort(ctx context.Context, ref string) (int64, error) {

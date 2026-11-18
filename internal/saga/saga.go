@@ -1,0 +1,482 @@
+// Package saga is the node's operation worker: it carries project
+// operations (create, restart, delete, purge) through their recorded steps
+// against the control-plane store and the node agent, one operation at a
+// time on the node.
+//
+// Every step first checks whether its effect already exists, so a worker
+// that dies between a step's effect and recording the step only repeats a
+// no-op when the operation resumes. Failures roll forward: a failed step is
+// retried with back-off and, after the fifth attempt, the operation is
+// failed at that step with nothing undone; only an explicit abort of a create
+// (or a create that cannot be placed) runs the compensation list.
+//
+// The worker holds the project's ref lock for the whole of an attempt, so
+// nothing else (an abort's compensation, the boot-time adoption loop) acts on
+// the project beside a step. While the node's containment flag is set the
+// worker takes no operation.
+//
+// Secrets never leave the store and the agent's spec in clear: no error, log
+// line, last_error or operation parameter carries one, and text from a
+// project's cluster or from Docker is sanitised and bounded before it is
+// stored or logged.
+package saga
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/Amphoze/supapace/internal/agent"
+	"github.com/Amphoze/supapace/internal/bootstrap"
+	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/pgsock"
+	"github.com/Amphoze/supapace/internal/routes"
+	"github.com/Amphoze/supapace/internal/secrets"
+	"github.com/Amphoze/supapace/internal/store"
+)
+
+// Agent is every node-agent method the steps call; *agent.Agent satisfies it.
+type Agent interface {
+	EnsureDir(context.Context, agent.Spec) error                      // create 3
+	SetQuota(context.Context, agent.Spec) error                       // restart R3 (cluster stopped)
+	EnsureNetwork(context.Context, agent.Spec) error                  // create 3
+	RemoveNetwork(context.Context, string) error                      // delete D4, abort C6
+	EnsureCluster(context.Context, agent.Spec) error                  // create 4a, 4 (one phase per call; FirstBoot only there); restart R3, R4
+	VerifyCluster(context.Context, agent.Spec) error                  // restart R4
+	StopCluster(context.Context, string) error                        // restart R3, delete D3, purge P1, abort C3
+	Prevalidate(context.Context, agent.Spec) error                    // restart R1
+	PromoteCandidate(context.Context, string) error                   // restart R3
+	EnsurePostgREST(context.Context, agent.Spec) error                // create 9, restart R5
+	StopPostgREST(context.Context, string) error                      // restart R2, delete D2, purge P1, abort C2
+	RouteFor(agent.Spec, string) routes.Project                       // create 11, restart R2, R5
+	SetRoute(context.Context, string, *routes.Project) (int64, error) // create 11, restart R2, R5, delete D1, abort C1
+	GatewayGeneration(context.Context) (int64, error)                 // create 11, restart R5, delete D1
+	ProbeREST(context.Context, string, string) error                  // create 11, restart R5
+	RemoveRender(context.Context, string) error                       // purge P3, abort C5
+	PurgeDir(context.Context, agent.Spec) error                       // purge P4, abort C6
+	ContainmentFailed() bool                                          // Run takes no operation while true
+}
+
+const (
+	maxAttempts         = 5    // attempts of a step before the operation is failed
+	maxCompensationRuns = 8    // failed compensation runs before an abort is parked
+	maxLastError        = 1024 // bytes of last_error
+	kekID               = "node"
+	clusterPids         = 512 // the cluster container's pids limit (the project's admission share adds PostgREST's 64)
+)
+
+// Runner is the worker. Its unexported timing fields are shortened by tests.
+type Runner struct {
+	st  *store.Store
+	ag  Agent
+	kek secrets.KEK
+	cfg nodecfg.Config
+	p   nodecfg.Paths
+	log *slog.Logger
+
+	worker sync.Mutex // held by Run: one worker per runner
+
+	backoff          []time.Duration // after failed attempt n: backoff[min(n, len)-1]
+	stepDeadline     time.Duration
+	attemptDeadline  time.Duration
+	containmentRetry time.Duration // requeue delay of an operation refused while the node is not contained
+	probeWindow      time.Duration // how long create 11 and restart R5 retry the end-to-end probe
+	probeEvery       time.Duration
+	idle             time.Duration // between polls of an empty or paused queue
+}
+
+func New(st *store.Store, ag Agent, kek secrets.KEK, c nodecfg.Config, p nodecfg.Paths) *Runner {
+	return &Runner{st: st, ag: ag, kek: kek, cfg: c, p: p, log: slog.Default(),
+		backoff:      []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second},
+		stepDeadline: 300 * time.Second, attemptDeadline: 900 * time.Second, containmentRetry: 10 * time.Second,
+		probeWindow: 60 * time.Second, probeEvery: time.Second, idle: time.Second}
+}
+
+func (r *Runner) backoffAfter(n int) time.Duration {
+	return r.backoff[max(min(n, len(r.backoff)), 1)-1]
+}
+
+// step is one row of a step table. Its id is what operation.step records.
+type step struct {
+	id string
+	do func(*job, context.Context) error
+}
+
+// errFinished is returned by a step whose own write recorded it and ended
+// the operation (create step 12).
+var errFinished = errors.New("operation finished by its step")
+
+var tables = map[string][]step{
+	"create":  createSteps,
+	"restart": restartSteps,
+	"delete":  deleteSteps,
+	"purge":   purgeSteps,
+}
+
+// job is one attempt at one operation.
+type job struct {
+	r    *Runner
+	op   store.Operation
+	held func(context.Context) error // the ref lock is still held
+}
+
+// Run is the worker: it takes the next ready operation and runs one attempt
+// of it, one operation at a time, until ctx ends. While the agent reports the
+// node's containment as failed it takes nothing. A second Run on the same
+// runner waits for the first to return.
+func (r *Runner) Run(ctx context.Context) {
+	r.worker.Lock()
+	defer r.worker.Unlock()
+	for ctx.Err() == nil {
+		if !r.ag.ContainmentFailed() {
+			op, ok, err := r.st.NextOperation(ctx)
+			if err != nil && ctx.Err() == nil {
+				r.log.Error("operation queue", "err", r.text(err))
+			}
+			if ok {
+				r.attempt(ctx, op)
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(r.idle):
+		}
+	}
+}
+
+// attempt runs one attempt of op under its ref lock.
+func (r *Runner) attempt(ctx context.Context, op store.Operation) {
+	unlock, held, err := r.st.LockRefChecked(ctx, op.Ref)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.log.Error("ref lock", "ref", op.Ref, "op", op.ID, "err", r.text(err))
+		}
+		return
+	}
+	defer unlock()
+	x := &job{r: r, held: held}
+	// Re-read under the lock: an abort or a retry may have come in between.
+	cur, err := r.st.GetOperation(ctx, op.ID)
+	if err != nil {
+		r.log.Error("operation", "ref", op.Ref, "op", op.ID, "err", r.text(err))
+		return
+	}
+	x.op = cur
+	switch {
+	case cur.State == "aborting":
+		x.compensate(ctx, "")
+		return
+	case cur.State != "pending" && cur.State != "running":
+		return
+	case cur.Kind == "create" && compensating(cur.Params):
+		// Its compensation has run: it never goes forward again, whatever
+		// put it back in the queue (an `op retry` of a parked abort).
+		x.resumeCompensation(ctx)
+		return
+	}
+	if err := r.st.StartOperation(ctx, cur.ID); err != nil {
+		x.afterError(ctx, err)
+		return
+	}
+	x.op.State, x.op.Attempts = "running", cur.Attempts+1
+	// Attempts are counted when started, so a step that ends the process
+	// every time cannot be resumed forever.
+	if x.op.Attempts-requeues(x.op.Params) > maxAttempts {
+		x.finishFailed(ctx, final("internal", errors.New("interrupted too many times before finishing a step (the daemon stopped during each attempt); the operator can retry it")))
+		return
+	}
+	actx, cancel := context.WithTimeout(ctx, r.attemptDeadline)
+	defer cancel()
+	if err := x.steps(ctx, actx); err != nil {
+		x.afterError(ctx, err)
+	}
+}
+
+// errLockLost ends an attempt whose ref lock went with its connection:
+// nothing more is recorded, the queue takes the operation again.
+var errLockLost = errors.New("ref lock lost")
+
+// record checks, before a step's completion is written, that the ref lock is
+// still held.
+func (x *job) record(ctx context.Context) error {
+	if err := x.held(ctx); err != nil {
+		return fmt.Errorf("%w: %v", errLockLost, err)
+	}
+	return nil
+}
+
+func (x *job) finishFailed(ctx context.Context, err error) {
+	if x.record(ctx) != nil {
+		return
+	}
+	if err := x.r.st.FinishOperation(ctx, x.op.ID, "failed", x.r.lastError(err)); err != nil {
+		x.r.log.Error("recording a failed operation", "op", x.op.ID, "ref", x.op.Ref, "err", x.r.text(err))
+	}
+}
+
+// steps runs the operation's table from the step after the recorded one,
+// then finishes it done. Store bookkeeping uses ctx; steps run under actx
+// (the attempt deadline) and each under its own step deadline.
+func (x *job) steps(ctx, actx context.Context) error {
+	table := tables[x.op.Kind]
+	if table == nil {
+		return final("internal", fmt.Errorf("unknown operation kind %q", x.op.Kind))
+	}
+	i, err := x.start(ctx, table)
+	if err != nil {
+		return err
+	}
+	for ; i < len(table); i++ {
+		s := table[i]
+		hitFailpoint(x.r.p, x.op.Kind+":"+s.id)
+		sctx, cancel := context.WithTimeout(actx, x.r.stepDeadline)
+		err := s.do(x, sctx)
+		cancel()
+		var rf *rollForward
+		if errors.As(err, &rf) {
+			// Restart R4 failed: write the rollback target first, so a resumed
+			// operation continues the rollback, then re-enter R1.
+			if err := x.rollForward(ctx, rf.err); err != nil {
+				return err
+			}
+			if actx.Err() != nil {
+				return actx.Err()
+			}
+			i = indexOf(table, "R1") - 1
+			continue
+		}
+		if errors.Is(err, errFinished) {
+			x.r.log.Info("step done", "op", x.op.ID, "ref", x.op.Ref, "kind", x.op.Kind, "step", s.id)
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := x.record(ctx); err != nil {
+			return err
+		}
+		if err := x.r.st.AdvanceStep(ctx, x.op.ID, s.id); err != nil {
+			return err
+		}
+		x.op.Step = s.id
+		x.r.log.Info("step done", "op", x.op.ID, "ref", x.op.Ref, "kind", x.op.Kind, "step", s.id)
+	}
+	if err := x.record(ctx); err != nil {
+		return err
+	}
+	return x.r.st.FinishOperation(ctx, x.op.ID, "done", x.doneNote())
+}
+
+// start returns the index of the first step to run: the one after the
+// recorded step (create's step 1 is the admin API's, outside the table).
+func (x *job) start(ctx context.Context, table []step) (int, error) {
+	if x.op.Kind == "restart" {
+		return x.restartStart(ctx, table)
+	}
+	return indexOf(table, x.op.Step) + 1, nil
+}
+
+func indexOf(table []step, id string) int {
+	for i, s := range table {
+		if s.id == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// failure is an error the step tables mark with its last_error code and
+// whether it is retried.
+type failure struct {
+	code  string
+	final bool // not retried: the operation is failed at once
+	err   error
+}
+
+func (f *failure) Error() string { return f.code + ": " + f.err.Error() }
+func (f *failure) Unwrap() error { return f.err }
+
+func final(code string, err error) error { return &failure{code: code, final: true, err: err} }
+
+// code maps an error to its last_error code.
+func code(err error) string {
+	var f *failure
+	switch {
+	case errors.As(err, &f):
+		return f.code
+	case errors.Is(err, store.ErrNodeFull):
+		return "node_full"
+	case errors.Is(err, agent.ErrContainment):
+		return "containment_failed"
+	case errors.Is(err, agent.ErrStaleGeneration):
+		return "stale_generation"
+	case errors.Is(err, agent.ErrEpochDivergence):
+		return "epoch_divergence"
+	case errors.Is(err, bootstrap.ErrAssertion):
+		return "assertion"
+	case errors.Is(err, pgsock.ErrPeer):
+		return "peer"
+	case pgsock.IsBudget(err):
+		return "timeout"
+	}
+	return "internal"
+}
+
+// text sanitises and bounds an error's text for a log line or last_error.
+func (r *Runner) text(err error) string {
+	var f *failure
+	if errors.As(err, &f) {
+		err = f.err
+	}
+	return pgsock.Sanitize(err.Error(), maxLastError)
+}
+
+// lastError is "<code>: <message>", sanitised, at most 1 KiB.
+func (r *Runner) lastError(err error) string {
+	return pgsock.Sanitize(code(err)+": "+r.text(err), maxLastError)
+}
+
+// afterError applies the failure policy to an attempt of op that ended with
+// err. It re-reads the operation first: an abort requested while the step
+// ran makes the step's own writes fail with ErrConflict, and the worker that
+// holds the lock compensates now.
+func (x *job) afterError(ctx context.Context, err error) {
+	r, op := x.r, x.op
+	if ctx.Err() != nil {
+		return // the worker is stopping; the operation resumes at its recorded step
+	}
+	if errors.Is(err, errLockLost) || x.record(ctx) != nil {
+		r.log.Warn("ref lock lost; attempt ended, nothing recorded", "op", op.ID, "ref", op.Ref, "kind", op.Kind)
+		return
+	}
+	cur, gerr := r.st.GetOperation(ctx, op.ID)
+	if gerr != nil {
+		r.log.Error("operation", "ref", op.Ref, "op", op.ID, "err", r.text(gerr))
+		return
+	}
+	x.op = cur
+	if cur.State == "aborting" {
+		x.compensate(ctx, "")
+		return
+	}
+	if cur.State != "running" {
+		return
+	}
+	msg := r.lastError(err)
+	r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,
+		"attempt", cur.Attempts, "err", msg)
+	var f *failure
+	var werr error
+	requeued := requeues(cur.Params)
+	switch {
+	case errors.Is(err, store.ErrNodeFull) && op.Kind == "create":
+		// Nothing to resume: straight to the compensation list.
+		if _, werr = r.st.RequestAbort(ctx, op.Ref); werr == nil {
+			cur, werr = r.st.GetOperation(ctx, op.ID)
+		}
+		if werr == nil {
+			x.op = cur
+			x.compensate(ctx, msg)
+			return
+		}
+	case errors.Is(err, agent.ErrContainment) && r.ag.ContainmentFailed():
+		// The node's fault, not the project's: back in the queue, not
+		// counted against the attempts, taken again once the flag clears.
+		if werr = r.patchParams(ctx, &cur, "requeued", requeued+1); werr == nil {
+			werr = r.st.FailAttempt(ctx, op.ID, msg, time.Now().Add(r.containmentRetry))
+		}
+	case errors.Is(err, agent.ErrContainment), errors.Is(err, bootstrap.ErrAssertion), errors.Is(err, agent.ErrEpochDivergence),
+		errors.As(err, &f) && f.final, cur.Attempts-requeued >= maxAttempts:
+		werr = r.st.FinishOperation(ctx, op.ID, "failed", msg)
+	default:
+		werr = r.st.FailAttempt(ctx, op.ID, msg, time.Now().Add(r.backoffAfter(cur.Attempts-requeued)))
+	}
+	if werr != nil {
+		if errors.Is(werr, store.ErrConflict) {
+			// An abort landed between the re-read and the write.
+			if cur, gerr := r.st.GetOperation(ctx, op.ID); gerr == nil && cur.State == "aborting" {
+				x.op = cur
+				x.compensate(ctx, "")
+				return
+			}
+		}
+		r.log.Error("recording a failed attempt", "op", op.ID, "ref", op.Ref, "err", r.text(werr))
+	}
+}
+
+// requeues is the number of attempts given back for a containment refusal.
+func requeues(params json.RawMessage) int {
+	var p struct {
+		Requeued int `json:"requeued"`
+	}
+	json.Unmarshal(params, &p)
+	return p.Requeued
+}
+
+// patchParams sets one member of the operation's parameters.
+func (r *Runner) patchParams(ctx context.Context, op *store.Operation, key string, v any) error {
+	m := map[string]json.RawMessage{}
+	if len(op.Params) > 0 {
+		if err := json.Unmarshal(op.Params, &m); err != nil {
+			return err
+		}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	m[key] = b
+	params, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if err := r.st.SetOperationParams(ctx, op.ID, params); err != nil {
+		return err
+	}
+	op.Params = params
+	return nil
+}
+
+// Submit queues a restart or delete of an active project; creates are
+// inserted by the admin API and picked up by Run. A restart's params are
+// {"base_generation": N, "config": <complete target configuration>}; the
+// operation stores {"base_generation", "prev": <configuration of N>,
+// "next": <target>} and is refused with store.ErrConflict when the project is
+// no longer at generation N. A delete takes no params.
+func (r *Runner) Submit(ctx context.Context, kind, ref string, params json.RawMessage) (int64, error) {
+	if kind != "restart" && kind != "delete" {
+		return 0, fmt.Errorf("%w: operation kind %q cannot be submitted", store.ErrConflict, kind)
+	}
+	p, err := r.st.GetProject(ctx, ref)
+	if err != nil {
+		return 0, err
+	}
+	if kind == "delete" {
+		return r.st.SubmitOperation(ctx, ref, kind, nil, p.Generation, time.Now())
+	}
+	var in struct {
+		BaseGeneration int64               `json:"base_generation"`
+		Config         store.ProjectConfig `json:"config"`
+	}
+	if err := strictJSON(params, &in); err != nil {
+		return 0, fmt.Errorf("restart parameters: %w", err)
+	}
+	// prev is read outside the admitting transaction; the generation check
+	// there proves it is still the configuration of base_generation.
+	out, err := json.Marshal(restartParams{BaseGeneration: in.BaseGeneration, Prev: p.Config, Next: in.Config})
+	if err != nil {
+		return 0, err
+	}
+	return r.st.SubmitOperation(ctx, ref, kind, out, in.BaseGeneration, time.Now())
+}
+
+// Abort marks the ref's create aborting and returns its id; the worker that
+// holds or next takes the ref lock compensates.
+func (r *Runner) Abort(ctx context.Context, ref string) (int64, error) {
+	return r.st.RequestAbort(ctx, ref)
+}

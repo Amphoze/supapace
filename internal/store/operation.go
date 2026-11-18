@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -38,9 +39,12 @@ func hasOpenOperation(ctx context.Context, tx pgx.Tx, ref string, except int64) 
 }
 
 // SubmitOperation queues a restart or delete of an active project with no
-// other open operation. A restart targets generation + 1, anything else the
-// current generation; project.generation itself is not touched.
-func (s *Store) SubmitOperation(ctx context.Context, ref, kind string, params json.RawMessage, notBefore time.Time) (int64, error) {
+// other open operation, provided the project is still at generation base —
+// the generation the caller read when it built params, so two restarts merged
+// from the same base cannot drop each other's settings. A restart targets
+// generation + 1, anything else the current generation; project.generation
+// itself is not touched.
+func (s *Store) SubmitOperation(ctx context.Context, ref, kind string, params json.RawMessage, base int64, notBefore time.Time) (int64, error) {
 	if kind != "restart" && kind != "delete" {
 		return 0, fmt.Errorf("%w: operation kind %q cannot be submitted", ErrConflict, kind)
 	}
@@ -53,6 +57,9 @@ func (s *Store) SubmitOperation(ctx context.Context, ref, kind string, params js
 		}
 		if state != "active" {
 			return fmt.Errorf("%w: %s needs an active project; it is %s", ErrConflict, kind, state)
+		}
+		if gen != base {
+			return fmt.Errorf("%w: the project is at generation %d, not %d; read it again", ErrConflict, gen, base)
 		}
 		// Two open restarts would both target generation + 1.
 		open, err := hasOpenOperation(ctx, tx, ref, 0)
@@ -72,13 +79,16 @@ func (s *Store) SubmitOperation(ctx context.Context, ref, kind string, params js
 	return id, err
 }
 
-// NextOperation returns the lowest-id open operation that is due, is the
-// oldest open operation of its ref, and whose ref lock nobody holds.
+// NextOperation returns the open operation that is due, is the oldest open
+// operation of its ref, and whose ref lock nobody holds — of those, the one
+// least recently written (every attempt and every FailAttempt refreshes
+// updated_at), so the project least recently run goes first and a backed-off
+// operation never pre-empts another project's ready one.
 func (s *Store) NextOperation(ctx context.Context) (op Operation, ok bool, err error) {
 	err = s.tx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, "select "+opCols+" from operation o where state in "+openStates+` and not_before <= now()
 			and not exists (select 1 from operation p where p.ref = o.ref and p.id < o.id and p.state in `+openStates+`)
-			order by id`)
+			order by updated_at, id`)
 		if err != nil {
 			return err
 		}
@@ -151,9 +161,12 @@ func (s *Store) SetOperationParams(ctx context.Context, id int64, params json.Ra
 }
 
 // FailAttempt backs an operation off until retryAt: a running one goes back to
-// pending; an aborting one stays aborting.
+// pending; an aborting one stays aborting and counts one more attempt (the
+// worker never starts an aborting operation, so there attempts counts failed
+// compensation runs).
 func (s *Store) FailAttempt(ctx context.Context, id int64, lastError string, retryAt time.Time) error {
 	return s.opUpdate(ctx, `update operation set state = case state when 'running' then 'pending' else state end,
+		attempts = case state when 'aborting' then attempts + 1 else attempts end,
 		last_error = $2, not_before = $3, updated_at = now() where id = $1 and state in ('running', 'aborting')`,
 		id, lastError, retryAt)
 }
@@ -201,6 +214,10 @@ func (s *Store) RetryOperation(ctx context.Context, id int64) error {
 
 // RequestAbort marks the open or failed create of a provisioning project
 // aborting and returns its id; a create already aborting is returned as is.
+// Every move to aborting resets attempts, which then counts compensation
+// runs; a create parked failed after its compensation runs is re-armed. A
+// project that is not provisioning (an active one included) is refused:
+// step 12 makes it active and finishes the create in one transaction.
 func (s *Store) RequestAbort(ctx context.Context, ref string) (opID int64, err error) {
 	err = s.tx(ctx, func(tx pgx.Tx) error {
 		state, err := lockProject(ctx, tx, ref)
@@ -215,11 +232,11 @@ func (s *Store) RequestAbort(ctx context.Context, ref string) (opID int64, err e
 			Scan(&opID, &opState); err != nil {
 			return fmt.Errorf("%w: no create operation", ErrConflict)
 		}
-		switch opState {
-		case "aborting":
+		switch {
+		case opState == "aborting":
 			return nil
-		case "pending", "running", "failed":
-			_, err := tx.Exec(ctx, "update operation set state = 'aborting', not_before = now(), updated_at = now() where id = $1", opID)
+		case opState == "failed" || opState == "pending" || opState == "running":
+			_, err := tx.Exec(ctx, "update operation set state = 'aborting', attempts = 0, not_before = now(), updated_at = now() where id = $1", opID)
 			return err
 		}
 		return fmt.Errorf("%w: create operation is %s", ErrConflict, opState)
@@ -238,6 +255,49 @@ func (s *Store) SetPurgeNow(ctx context.Context, ref string) error {
 			where ref = $1 and kind = 'purge' and state = 'pending'`, ref)
 		if err == nil && tag.RowsAffected() == 0 {
 			return fmt.Errorf("%w: no pending purge; project is %s", ErrConflict, state)
+		}
+		return err
+	})
+}
+
+// ParkAbort ends an aborting create whose compensation has failed in 8 runs
+// as failed, so it stops costing the worker; RequestAbort re-arms it.
+func (s *Store) ParkAbort(ctx context.Context, id int64, lastError string) error {
+	return s.opUpdate(ctx, `update operation set state = 'failed', last_error = $2, updated_at = now()
+		where id = $1 and state = 'aborting' and attempts >= 8`, id, lastError)
+}
+
+// FinishCreate is a create's step 12 in one transaction: the operation done
+// at step 12 and the project active at the operation's generation, only while
+// the operation is a running create and the project provisioning. An abort
+// that won leaves both as they were (ErrConflict).
+func (s *Store) FinishCreate(ctx context.Context, id int64) error {
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		// The project row first, then the operation row: the order of
+		// RequestAbort, so the two cannot deadlock.
+		var ref string
+		if err := tx.QueryRow(ctx, "select ref from operation where id = $1", id).Scan(&ref); err != nil {
+			return err
+		}
+		if _, err := lockProject(ctx, tx, ref); err != nil {
+			return err
+		}
+		var gen int64
+		err := tx.QueryRow(ctx, `update operation set state = 'done', step = '12', last_error = null, updated_at = now()
+			where id = $1 and kind = 'create' and state = 'running' returning generation`, id).Scan(&gen)
+		if errors.Is(err, pgx.ErrNoRows) {
+			var state string
+			if err := tx.QueryRow(ctx, "select state from operation where id = $1", id).Scan(&state); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: operation is %s", ErrConflict, state)
+		}
+		if err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, "update project set state = 'active', applied_gen = $2 where ref = $1 and state = 'provisioning'", ref, gen)
+		if err == nil && tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: project is no longer provisioning", ErrConflict)
 		}
 		return err
 	})
