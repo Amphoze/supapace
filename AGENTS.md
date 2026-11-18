@@ -310,7 +310,8 @@ patch surface, backup model) were verified against upstream source first.
   `not_found` (404), `body_too_large` (413), `misdirected` (421), `too_many_requests` (429,
   per project), `unavailable` (503, gateway-wide or an empty table), `project_restarting` (503,
   a draining project), `bad_request` and `upgrade_not_supported` (400), `upstream_unavailable` (502),
-  `upstream_timeout` (504). The gateway refuses tokens without `kid`,
+  `upstream_timeout` (504), `http_version_not_supported` (505). The gateway refuses tokens
+  without `kid`,
   `exp` or `role`, with an unknown `crit`, a duplicate `role`, or `role = authenticator`.
 - Limits (constants next to each other in `server.go` / `limit.go`, pinned by tests):
   2,048 connections and 64 per source (an IPv6 /64 is one source); 2,048 proxied requests in
