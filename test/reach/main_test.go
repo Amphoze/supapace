@@ -143,7 +143,17 @@ func buildFixtures(t testing.TB) {
 	var list projectsJSON
 	decode(t, "project list", out, &list)
 	for _, p := range list.Projects {
-		if p.Name == scratchName && !removeProject(t, p.Ref) {
+		if p.Name != scratchName {
+			continue
+		}
+		// A killed run of test 14 can leave the include of a FIFO behind,
+		// which makes every retry of the project's restart fail.
+		if p.State == "restarting" {
+			if err := dropFifoInclude(t, p.Ref, p.UID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !removeProject(t, p.Ref) {
 			t.Fatalf("a scratch project of an earlier run (%s) cannot be removed", p.Ref)
 		}
 	}

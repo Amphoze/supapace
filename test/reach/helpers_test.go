@@ -592,11 +592,11 @@ func platformKey(t testing.TB, p Project, name string) (*rsa.PrivateKey, string)
 	return priv, jwtx.KID(&priv.PublicKey)
 }
 
-// sqlAs runs sql in p's cluster as role over loopback (docker exec … psql -h
-// 127.0.0.1) and returns the unaligned, tuples-only output. postgres uses p's
-// password, supabase_admin and authenticator their platform secrets, any other
-// role none. The password reaches psql through the environment, never argv.
-// The error carries psql's message.
+// sqlAs runs sql in p's cluster as role (docker exec … psql -h psqlHost(role))
+// and returns the unaligned, tuples-only output. postgres uses p's password,
+// supabase_admin and authenticator their platform secrets, any other role
+// none. The password reaches psql through the environment, never argv. The
+// error carries psql's message.
 func sqlAs(t testing.TB, p Project, role, sql string) (string, error) {
 	t.Helper()
 	var pw string
@@ -606,8 +606,7 @@ func sqlAs(t testing.TB, p Project, role, sql string) (string, error) {
 	case "supabase_admin", "authenticator":
 		pw = string(platformSecret(t, p, "pg."+role+".password"))
 	}
-	r, err := run(cmdTimeout, []string{"PGPASSWORD=" + pw}, "docker", "exec", "-e", "PGPASSWORD", "pg-"+p.Ref,
-		"psql", "-X", "-w", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-U", role, "-d", "postgres", "-c", sql)
+	r, err := run(cmdTimeout, []string{"PGPASSWORD=" + pw}, psqlArgv(p.Ref, role, sql)...)
 	if err != nil {
 		t.Fatalf("sql as %s in %s: %v", role, p.Ref, err)
 	}
@@ -615,6 +614,16 @@ func sqlAs(t testing.TB, p Project, role, sql string) (string, error) {
 		return "", fmt.Errorf("psql exit %d: %s", r.code, redact(brief(r.stderr)))
 	}
 	return strings.TrimSpace(r.stdout), nil
+}
+
+// psqlHost is where psql inside the cluster container reaches the server as
+// role: the platform's administrative role is admitted over the socket only
+// (its loopback line rejects), every other role over loopback.
+func psqlHost(role string) string {
+	if role == "supabase_admin" {
+		return "/var/run/postgresql"
+	}
+	return "127.0.0.1"
 }
 
 // ───────── node ─────────

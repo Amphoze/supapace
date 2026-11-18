@@ -820,3 +820,50 @@ patch surface, backup model) were verified against upstream source first.
   image); about 50 s with `-race`. As root they run the server at an unprivileged project uid.
   `TestAssert_NamesAreFrozen` fixes the check names; `TestAssert_AllowListMatchesImageFixture`
   ties the source-file allow-list to the image fixture.
+
+### 2026-11-18 — reach suite: cluster and saga tests
+
+- New tests in `test/reach/cluster_test.go` (tagged `reach`): the image's own refusals and
+  the platform's drift report (07, `7a_image_parity`, `7b_bootstrap`); socket and loopback
+  rules, a planted link, a fake backend in the container and a container whose init is a
+  fake backend (09, `socket_replaced`), and per-project secrets (09); outbound extensions
+  off by default (10); refs (11); disk and inode quota with a log flood (13); resumable
+  creates, queueing, retention, identity release, purge of a hostile tree and a restart
+  against an include of a FIFO (14); the route and adoption half of test 16.
+- Helpers that need no daemon are in the untagged `clusterhelp_test.go` (self-tests in
+  `clusterhelp_self_test.go`, `!reach`): the check document and drift names, the fake
+  backend's log read by its LEN fields, the messages a client sent it, the expected
+  verdict of each fake mode, the user quota report, the agent's state file, a log bound
+  and tail, a tree count by descriptor, and background steps (`repeatWhile`,
+  `inBackground`). `sqlAs` reaches the administrative role over the socket (its loopback
+  line rejects).
+- Rules for later tests:
+  - Results are read as the CLI's JSON documents and codes, and drift by its check name.
+  - Quota verdicts come from `xfs_quota`'s report, never from shell text. Fills run in a
+    separate container of the cluster image at the project's uid.
+  - A log bound is checked as configured (under 31 MiB) as well as stored. Rotated files
+    are compressed. Docker's data root is read from `docker info`.
+  - The fake backend is started one per socket path, and the test waits for `listening`.
+    "No connection" means "received no bytes".
+  - Anything placed in a project (fake, password file, canaries, fills) is removed in
+    cleanup. Every command has a deadline.
+  - A step run beside the test (`inBackground`) is waited for on every exit path, within
+    a bound longer than its own deadline.
+  - A container of A or B that a test stops is brought back with `project restart`, never
+    `docker start`, in cleanup and at the start of test 16.
+  - A's settings that a test changes are reset at the start as well as in cleanup.
+- Fixture setup: before removing a scratch project an earlier run left `restarting`, the
+  setup removes the include of a FIFO from its `postgresql.auto.conf`, through a
+  container of the cluster image at the project's uid (`dropFifoInclude`). The restart can
+  then be retried and the project deleted and purged. The suite reset is unchanged.
+- Exercised so far only against stand-ins in a bare node (a cluster container of the
+  pinned image with the platform's flags and rendered files, quota on the node's XFS, a
+  check made with `pgsock` and `bootstrap`): 07, 09 (socket rules and the three fakes'
+  verdicts), 10, 13 (fills and flood) and the hostile tree of 14. Everything that needs
+  the daemon is unexercised until it exists: creates, restarts, purge, failpoints, the
+  gateway, and tests 11 and 16. The log-line half of 14's control-character check waits
+  for the harness to keep the daemon's output.
+- Found while proving the hostile tree of 14: the shell tools of the cluster image walk by
+  path and cannot remove a tree nested deeper than a path can name. The purge and wipe
+  tasks therefore must not rely on them; the test stays red until they remove by
+  descriptor.
