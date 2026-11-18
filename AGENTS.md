@@ -1590,3 +1590,30 @@ Known limits
   minute); when the store is unreachable a dead container's route stays active; a hold that is
   refreshed forever pauses project repairs forever; a daemon stopped during the disconnect
   phase of `StopAllTenants` kills every tenant (crash recovery at the next start).
+
+### 2026-11-19 — Documentation, CI workflow, measurement script, Makefile entry points
+
+- README.md (what exists and what does not yet: no backups; quick start on the test node;
+  contributing rules), docs/architecture.md, docs/node-install.md, docs/operations.md and
+  docs/measurements.md describe the system as built. They document today's behaviour where it
+  is a known limit: a restart to a disk quota below usage, or whose new cluster does not start,
+  leaves the project `restarting` (the former with no command out); `--user-role` replaces
+  `authenticated`; a blocking node-check row that fails while the daemon runs is acted on only
+  at the next start. Change those passages together with the code.
+- .github/workflows/ci.yml: push to master and tags, pull requests. `public` (content gate over
+  the tree, the pushed or proposed range — whole history for a new ref or force push — and the
+  tag object on a tag push; deny-list from the secret SUPAPACE_DENYLIST, written to
+  $RUNNER_TEMP and never printed, or a stand-in that matches nothing), `unit` (gofmt, vet with
+  and without the reach tag, pinned images pulled, go test -race with the skipped tests listed),
+  `reach` (make images, node-up, reach) and `reach-host` (install-node.sh on the runner VM).
+  Actions pinned by major tag. Job-level concurrency on the two reach jobs only.
+- test/measure/cluster_mem.sh (test nodes only): memory of one cluster idle and under pgbench
+  load; samples memory.current and anon every second per phase (max_cur, max_anon); memory.peak
+  is printed since container start only. The client shares the cluster's network namespace, not
+  its cgroup.
+- Makefile: `node-up` (full mode) waits up to 60 s until `supapace node check` answers, else
+  prints the daemon log tail and fails; `reach-host` installs bin/* to /opt/supapace/bin first;
+  `measure` takes REF, IDLE, LOAD, CLIENTS and on Ctrl-C stops the script through
+  /run/sp-measure.pid.
+- Known limits: no gateway capacity script yet (docs/measurements.md lists the method). Merge by
+  local fast-forward push: GitHub's merge buttons commit as an address the gate refuses.

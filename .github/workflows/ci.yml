@@ -1,0 +1,209 @@
+# Continuous integration. Actions are pinned by major tag, not by commit.
+#
+#   public      the content gate over the tree and over the pushed or proposed commits
+#   unit        gofmt, go vet (also with the reach tag), go test -race
+#   reach       the end-to-end suite in the test node container, as `make reach` locally
+#   reach-host  the suite on the runner VM itself, installed by scripts/install-node.sh
+#
+# Pull requests from forks get no secrets: the public job then runs the gate's built-in
+# rules with a stand-in deny-list and says so.
+name: ci
+
+# Pushes to master and tags, and pull requests: a branch with a pull request runs once.
+# There is no workflow-wide concurrency group: a pending push run is never cancelled before
+# its commits are range-checked; only the long node jobs share a group per ref.
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.x"
+
+jobs:
+  public:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      # The deny-list is written to a file outside the workspace and never printed.
+      # Without the secret, the stand-in pattern [^\x00-\x{10FFFF}] is a character
+      # class that excludes every character: it compiles and matches no line, so the
+      # gate runs with its built-in rules only.
+      - name: Deny-list
+        env:
+          DENYLIST: ${{ secrets.SUPAPACE_DENYLIST }}
+        run: |
+          umask 077
+          f="$RUNNER_TEMP/denylist"
+          if [ -n "$DENYLIST" ]; then
+            printf '%s\n' "$DENYLIST" >"$f"
+          else
+            printf '%s\n' '[^\x00-\x{10FFFF}]' >"$f"
+            echo "::notice title=content gate::the operator's deny-list is not available to this run; only the built-in rules were applied"
+          fi
+          echo "SUPAPACE_DENYLIST=$f" >>"$GITHUB_ENV"
+      - name: Gate over the tree
+        run: scripts/check-public.sh --tree
+      - name: Gate over the commits
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          case $EVENT in
+          pull_request) range="$BASE..$HEAD" ;;
+          push)
+            if git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then range="$BEFORE..$GITHUB_SHA"
+            else range=$GITHUB_SHA; fi ;; # new branch, tag or force push: the whole history
+          *) range=$GITHUB_SHA ;;
+          esac
+          scripts/check-public.sh --range "$range"
+          # A tag push: the tag object too (tagger, time zone, message).
+          # The checkout leaves the tag pointing at its commit: fetch the tag object itself.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            git fetch --force --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+            scripts/check-public.sh --tag "refs/tags/$GITHUB_REF_NAME"
+          fi
+      - name: Gate tests
+        run: scripts/test-check-public.sh
+
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          [ -z "$out" ] || { printf 'not gofmt-formatted:\n%s\n' "$out"; exit 1; }
+      - run: go vet ./...
+      - run: go vet -tags reach ./...
+      # The Docker tests skip when their pinned image is absent: pull both so they run.
+      - name: Pinned images
+        run: |
+          for k in control_plane postgres; do
+            ref=$(sed -n "s/^ *\"$k\": *{\"tag\": *\"\([^\":]*\)[^\"]*\", *\"digest\": *\"\([^\"]*\)\".*/\1@\2/p" internal/nodecfg/images.lock)
+            docker pull -q "$ref"
+          done
+      # Tests that need Docker start throw-away containers labelled supapace.test=1. The
+      # skipped tests are listed (root-only tests skip here), so a new skip is visible.
+      - name: go test -race
+        run: |
+          s=0
+          go test -race -v ./... >"$RUNNER_TEMP/test.log" 2>&1 || s=$?
+          grep -E -- '^(--- FAIL|FAIL|ok)' "$RUNNER_TEMP/test.log" || true
+          grep -E -- '--- SKIP' "$RUNNER_TEMP/test.log" || true
+          echo "::notice title=skipped tests::$(grep -c -- '--- SKIP' "$RUNNER_TEMP/test.log") skipped"
+          [ "$s" = 0 ] || { grep -B 30 -E -- '^--- FAIL' "$RUNNER_TEMP/test.log" || tail -n 100 "$RUNNER_TEMP/test.log"; exit "$s"; }
+
+  # The node is a privileged Docker-in-Docker container with a loop-mounted XFS file
+  # system (user and project quota) and nftables inside its own network namespace.
+  # From the runner it needs: Docker with --privileged and cgroup v2 (--cgroupns
+  # private), free loop devices, and the kernel modules the node's mount and nft
+  # load on demand (xfs, nf_tables, bridge connection tracking).
+  reach:
+    needs: [public, unit]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: reach-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Runner facts
+        run: |
+          uname -r
+          docker version --format 'docker {{.Server.Version}}'
+          docker info -f 'store {{.Driver}} {{json .DriverStatus}}'
+          stat -fc 'cgroup %T' /sys/fs/cgroup
+          sudo losetup -f
+          grep -qw xfs /proc/filesystems || sudo modprobe xfs
+          grep -w xfs /proc/filesystems
+          # ct state in the bridge table needs bridge connection tracking.
+          sudo modprobe nf_conntrack_bridge && echo "nf_conntrack_bridge: available"
+      # Upstream images by digest (images.lock); make images skips archives already cached.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/supapace/images
+          key: images-${{ runner.arch }}-${{ hashFiles('internal/nodecfg/images.lock') }}
+      - run: make images
+      - run: make node-up
+      - run: make reach
+      - name: Node logs
+        if: failure()
+        run: |
+          docker logs --tail 50 sp-node || true
+          docker exec sp-node tail -n 200 /var/log/supapaced.log || true
+      - name: Node down
+        if: always()
+        run: make node-down
+
+  # The same suite on the runner VM, installed as a real node (systemd, the host's
+  # Docker and nftables), with the host-only tests.
+  reach-host:
+    needs: [public, unit]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: reach-host-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # Pulls every pinned image into the runner's Docker and builds the gateway image.
+      - run: make images IMAGE_CACHE="$RUNNER_TEMP/images"
+      - name: Prepare the host
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nftables xfsprogs
+          # init writes daemon.json itself and refuses one holding other keys.
+          sudo rm -f /etc/docker/daemon.json
+          # TestHost_FirewallRestartReloadsRules restarts the distribution's firewall.
+          sudo systemctl enable --now nftables.service
+          sudo truncate -s 8G /var/lib/supapace-projects.img
+          sudo mkfs.xfs -q /var/lib/supapace-projects.img
+          sudo mkdir -p /var/lib/supapace/projects
+          sudo mount -o loop,usrquota,prjquota /var/lib/supapace-projects.img /var/lib/supapace/projects
+      # The key escrow goes to a file the runner user writes, not to the job log.
+      - name: Install the node
+        run: |
+          # shellcheck disable=SC2024
+          sudo scripts/install-node.sh --domain sp.test --dev --ack-escrow >"$RUNNER_TEMP/init.out"
+          # The daemon serves, then has ensured the gateway.
+          for _ in $(seq 120); do
+            sudo /usr/local/bin/supapace node check 2>/dev/null | grep -q '"name":"gateway","ok":true' && break
+            sleep 1
+          done
+          sudo /usr/local/bin/supapace node check
+      - run: sudo env "PATH=$PATH" make reach-host
+      - name: Daemon log
+        if: failure()
+        run: sudo journalctl -u supapaced --no-pager -n 300 || true

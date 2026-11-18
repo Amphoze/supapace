@@ -77,6 +77,12 @@ node-up node-bare:
 			echo "node: $(NODE) stopped during boot:" >&2; docker logs --tail 20 $(NODE) >&2; exit 1; fi; \
 		sleep 1; done; \
 		echo "node: docker did not come up" >&2; exit 1
+	@# Full mode: also wait until the daemon answers on its admin socket.
+	@if [ $(MODE) = full ] && [ -x $(BIN)/supapaced ]; then \
+		for i in $$(seq 60); do \
+			docker exec $(NODE) $(NODE_BIN)/supapace node check 2>/dev/null | grep -q '"checks"' && exit 0; sleep 1; done; \
+		echo "node: the daemon did not answer node check within 60 s:" >&2; \
+		docker exec $(NODE) tail -n 20 /var/log/supapaced.log >&2; exit 1; fi
 
 # Volumes go too: a kept Docker volume would leave stale proj-* networks behind.
 node-down:
@@ -92,14 +98,19 @@ reach-reboot: build
 		echo "node: admin socket did not appear" >&2; exit 1
 	$(call node_reach,-test.run 'TestReach05_AfterReboot|TestReach03' $(REACH_ARGS),-e SUPAPACE_REBOOT=1)
 
-# On a host prepared by scripts/install-node.sh, as root.
+# On a host prepared by scripts/install-node.sh, as root. The suite runs the
+# binaries from $(NODE_BIN), as in the test node, so they are installed there first.
 reach-host: build
+	install -d -m 0755 $(NODE_BIN) && install -m 0755 $(BIN)/* $(NODE_BIN)/ || exit 1; \
 	sh -c '$(call reset,supapaced)' || exit 1; \
 	SUPAPACE_HOST=1 $(BIN)/reach.test $(REACH_FLAGS) $(REACH_ARGS); s=$$?; \
 	sh -c '$(call reset,supapaced)' || exit 1; exit $$s
 
+# Ctrl-C ends docker exec (with status 0) but reaches no process inside the node: a
+# script still running afterwards (its pid file exists) is stopped.
 measure:
-	docker exec -i $(NODE) sh -s < test/measure/cluster_mem.sh
+	docker exec -i $(foreach v,REF IDLE LOAD CLIENTS,$(if $($(v)),-e $(v)=$($(v)))) $(NODE) sh -s < test/measure/cluster_mem.sh; s=$$?; \
+	docker exec $(NODE) sh -c 'test ! -e /run/sp-measure.pid || kill $$(cat /run/sp-measure.pid)'; exit $$s
 
 public-check:
 	scripts/check-public.sh --tree
