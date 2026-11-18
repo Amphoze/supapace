@@ -352,12 +352,19 @@ func TestCLI_RuntimeErrorWithoutUsage(t *testing.T) {
 }
 
 func TestCLI_Help(t *testing.T) {
-	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"project", "create", "--help"},
-		{"project", "list", "-h"}, {"op", "retry", "12", "-help"}} {
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}} {
 		f := newFake(t, reply{200, `{}`})
 		out, errOut, code := f.run(t, args...)
 		if code != 0 || errOut != "" || len(f.requests()) != 0 || out != usageText() {
 			t.Errorf("%q: exit %d stderr %q, %d requests", args, code, errOut, len(f.requests()))
+		}
+	}
+	// A command's help is its own usage.
+	for _, args := range [][]string{{"project", "create", "--help"}, {"project", "list", "-h"}, {"op", "retry", "12", "-help"}} {
+		f := newFake(t, reply{200, `{}`})
+		out, errOut, code := f.run(t, args...)
+		if code != 0 || errOut != "" || len(f.requests()) != 0 || out != "usage:\n"+commandUsage(args[0]+" "+args[1]) {
+			t.Errorf("%q: exit %d stdout %q stderr %q, %d requests", args, code, out, errOut, len(f.requests()))
 		}
 	}
 	u := usageText()
@@ -369,11 +376,12 @@ func TestCLI_Help(t *testing.T) {
 			t.Errorf("usage lacks %q", s)
 		}
 	}
-	// Missing or unknown commands: usage on stderr, exit 2.
+	// Missing or unknown commands: the error and a pointer to --help on stderr,
+	// not the whole usage; exit 2.
 	for _, args := range [][]string{nil, {"project"}, {"frob"}, {"project", "frob"}} {
 		f := newFake(t, reply{200, `{}`})
 		out, errOut, code := f.run(t, args...)
-		if code != 2 || out != "" || !strings.Contains(errOut, usageText()) {
+		if code != 2 || out != "" || strings.Count(errOut, "\n") != 2 || !strings.Contains(errOut, "supapace --help") {
 			t.Errorf("%q: exit %d stdout %q", args, code, out)
 		}
 	}
@@ -445,7 +453,7 @@ func TestCLI_ProgressWording(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
-	for _, s := range []string{"operation 12: pending, starting", "operation 12: running, after step 3",
+	for _, s := range []string{"operation 12: pending, before its first step", "operation 12: running, after step 3",
 		"operation 12: last error: timeout: step 4: cluster not ready"} {
 		if !strings.Contains(errOut, s) {
 			t.Errorf("stderr lacks %q:\n%s", s, errOut)
@@ -640,8 +648,99 @@ func TestCLI_GroupHelp(t *testing.T) {
 	for _, g := range []string{"project", "op", "node"} {
 		f := newFake(t, reply{200, `{}`})
 		out, errOut, code := f.run(t, g)
-		if code != 2 || out != "" || !strings.Contains(errOut, "missing command") || !strings.Contains(errOut, usageText()) {
+		if code != 2 || out != "" || !strings.Contains(errOut, "missing command") || strings.Contains(errOut, "Exit status") {
 			t.Errorf("%s: exit %d stderr %q", g, code, errOut)
 		}
+	}
+}
+
+// TestCLI_UsageErrorShowsTheCommandOnly: a malformed command prints the
+// error, that command's usage and a pointer to --help, not the whole text.
+func TestCLI_UsageErrorShowsTheCommandOnly(t *testing.T) {
+	f := newFake(t, reply{200, `{}`})
+	out, errOut, code := f.run(t, "project", "restart", "abcdefghij0123456789", "--frob")
+	want := "supapace: project restart: flag provided but not defined: -frob\nusage:\n" +
+		commandUsage("project restart") + "see 'supapace --help' for the usage of every command\n"
+	if code != 2 || out != "" || errOut != want {
+		t.Fatalf("exit %d stdout %q stderr:\n%s\nwant:\n%s", code, out, errOut, want)
+	}
+	if u := commandUsage("project restart"); !strings.HasPrefix(u, "  project restart REF") || !strings.Contains(u, "max_connections") ||
+		strings.Contains(u, "project delete") {
+		t.Fatalf("command usage %q", u)
+	}
+	if commandUsage("node check") != "  node check\n" || commandUsage("project frob") != "" {
+		t.Fatalf("node check %q", commandUsage("node check"))
+	}
+}
+
+// TestCLI_HelpSaysWhatKeysAndTokensAre: the help of create, keys and show
+// explains how tokens are signed, what each key is for and that show's state
+// is not health.
+func TestCLI_HelpSaysWhatKeysAndTokensAre(t *testing.T) {
+	flat := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	for verb, wants := range map[string][]string{
+		"project create": {"no shared secret", "RS256", `"kid"`, `"role"`, `"exp"`, "Authorization: Bearer",
+			"create role editor nologin", "grant editor to authenticator"},
+		"project keys": {"url", "ca_cert", "anon_key", "client applications", "service_role_key", "trusted servers",
+			"postgres_password", "docker exec -it pg-REF psql -h 127.0.0.1 -U postgres", "psql asks for it"},
+		"project show": {"not health", "project check"},
+		"project list": {"--state STATE", "aborted"},
+	} {
+		u := flat(commandUsage(verb))
+		for _, w := range wants {
+			if !strings.Contains(u, w) {
+				t.Errorf("%s: usage lacks %q", verb, w)
+			}
+		}
+	}
+}
+
+func TestCLI_ListStateFilter(t *testing.T) {
+	f := newFake(t, reply{200, `{"projects":[]}`})
+	if _, _, code := f.run(t, "project", "list", "--state", "active", "--state", "deleted"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if r := f.requests(); len(r) != 1 || r[0].uri != "/v1/projects?state=active&state=deleted" {
+		t.Fatalf("requests %+v", r)
+	}
+}
+
+// TestCLI_CreateSaysWhereToLook: a create that succeeded points at project
+// keys and, for user roles other than authenticated, says they must exist.
+func TestCLI_CreateSaysWhereToLook(t *testing.T) {
+	jf := jwksFile(t)
+	f := newFake(t, reply{202, accepted}, reply{200, final("done")})
+	_, errOut, code := f.run(t, "project", "create", "--name", "d", "--issuer-jwks", jf, "--user-role", "authenticated",
+		"--user-role", "editor")
+	if code != 0 || !strings.Contains(errOut, "'supapace project keys abcdefghij0123456789'") ||
+		!strings.Contains(errOut, "role(s) editor once each exists") {
+		t.Fatalf("exit %d stderr %q", code, errOut)
+	}
+	f = newFake(t, reply{202, accepted})
+	_, errOut, code = f.run(t, "project", "create", "--name", "d", "--issuer-jwks", jf, "--no-wait")
+	if code != 0 || !strings.Contains(errOut, "abcdefghij0123456789 is being created; follow it with 'supapace op show 12'; once it is done") ||
+		strings.Contains(errOut, "role") {
+		t.Fatalf("no-wait: exit %d stderr %q", code, errOut)
+	}
+	// Nothing on a failure, nor for other commands.
+	f = newFake(t, reply{202, accepted}, reply{200, final("failed")})
+	if _, errOut, _ = f.run(t, "project", "create", "--name", "d", "--issuer-jwks", jf); strings.Contains(errOut, "project keys") {
+		t.Fatalf("failed create: %q", errOut)
+	}
+	f = newFake(t, reply{202, accepted}, reply{200, final("done")})
+	if _, errOut, _ = f.run(t, "project", "delete", "abcdefghij0123456789"); strings.Contains(errOut, "project keys") {
+		t.Fatalf("delete: %q", errOut)
+	}
+}
+
+// TestCLI_EmptyStepWording: an operation that has completed no step is
+// "before its first step", never "after step ".
+func TestCLI_EmptyStepWording(t *testing.T) {
+	df := strings.Replace(opJSON("failed", "", "internal: x"), `"create"`, `"delete"`, 1)
+	f := newFake(t, reply{202, accepted}, reply{200, df})
+	_, errOut, code := f.run(t, "project", "delete", "abcdefghij0123456789")
+	if code != 1 || !strings.Contains(errOut, "operation 12 failed before its first step: internal: x") ||
+		strings.Contains(errOut, "after step") {
+		t.Fatalf("exit %d stderr %q", code, errOut)
 	}
 }

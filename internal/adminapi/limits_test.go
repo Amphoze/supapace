@@ -28,13 +28,13 @@ func TestAPI_KeysInternalErrorsLogNoSecret(t *testing.T) {
 	b := logs(t)
 	var wrong secrets.KEK
 	rand.Read(wrong[:])
-	e.h = New(e.st, wrong, e.ops)
+	e.h = New(e.st, wrong, e.ops, "sp.test", e.p)
 	eb := e.wantCode(t, "GET", "/v1/projects/"+ref+"/keys", "", 500, "internal")
 	if eb.Message != "internal error" || strings.Count(b.String(), "\n") != 1 {
 		t.Fatalf("wrong KEK: message %q, log %q", eb.Message, b.String())
 	}
 	// A secret sealed for another name (ciphertext moved): Open fails.
-	e.h = New(e.st, e.kek, e.ops)
+	e.h = New(e.st, e.kek, e.ops, "sp.test", e.p)
 	other := "move0000000000000000"
 	e.active(t, other)
 	dek := make([]byte, 32)

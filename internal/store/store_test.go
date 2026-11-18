@@ -2009,3 +2009,92 @@ func TestTryLockRefChecked_DetectsLostLock(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestOpenOperation_ConflictNamesIt: a refusal for an open operation names
+// its id, kind and state, for a submit and for a retry.
+func TestOpenOperation_ConflictNamesIt(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	op := mustCreate(t, s, ref(1))
+	mustPlace(t, s, ref(1))
+	activate(t, s, ref(1), op)
+	rid, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
+	must(t, err)
+	_, err = s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
+	wantErr(t, err, ErrConflict)
+	if want := fmt.Sprintf("operation %d (restart) of the project is pending", rid); !strings.Contains(err.Error(), want) {
+		t.Fatalf("error %q lacks %q", err, want)
+	}
+	// A failed restart is refused a retry while a delete is open.
+	must(t, s.StartOperation(ctx, rid))
+	must(t, s.FinishOperation(ctx, rid, "failed", "x"))
+	did, err := s.SubmitOperation(ctx, ref(1), "delete", nil, 1, time.Now())
+	must(t, err)
+	err = s.RetryOperation(ctx, rid)
+	wantErr(t, err, ErrConflict)
+	if want := fmt.Sprintf("operation %d (delete) of the project is pending", did); !strings.Contains(err.Error(), want) {
+		t.Fatalf("error %q lacks %q", err, want)
+	}
+}
+
+// TestCheckAdmission: the pre-check applies Place's rule, counts projects
+// not placed yet, and names the figures.
+func TestCheckAdmission(t *testing.T) {
+	c := testConfig()
+	c.MemAllocMB = 2 * 768 // two default projects
+	s := newStore(t, c)
+	ctx := context.Background()
+	must(t, s.CheckAdmission(ctx, 512))
+	mustCreate(t, s, ref(1))
+	mustPlace(t, s, ref(1))
+	must(t, s.CheckAdmission(ctx, 512))
+	mustCreate(t, s, ref(2)) // not placed yet: counted all the same
+	err := s.CheckAdmission(ctx, 512)
+	wantErr(t, err, ErrNodeFull)
+	if want := "2 projects hold 1536 of the node's 1536 MiB; a project needs 768 MiB"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error %q lacks %q", err, want)
+	}
+	// Place keeps its own rule: it counts placed projects only.
+	mustPlace(t, s, ref(2))
+	mustCreate(t, s, ref(3))
+	_, err = s.Place(ctx, ref(3))
+	wantErr(t, err, ErrNodeFull)
+	if want := "2 projects hold 1536 of the node's 1536 MiB"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("Place: error %q lacks %q", err, want)
+	}
+	// An aborted project no longer counts.
+	must(t, s.MarkAborted(ctx, ref(1)))
+	must(t, s.MarkAborted(ctx, ref(3)))
+	must(t, s.CheckAdmission(ctx, 512))
+}
+
+// TestCheckAdmission_Pids: the process ceiling refuses on its own, with its
+// own figures, as Place's does.
+func TestCheckAdmission_Pids(t *testing.T) {
+	c := testConfig()
+	c.PidsAlloc = 2*projectPids - 1 // room for one project's processes, not two
+	s := newStore(t, c)
+	ctx := context.Background()
+	must(t, s.CheckAdmission(ctx, 512))
+	mustCreate(t, s, ref(1))
+	err := s.CheckAdmission(ctx, 512)
+	wantErr(t, err, ErrNodeFull)
+	if want := fmt.Sprintf("1 projects hold %d of the node's %d processes; a project needs %d", projectPids, 2*projectPids-1, projectPids); !strings.Contains(err.Error(), want) {
+		t.Fatalf("error %q lacks %q", err, want)
+	}
+}
+
+// TestCheckAdmission_NoNode: without a node row the pre-check says the node
+// is not initialised, not that a project is missing.
+func TestCheckAdmission_NoNode(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, "delete from node"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.CheckAdmission(ctx, 512)
+	wantErr(t, err, ErrConflict)
+	if errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "not initialised") {
+		t.Fatalf("error %v", err)
+	}
+}

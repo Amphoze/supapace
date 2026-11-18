@@ -1,1 +1,1 @@
-{"ref":"abcdefghij0123456789","anon_key":"anon-token","service_role_key":"service-token","postgres_password":"pg-password"}
+{"ref":"abcdefghij0123456789","anon_key":"anon-token","service_role_key":"service-token","postgres_password":"pg-password","url":"https://abcdefghij0123456789.sp.test","ca_cert":null}

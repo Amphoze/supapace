@@ -157,7 +157,7 @@ func serveCmd(args []string) int {
 		}
 		rn := saga.New(st, ag, kek, cfg, paths)
 		return &backend{st: st, rn: rn, close: st.Close,
-			api: func(o adminapi.Ops) http.Handler { return adminapi.New(st, kek, o) }}, nil
+			api: func(o adminapi.Ops) http.Handler { return adminapi.New(st, kek, o, cfg.Domain, paths) }}, nil
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

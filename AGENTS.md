@@ -1387,3 +1387,42 @@ Known limits
     one tick;
   - in the test node a killed log pipe ends the daemon at its next log line (it is started
     again after 1 s).
+
+### 2026-11-18 — operator surface: where to connect, early admission, clearer messages
+
+- `project show`, each element of `project list` and `project keys` carry `url`
+  (`https://<ref>.<domain>`, the domain the daemon loaded at start) and `ca_cert` (the path
+  of the node CA's certificate when that CA signed the gateway's certificate, else null;
+  checked at each request). No field was renamed or removed.
+- `adminapi.New(st, kek, ops, domain, paths)`: the daemon passes its node domain and paths;
+  the API reads no node configuration itself.
+- `POST /v1/projects` checks, in this order: request fields, a chosen ref's form
+  (400 `bad_ref`), a chosen ref that exists or existed (409 `ref_exists`), then admission:
+  409 `node_full` "admission ceiling reached: N projects hold X of the node's Y MiB; a
+  project needs Z MiB" (or the process ceiling, likewise) before any row is written, so a
+  refused create burns no ref. Creates through the API pass these checks and the insert
+  one at a time; a create waiting its turn gives up when its request ends.
+- `store.CheckAdmission` applies `Place`'s rule but also counts projects not placed yet;
+  it is advisory and `Place` stays the authority (its `node_full` last_error now carries the
+  same figures). Without a node row it refuses with a conflict: the node is not initialised.
+- `GET /v1/projects?state=S` (repeatable; an unknown state or any other parameter is 400);
+  `supapace project list --state S`. The default listing still includes tombstones.
+- Conflicts name the open operation: "operation N (KIND) of the project is STATE; wait for
+  it to end" (submit and retry). Abort on a project that is not provisioning says abort
+  applies only to a create in progress, pointing at delete (active) or purge (deleted).
+  A setting refused for its form names the accepted form; one that cannot be set points at
+  `project restart --help`. A reserved user role says which names are reserved and why.
+- Outside text (check messages, last_error, error bodies) passes the sanitiser and cap,
+  then `tidy`: whole ": "-separated parts that are platform package names, and a part that
+  repeats the one before it, are dropped. It only removes parts, keeps their order, never
+  removes the leading code of last_error, and keeps the stored last_error unchanged.
+- CLI: `<command> --help` prints that command alone; a usage error prints the error, that
+  command's usage and a pointer to `--help`. Help says what each key is for, how user
+  tokens are signed (RS256 with an issuer key; header `kid`; claims `role`, integer `exp`,
+  optional `sub` and `nbf`; at most 8 KiB) and how to open psql as postgres
+  (`docker exec -it pg-REF psql -h 127.0.0.1 -U postgres`, which prompts). A create adds
+  stderr notes (where to find url, keys and CA; with --no-wait, the operation to follow;
+  the --user-role roles the developer must create and grant to authenticator). stdout is
+  still exactly one JSON document. An operation with no step reads "before its first step".
+- Limits: the create serialisation is in-process (one daemon per node); the pre-check is
+  advisory and counts creates not placed yet, so it can refuse slightly earlier than `Place`.

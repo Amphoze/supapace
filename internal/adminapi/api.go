@@ -6,20 +6,26 @@
 // Requests are bounded (maxBody) and decoded strictly: unknown members,
 // trailing data and bodies on routes that take none are refused. Text that
 // reaches a response from elsewhere (store errors, operation errors, check
-// results) passes through pgsock.Sanitize and is capped. An unexpected error
+// results) passes through pgsock.Sanitize, is capped and loses the platform's
+// package-name prefixes and repeated parts (tidy). An unexpected error
 // answers "internal error"; its text goes to the log (log/slog), never to
 // the response. A path that is not clean is not found, never redirected.
 //
 // Mutations answer 202 with {"ref","operation_id"} and are refused with
 // containment_failed while the node's containment is not verified; reads are
-// always served.
+// always served. A create the placement would refuse for room is refused at once
+// with node_full. Projects and keys carry the project's URL and the path of
+// the CA certificate that signed the gateway's (read from node.json and the
+// node's TLS files at each request).
 package adminapi
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +33,9 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -119,17 +127,26 @@ func NewRef() (string, error) {
 // newRef is NewRef; tests replace it to force a collision.
 var newRef = NewRef
 
+// afterAdmission runs between a create's admission check and its insert;
+// tests replace it to race a second create there.
+var afterAdmission = func() {}
+
 type api struct {
-	st  *store.Store
-	kek secrets.KEK
-	ops Ops
+	st     *store.Store
+	kek    secrets.KEK
+	ops    Ops
+	domain string        // the node's domain, as the daemon loaded it
+	paths  nodecfg.Paths // the node CA and the gateway's certificate
+	// create holds one token: admission pre-check and insert of a create.
+	createSlot chan struct{}
 }
 
 // New returns the admin API. It inserts creates itself (store.CreateProject,
 // generating the ref when none is given); restarts and deletes go through
-// ops.Submit, aborts through ops.Abort.
-func New(st *store.Store, kek secrets.KEK, ops Ops) http.Handler {
-	a := &api{st: st, kek: kek, ops: ops}
+// ops.Submit, aborts through ops.Abort. domain is the node's domain as the
+// daemon loaded it; p locates the node CA and the gateway's certificate.
+func New(st *store.Store, kek secrets.KEK, ops Ops, domain string, p nodecfg.Paths) http.Handler {
+	a := &api{st: st, kek: kek, ops: ops, domain: domain, paths: p, createSlot: make(chan struct{}, 1)}
 	m := http.NewServeMux()
 	m.HandleFunc("POST /v1/projects", a.mutation(a.create))
 	m.HandleFunc("GET /v1/projects", read(a.listProjects))
@@ -201,12 +218,31 @@ func toError(r *http.Request, err error) (int, errorJSON) {
 	return http.StatusInternalServerError, errorJSON{"internal", "internal error"}
 }
 
-// clean sanitises outside text; an empty result becomes fallback.
+// clean sanitises outside text and tidies it; an empty result becomes
+// fallback.
 func clean(s string, max int, fallback string) string {
-	if s = pgsock.Sanitize(s, max); s == "" {
+	if s = tidy(pgsock.Sanitize(s, max)); s == "" {
 		return fallback
 	}
 	return s
+}
+
+// internalPrefixes are the platform's package names, which its error texts
+// carry as prefixes.
+var internalPrefixes = []string{"adminapi", "agent", "bootstrap", "dockerx", "jwtx", "nodecfg", "nodefs", "nft",
+	"pgconf", "pgsock", "routes", "saga", "secrets", "store"}
+
+// tidy drops the package-name parts of a "part: part: …" message and a part
+// that repeats the one before it ("connect: connect: refused").
+func tidy(s string) string {
+	var out []string
+	for _, p := range strings.Split(s, ": ") {
+		if slices.Contains(internalPrefixes, p) || len(out) > 0 && out[len(out)-1] == p {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, ": ")
 }
 
 type handler func(r *http.Request) (any, error)
@@ -337,6 +373,14 @@ type operationJSON struct {
 	UpdatedAt  string `json:"updated_at"`
 }
 
+// endpointJSON is where a client reaches a project: its URL and, when the
+// node's development CA signed the gateway's certificate, that CA's
+// certificate (null when the certificate is the operator's own).
+type endpointJSON struct {
+	URL    string  `json:"url"`
+	CACert *string `json:"ca_cert"`
+}
+
 type projectJSON struct {
 	Ref         string              `json:"ref"`
 	Name        string              `json:"name"`
@@ -350,6 +394,7 @@ type projectJSON struct {
 	CreatedAt   string              `json:"created_at"`
 	DeletedAt   *string             `json:"deleted_at"`
 	PurgeAfter  *string             `json:"purge_after"`
+	endpointJSON
 }
 
 type keysJSON struct {
@@ -357,6 +402,40 @@ type keysJSON struct {
 	AnonKey          string `json:"anon_key"`
 	ServiceRoleKey   string `json:"service_role_key"`
 	PostgresPassword string `json:"postgres_password"`
+	endpointJSON
+}
+
+// caCert is the path of the node CA's certificate when that CA signed the
+// gateway's certificate, else nil (the operator's own certificate).
+func (a *api) caCert() *string {
+	caPath := filepath.Join(a.paths.CADir(), "ca.pem")
+	if signedBy(filepath.Join(a.paths.TLSDir(), "cert.pem"), caPath) {
+		return &caPath
+	}
+	return nil
+}
+
+// signedBy reports whether the first certificate in certFile is signed by the
+// first certificate in caFile.
+func signedBy(certFile, caFile string) bool {
+	first := func(name string) *x509.Certificate {
+		b, err := os.ReadFile(name)
+		if err != nil {
+			return nil
+		}
+		blk, _ := pem.Decode(b)
+		if blk == nil || blk.Type != "CERTIFICATE" {
+			return nil
+		}
+		c, _ := x509.ParseCertificate(blk.Bytes)
+		return c
+	}
+	leaf, ca := first(certFile), first(caFile)
+	return leaf != nil && ca != nil && leaf.CheckSignatureFrom(ca) == nil
+}
+
+func endpoint(ref, domain string, ca *string) endpointJSON {
+	return endpointJSON{URL: "https://" + ref + "." + domain, CACert: ca}
 }
 
 type checkJSON struct {
@@ -384,11 +463,11 @@ func optStamp(t *time.Time) *string {
 
 func toOperation(o store.Operation) operationJSON {
 	return operationJSON{ID: o.ID, Ref: o.Ref, Kind: o.Kind, State: o.State, Step: o.Step, Attempts: o.Attempts,
-		Epoch: o.Epoch, Generation: o.Generation, LastError: pgsock.Sanitize(o.LastError, maxMessage),
+		Epoch: o.Epoch, Generation: o.Generation, LastError: tidy(pgsock.Sanitize(o.LastError, maxMessage)),
 		CreatedAt: stamp(o.CreatedAt), UpdatedAt: stamp(o.UpdatedAt)}
 }
 
-func toProject(p store.Project) projectJSON {
+func toProject(p store.Project, domain string, ca *string) projectJSON {
 	cfg := p.Config
 	if cfg.GUC == nil {
 		cfg.GUC = map[string]string{}
@@ -399,7 +478,8 @@ func toProject(p store.Project) projectJSON {
 	}
 	return projectJSON{Ref: p.Ref, Name: pgsock.Sanitize(p.Name, maxMessage), State: p.State, Generation: p.Generation,
 		AppliedGen: p.AppliedGen, UID: p.UID, SubnetIndex: p.SubnetIndex, Config: cfg, UserRoles: roles,
-		CreatedAt: stamp(p.CreatedAt), DeletedAt: optStamp(p.DeletedAt), PurgeAfter: optStamp(p.PurgeAfter)}
+		CreatedAt: stamp(p.CreatedAt), DeletedAt: optStamp(p.DeletedAt), PurgeAfter: optStamp(p.PurgeAfter),
+		endpointJSON: endpoint(p.Ref, domain, ca)}
 }
 
 // ───────── projects ─────────
@@ -432,9 +512,11 @@ func (a *api) create(r *http.Request) (any, error) {
 	for i, role := range req.UserRoles {
 		switch {
 		case !roleRE.MatchString(role):
-			return nil, badRequest("user role %d is not a lower-case identifier of at most 63 characters", i+1)
+			return nil, badRequest("user role %d is not a lower-case identifier of at most 63 characters "+
+				"(a-z, 0-9 and '_', not starting with a digit)", i+1)
 		case jwtx.ForbiddenUserRole(role):
-			return nil, badRequest("user role %q is reserved", role)
+			return nil, badRequest("user role %q is reserved: anon, service_role, the database image's own roles "+
+				"and every name starting with pg_, supabase_ or supapace_ belong to the platform and no user token may claim them", role)
 		case slices.Contains(req.UserRoles[:i], role):
 			return nil, badRequest("user role %q is listed twice", role)
 		}
@@ -455,6 +537,33 @@ func (a *api) create(r *http.Request) (any, error) {
 	}
 	np := store.NewProject{Ref: req.Ref, Name: req.Name, UserRoles: req.UserRoles, Params: params,
 		Config: store.ProjectConfig{DiskQuotaMB: quota, MemMB: clusterMemMB, GUC: map[string]string{}}}
+	// The worker's placement decides; this refuses a create it would refuse
+	// before a ref is burned. Creates through this API are serialised so two
+	// cannot both pass on the same room.
+	// ponytail: an in-process lock; the daemon holds the node's single admin socket.
+	select {
+	case a.createSlot <- struct{}{}:
+		defer func() { <-a.createSlot }()
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	}
+	// A chosen ref that exists is refused as such, also on a full node.
+	if req.Ref != "" {
+		if !refRE.MatchString(req.Ref) {
+			return nil, store.ErrBadRef
+		}
+		if _, err := a.st.GetProject(r.Context(), req.Ref); err == nil {
+			return nil, refExists(req.Ref)
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+	}
+	if err := a.st.CheckAdmission(r.Context(), clusterMemMB); errors.Is(err, store.ErrNodeFull) {
+		return nil, &apiError{http.StatusConflict, "node_full", strings.TrimPrefix(err.Error(), store.ErrNodeFull.Error()+": ")}
+	} else if err != nil {
+		return nil, err
+	}
+	afterAdmission()
 	for range refAttempts {
 		if req.Ref == "" {
 			if np.Ref, err = newRef(); err != nil {
@@ -466,7 +575,7 @@ func (a *api) create(r *http.Request) (any, error) {
 			continue // a generated ref collided: draw again
 		}
 		if errors.Is(err, store.ErrRefExists) {
-			return nil, &apiError{http.StatusConflict, "ref_exists", "ref " + np.Ref + " exists or existed; refs are never reused"}
+			return nil, refExists(np.Ref)
 		}
 		if err != nil {
 			return nil, err
@@ -476,16 +585,42 @@ func (a *api) create(r *http.Request) (any, error) {
 	return nil, errors.New("no free ref after repeated draws")
 }
 
+var projectStates = []string{"provisioning", "active", "restarting", "deleting", "deleted", "purged", "aborted"}
+
+// refExists is the refusal for a ref that is, or once was, a project's.
+func refExists(ref string) error {
+	return &apiError{http.StatusConflict, "ref_exists", "ref " + ref + " exists or existed; refs are never reused"}
+}
+
+// listProjects lists every project, or with ?state= (repeatable) those in
+// the states named.
 func (a *api) listProjects(r *http.Request) (any, error) {
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return nil, badRequest("query: %v", err)
+	}
+	for k, v := range q {
+		if k != "state" {
+			return nil, badRequest("the only query parameter is state")
+		}
+		for _, s := range v {
+			if !slices.Contains(projectStates, s) {
+				return nil, badRequest("state %q: want one of %s", s, strings.Join(projectStates, ", "))
+			}
+		}
+	}
 	ps, err := a.st.ListProjects(r.Context())
 	if err != nil {
 		return nil, err
 	}
+	ca := a.caCert()
 	out := struct {
 		Projects []projectJSON `json:"projects"`
 	}{[]projectJSON{}}
 	for _, p := range ps {
-		out.Projects = append(out.Projects, toProject(p))
+		if len(q["state"]) == 0 || slices.Contains(q["state"], p.State) {
+			out.Projects = append(out.Projects, toProject(p, a.domain, ca))
+		}
 	}
 	return out, nil
 }
@@ -499,7 +634,7 @@ func (a *api) showProject(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return toProject(p), nil
+	return toProject(p, a.domain, a.caCert()), nil
 }
 
 // keys returns the project's own credentials, unsealed with its DEK.
@@ -538,7 +673,7 @@ func (a *api) keys(r *http.Request) (any, error) {
 		}
 		v[i] = string(plain)
 	}
-	return keysJSON{ref, v[0], v[1], v[2]}, nil
+	return keysJSON{ref, v[0], v[1], v[2], endpoint(ref, a.domain, a.caCert())}, nil
 }
 
 func (a *api) check(r *http.Request) (any, error) {
@@ -601,7 +736,7 @@ func (a *api) restart(r *http.Request) (any, error) {
 	}
 	// The merged result, against the cluster container's memory.
 	if _, err := pgconf.Overrides(next.GUC, next.MemMB); err != nil {
-		return nil, badRequest("set: %v", err)
+		return nil, badRequest("%s", settingError(err, next.GUC))
 	}
 	// The worker refuses the restart when the project's generation is no
 	// longer the one this merge was based on.
@@ -614,6 +749,26 @@ func (a *api) restart(r *http.Request) (any, error) {
 		return nil, err
 	}
 	return mutationJSON{ref, id}, nil
+}
+
+// settingError words a refused setting for the operator. A value refused for
+// its form alone carries no reason from pgconf; the form is added here.
+func settingError(err error, gucs map[string]string) string {
+	msg := err.Error()
+	if rest, ok := strings.CutPrefix(msg, pgconf.ErrGUCNotAllowed.Error()+": "); ok {
+		return "setting " + rest + " cannot be set; see 'supapace project restart --help' for those that can"
+	}
+	rest, ok := strings.CutPrefix(msg, pgconf.ErrGUCValue.Error()+": ")
+	if !ok {
+		return msg
+	}
+	for name, v := range gucs {
+		if rest == fmt.Sprintf("%s = %q", name, v) {
+			return rest + ": a value is 1 to 64 letters, digits or '.', and does not start with 0 " +
+				"followed by a digit or letter (Postgres would read that as octal or hex)"
+		}
+	}
+	return rest
 }
 
 func (a *api) delete(r *http.Request) (any, error) {
@@ -664,6 +819,13 @@ func (a *api) abort(r *http.Request) (any, error) {
 		return nil, err
 	}
 	id, err := a.ops.Abort(r.Context(), ref)
+	if errors.Is(err, store.ErrConflict) {
+		if p, gerr := a.st.GetProject(r.Context(), ref); gerr == nil && p.State != "provisioning" {
+			next := map[string]string{"active": "; an active project is removed with delete",
+				"deleted": "; a deleted project is removed for good with purge"}[p.State]
+			return nil, conflict("project is %s; abort applies only to a create in progress%s", p.State, next)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
@@ -212,14 +213,8 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 			Scan(&base, &count, &next, &memAlloc, &pidsAlloc, &slices); err != nil {
 			return err
 		}
-		var usedMem, usedPids int64
-		if err := tx.QueryRow(ctx, `select coalesce(sum(mem_mb), 0), coalesce(sum(pids), 0) from project
-				where node_id = $1 and ref <> $2 and uid is not null and state in ('provisioning', 'active', 'restarting', 'deleting')`,
-			node, ref).Scan(&usedMem, &usedPids); err != nil {
+		if err := admit(ctx, tx, node, ref, false, mem, pids, memAlloc, pidsAlloc); err != nil {
 			return err
-		}
-		if usedMem+mem > memAlloc || usedPids+pids > pidsAlloc {
-			return fmt.Errorf("%w: admission ceiling reached", ErrNodeFull)
 		}
 		if next >= base+count {
 			return fmt.Errorf("%w: uid range exhausted", ErrNodeFull)
@@ -242,6 +237,48 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 		return nil
 	})
 	return pl, err
+}
+
+// admit is the admission rule: a project needing mem MiB and pids fits when
+// the projects counted against the node's ceilings leave room for it. Counted
+// are the projects other than ref in provisioning, active, restarting or
+// deleting — placed ones only, or with unplaced also those not placed yet.
+// ErrNodeFull carries the figures.
+func admit(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, node, ref string, unplaced bool, mem, pids, memAlloc, pidsAlloc int64) error {
+	var n, usedMem, usedPids int64
+	if err := q.QueryRow(ctx, `select count(*), coalesce(sum(mem_mb), 0), coalesce(sum(pids), 0) from project
+			where node_id = $1 and ref <> $2 and (uid is not null or $3) and state in ('provisioning', 'active', 'restarting', 'deleting')`,
+		node, ref, unplaced).Scan(&n, &usedMem, &usedPids); err != nil {
+		return err
+	}
+	switch {
+	case usedMem+mem > memAlloc:
+		return fmt.Errorf("%w: admission ceiling reached: %d projects hold %d of the node's %d MiB; a project needs %d MiB",
+			ErrNodeFull, n, usedMem, memAlloc, mem)
+	case usedPids+pids > pidsAlloc:
+		return fmt.Errorf("%w: admission ceiling reached: %d projects hold %d of the node's %d processes; a project needs %d",
+			ErrNodeFull, n, usedPids, pidsAlloc, pids)
+	}
+	return nil
+}
+
+// CheckAdmission answers whether a new project whose cluster has clusterMemMB
+// would be admitted now, by the rule Place applies, also counting projects not
+// placed yet. It is advisory: Place remains the authority.
+func (s *Store) CheckAdmission(ctx context.Context, clusterMemMB int) error {
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		var node string
+		var memAlloc, pidsAlloc int64
+		if err := tx.QueryRow(ctx, "select id, mem_alloc_mb, pids_alloc from node order by id limit 1").
+			Scan(&node, &memAlloc, &pidsAlloc); errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: the node is not initialised (no node row); start the daemon, which records it", ErrConflict)
+		} else if err != nil {
+			return err
+		}
+		return admit(ctx, tx, node, "", true, int64(clusterMemMB+postgrestMemMB), projectPids, memAlloc, pidsAlloc)
+	})
 }
 
 // BeginRestart sets the desired generation and configuration of an active or

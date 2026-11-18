@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -39,6 +40,7 @@ func usageText() string {
 Talks to the node daemon's admin API on ` + nodecfg.Paths{}.AdminSock() + ` (run as root).
 stdout holds exactly one JSON document, the body of the last API response;
 progress and errors go to stderr. Flags may come before or after REF or ID.
+'supapace <command> --help' prints the usage of that command alone.
 
 Projects:
   project create --name NAME --issuer-jwks FILE [--ref REF]
@@ -51,12 +53,36 @@ Projects:
       --ref REF            20 characters of a-z and 0-9; generated when omitted;
                            a ref is never reused
       --user-role ROLE     a role the issuer's tokens may claim (repeatable;
-                           default authenticated)
+                           default authenticated). The platform does not
+                           create it: create it in the project's database
+                           and grant it to authenticator, as PostgREST
+                           requires (create role editor nologin;
+                           grant editor to authenticator;)
       --disk-quota SIZE    MiB, or a number with suffix m, g or t
                            (default 8g, at least 1g, at most 16t)
-  project list
-  project show REF
-  project keys REF         its anon key, service_role key and postgres password
+      User tokens: there is no shared secret. The issuer signs each token
+      with RS256 and a private key of the set; the header carries
+      "alg":"RS256" and that key's "kid"; the claims carry "role"
+      (authenticated or a --user-role), "exp" (integer seconds, in the
+      future) and optionally "sub" and "nbf"; at most 8 KiB. A client sends
+      it as "Authorization: Bearer TOKEN" with the anon key as apikey.
+  project list [--state STATE]...
+      --state STATE        only projects in STATE (repeatable): provisioning,
+                           active, restarting, deleting, deleted, purged or
+                           aborted
+  project show REF         the project's record and url; its state is the
+                           lifecycle state, not health (see project check)
+  project keys REF         the project's url and credentials:
+      url                  https://REF.DOMAIN, the gateway's address for it
+      ca_cert              the CA that signed the gateway's certificate, or
+                           null when the certificate is the operator's own
+      anon_key             for client applications: the apikey header (or
+                           query parameter) of every request; RLS applies
+      service_role_key     for trusted servers only; it bypasses RLS
+      postgres_password    the database role postgres (not a superuser), for
+                           schema changes; no port is published; psql asks
+                           for it: docker exec -it pg-REF
+                           psql -h 127.0.0.1 -U postgres
   project check REF        check the project's database server and report
   project restart REF [--set KEY=VALUE]... [--no-wait]
       --set KEY=VALUE      disk_quota_mb=MIB or one of these (repeatable):
@@ -85,6 +111,23 @@ Exit status:
   2    usage, or an argument that cannot be read
   130  interrupted while waiting (the operation continues on the node)
 `
+}
+
+// commandUsage returns the lines of the usage text that describe verb, or ""
+// for no such command.
+func commandUsage(verb string) string {
+	var b strings.Builder
+	for _, l := range strings.SplitAfter(usageText(), "\n") {
+		switch {
+		case strings.HasPrefix(l, "  "+verb+" ") || l == "  "+verb+"\n":
+			b.WriteString(l)
+		case b.Len() > 0 && strings.HasPrefix(l, "   "):
+			b.WriteString(l)
+		case b.Len() > 0:
+			return b.String()
+		}
+	}
+	return b.String()
 }
 
 // wrap breaks s at spaces into lines of at most width bytes, each indented.
@@ -128,10 +171,11 @@ func main() {
 // call is one parsed command.
 type call struct {
 	method, path string
-	body         any    // nil: no body
-	wait         string // final operation state that is success; "" = do not poll
-	check        bool   // the body's "ok" decides the exit status
-	ref          string // the project the command is about, when known
+	body         any      // nil: no body
+	wait         string   // final operation state that is success; "" = do not poll
+	check        bool     // the body's "ok" decides the exit status
+	ref          string   // the project the command is about, when known
+	roles        []string // project create: the user roles asked for
 }
 
 // usageError is a malformed command line: printed with the usage text.
@@ -210,7 +254,7 @@ func parse(args []string) (c call, err error) {
 	}
 	var name, jwks, ref string
 	var quota *int
-	var roles, sets list
+	var roles, sets, states list
 	switch verb {
 	case "project create":
 		fs.StringVar(&name, "name", "", "")
@@ -230,6 +274,8 @@ func parse(args []string) (c call, err error) {
 		})
 	case "project restart":
 		fs.Var(&sets, "set", "")
+	case "project list":
+		fs.Var(&states, "state", "")
 	}
 	// Flags may come before, between and after positional arguments; "--"
 	// ends them.
@@ -293,9 +339,12 @@ func parse(args []string) (c call, err error) {
 			UserRoles   []string        `json:"user_roles,omitempty"`
 			DiskQuotaMB *int            `json:"disk_quota_mb,omitempty"`
 		}{Name: name, Ref: ref, IssuerJWKS: set, UserRoles: roles, DiskQuotaMB: quota}
-		return call{method: "POST", path: "/v1/projects", body: body, wait: wait("done")}, nil
+		return call{method: "POST", path: "/v1/projects", body: body, wait: wait("done"), roles: roles}, nil
 	case "project list":
-		return call{method: "GET", path: "/v1/projects"}, nil
+		if len(states) == 0 {
+			return call{method: "GET", path: "/v1/projects"}, nil
+		}
+		return call{method: "GET", path: "/v1/projects?" + url.Values{"state": states}.Encode()}, nil
 	case "project show":
 		return call{method: "GET", path: project}, nil
 	case "project keys":
@@ -361,20 +410,32 @@ type operation struct {
 // after names the last completed step.
 func after(step string) string {
 	if step == "" {
-		return "starting"
+		return "before its first step"
 	}
 	return "after step " + step
 }
 
 func run(args []string, c client, stdout, stderr io.Writer) int {
 	cl, err := parse(args)
+	// The command named, when it is one: its usage stands for the whole text.
+	var cmd string
+	if len(args) > 1 {
+		cmd = commandUsage(args[0] + " " + args[1])
+	}
 	var ue usageError
 	switch {
+	case errors.Is(err, errHelp) && cmd != "":
+		io.WriteString(stdout, "usage:\n"+cmd)
+		return 0
 	case errors.Is(err, errHelp):
 		io.WriteString(stdout, usageText())
 		return 0
 	case errors.As(err, &ue):
-		fmt.Fprintf(stderr, "supapace: %v\n\n%s", err, usageText())
+		fmt.Fprintf(stderr, "supapace: %v\n", err)
+		if cmd != "" {
+			fmt.Fprint(stderr, "usage:\n"+cmd)
+		}
+		fmt.Fprintln(stderr, "see 'supapace --help' for the usage of every command")
 		return 2
 	case err != nil:
 		fmt.Fprintf(stderr, "supapace: %v\n", err)
@@ -418,6 +479,7 @@ func run(args []string, c client, stdout, stderr io.Writer) int {
 				return 1
 			}
 		}
+		cl.created(stderr, body)
 		return 0
 	}
 
@@ -471,6 +533,7 @@ func run(args []string, c client, stdout, stderr io.Writer) int {
 		case "done", "failed", "aborted":
 			stdout.Write(b)
 			if op.State == cl.wait {
+				cl.created(stderr, b)
 				return 0
 			}
 			summary(stderr, op)
@@ -486,6 +549,31 @@ func run(args []string, c client, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "operation %d: last error: %s\n", id, lastErr)
 			}
 		}
+	}
+}
+
+// created tells the operator of a create that succeeded where to look next,
+// and what user roles still need. body is the create's last answer.
+func (cl call) created(w io.Writer, body []byte) {
+	if cl.method != "POST" || cl.path != "/v1/projects" {
+		return
+	}
+	var r struct {
+		Ref         string
+		OperationID int64 `json:"operation_id"`
+	}
+	if json.Unmarshal(body, &r) != nil || r.Ref == "" {
+		return
+	}
+	if r.OperationID > 0 { // --no-wait: the create is queued, nothing is issued yet
+		fmt.Fprintf(w, "supapace: project %s is being created; follow it with 'supapace op show %d'; once it is done, "+
+			"its url, keys and CA: 'supapace project keys %s'\n", r.Ref, r.OperationID, r.Ref)
+	} else {
+		fmt.Fprintf(w, "supapace: project %s: its url, keys and CA: 'supapace project keys %s'\n", r.Ref, r.Ref)
+	}
+	if roles := slices.DeleteFunc(slices.Clone(cl.roles), func(s string) bool { return s == "authenticated" }); len(roles) > 0 {
+		fmt.Fprintf(w, "supapace: tokens can use the role(s) %s once each exists in the project's database "+
+			"and is granted to authenticator (see 'supapace project create --help')\n", strings.Join(roles, ", "))
 	}
 }
 

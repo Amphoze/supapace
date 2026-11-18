@@ -30,12 +30,20 @@ func orEmpty(params json.RawMessage) json.RawMessage {
 	return params
 }
 
-// hasOpenOperation reports whether ref has an open operation other than except.
-func hasOpenOperation(ctx context.Context, tx pgx.Tx, ref string, except int64) (bool, error) {
-	var open bool
-	err := tx.QueryRow(ctx, "select exists (select 1 from operation where ref = $1 and id <> $2 and state in "+openStates+")",
-		ref, except).Scan(&open)
-	return open, err
+// openOperation refuses with ErrConflict, naming the operation, when ref has
+// an open operation other than except.
+func openOperation(ctx context.Context, tx pgx.Tx, ref string, except int64) error {
+	var id int64
+	var kind, state string
+	err := tx.QueryRow(ctx, "select id, kind, state from operation where ref = $1 and id <> $2 and state in "+openStates+
+		" order by id limit 1", ref, except).Scan(&id, &kind, &state)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return err
+	}
+	return fmt.Errorf("%w: operation %d (%s) of the project is %s; wait for it to end", ErrConflict, id, kind, state)
 }
 
 // SubmitOperation queues a restart or delete of an active project with no
@@ -62,12 +70,8 @@ func (s *Store) SubmitOperation(ctx context.Context, ref, kind string, params js
 			return fmt.Errorf("%w: the project is at generation %d, not %d; read it again", ErrConflict, gen, base)
 		}
 		// Two open restarts would both target generation + 1.
-		open, err := hasOpenOperation(ctx, tx, ref, 0)
-		if err != nil {
+		if err := openOperation(ctx, tx, ref, 0); err != nil {
 			return err
-		}
-		if open {
-			return fmt.Errorf("%w: the project has an open operation", ErrConflict)
 		}
 		if kind == "restart" {
 			gen++
@@ -200,14 +204,10 @@ func (s *Store) RetryOperation(ctx context.Context, id int64) error {
 		if state != "failed" {
 			return fmt.Errorf("%w: operation is %s", ErrConflict, state)
 		}
-		open, err := hasOpenOperation(ctx, tx, ref, id)
-		if err != nil {
+		if err := openOperation(ctx, tx, ref, id); err != nil {
 			return err
 		}
-		if open {
-			return fmt.Errorf("%w: the project has another open operation", ErrConflict)
-		}
-		_, err = tx.Exec(ctx, "update operation set state = 'pending', attempts = 0, not_before = now(), updated_at = now() where id = $1", id)
+		_, err := tx.Exec(ctx, "update operation set state = 'pending', attempts = 0, not_before = now(), updated_at = now() where id = $1", id)
 		return err
 	})
 }

@@ -3,14 +3,20 @@ package adminapi
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -203,6 +209,7 @@ type env struct {
 	ops *fakeOps
 	kek secrets.KEK
 	h   http.Handler
+	p   nodecfg.Paths // the node CA and the gateway certificate
 }
 
 // newEnv returns an API on an empty, migrated database with one node row.
@@ -233,7 +240,8 @@ func newEnv(t *testing.T) *env {
 	var kek secrets.KEK
 	rand.Read(kek[:])
 	ops := &fakeOps{st: st}
-	return &env{st: st, ops: ops, kek: kek, h: New(st, kek, ops)}
+	p := nodecfg.Paths{Root: t.TempDir()}
+	return &env{st: st, ops: ops, kek: kek, h: New(st, kek, ops, "sp.test", p), p: p}
 }
 
 func (e *env) do(t *testing.T, method, path, body string) (int, []byte) {
@@ -699,6 +707,8 @@ type (
 		CreatedAt   string      `json:"created_at"`
 		DeletedAt   *string     `json:"deleted_at"`
 		PurgeAfter  *string     `json:"purge_after"`
+		URL         string      `json:"url"`
+		CACert      *string     `json:"ca_cert"`
 	}
 	opShape struct {
 		ID         int64  `json:"id"`
@@ -714,10 +724,12 @@ type (
 		UpdatedAt  string `json:"updated_at"`
 	}
 	keysShape struct {
-		Ref              string `json:"ref"`
-		AnonKey          string `json:"anon_key"`
-		ServiceRoleKey   string `json:"service_role_key"`
-		PostgresPassword string `json:"postgres_password"`
+		Ref              string  `json:"ref"`
+		AnonKey          string  `json:"anon_key"`
+		ServiceRoleKey   string  `json:"service_role_key"`
+		PostgresPassword string  `json:"postgres_password"`
+		URL              string  `json:"url"`
+		CACert           *string `json:"ca_cert"`
 	}
 	checkShape struct {
 		OK      bool   `json:"ok"`
@@ -1089,13 +1101,14 @@ func TestAPI_ErrorMessages(t *testing.T) {
 		{"POST", "/v1/operations/999/retry", "", 404, "not_found", "no such operation"},
 		{"GET", "/v1/projects/" + purged + "/keys", "", 404, "not_found",
 			"the project's keys were destroyed when it was purged or aborted"},
-		{"POST", "/v1/projects/" + demoRef + "/abort", "", 409, "conflict", "project is active"},
+		{"POST", "/v1/projects/" + demoRef + "/abort", "", 409, "conflict",
+			"project is active; abort applies only to a create in progress; an active project is removed with delete"},
 		{"GET", "/v1/nothing", "", 404, "not_found", "no such route"},
 		{"POST", "/v1/projects", `{"name":"demo","issuer_jwks":{"keys":[]}}`, 400, "bad_request",
-			"issuer_jwks: jwtx: unacceptable key; it must be a JSON Web Key Set of 1 to 16 RSA signing keys " +
+			"issuer_jwks: unacceptable key; it must be a JSON Web Key Set of 1 to 16 RSA signing keys " +
 				"(RS256, 2048 to 4096 bits, exponent 65537), each with a kid and without private members"},
 		{"POST", "/v1/projects", `{"name":"demo"}`, 400, "bad_request",
-			"issuer_jwks: jwtx: malformed; it must be a JSON Web Key Set of 1 to 16 RSA signing keys " +
+			"issuer_jwks: malformed; it must be a JSON Web Key Set of 1 to 16 RSA signing keys " +
 				"(RS256, 2048 to 4096 bits, exponent 65537), each with a kid and without private members"},
 		{"POST", "/v1/projects", `null`, 400, "bad_request", "request body must be a JSON object"},
 	} {
@@ -1166,7 +1179,7 @@ func TestAPI_KeysShape(t *testing.T) {
 	e.seedKeys(t, demoRef)
 	var k keysShape
 	strict(t, e.wantOK(t, "GET", "/v1/projects/"+demoRef+"/keys", "", 200), &k)
-	if k != (keysShape{demoRef, "anon-token", "service-token", "pg-password"}) {
+	if k != (keysShape{demoRef, "anon-token", "service-token", "pg-password", "https://" + demoRef + ".sp.test", nil}) {
 		t.Fatalf("keys %+v", k)
 	}
 	must(t, e.st.DestroyKeys(context.Background(), demoRef))
@@ -1186,7 +1199,7 @@ func TestAPI_KeysShape(t *testing.T) {
 	e.active(t, third)
 	e.seedKeys(t, third)
 	var wrong secrets.KEK
-	e.h = New(e.st, wrong, e.ops)
+	e.h = New(e.st, wrong, e.ops, "sp.test", e.p)
 	e.wantCode(t, "GET", "/v1/projects/"+third+"/keys", "", 500, "internal")
 }
 
@@ -1385,4 +1398,333 @@ func TestAPI_DiskQuotaFloor(t *testing.T) {
 	}
 	e.active(t, demoRef)
 	e.wantOK(t, "POST", "/v1/projects/"+demoRef+"/restart", `{"disk_quota_mb":1024}`, 202)
+}
+
+// ───────── where to connect, admission, messages, list filter ─────────
+
+// writeCert issues a certificate for name signed by parent (self-signed when
+// parent is nil) and writes it as PEM to path.
+func writeCert(t *testing.T, path, name string, ca bool, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	must(t, err)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: name},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: ca, BasicConstraintsValid: true}
+	if ca {
+		tmpl.KeyUsage = x509.KeyUsageCertSign
+	}
+	if parent == nil {
+		parent, parentKey = tmpl, key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+	must(t, err)
+	must(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	must(t, os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	c, err := x509.ParseCertificate(der)
+	must(t, err)
+	return c, key
+}
+
+// TestAPI_ProjectEndpoint: show, list and keys carry the project's URL and,
+// only when the node's CA signed the gateway's certificate, that CA's path.
+func TestAPI_ProjectEndpoint(t *testing.T) {
+	e := newEnv(t)
+	e.active(t, demoRef)
+	e.seedKeys(t, demoRef)
+	caPath := filepath.Join(e.p.CADir(), "ca.pem")
+	certPath := filepath.Join(e.p.TLSDir(), "cert.pem")
+	t.Cleanup(func() { os.RemoveAll(e.p.CADir()); os.RemoveAll(e.p.TLSDir()) })
+	type ep struct {
+		URL    string  `json:"url"`
+		CACert *string `json:"ca_cert"`
+	}
+	want := func(what string, ca *string) {
+		t.Helper()
+		var list struct{ Projects []ep }
+		must(t, json.Unmarshal(e.wantOK(t, "GET", "/v1/projects", "", 200), &list))
+		for _, p := range []string{"/v1/projects/" + demoRef, "/v1/projects/" + demoRef + "/keys", ""} {
+			var got ep
+			if p == "" {
+				got = list.Projects[0]
+			} else {
+				must(t, json.Unmarshal(e.wantOK(t, "GET", p, "", 200), &got))
+			}
+			if got.URL != "https://"+demoRef+".sp.test" || (got.CACert == nil) != (ca == nil) || ca != nil && *got.CACert != *ca {
+				t.Errorf("%s: %s: %+v, want CA %v", what, p, got, ca)
+			}
+		}
+	}
+	want("no certificate", nil)
+	ca, caKey := writeCert(t, caPath, "test CA", true, nil, nil)
+	writeCert(t, certPath, "*.sp.test", false, ca, caKey)
+	want("signed by the node's CA", &caPath)
+	writeCert(t, certPath, "*.sp.test", false, nil, nil) // the operator's own
+	want("another issuer", nil)
+}
+
+// setCeiling sets the node's memory admission ceiling.
+func (e *env) setCeiling(t *testing.T, memMB int) {
+	t.Helper()
+	c := nodecfg.Default("sp.test")
+	c.MemAllocMB, c.PidsAlloc, c.Uplinks = memMB, 1<<20, nil
+	must(t, e.st.EnsureNode(context.Background(), c))
+}
+
+// TestAPI_CreateRefusedWhenNodeFull: a create the placement would refuse is
+// refused at once with node_full and the figures, and writes nothing.
+func TestAPI_CreateRefusedWhenNodeFull(t *testing.T) {
+	e := newEnv(t)
+	e.setCeiling(t, 2*768)
+	e.active(t, demoRef)
+	e.create(t, "") // pending, not placed yet: it counts
+	eb := e.wantCode(t, "POST", "/v1/projects", createBody(t, "full0000000000000000"), 409, "node_full")
+	if want := "admission ceiling reached: 2 projects hold 1536 of the node's 1536 MiB; a project needs 768 MiB"; eb.Message != want {
+		t.Fatalf("message %q, want %q", eb.Message, want)
+	}
+	if _, err := e.st.GetProject(context.Background(), "full0000000000000000"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("refused create left a row: %v", err)
+	}
+	ops, err := e.st.ListOperations(context.Background(), "")
+	must(t, err)
+	if len(ops) != 2 {
+		t.Fatalf("%d operations after the refusal, want 2", len(ops))
+	}
+}
+
+// TestAPI_ConcurrentCreatesAdmitOne: a second create arriving while the
+// first one, already admitted, has not inserted its row yet, is refused with
+// node_full and burns no ref.
+func TestAPI_ConcurrentCreatesAdmitOne(t *testing.T) {
+	e := newEnv(t)
+	e.setCeiling(t, 768)
+	post := func() int {
+		w := httptest.NewRecorder()
+		e.h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/projects", strings.NewReader(createBody(t, ""))))
+		return w.Code
+	}
+	second := make(chan int, 1)
+	var once sync.Once
+	afterAdmission = func() {
+		once.Do(func() {
+			go func() { second <- post() }()
+			// The second create must wait for the first; give it time to
+			// get past the admission check if it does not.
+			select {
+			case <-second:
+				t.Error("the second create finished while the first held its admission")
+			case <-time.After(500 * time.Millisecond):
+			}
+		})
+	}
+	t.Cleanup(func() { afterAdmission = func() {} })
+	if got := post(); got != http.StatusAccepted {
+		t.Fatalf("first create: %d", got)
+	}
+	if got := <-second; got != http.StatusConflict {
+		t.Fatalf("second create: %d, want 409", got)
+	}
+	ps, err := e.st.ListProjects(context.Background())
+	must(t, err)
+	if len(ps) != 1 {
+		t.Fatalf("%d projects, want 1", len(ps))
+	}
+}
+
+func TestAPI_MessagesAreClean(t *testing.T) {
+	e := newEnv(t)
+	e.active(t, demoRef)
+	pr := "/v1/projects/" + demoRef + "/restart"
+	for body, want := range map[string]string{
+		`{"set":{"max_connections":"0100"}}`: `max_connections = "0100": a value is 1 to 64 letters, digits or '.', and does not start with 0`,
+		`{"set":{"max_connections":"-1"}}`:   `max_connections = "-1": a value is 1 to 64 letters, digits or '.'`,
+		`{"set":{"max_connections":"5"}}`:    `max_connections = "5": want an integer 16–400`,
+		`{"set":{"fsync":"off"}}`:            `setting "fsync" cannot be set; see 'supapace project restart --help'`,
+	} {
+		eb := e.wantCode(t, "POST", pr, body, 400, "bad_request")
+		if !strings.HasPrefix(eb.Message, want) || strings.Contains(eb.Message, "pgconf") {
+			t.Errorf("%s: message %q, want it to start with %q", body, eb.Message, want)
+		}
+	}
+	// Text from elsewhere loses package prefixes and repeated parts.
+	e.ops.code, e.ops.msg = "internal", "pgsock: connect: connect: connection refused"
+	var c checkShape
+	strict(t, e.wantOK(t, "POST", "/v1/projects/"+demoRef+"/check", "", 200), &c)
+	if c.Message != "connect: connection refused" {
+		t.Errorf("check message %q", c.Message)
+	}
+	m := e.create(t, "")
+	e.failed(t, m.OperationID, "internal: agent: pgsock: socket peer is not the recorded cluster process")
+	var o opShape
+	strict(t, e.wantOK(t, "GET", "/v1/operations/"+strconv.FormatInt(m.OperationID, 10), "", 200), &o)
+	if o.LastError != "internal: socket peer is not the recorded cluster process" {
+		t.Errorf("last_error %q", o.LastError)
+	}
+	// A busy project names the operation that holds it.
+	m = mutation{}
+	strict(t, e.wantOK(t, "POST", pr, `{}`, 202), &m)
+	eb := e.wantCode(t, "DELETE", "/v1/projects/"+demoRef, "", 409, "conflict")
+	if want := fmt.Sprintf("operation %d (restart) of the project is pending", m.OperationID); !strings.Contains(eb.Message, want) {
+		t.Errorf("message %q lacks %q", eb.Message, want)
+	}
+	// A reserved role says why.
+	eb = e.wantCode(t, "POST", "/v1/projects", `{"name":"demo","issuer_jwks":`+jwks(t, 1)+`,"user_roles":["postgres"]}`, 400, "bad_request")
+	if !strings.Contains(eb.Message, "no user token may claim") {
+		t.Errorf("message %q", eb.Message)
+	}
+}
+
+func TestAPI_ListStateFilter(t *testing.T) {
+	e := newEnv(t)
+	act, prov, abt := "acti0000000000000000", "prov0000000000000000", "abor0000000000000000"
+	e.active(t, act)
+	e.create(t, prov)
+	e.create(t, abt)
+	must(t, e.st.MarkAborted(context.Background(), abt))
+	refs := func(q string) []string {
+		var l struct{ Projects []projectShape }
+		must(t, json.Unmarshal(e.wantOK(t, "GET", "/v1/projects"+q, "", 200), &l))
+		var out []string
+		for _, p := range l.Projects {
+			out = append(out, p.Ref)
+		}
+		return out
+	}
+	for q, want := range map[string][]string{
+		"":                                 {abt, act, prov},
+		"?state=active":                    {act},
+		"?state=active&state=provisioning": {act, prov},
+		"?state=deleted":                   nil,
+	} {
+		if got := refs(q); !slices.Equal(got, want) {
+			t.Errorf("%q: %v, want %v", q, got, want)
+		}
+	}
+	e.wantCode(t, "GET", "/v1/projects?state=gone", "", 400, "bad_request")
+	e.wantCode(t, "GET", "/v1/projects?ref=x", "", 400, "bad_request")
+	// A parameter other than state is refused even when its value is a state.
+	if eb := e.wantCode(t, "GET", "/v1/projects?ref=active", "", 400, "bad_request"); eb.Message != "the only query parameter is state" {
+		t.Errorf("message %q", eb.Message)
+	}
+}
+
+// TestTidy_DropsOnlyAndKeepsTheCode: tidy only removes whole parts, never
+// the leading code of a last_error, never a part that precedes a hostile
+// repeat, and leaves text without package names or repeats unchanged.
+func TestTidy_DropsOnlyAndKeepsTheCode(t *testing.T) {
+	codes := []string{"node_full", "containment_failed", "stale_generation", "epoch_divergence", "assertion", "peer",
+		"timeout", "internal"}
+	hostile := []string{"", "store", "store: store", "x: x: x", "server error XX000: store: agent: y",
+		"internal: internal", "a:b: c ", ": : ", "jwtx:jwtx: z"}
+	for _, c := range codes {
+		if slices.Contains(internalPrefixes, c) {
+			t.Fatalf("code %q is also a package name: tidy would drop it", c)
+		}
+		for _, h := range hostile {
+			in := c + ": pgsock: server error XX000: " + h
+			got := tidy(in)
+			if !strings.HasPrefix(got, c+": server error XX000") {
+				t.Errorf("tidy(%q) = %q: the code or the platform's part moved", in, got)
+			}
+			// Drop-only: every part of the result is a part of the input, in order.
+			rest := strings.Split(in, ": ")
+			for _, p := range strings.Split(got, ": ") {
+				i := slices.Index(rest, p)
+				if i < 0 {
+					t.Fatalf("tidy(%q) = %q: part %q is not from the input in order", in, got, p)
+				}
+				rest = rest[i+1:]
+			}
+		}
+	}
+	for _, s := range []string{"conflict without parts", "operation 7 (restart) of the project is running; wait for it to end",
+		`user role "store" is reserved`} {
+		if got := tidy(s); got != s {
+			t.Errorf("tidy(%q) = %q, want it unchanged", s, got)
+		}
+	}
+}
+
+// TestAPI_EndpointFromConstruction: the URL is built from the domain the API
+// was given; no node.json is read, so an unreadable one changes nothing.
+func TestAPI_EndpointFromConstruction(t *testing.T) {
+	e := newEnv(t)
+	e.active(t, demoRef)
+	must(t, os.MkdirAll(filepath.Dir(e.p.NodeJSON()), 0o700))
+	must(t, os.WriteFile(e.p.NodeJSON(), []byte("not json"), 0o000))
+	e.h = New(e.st, e.kek, e.ops, "example.test", e.p)
+	var p projectShape
+	strict(t, e.wantOK(t, "GET", "/v1/projects/"+demoRef, "", 200), &p)
+	if p.URL != "https://"+demoRef+".example.test" {
+		t.Fatalf("url %q", p.URL)
+	}
+}
+
+// TestAPI_CreateWaitHonoursContext: a create waiting for another create's
+// admission gives up when its request ends.
+func TestAPI_CreateWaitHonoursContext(t *testing.T) {
+	e := newEnv(t)
+	release, inside := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	afterAdmission = func() { once.Do(func() { close(inside); <-release }) }
+	t.Cleanup(func() { afterAdmission = func() {} })
+	first := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		e.h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/projects", strings.NewReader(createBody(t, ""))))
+		first <- w.Code
+	}()
+	<-inside
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	second := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		e.h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/projects", strings.NewReader(createBody(t, ""))).WithContext(ctx))
+		second <- w.Code
+	}()
+	select {
+	case code := <-second:
+		if code == http.StatusAccepted {
+			t.Errorf("second create accepted while the first held the admission")
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the second create did not give up when its request ended")
+	}
+	close(release)
+	if code := <-first; code != http.StatusAccepted {
+		t.Fatalf("first create: %d", code)
+	}
+}
+
+// TestAPI_CreateExistingRefOnFullNode: a taken ref is ref_exists even when
+// the node is full.
+func TestAPI_CreateExistingRefOnFullNode(t *testing.T) {
+	e := newEnv(t)
+	e.setCeiling(t, 768)
+	e.active(t, demoRef)
+	e.wantCode(t, "POST", "/v1/projects", createBody(t, demoRef), 409, "ref_exists")
+	e.wantCode(t, "POST", "/v1/projects", createBody(t, "UPPER0000000000000000"[:20]), 400, "bad_ref")
+	e.wantCode(t, "POST", "/v1/projects", createBody(t, "free0000000000000000"), 409, "node_full")
+}
+
+// TestAPI_AbortMessageFitsTheState: the pointer to delete is for an active
+// project only.
+func TestAPI_AbortMessageFitsTheState(t *testing.T) {
+	e := newEnv(t)
+	act, del := "acti0000000000000000", "dele0000000000000000"
+	e.active(t, act)
+	e.active(t, del)
+	e.deleted(t, del)
+	if eb := e.wantCode(t, "POST", "/v1/projects/"+act+"/abort", "", 409, "conflict"); !strings.Contains(eb.Message, "removed with delete") {
+		t.Errorf("active: %q", eb.Message)
+	}
+	eb := e.wantCode(t, "POST", "/v1/projects/"+del+"/abort", "", 409, "conflict")
+	if strings.Contains(eb.Message, "with delete") || !strings.Contains(eb.Message, "purge") {
+		t.Errorf("deleted: %q", eb.Message)
+	}
+	must(t, e.st.MarkPurged(context.Background(), del))
+	eb = e.wantCode(t, "POST", "/v1/projects/"+del+"/abort", "", 409, "conflict")
+	if eb.Message != "project is purged; abort applies only to a create in progress" {
+		t.Errorf("purged: %q", eb.Message)
+	}
 }
