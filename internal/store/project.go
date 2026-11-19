@@ -159,6 +159,16 @@ func (s *Store) release(ctx context.Context, ref, to string, allowed func(tx pgx
 		if !ok {
 			return fmt.Errorf("%w: project is %s", ErrConflict, state)
 		}
+		// A slice freed by a purge is held: something may still name it. One freed
+		// by an abort was never named.
+		if hold := time.Duration(sliceHold.Load()); to == "purged" && hold > 0 {
+			if _, err := tx.Exec(ctx, `insert into slice_hold (node_id, subnet_index, free_after)
+					select node_id, subnet_index, now() + $2 * interval '1 microsecond' from project where ref = $1 and subnet_index is not null
+				on conflict (node_id, subnet_index) do update set free_after = greatest(slice_hold.free_after, excluded.free_after)`,
+				ref, hold.Microseconds()); err != nil {
+				return err
+			}
+		}
 		_, err = tx.Exec(ctx, "update project set state = $2, subnet_index = null where ref = $1", ref, to)
 		return err
 	})
@@ -219,10 +229,31 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 		if next >= base+count {
 			return fmt.Errorf("%w: uid range exhausted", ErrNodeFull)
 		}
+		// With a hold set, an index held until later than now is not free, and a
+		// hold that has passed is dropped. With none set the allocator is the
+		// as-built one and reads no hold.
+		holding := sliceHold.Load() > 0
+		q := `select min(i) from generate_series(0, $2 - 1) i
+			where not exists (select 1 from project where node_id = $1 and subnet_index = i)`
+		if holding {
+			if _, err := tx.Exec(ctx, "delete from slice_hold where node_id = $1 and free_after <= now()", node); err != nil {
+				return err
+			}
+			q += ` and not exists (select 1 from slice_hold where node_id = $1 and subnet_index = i)`
+		}
 		var free *int
-		if err := tx.QueryRow(ctx, `select min(i) from generate_series(0, $2 - 1) i
-				where not exists (select 1 from project where node_id = $1 and subnet_index = i)`, node, slices).Scan(&free); err != nil {
+		if err := tx.QueryRow(ctx, q, node, slices).Scan(&free); err != nil {
 			return err
+		}
+		if free == nil && holding {
+			var held int
+			var until *time.Time
+			if err := tx.QueryRow(ctx, "select count(*), min(free_after) from slice_hold where node_id = $1", node).Scan(&held, &until); err != nil {
+				return err
+			}
+			if held > 0 {
+				return fmt.Errorf("%w: no free slice; %d held until %s", ErrNodeFull, held, until.UTC().Format(time.RFC3339))
+			}
 		}
 		if free == nil {
 			return fmt.Errorf("%w: no free slice", ErrNodeFull)
@@ -408,3 +439,10 @@ func (s *Store) EnterNewEpoch(ctx context.Context, uidFloor int) (epoch int64, e
 	})
 	return epoch, err
 }
+
+// SetSliceHold sets how long a slice freed by a purge stays unassigned, so
+// that nothing still naming it reaches the next project placed on it. Zero,
+// the default, reuses a freed slice at once. The setting is the process's,
+// not this Store value's: set it once, before the saga runner, the clean-up
+// converger and the admin API start.
+func (s *Store) SetSliceHold(d time.Duration) { sliceHold.Store(int64(d)) }

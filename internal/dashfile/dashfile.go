@@ -68,7 +68,14 @@ type Member struct {
 	Role string `json:"role"`
 }
 
-const MaxProjects, MaxMembers, MaxRevocations, MaxKeys = 4096, 256, 65536, 16
+// The caps: rows, then string lengths in bytes before encoding (an issuer or
+// a subject is 1 to 255 bytes). With every string at its cap and every byte of
+// it written as six, the largest file they allow is under MaxBytes, the bound
+// of Parse's input, of Marshal's output and of the gateway's read.
+const MaxProjects, MaxMembers, MaxRevocations, MaxKeys = 4096, 256, 4096, 16
+const MaxMemberRows = 16384 // the whole file
+const MaxBytes = 64 << 20
+const MaxClientIDBytes, MaxURLBytes, MaxKidBytes, MaxNBytes, MaxEBytes, MaxNameBytes, MaxNodeBytes = 255, 2048, 255, 1400, 16, 64, 255
 
 // maxSessionSeconds is the longest session an issuer row may set (8 h).
 const maxSessionSeconds = 8 * 3600
@@ -77,6 +84,9 @@ var refRE = regexp.MustCompile(`^[a-z0-9]{20}$`)
 
 // Parse reads the file strictly and validates it.
 func Parse(b []byte) (File, error) {
+	if len(b) > MaxBytes {
+		return File{}, fmt.Errorf("dashfile: %d bytes, more than %d", len(b), MaxBytes)
+	}
 	if !utf8.Valid(b) {
 		return File{}, errors.New("dashfile: not UTF-8")
 	}
@@ -96,8 +106,11 @@ func Parse(b []byte) (File, error) {
 }
 
 // Marshal validates f and writes its one form: members in declaration order,
-// projects sorted by ref, empty collections as [] and {}.
-func (f File) Marshal() ([]byte, error) {
+// projects sorted by ref, empty collections as [] and {}. It refuses an output
+// of more than MaxBytes.
+func (f File) Marshal() ([]byte, error) { return f.marshal(MaxBytes) }
+
+func (f File) marshal(max int) ([]byte, error) {
 	if err := f.validate(); err != nil {
 		return nil, err
 	}
@@ -117,8 +130,15 @@ func (f File) Marshal() ([]byte, error) {
 		iss.Keys = []IssuerKey{}
 		f.Issuer = &iss
 	}
-	return json.Marshal(f)
+	b, err := json.Marshal(f)
+	if err == nil && len(b) > max {
+		return nil, fmt.Errorf("dashfile: %d bytes, more than %d", len(b), max)
+	}
+	return b, err
 }
+
+// within: at most max bytes, and at least one when required.
+func within(s string, required bool, max int) bool { return len(s) <= max && (s != "" || !required) }
 
 // principal: 1 to 255 bytes of printable ASCII, as an issuer and a subject are.
 func principal(s string) bool {
@@ -157,8 +177,8 @@ func (f File) validate() error {
 	if f.Generation < 1 {
 		bad("generation %d below 1", f.Generation)
 	}
-	if f.Node == "" {
-		bad("empty node")
+	if !within(f.Node, true, MaxNodeBytes) {
+		bad("node: empty or more than %d bytes", MaxNodeBytes)
 	}
 	if !nodecfg.ValidDomain(f.StudioDomain) {
 		bad("studio_domain %q is not a domain name", f.StudioDomain)
@@ -167,8 +187,9 @@ func (f File) validate() error {
 		bad("studio %q is not http://<IPv4>:%d", f.Studio, dashcfg.StudioPort)
 	}
 	if is := f.Issuer; is != nil {
-		if !principal(is.Iss) || is.ClientID == "" || is.AuthorizeURL == "" {
-			bad("issuer: iss, client_id and authorize_url are required")
+		if !principal(is.Iss) || !within(is.ClientID, true, MaxClientIDBytes) ||
+			!within(is.AuthorizeURL, true, MaxURLBytes) || !within(is.EndSessionURL, false, MaxURLBytes) {
+			bad("issuer: iss, client_id and authorize_url are required; iss and client_id at most 255 bytes, each URL at most %d", MaxURLBytes)
 		}
 		if is.SessionSeconds < 1 || is.SessionSeconds > maxSessionSeconds {
 			bad("issuer: session_seconds %d outside 1 to %d", is.SessionSeconds, maxSessionSeconds)
@@ -177,8 +198,8 @@ func (f File) validate() error {
 			bad("issuer: %d keys, more than %d", len(is.Keys), MaxKeys)
 		}
 		for _, k := range is.Keys {
-			if k.Kid == "" || k.Kty != "RSA" || k.N == "" || k.E == "" {
-				bad("issuer: key %q is not an RSA key with kid, n and e", k.Kid)
+			if !within(k.Kid, true, MaxKidBytes) || k.Kty != "RSA" || !within(k.N, true, MaxNBytes) || !within(k.E, true, MaxEBytes) {
+				bad("issuer: key %.64q is not an RSA key with kid, n and e within their caps", k.Kid)
 			}
 		}
 	}
@@ -193,7 +214,12 @@ func (f File) validate() error {
 	if len(f.Projects) > MaxProjects {
 		bad("%d projects, more than %d", len(f.Projects), MaxProjects)
 	}
+	rows := 0
 	for ref, p := range f.Projects {
+		rows += len(p.Members)
+		if len(p.Name) > MaxNameBytes {
+			bad("project %s: name of more than %d bytes", ref, MaxNameBytes)
+		}
 		if !refRE.MatchString(ref) {
 			bad("project %q is not a ref", ref)
 		}
@@ -213,6 +239,9 @@ func (f File) validate() error {
 			}
 			seen[k] = true
 		}
+	}
+	if rows > MaxMemberRows {
+		bad("%d member rows, more than %d", rows, MaxMemberRows)
 	}
 	return errors.Join(errs...)
 }

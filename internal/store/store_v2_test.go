@@ -201,7 +201,60 @@ func TestMigrate_V1ToV2(t *testing.T) {
 	wantOpState(t, s, rid, "superseded")
 }
 
-func TestMigrate_FreshIsV2(t *testing.T) {
+// migrationSchemaText is the schema of the public tables as text, one line
+// per column, constraint and index, leaving out the tables in skip.
+func migrationSchemaText(t *testing.T, s *Store, skip ...string) string {
+	t.Helper()
+	var out string
+	must(t, s.pool.QueryRow(context.Background(), `select string_agg(l, E'\n' order by l) from (
+		select concat_ws(' ', 'column', table_name, column_name, data_type, is_nullable, column_default, ordinal_position) l
+			from information_schema.columns where table_schema = 'public' and not (table_name = any($1))
+		union all
+		select concat_ws(' ', 'constraint', conrelid::regclass::text, conname, pg_get_constraintdef(oid))
+			from pg_constraint where connamespace = 'public'::regnamespace and not (conrelid::regclass::text = any($1))
+		union all
+		select concat_ws(' ', 'index', tablename, indexname, indexdef)
+			from pg_indexes where schemaname = 'public' and not (tablename = any($1))) x`, append([]string{}, skip...)).Scan(&out))
+	return out
+}
+
+// A version-2 database gains the five tables of version 3, and its schema is
+// otherwise unchanged: no table, column, constraint, kind or index.
+func TestMigrate_V2ToV3(t *testing.T) {
+	s := v1Store(t)
+	ctx := context.Background()
+	v2, err := migrationFiles.ReadFile(migrations[0])
+	must(t, err)
+	sqlExec(t, s, string(v2))
+	sqlExec(t, s, "update cp_meta set schema_ver = 2")
+	r := newActive(t, s, 1)
+	added := []string{"dashboard_issuer", "member", "principal_revocation", "readonly_cleanup", "slice_hold"}
+	before := migrationSchemaText(t, s)
+	if before == "" || strings.Contains(before, "readonly_cleanup") {
+		t.Fatal("fixture is not a version-2 database")
+	}
+	must(t, s.Migrate(ctx))
+	if v := schemaVer(t, s); v != schemaVersion {
+		t.Fatalf("schema version %d, want %d", v, schemaVersion)
+	}
+	if after := migrationSchemaText(t, s, added...); after != before {
+		t.Fatalf("version 2's schema changed:\nbefore\n%s\nafter\n%s", before, after)
+	}
+	for _, tbl := range added {
+		if n := count(t, s, "select count(*) from information_schema.tables where table_schema = 'public' and table_name = $1", tbl); n != 1 {
+			t.Fatalf("table %s missing", tbl)
+		}
+	}
+	if n := count(t, s, "select count(*) from information_schema.tables where table_schema = 'public'"); n != len(schemaTables(t)) {
+		t.Fatalf("%d tables, want %d", n, len(schemaTables(t)))
+	}
+	wantState(t, s, r, "active")
+	// The new tables take rows.
+	sqlExec(t, s, "insert into member (ref, issuer, subject, role) values ($1, 'i', 's', 'read_only')", r)
+	sqlExec(t, s, "insert into readonly_cleanup (ref, due) values ($1, now())", r)
+}
+
+func TestMigrate_FreshIsCurrent(t *testing.T) {
 	s := newStore(t, testConfig())
 	if v := schemaVer(t, s); v != schemaVersion {
 		t.Fatalf("schema version %d, want %d", v, schemaVersion)

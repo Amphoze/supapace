@@ -3186,3 +3186,68 @@ API answers do not. A seam that writes its own answer must call dashHeaders to k
   validators unset (a required role would refuse every call).
 - pooler_reach_test.go (tag reach): one admin call per run against a running pooler through the
   namespace dial, driven by a lab script; secrets come from files named in the environment.
+
+### 2026-11-19 — store: dashboard members, issuer, revocations; dashboard file writer; slice hold
+
+- Schema version 3 (migration_3.sql): member, principal_revocation, dashboard_issuer,
+  slice_hold, readonly_cleanup. Nothing existing changes. schemaVersion = 1 + len(migrations).
+- store.AddMember: project active, restarting or restoring. ErrConflict for an existing member,
+  the 257th member of a project (dashfile.MaxMembers, counted under the project row lock) and the
+  16,385th member row of the node (dashfile.MaxMemberRows, counted under the node advisory lock
+  Place takes; rows of deleted, purged and aborted projects are not counted).
+- store.ChangeMember(ref, iss, sub, fromRole, toRole): toRole "" removes; no row is ErrNotFound;
+  a stored role other than fromRole is ErrConflict. It is changeMemberTx in its own transaction;
+  any other path that changes a role must call changeMemberTx.
+- A change from read_only to anything else writes the clean-up record in the same transaction,
+  only through oweReadOnlyCleanupTx(ctx, tx, ref): due = later of stored and now() + delay;
+  due_fixed false, failures 0, next_try now(). Never insert into readonly_cleanup elsewhere.
+- Converger functions: ReadOnlyCleanups(limit) lists records of active projects whose next_try
+  has come, earliest first, with the database's now(). FixReadOnlyCleanupDue(ctx, ref,
+  generation, seenDue) fixes due once to the later of due and generation (ms) + delay, only
+  while due still equals seenDue (the due the caller read); otherwise it changes nothing and
+  the next round fixes it. FailReadOnlyCleanup(ref, retry) backs off, doubling, at most an hour.
+  DoneReadOnlyCleanup(ref, startedAt) deletes a fixed record due by startedAt; otherwise sets
+  failures 0 and, on a fixed record only, next_try = due.
+- store.Revoke: one transaction under a table lock; rows older than MaxSessionSeconds (28,800)
+  are deleted first; a principal without a row when dashfile.MaxRevocations (4,096) remain is
+  ErrConflict; the later of two times is kept. Callers pass now: a future time holds a place.
+- store.SetDashboardIssuer: issuer 1-255 bytes of printable ASCII; client_id, authorize_url,
+  end_session_url within the file's caps; session_seconds 300-28,800; at most 16 keys, each RSA
+  with kid, n, e within caps and accepted by jwtx.DashboardKeyFromJWK. The stored jwks is read
+  back in the same transaction and must decode to the same keys (refuses repeated members and
+  members that differ only in case). Every RSA key stored becomes a sign-in key: pass only the
+  keys jwtx.ParseDashboardJWKS kept. GetDashboardIssuer: ErrNotFound while unset.
+- Every refusal is ErrConflict (match with errors.Is). Rule: the store refuses at insert every
+  value or count the dashboard file refuses; one row that Marshal or the gateway refuses would
+  stop every push, revocations included. A new column or cap must keep this.
+- store.DashboardTable: one repeatable-read, read-only snapshot: issuer, revocations younger than
+  MaxSessionSeconds by the database clock, live projects with their members in ref order.
+- SetCleanupDelay and SetSliceHold are process-wide (package variables), zero until set; the
+  daemon sets both once, before the saga runner, the clean-up converger and the admin API start.
+- Slice hold: with the hold above zero, a purge writes slice_hold (node, index, now() + hold,
+  later time kept) in the transaction that frees the index; Place skips held indices, drops
+  passed rows, and with none free answers ErrNodeFull "no free slice; N held until <RFC 3339>".
+  An abort is not held. With the hold at zero Place reads no hold row (as before).
+- internal/dashpush: New(src, cfg, paths); Push renders one snapshot, compares it with the file
+  on disk without its generation, and when they differ writes by rename (temp file in the same
+  directory, mode 0444, file and directory synced) with generation max(disk, now ms) + 1.
+  InForce compares and writes nothing. Generation 0 always means no file is in force: with no
+  studio domain both return 0. New does not yet read a studio domain (node config has none);
+  the change that adds one sets it in New. Keep one Pusher per process: its mutex orders the
+  snapshots, and a second pusher can put an older one in place last or remove the other's
+  temporary file. A push removes leftover ".dashboard.json-*" names in the directory (the
+  name itself, never followed). The path is read with O_NOFOLLOW|O_NONBLOCK; anything that is
+  not a regular file of at most MaxBytes that parses is replaced.
+
+internal/dashfile — supersedes, in the entry above, "(MaxProjects 4096, MaxMembers 256,
+MaxRevocations 65536, MaxKeys 16)" and "String lengths are not capped here: the reader bounds
+the bytes it reads":
+- Caps: MaxProjects 4096, MaxMembers 256, MaxRevocations 4096, MaxKeys 16, MaxMemberRows 16384
+  (whole file). Strings, in bytes before encoding: node 255, issuer and subject 255, client_id
+  255, authorize_url and end_session_url 2048, kid 255, n 1400, e 16, project name 64.
+- MaxBytes = 64 MiB bounds Parse's input, Marshal's output and the gateway's read. The largest
+  file the caps allow is 65,486,655 bytes (every byte escaped to six);
+  TestCaps_WorstCaseFromTheConstantsFitsMaxBytes pins that figure: a cap raised fails it.
+- TestDashTable_AtTheCaps_GatewayHeap (internal/gateway, run without -race) bounds the heap
+  growth of one reload at the caps under 128 MiB (measured in a child process, GOGC=10); a
+  reload allocates about 3.7 times the file size in short-lived garbage.

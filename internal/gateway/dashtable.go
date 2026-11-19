@@ -17,9 +17,8 @@ import (
 )
 
 // maxDashFile is the largest dashboard file the gateway reads; a larger one
-// is a bad file.
-// ponytail: 64 MiB fits the gateway's memory, not every file dashfile's caps allow; the caps are to shrink to fit it.
-const maxDashFile = 64 << 20
+// is a bad file. The caps of the file keep every legal file within it.
+const maxDashFile = dashfile.MaxBytes
 
 // principal is an (issuer, subject) pair.
 type principal struct{ iss, sub string }

@@ -19,7 +19,7 @@ var migrationFiles embed.FS
 
 // migrations names the numbered migrations: element i takes the schema from
 // version i+1 to i+2. A new version is a new file and one more element.
-var migrations = [...]string{"migration_2.sql"}
+var migrations = [...]string{"migration_2.sql", "migration_3.sql"}
 
 // schemaVersion is the version this build migrates to.
 const schemaVersion = 1 + len(migrations)

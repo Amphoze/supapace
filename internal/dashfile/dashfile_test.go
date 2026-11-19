@@ -336,3 +336,166 @@ func FuzzParse(f *testing.F) {
 		}
 	})
 }
+
+// encMax is the most bytes the encoder writes for one byte of a string: "<",
+// ">", "&", a control character and a byte of invalid UTF-8 become six.
+const encMax = 6
+
+// worstString is a quoted string of n bytes at encMax bytes each.
+func worstString(n int) int { return 2 + encMax*n }
+
+// marshalLen is the length of v as Marshal's encoder writes it.
+func marshalLen(t *testing.T, v any) int {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(b)
+}
+
+// The largest file the caps allow, computed from the constants with every
+// string at its cap and every byte of it at six, fits MaxBytes.
+func TestCaps_WorstCaseFromTheConstantsFitsMaxBytes(t *testing.T) {
+	// The encoder's own figure: no byte of a string takes more than encMax.
+	for c := range 256 {
+		if n := marshalLen(t, string([]byte{byte(c)})) - 2; n > encMax {
+			t.Fatalf("byte %#x encodes as %d bytes", c, n)
+		}
+	}
+	if n := marshalLen(t, strings.Repeat("<", 255)); n != worstString(255) {
+		t.Fatalf("255 × '<' encodes as %d bytes, want %d", n, worstString(255))
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	// Each row with empty strings, the widest number, and its separating comma;
+	// then the strings at their caps.
+	member := marshalLen(t, Member{Role: dashcfg.RoleReadOnly}) + 1 - 2*2 + 2*worstString(255)
+	revocation := marshalLen(t, Revocation{NotBefore: maxInt64}) + 1 - 2*2 + 2*worstString(255)
+	project := len(`"`+ref1+`":`) + marshalLen(t, Project{Members: []Member{}}) + 1 - 2 + worstString(MaxNameBytes)
+	key := marshalLen(t, IssuerKey{}) + 1 - 4*2 + worstString(MaxKidBytes) + worstString(3) + worstString(MaxNBytes) + worstString(MaxEBytes)
+	head := marshalLen(t, File{Generation: maxInt64, Issuer: &Issuer{SessionSeconds: maxInt64, Keys: []IssuerKey{}},
+		Revoked: []Revocation{}, Projects: map[string]Project{}}) -
+		7*2 + worstString(MaxNodeBytes) + worstString(253) + worstString(len("http://255.255.255.255:3000")) +
+		worstString(255) + worstString(MaxClientIDBytes) + 2*worstString(MaxURLBytes)
+	// The arithmetic the caps were chosen by: a member row of 3,099 bytes and a
+	// revocation of 3,113.
+	if member != 3099 || revocation != 3113 {
+		t.Fatalf("member row %d, revocation row %d; want 3099 and 3113", member, revocation)
+	}
+	total := head + MaxKeys*key + MaxMemberRows*member + MaxRevocations*revocation + MaxProjects*project
+	t.Logf("worst case %d bytes (%.1f MB) of %d", total, float64(total)/1e6, MaxBytes)
+	if total > MaxBytes {
+		t.Fatalf("the caps allow a file of %d bytes, above MaxBytes %d", total, MaxBytes)
+	}
+	// Every cap is part of the sum: 16,384 member rows and 4,096 revocations
+	// (63.5 MB), 4,096 projects of 432 bytes (1.8 MB), the head and sixteen keys
+	// (0.2 MB). A cap changed without the bound being checked again fails here.
+	if want := 16384*3099 + 4096*3113 + 4096*432 + 192_319; total != want {
+		t.Fatalf("worst case %d bytes, want %d", total, want)
+	}
+}
+
+// pad makes b a document of exactly n bytes; trailing white space is valid.
+func pad(b []byte, n int) []byte { return append(b, bytes.Repeat([]byte(" "), n-len(b))...) }
+
+func TestParse_AboveMaxBytes_Refused(t *testing.T) {
+	if _, err := Parse(pad([]byte(good), MaxBytes)); err != nil {
+		t.Fatalf("a file of exactly MaxBytes: %v", err)
+	}
+	if _, err := Parse(pad([]byte(good), MaxBytes+1)); err == nil || !strings.Contains(err.Error(), "bytes") {
+		t.Fatalf("a file of MaxBytes+1 bytes: %v", err)
+	}
+}
+
+func TestMarshal_AboveMaxBytes_Refused(t *testing.T) {
+	f, err := Parse([]byte(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := f.marshal(len(good))
+	if err != nil || string(b) != good {
+		t.Fatalf("output of exactly the bound: %v", err)
+	}
+	if _, err := f.marshal(len(good) - 1); err == nil {
+		t.Fatal("output one byte above the bound was returned")
+	}
+}
+
+// Each string one byte above its cap is refused by Parse and Marshal; at the
+// cap it is accepted. So are the whole file's member rows and revocations.
+func TestValidate_StringCaps(t *testing.T) {
+	type edit func(f *File, n int)
+	at := func(c byte, n int) string { return strings.Repeat(string(c), n) }
+	for name, c := range map[string]struct {
+		cap int
+		set edit
+	}{
+		"node":            {MaxNodeBytes, func(f *File, n int) { f.Node = at('n', n) }},
+		"iss":             {255, func(f *File, n int) { f.Issuer.Iss = at('<', n) }},
+		"client_id":       {MaxClientIDBytes, func(f *File, n int) { f.Issuer.ClientID = at('c', n) }},
+		"authorize_url":   {MaxURLBytes, func(f *File, n int) { f.Issuer.AuthorizeURL = at('a', n) }},
+		"end_session_url": {MaxURLBytes, func(f *File, n int) { f.Issuer.EndSessionURL = at('e', n) }},
+		"kid":             {MaxKidBytes, func(f *File, n int) { f.Issuer.Keys[0].Kid = at('k', n) }},
+		"n":               {MaxNBytes, func(f *File, n int) { f.Issuer.Keys[0].N = at('A', n) }},
+		"e":               {MaxEBytes, func(f *File, n int) { f.Issuer.Keys[0].E = at('A', n) }},
+		"revocation sub":  {255, func(f *File, n int) { f.Revoked[0].Sub = at('s', n) }},
+		"member iss":      {255, func(f *File, n int) { f.Projects[ref1].Members[0].Iss = at('i', n) }},
+		"name":            {MaxNameBytes, func(f *File, n int) { p := f.Projects[ref1]; p.Name = at('<', n); f.Projects[ref1] = p }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, n := range []int{c.cap, c.cap + 1} {
+				f, err := Parse([]byte(good))
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.set(&f, n)
+				b, merr := f.Marshal()
+				if n == c.cap {
+					if merr != nil {
+						t.Fatalf("at the cap: %v", merr)
+					}
+					if _, err := Parse(b); err != nil {
+						t.Fatalf("at the cap, Parse: %v", err)
+					}
+					continue
+				}
+				if merr == nil {
+					t.Fatal("Marshal wrote a string above its cap")
+				}
+				f.Generation = 7
+				raw, _ := json.Marshal(f) // the same file, written without the check
+				if _, err := Parse(raw); err == nil {
+					t.Fatal("Parse read a string above its cap")
+				}
+			}
+		})
+	}
+	// MaxMemberRows over the whole file: 64 projects of 256 rows, then one more.
+	f := File{Generation: 1, Node: "local", StudioDomain: "studio.test", Studio: "http://10.212.0.3:3000", Projects: map[string]Project{}}
+	for p := range MaxMemberRows / MaxMembers {
+		ms := make([]Member, MaxMembers)
+		for i := range ms {
+			ms[i] = Member{Iss: "i", Sub: strconv.Itoa(i), Role: dashcfg.RoleOwner}
+		}
+		f.Projects[refN(p)] = Project{Members: ms}
+	}
+	b, err := f.Marshal()
+	if err != nil {
+		t.Fatalf("%d member rows: %v", MaxMemberRows, err)
+	}
+	if _, err := Parse(b); err != nil {
+		t.Fatalf("%d member rows, Parse: %v", MaxMemberRows, err)
+	}
+	f.Projects[refN(MaxMemberRows/MaxMembers)] = Project{Members: []Member{{Iss: "i", Sub: "s", Role: dashcfg.RoleOwner}}}
+	if _, err := f.Marshal(); err == nil {
+		t.Fatalf("Marshal wrote %d member rows", MaxMemberRows+1)
+	}
+	raw, _ := json.Marshal(f)
+	if _, err := Parse(raw); err == nil {
+		t.Fatalf("Parse read %d member rows", MaxMemberRows+1)
+	}
+	// MaxRevocations: 4,096 is read, 4,097 is not.
+	if MaxRevocations != 4096 {
+		t.Fatalf("MaxRevocations %d", MaxRevocations)
+	}
+}
