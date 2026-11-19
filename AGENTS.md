@@ -2085,3 +2085,58 @@ Known limits
   pool) is recorded as failed and not retried; jobs run only in `cron.database_name`
   (`postgres`); jobs that exhaust the container's memory make its server restart in a loop
   until they are unscheduled (that project only).
+
+### 2026-11-20 — Dashboard interfaces: constants, bounds, the dashboard file, socket types
+internal/dashcfg — computes only; reads no clock, socket or file.
+- Constants: Studio, postgres-meta and pgcap uids 65527/65528/65529 (each also the gid),
+  container names sp-studio, sp-pgmeta-0/1, sp-pgcap, images, ports 3000 and 8080,
+  MetaPortBase 20000, project-bridge host offsets, the three roles, the two logins, and the
+  read-only secret's name.
+- Addrs/For/Static: Studio, PgMeta0, PgMeta1 and Pgcap are platform subnet base + 3..6; meta
+  ports MetaPortBase..+Slices()-1; RestLo/RestHi are the fixed PostgREST addresses. For refuses
+  (errors.Join; plain errors) a dashboard address that is the gateway's, in the allocation range
+  or outside the subnet, a port range past 65535, no room for the PostgREST range, more than
+  4096 slices, and a project uid range containing 70 or 65527-65532. Static never fails or
+  panics: it returns For's value with each refused member zero (ports 0-0), never a port above
+  65535; when For accepts, Static equals it. For assumes nodecfg.Validate already passed (Load
+  and init run it). Hand a server For's Addrs, never Static's.
+- DSN/ParseDSN: postgresql://<login>:<password>@<Pgcap>:<MetaPort(i)>/postgres?sslmode=disable.
+  The password escapes every byte outside A-Za-z0-9-._~ as %XX, upper-case. ParseDSN accepts
+  only that exact form: a non-empty password decoding to bytes 0x20-0x7e, the exact proxy
+  address, a canonical port in range, at most 512 bytes, and Addrs that have a proxy address and
+  a port range. Its vectors (testdata/dsn.json) are shared with Studio's twin; add vectors,
+  never remove one.
+- Paths: PathsFor(nodecfg.Paths) and ten path methods (KeyDir ... DataDir).
+- LimitSet/Limits: the one bounds table. Check holds the nesting rules (strict <); a renderer
+  refuses a set that fails it. SliceHoldSecs (8 days) must exceed the resolve disk and memory
+  lifetimes plus rows 2 and 6, compared in milliseconds. StudioJSON is SUPAPACE_LIMITS: 14
+  members in fixed order, no white space, without SliceHoldSecs. Figures change here and in
+  TestLimits_DefaultsPassCheck only.
+- StudioEnv(a, node, l, imageEnv): sorted NAME=value. The eight fixed names, plus from the
+  image label only ListenerNames (a port name must be 3000) and
+  ENABLED_FEATURES_[A-Z0-9_]+=false; anything else, a fixed name included, is an error.
+  FixedEnvNames lists the fixed names. Docker's HOSTNAME and the image's own ENV are outside
+  its reach.
+- PgMetaEnv(l): postgres-meta's environment without CRYPTO_KEY, which the agent appends from the
+  key file. It holds no PG*/libpq name; keep it that way (node-postgres reads them).
+- NoForwardArgs: the four --sysctl arguments for containers on two networks.
+internal/dashfile — the gateway's authorization table; one writer (Marshal), one reader (Parse).
+- Parse: UTF-8 only; a first token pass checks exact member names (no case folding, escapes
+  decoded), each once and all present, null only for issuer, value kinds, and the caps
+  (MaxProjects 4096, MaxMembers 256, MaxRevocations 65536, MaxKeys 16) before the value is
+  built. Then a single-value decode (no trailing data) and validate.
+- validate: generation >= 1; node non-empty; studio_domain is a domain; studio is
+  http://<IPv4>:3000; issuer iss, sub and every principal are 1-255 bytes of printable ASCII;
+  client_id and authorize_url non-empty; session_seconds 1-28800; keys are kty RSA with kid, n
+  and e non-empty; refs are ^[a-z0-9]{20}$; roles are the three; no duplicate (iss, sub) in a
+  project; not_before >= 0.
+- Marshal validates and writes one canonical form (projects sorted, empty collections [] and
+  {}); Marshal -> Parse -> Marshal is byte-identical. The store must refuse at insert whatever
+  validate refuses, or one row blocks every write. String lengths are not capped here: the
+  reader bounds the bytes it reads. Errors carry no sentinel: match with err != nil.
+internal/dashsock (proto.go): ResolveAnswer, DataAPI, KeysAnswer, SigningKey (json as on the
+wire; dsn_rw, dsn_ro and service_role_key are omitted when empty); HeaderAssertion; RoleClass
+("rw" for owner and developer, "ro" for read_only, "" otherwise).
+cmd/sp-dashstub: sub-commands register in init() as
+subcommands[name] = func(args []string, stdout, stderr io.Writer) int; an unknown one exits 2.
+"limits" prints SUPAPACE_LIMITS; "limits --names" prints {"fixed":[...],"listener":[...]}.
