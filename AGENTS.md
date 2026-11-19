@@ -3941,3 +3941,75 @@ Known limits
 - After RekeyLogin of supabase_read_only_user the check service-passwords reports that role
   until servicePasswordRoles no longer lists it.
 - Tests: the cluster tests need the pinned image and skip without it.
+
+### 2026-11-19 — internal/backup: job runner (lanes, scheduler, launch, push and backup records)
+- `backup.New(st, ag, pr, kek, cfg, paths) *Runner`. `Agent` lists every node-agent method the
+  runner calls; `Projects` gives `SpecFor(ctx, ref)` and `Adopted(ref)` (not in the pending set).
+- Daemon wiring, in this order: `New`; `Start(ctx)` - `KillJobs(ctx, "")` (job containers,
+  recovery clusters, job files), then, only if that succeeded, `store.InterruptJobs`; a failed
+  `Start` touches no job row and is retried before anything else runs. Then hand the runner to the
+  operation worker as its `saga.Jobs`, start `Run(ctx)` (two push-lane and two backup-lane
+  workers and the 5 s scheduler) and the operation worker. `SetOffsite(decl, state, addrs)` is
+  called by the resolver loop after each install of the address set (addrs copied); before the
+  first call the state is `undeclared`. Stopping = cancelling Run's ctx: a running job is left
+  `running` and the next `Start` ends it `interrupted`.
+- `saga.Jobs`: `Cancel(ctx, op)` / `CancelSubject(ctx, subject)` end queued jobs `cancelled`, stop
+  the running ones, re-read every second, and return once each is recorded or no longer running
+  (bounded by ctx). Call `Cancel` only for an operation that has left `waiting_job`.
+  `PushNow(ctx, subject, wait)`: `ok`, `incomplete`, `timeout` (a wait of 0 asks once and
+  returns `timeout`), `failed`; never a second push beside a queued or running one.
+  `Offsite()`: `undeclared`, `partial` or `declared`.
+- Pick-time check, one function of the job row: no operation - an `active`, or `restarting`,
+  project adopted here (`cp` exempt); an operation - that operation is `waiting_job`. Else
+  `cancelled`, nothing launched; a check that cannot read the store: `interrupted`. While
+  containment has failed nothing is picked, a picked replicate/fetch is `interrupted` and the
+  tick stops running ones with `interrupted`.
+- Secrets: `SecretEnv` holds only `PGBACKREST_REPO1_CIPHER_PASS`, for push, stanza-create, backup,
+  check, restore and serve (the job program builds the rest of the tool's environment). replicate
+  gets its bucket's write and fetch its read-only credential in `Cred`
+  ("<access key>\n<secret key>", no final newline), the `SUPAPACE_S3_*` environment, the loaded
+  address set and `/job/ca.pem` when declared; while not `declared` such a job ends `internal`.
+  The control plane's passphrase is read from its sealed file, never created here.
+- Job parameters, strict (exact unique member names, else `internal`):
+  restore `{"set":"<label>","mode":"none"|"standby","target_timeline":N}` (N >= 1 with standby
+  only); recover `{"target":{"time":"<RFC 3339>","lsn":"<hex>/<hex>","timeline":
+  "latest"|"current"|"<decimal>"}}`, `time` and `lsn` omitted when unset.
+- Results: parsed by `jobio.ParseResult`; exit 0 with ok, 1 with a failure, else `crashed`; no
+  line -> `crashed`; launcher mount-source refusal -> `host_state` (matched by the error's text
+  until the agent exports it); other launch errors -> `internal`; `TimedOut` -> `deadline`.
+  Code rule: a job's own failure code that the runner, the store or a step assigns (deadline,
+  interrupted, cancelled, crashed, host_state, record_not_rebuilt, fetch_too_large, internal,
+  recovered, recovery_failed, target_not_reached, interrupted_limit) -> `crashed`. Messages are
+  sanitised and cut to 256 bytes.
+- Bounds, checked before any write (else `crashed`, nothing written): push (also nested in
+  stanza-create, check, backup) `pushed` 0-56; counts >= 0; `spool_entries` <= 2^31-1;
+  `first`/`last` empty or a spool name; `histories` <= 64 history names; quarantined names 1-255
+  bytes without a control byte, reasons timeline|shape|refused-44|45|46; `newest` keys
+  `^[0-9A-F]{8}$` of admitted timelines, values segments of that timeline, the highest one
+  recorded. Backup label, timeline, segments and positions by pattern; restore mode; seed counts.
+  A serve result is kept by its recover job only if exit 0 and every name is a request name,
+  else `serve` is null. Stored is the parsed value re-encoded, never the raw line.
+- Records: push -> `RecordPush` with `QuotaUse`; backup -> `RecordSet`; stanza-create ->
+  `MarkStanza`; seed -> `SetSeeded`; a quarantine -> one forced full per UTC day; a push or backup
+  recorded done -> a replicate (store declared, none queued or running); one lost to a daemon stop
+  is queued after the next done push. `repository_quota` -> notice `repo-quota-full`, a failed
+  backup -> `backup-failed`. A failed record is retried (1 s doubling to 30 s) until written,
+  refused as not running, or the daemon stops.
+- Recover job: `EnsureRecovery`, a serve job beside it, `RecoveryState` every 2 s until promoted
+  (serve stopped, its result kept), exited (`recovery_failed`, or `target_not_reached` when the
+  serve's `last_none`), an error, or the deadline (`deadline`); on every outcome but promotion the
+  serve job is stopped and the recovery cluster removed first.
+- Scheduler: `cp` once its stanza exists and every layout-2 project `active` (or `restarting` with
+  an open restart), adopted, with its stanza: a push 60 s after the last when none is queued or
+  running; 2 + 2N store calls per tick whatever the table holds; one subject's error skips only
+  it. Hourly: `PruneJobs` repeated while it deletes 10,000; `cp-quota-half`, `repo-space-low`;
+  `RemoveFetch` for adopted layout-2 projects without an open restore.
+- Seam for the replication files (same package): `buildReplicate`, `buildFetch func(ctx,
+  *Runner, store.Job, *jobio.Input, *agent.JobSpec) error` complete a spec that already holds the
+  credential, environment and addresses (never replace them; refuse with `jobErr(code, msg)`);
+  `recordReplicate func(ctx, *Runner, store.Job, jobio.ReplResult) (json.RawMessage, error)`,
+  `recordFetch` likewise with `jobio.FetchResult`: handed the job row (its launch number
+  included) and the parsed result, they return the stored document; an error -> `crashed`. While
+  nil, such a job ends `internal`.
+- Known limit: the backup-lane bound is ceil(k/2) x the deadline plus, per pick, the 0-2 s delay
+  and the removal of a container killed at its deadline.
