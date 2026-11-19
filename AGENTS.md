@@ -2568,3 +2568,14 @@ the 421 check (as built); a refused non-regular table file is checked again on e
   connections per project stay open until the upstream closes them. The wait before the
   connection is closed after a 413 is the server library's; `TestServer_BodyLimitStillSending`
   fails if it goes away.
+
+### 2026-11-19 — agent: route stress test runs until the race was exercised
+
+`TestSetRoute_FlagDrainStress` no longer counts rounds after a fixed window: it runs at least
+PR_STRESS_SECONDS (default 2 s) and until 10 rounds were contested (an activation accepted since
+the round before), failing only after that window plus 2 minutes. A fixed window let a slow
+2-core race-instrumented runner finish with 9 rounds, and a run of the test alone spend the
+window generating the shared RSA keys with no activation accepted. The invariant check is
+unchanged. New `TestSetRoute_FlagReadUnderLock` holds the route lock, waits until an activation
+is parked on it, sets the flag and requires ErrContainment: it fails if the flag is read before
+the lock is taken, which the stress test does not catch. No product code changed.

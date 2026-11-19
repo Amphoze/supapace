@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1185,10 +1186,58 @@ func TestGatewayGeneration(t *testing.T) {
 
 // ───────── further route and adoption tests ─────────
 
+// An activation already past its Docker read and waiting for the route lock
+// when the flag is set is refused: the flag is read under the lock, so it
+// cannot be written after a drain that follows the flag. The test holds the
+// lock itself and waits until the activation is parked on it (seen in the
+// goroutine dump) before setting the flag.
+func TestSetRoute_FlagReadUnderLock(t *testing.T) {
+	a, _, _ := prRouteAgent(t)
+	r := prRoute(t, a, 1, "active")
+	routeMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			routeMu.Unlock()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.SetRoute(context.Background(), prRef(1), r)
+		done <- err
+	}()
+	parked := func() bool {
+		buf := make([]byte, 1<<20)
+		for _, g := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+			if strings.Contains(g, "[sync.Mutex.Lock") && strings.Contains(g, "(*Agent).SetRoute") {
+				return true
+			}
+		}
+		return false
+	}
+	for end := time.Now().Add(time.Minute); !parked(); runtime.Gosched() {
+		if time.Now().After(end) {
+			t.Fatal("the activation never waited for the route lock")
+		}
+	}
+	a.SetContainmentFailed(true)
+	routeMu.Unlock()
+	locked = false
+	if err := <-done; !errors.Is(err, ErrContainment) {
+		t.Fatalf("activation waiting for the lock when the flag was set: %v, want ErrContainment", err)
+	}
+	if _, err := os.Stat(prRoutePath(a)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("route file written: %v", err)
+	}
+}
+
 // TestSetRoute_FlagDrainStress races activations of many projects against
 // repeated rounds of "set the flag, drain everything, check, clear the flag":
 // between the drain's return and the clear, the file never holds an active
-// entry. PR_STRESS_SECONDS lengthens the run (default 2 s).
+// entry. The run lasts at least PR_STRESS_SECONDS (default 2 s) and until
+// enough rounds were contested — an activation was accepted since the round
+// before, so the drain had an active entry to beat; a slow runner takes
+// longer, and only a run that gets there by no deadline fails.
 func TestSetRoute_FlagDrainStress(t *testing.T) {
 	a, _, _ := prRouteAgent(t)
 	ctx := context.Background()
@@ -1217,8 +1266,16 @@ func TestSetRoute_FlagDrainStress(t *testing.T) {
 			}
 		}()
 	}
-	rounds := 0
-	for end := time.Now().Add(d); time.Now().Before(end); rounds++ {
+	const minContested = 10
+	start, deadline := time.Now(), time.Now().Add(d+2*time.Minute)
+	rounds, contested, seen := 0, 0, int64(0)
+	for ; time.Since(start) < d || contested < minContested; rounds++ {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d rounds, %d contested, %d activations accepted: the race was not exercised", rounds, contested, accepted.Load())
+		}
+		if n := accepted.Load(); n > seen {
+			seen, contested = n, contested+1
+		}
 		a.SetContainmentFailed(true)
 		if _, err := a.DrainAllRoutes(ctx); err != nil {
 			t.Fatal(err)
@@ -1239,10 +1296,7 @@ func TestSetRoute_FlagDrainStress(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
-	if rounds < 10 || accepted.Load() == 0 {
-		t.Fatalf("%d rounds, %d activations accepted: the race was not exercised", rounds, accepted.Load())
-	}
-	t.Logf("%d rounds, %d activations accepted", rounds, accepted.Load())
+	t.Logf("%d rounds, %d contested, %d activations accepted in %v", rounds, contested, accepted.Load(), time.Since(start).Round(time.Millisecond))
 }
 
 // The gateway keeps its last table while the route file is missing, and the
