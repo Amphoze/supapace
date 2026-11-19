@@ -29,6 +29,31 @@ var afterInnerChown func() error
 // before the outer chown, so before any tenant process could exist, and the
 // steps run again. Any other owner is ErrExistsForeign.
 func CreateProjectDir(p nodecfg.Paths, ref string, uid, gid, quotaMB int) error {
+	return createProjectDir(p, ref, uid, gid, quotaMB, layout1Dirs)
+}
+
+// CreateProjectDirL2 is CreateProjectDir with the spool directories of a
+// project that is backed up: data/, sock/, spool/, rspool/, rspool/req/ and
+// rspool/out/, all uid:gid 0700, with the same resume rules. A directory that
+// is already complete (outer owned by uid:gid) is not touched, whatever its
+// layout.
+func CreateProjectDirL2(p nodecfg.Paths, ref string, uid, gid, quotaMB int) error {
+	return createProjectDir(p, ref, uid, gid, quotaMB, layout2Dirs)
+}
+
+// subDir is a directory below the outer one: name, created in the outer
+// directory (parent -1) or in the subDir at index parent of the same list.
+type subDir struct {
+	parent int
+	name   string
+}
+
+var (
+	layout1Dirs = []subDir{{-1, "data"}, {-1, "sock"}}
+	layout2Dirs = []subDir{{-1, "data"}, {-1, "sock"}, {-1, "spool"}, {-1, "rspool"}, {3, "req"}, {3, "out"}}
+)
+
+func createProjectDir(p nodecfg.Paths, ref string, uid, gid, quotaMB int, dirs []subDir) error {
 	if !refRE.MatchString(ref) {
 		return fmt.Errorf("nodefs: invalid ref %q", ref)
 	}
@@ -78,11 +103,15 @@ func CreateProjectDir(p nodecfg.Paths, ref string, uid, gid, quotaMB int) error 
 			syscall.Close(fd)
 		}
 	}()
-	for _, name := range []string{"data", "sock"} {
-		if err := syscall.Mkdirat(rfd, name, 0o700); err != nil && !errors.Is(err, syscall.EEXIST) {
+	for _, d := range dirs {
+		dfd, name := rfd, d.name
+		if d.parent >= 0 {
+			dfd, name = inner[d.parent], dirs[d.parent].name+"/"+d.name
+		}
+		if err := syscall.Mkdirat(dfd, d.name, 0o700); err != nil && !errors.Is(err, syscall.EEXIST) {
 			return fmt.Errorf("nodefs: mkdir %s/%s: %w", ref, name, err)
 		}
-		fd, err := openDirAt(rfd, name)
+		fd, err := openDirAt(dfd, d.name)
 		if err != nil {
 			return fmt.Errorf("nodefs: open %s/%s: %w", ref, name, err)
 		}
@@ -94,7 +123,7 @@ func CreateProjectDir(p nodecfg.Paths, ref string, uid, gid, quotaMB int) error 
 			return fmt.Errorf("%w: %s/%s owned by %d:%d", ErrExistsForeign, ref, name, st.Uid, st.Gid)
 		}
 	}
-	// data/ and sock/ exist before the outer directory carries the project
+	// The subdirectories exist before the outer directory carries the project
 	// id, so each is given it directly; entries created later inherit it.
 	for _, fd := range append([]int{rfd}, inner...) {
 		if err := setProjectID(fd, uint32(uid)); err != nil {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -31,10 +32,29 @@ func SetQuota(p nodecfg.Paths, uid, quotaMB int) error {
 	if !projectID(uid) {
 		return fmt.Errorf("nodefs: invalid project uid %d", uid)
 	}
+	return setQuotaAt(p.ProjectsDir(), uid, quotaMB)
+}
+
+// SetQuotaAt is SetQuota on any XFS mount (a root-owned directory writable
+// by no one else), for a project id or exactly the control plane's or the
+// replicator's id; every other id, 0 included, is refused.
+func SetQuotaAt(mount string, id, quotaMB int) error {
+	if !quotaID(id) {
+		return fmt.Errorf("nodefs: invalid quota id %d", id)
+	}
+	return setQuotaAt(mount, id, quotaMB)
+}
+
+// quotaID accepts the ids that may carry a user quota: a project id, or
+// exactly one of the two platform ids.
+func quotaID(id int) bool {
+	return projectID(id) || id == nodecfg.ControlPlaneUID || id == nodecfg.ReplicatorUID
+}
+
+func setQuotaAt(mount string, uid, quotaMB int) error {
 	if quotaMB < 0 || quotaMB > 1<<30 {
 		return fmt.Errorf("nodefs: invalid disk quota %d MiB", quotaMB)
 	}
-	mount := p.ProjectsDir()
 	fd, err := openTrustedDir(mount, "")
 	if err != nil {
 		return err
@@ -94,7 +114,7 @@ const (
 
 func projectID(id int) bool { return id >= minProjectID && id <= maxProjectID }
 
-var errQuotaNotEnforced = errors.New("nodefs: user quota is not enforced on the projects mount")
+var errQuotaNotEnforced = errors.New("nodefs: user quota is not enforced on the mount")
 
 var bracketRE = regexp.MustCompile(`\[[^\]]*\]`)
 
@@ -116,6 +136,31 @@ func DiskUsage(ctx context.Context, p nodecfg.Paths, uid int) (int64, error) {
 		return 0, fmt.Errorf("nodefs: %d quota records for %d on %s, want one", len(recs), uid, p.ProjectsDir())
 	}
 	return int64(recs[0][0]) << 10, nil
+}
+
+// QuotaUsage returns the KiB of blocks the user quota of id charges on mount
+// and its block hard limit in KiB (0: none), for the ids SetQuotaAt accepts.
+// An id with neither usage nor limits has no record: 0, 0. The quota tool is
+// killed, with what it started, when ctx ends; the error is then ctx's.
+func QuotaUsage(ctx context.Context, mount string, id int) (usedKB, hardKB int64, err error) {
+	if !quotaID(id) {
+		return 0, 0, fmt.Errorf("nodefs: invalid quota id %d", id)
+	}
+	if !filepath.IsAbs(mount) {
+		return 0, 0, fmt.Errorf("nodefs: mount %q is not absolute", mount)
+	}
+	recs, err := readQuota(ctx, mount, id)
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return 0, 0, fmt.Errorf("nodefs: quota of %d on %s: %w", id, mount, ctx.Err())
+	case err != nil:
+		return 0, 0, err
+	case len(recs) == 0:
+		return 0, 0, nil
+	case len(recs) > 1:
+		return 0, 0, fmt.Errorf("nodefs: %d quota records for %d on %s, want one", len(recs), id, mount)
+	}
+	return int64(recs[0][0]), int64(recs[0][1]), nil
 }
 
 // readLimits returns the (block hard limit in KiB, inode hard limit) of each

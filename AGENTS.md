@@ -2815,3 +2815,36 @@ test node with that image loaded: build it with `go test -c -tags reach ./intern
 run `TestNode_ClientAfterWrongServerSignature` there as root; it records what that client does
 after a wrong server signature. `sp-probe fakepg` gained `--listen ADDR:PORT` (TCP, in place
 of `--socket`) and the mode `scram-bad-signature`.
+
+### 2026-11-19 — nodefs: layout-2 project directory, repository directories, quotas
+- CreateProjectDirL2(p, ref, uid, gid, quotaMB): CreateProjectDir plus spool/, rspool/,
+  rspool/req/, rspool/out/ (all uid:gid 0700, project id with inheritance), same resume rules:
+  outer dir owned by uid:gid = complete, nothing below touched (a completed layout-1 directory
+  stays layout 1; its spool directories come from a task at the project uid); root-owned =
+  interrupted, redone; any other owner = ErrExistsForeign. CreateProjectDir is unchanged.
+- EnsureRepoDir(p, subject, uid, gid, quotaMB): subject is a ref or "cp". RepoRoot/<subject>
+  root 0755, repo/ uid:gid 0750, user quota of uid on RepoRoot set on every call and, on
+  creation, before repo/ is chowned (a quota error leaves repo/ root's). repo/ owned by
+  uid:gid is complete and left as the project left it; root-owned is completed; any other
+  owner is ErrExistsForeign. quotaMB in 1..2^30.
+- EnsureFetchDir(p, subject, uid, gid): fetch/ uid:gid 2750 (files written there get group
+  gid); refuses when RepoRoot/<subject> is absent and never creates it. Same owner rules.
+- RemoveEmptyRepoDirs(p, subject): repo/, fetch/, then the subject; RemoveEmptyFetchDir(p,
+  subject): fetch/ only, repo/ and the subject never touched. Each removal is one
+  unlinkat(AT_REMOVEDIR) from a descriptor: never recursive, never follows a link; a non-empty
+  directory, a non-directory or a mount point fails and is left. An absent subject, repo/ or
+  fetch/ is done; an absent or untrusted RepoRoot is an error. Empty the directories first.
+- SetQuotaAt(mount, id, quotaMB): SetQuota's body on any trusted XFS mount; 0 clears.
+  QuotaUsage(ctx, mount, id): used KiB and block hard limit KiB of id's user quota (0, 0 = no
+  record). The quota tool runs in its own process group, killed when ctx ends; the error then
+  wraps ctx.Err() (match with errors.Is); an ended ctx starts nothing.
+- Ids for SetQuotaAt, QuotaUsage, EnsureRepoDir and EnsureFetchDir (uid and gid): a project id
+  (65536..2^31-1), exactly 70 (control plane) or exactly 65530 (replicator); 0 and every other
+  id refused before anything runs. SetQuota and DiskUsage still take project ids only.
+- Every path is reached by descriptor from a root-owned, non-group/other-writable root with
+  O_DIRECTORY|O_NOFOLLOW; links, FIFOs, devices, files and foreign owners are refused unopened.
+  Root never opens anything inside repo/ or fetch/. The project uid can create nothing in its
+  subject directory.
+- Known limits: no check that a subject's ids belong to it ("cp" with 70 is the caller's
+  rule). Reach tests mount throwaway loop XFS images; their helper creates missing loop device
+  nodes and retries the attach three times.
