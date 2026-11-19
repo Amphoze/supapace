@@ -2848,3 +2848,73 @@ of `--socket`) and the mode `scram-bad-signature`.
 - Known limits: no check that a subject's ids belong to it ("cp" with 70 is the caller's
   rule). Reach tests mount throwaway loop XFS images; their helper creates missing loop device
   nodes and retries the attach three times.
+
+### 2026-11-19 — Browser harness and the model of the dashboard sign-in
+
+What it is
+- test/harness/browsers: an image with Chromium, Firefox and WebKit (the pinned upstream
+  browser-automation image, digest-pinned) plus the automation package at the same release, and
+  run.mjs, a step interpreter: one JSON scenario on stdin, one JSON result on stdout.
+  Steps: goto, click, fill, wait (url | contains, text), eval (expr | fetch), cookies, setCookie,
+  requests, reload, drive (press each page's button; for script off), newTab, pause, clearCookies.
+  A scenario names its engine, its host map, an optional CA, a timeout and script on/off.
+- sp-dashstub flow: a model of the dashboard's sign-in and log-out on one TLS listener: S (one
+  redirect), sign-in.S, <ref>.S and an issuer host. Same endpoints, cookie names and attributes,
+  state format, statuses, page headers and order of requests as the gateway; no cryptography.
+- test/browser (build tag browser): the CA/secure-context check, the public-suffix control and
+  the sign-in and log-out scenarios in three engines, studio domain off and on the list.
+
+Build and run
+- Build (the only step that needs the network): docker build -t supapace-browsers:local
+  -f test/harness/browsers/Dockerfile test/harness/browsers. The NSS tools are pinned to an exact
+  archive version (checked after install); the automation package comes from the committed
+  lockfile with npm ci --ignore-scripts.
+- Run, in a node started bare with the image loaded, as root:
+  go test -c -tags browser -o bin/browser.test ./test/browser, then run bin/browser.test in the
+  node. sp-dashstub is taken from /opt/supapace/bin (override: SP_DASHSTUB). The model listens on
+  the node's 127.0.0.1:443. Each scenario runs in a fresh container: --network host,
+  --cap-drop ALL, no-new-privileges, read-only root, tmpfs /tmp, --memory 2g.
+- The run needs no network. Names resolve only from --add-host; /etc/resolv.conf names a server
+  that does not answer; every engine uses a proxy that does not exist, bypassed for the mapped
+  names, so an unmapped name can be neither resolved nor reached.
+- Certificate errors are never ignored: run.mjs installs the run's CA (a fresh NSS database for
+  Chromium and Firefox, the system store for WebKit), and every top-level document must report
+  window.isSecureContext true.
+- The second configuration uses dyndns.org (a public-suffix entry, not HSTS-preloaded); the CA
+  of each run is name-constrained to the studio domain and the issuer host.
+
+The model's test-only endpoints (on the issuer host)
+- /-/count: requests to the dashboard's hosts (favicon not counted) and to /authorize since the
+  last read, as JSON; reading resets both.
+- /-/clock?add=N: moves the model's clock N seconds ahead.
+- /-/drop-session?n=N: the next N successful sign-ins set no session cookie (a browser that
+  does not present it).
+- /link?to=URL: a page on another site linking to a URL under the studio domain.
+- The issuer page posts itself unless the issuer host holds the cookie hold=1.
+
+Bounds the model enforces (the gateway's tests should reuse its tables)
+- state v1.<target>.<a>.<n>.<p>, at most 1,404 characters; return path at most 1,024 bytes,
+  rule 0 on its path, first segment neither "-" nor "api"; a raw 0x00-0x20 or 0x7f anywhere,
+  "//" or "\" refuse it to "/"; a percent-encoded space is kept.
+- At most 16 login cookies (a login with 16 or more clears them first); a login cookie is
+  __Host-sp-login- and exactly 11 base64url characters.
+- Callback and session endpoint: id_token and state exactly once; 16 KiB body; token at most
+  8 KiB of the token alphabet; other methods 405.
+- Session-page mark: Referer /-/auth/session?at=<n>, n at most 60 s past and not in the future.
+- Log-out ticket: 1 to 16 refs, refused from 60 s after its first issue; chain cap 16.
+
+What the model does NOT stand for
+- No signatures: the ID token is "idt." plus the nonce, the session is "s." plus the ref, the
+  ticket is "<iat>.<refs>". Token claims, signed tickets, revocation and login CSRF are tested on
+  the real gateway only. Rule 0 is applied to return paths, not to request paths.
+- Not yet: the ticket's "more" member, /-/auth/signed-out?ended=0 and ?more=1.
+
+Engine facts (the harness's gate runs)
+- All three keep __Host- cookies one label below a listed suffix; WebKit keeps no cookie on a
+  host that is itself a listed suffix.
+- The relay's cross-site post with a SameSite=None login cookie works in all three.
+- The session page's script navigation and its no-script refresh both send the full
+  /-/auth/session?at=<n> Referer, and a reload re-sends it, in all three.
+- WebKit sends no SameSite=Strict cookie on a navigation the harness types after another site:
+  start a log-out from a page of the origin, as a person does.
+- Firefox and WebKit apply a proxy bypass entry to its subdomains; Chromium matches it exactly.

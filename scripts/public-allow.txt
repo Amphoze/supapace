@@ -16,5 +16,8 @@ example.com       # reserved documentation domain: the external name a tenant mu
 100.64.0.1        # shared-address-space (CGNAT) probe target a tenant must not reach (reach test 3)
 www.docker.com    # attribution line of the upstream NOTICE file, required with the vendored seccomp profile
 examplebucket.s3.amazonaws.com # host of the published signature-version-4 worked examples (internal/s3x known-vector test)
+dyndns.org        # the browser tests' second studio domain: a public-suffix entry that is not HSTS-preloaded
+mcr.microsoft.com # registry of the browser harness's pinned base image (test/harness/browsers/Dockerfile)
 169.254.0.0       # link-local block a pooler allow-list entry must not overlap (internal/poolcfg)
 api.supabase.com  # the upstream CLI's default Management API host, named where docs/management-api.md says how to point it elsewhere
+registry.npmjs.org # the registry the browser harness lockfile resolves its pinned packages from (test/harness/browsers/package-lock.json)
