@@ -1,0 +1,5 @@
+# The upstream commit the series applies to, the Node base image the build and the runtime
+# image use, and the postgres-meta tag that commit's compose file names. One "key value" per line.
+commit 3da15da39adfcf4b424f9be4ab2e6120129ea76c
+node node:24-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54
+postgres-meta v0.100.0

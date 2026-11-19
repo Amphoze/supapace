@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 2/3] build: mcp library chunk
+
+The MCP server library and its utilities in a chunk of their own, so that only a
+module importing them loads the library and the hosted defaults it holds.
+---
+ apps/studio/vite.config.ts | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/apps/studio/vite.config.ts b/apps/studio/vite.config.ts
+index e5489a7e..4e947810 100644
+--- a/apps/studio/vite.config.ts
++++ b/apps/studio/vite.config.ts
+@@ -799,6 +799,24 @@ export default defineConfig(({ command, mode }) => {
+         // supapace: no server source maps in the image; the public files are precompressed.
+         sourcemap: false,
+         compressPublicAssets: true,
++        // supapace: the MCP server library and its utilities in a chunk of their own, so that only
++        // a module importing them loads the library (and the hosted defaults it holds).
++        rolldownConfig: {
++          output: {
++            codeSplitting: {
++              groups: [
++                {
++                  name: 'mcp-server',
++                  test: /[\\/]node_modules[\\/]@supabase[\\/]mcp-(?:server-supabase|utils)[\\/]/,
++                  priority: 10,
++                  // the library alone: its dependencies (zod, graphql, common-tags…) stay
++                  // in their own chunks, which the rest of the server shares
++                  includeDependenciesRecursively: false,
++                },
++              ],
++            },
++          },
++        },
+         experimental: { sourcemapMinify: false },
+         // `server.ts` is TanStack Start's SSR entry, not a Nitro entry;
+         // without this Nitro's scan picks it up as both and warns.

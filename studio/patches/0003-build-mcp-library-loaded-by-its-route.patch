@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 3/3] build: mcp library loaded by its route
+
+The MCP route imports the MCP server library and the self-hosted platform module when
+it runs, so that no other module of the server loads the library.
+---
+ apps/studio/routes/api/mcp/index.ts | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/apps/studio/routes/api/mcp/index.ts b/apps/studio/routes/api/mcp/index.ts
+index b7b8b5b7..b9194a2d 100644
+--- a/apps/studio/routes/api/mcp/index.ts
++++ b/apps/studio/routes/api/mcp/index.ts
+@@ -1,11 +1,9 @@
+ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
+-import { createSupabaseMcpServer } from '@supabase/mcp-server-supabase'
+ import { createFileRoute } from '@tanstack/react-router'
+ import { stripIndent } from 'common-tags'
+ import { z } from 'zod'
+ 
+ import { commaSeparatedStringIntoArray, zBooleanString } from '@/lib/api/apiHelpers'
+-import { getSelfHostedPlatform } from '@/lib/api/self-hosted/mcp'
+ import { DEFAULT_PROJECT } from '@/lib/constants/api'
+ 
+ const supportedFeatureGroupSchema = z.enum([
+@@ -51,6 +49,9 @@ const POST = async ({ request }: { request: Request }) => {
+   const { features, read_only } = data
+   const headers = request.headers
+ 
++  // supapace: the MCP library is loaded by this route alone, when it runs
++  const { createSupabaseMcpServer } = await import('@supabase/mcp-server-supabase')
++  const { getSelfHostedPlatform } = await import('@/lib/api/self-hosted/mcp')
+   const platform = getSelfHostedPlatform({ headers })
+ 
+   try {

@@ -1,0 +1,2 @@
+# Upstream paths removed before the series applies, one per line (a file or a directory).
+apps/studio/.env

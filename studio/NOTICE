@@ -1,0 +1,14 @@
+The dashboard image is built from Supabase Studio, part of the upstream repository
+https://github.com/supabase/supabase, at the commit named in studio/PIN. Supabase Studio is
+licensed under the Apache License, Version 2.0 (the upstream repository's LICENSE file).
+
+This directory holds only this project's changes to it: a list of upstream files removed
+before the build (delete.txt), a series of patches (patches/), tables and gates the build
+checks, and the scripts that build the image. The patches are offered under the Apache
+License, Version 2.0, this repository's licence. No upstream file is held here beyond the
+context lines a patch needs.
+
+Every built image carries upstream's LICENSE, a NOTICE.supapace naming the upstream commit
+and every file the build modified, removed or added, the licence notices of the third-party
+packages the server is built from (THIRD-PARTY-NOTICES), and a one-line change notice in
+every modified source file whose format admits a comment.

@@ -9,8 +9,13 @@ import (
 )
 
 // ListenerNames is the closed list of the names Studio's server can read for its
-// listener. An image may declare only these, with the features it switches off.
-var ListenerNames = []string{"PORT", "HOST", "NITRO_PORT", "NITRO_HOST"}
+// listener. An image may declare these, but for tlsNames, with the features it
+// switches off.
+var ListenerNames = []string{"PORT", "HOST", "NITRO_PORT", "NITRO_HOST", "NITRO_SSL_CERT", "NITRO_SSL_KEY"}
+
+// tlsNames switch Studio's listener to TLS; the gateway terminates TLS, so an
+// image may not set them.
+var tlsNames = []string{"NITRO_SSL_CERT", "NITRO_SSL_KEY"}
 
 // portNames are the listener names whose value must be StudioPort.
 var portNames = []string{"PORT", "NITRO_PORT"}
@@ -42,8 +47,8 @@ func FixedEnvNames() []string {
 
 // StudioEnv is Studio's whole environment, NAME=value, sorted: the fixed names
 // and what the image declares it needs (its label supapace.studio.env). An
-// image may name its listener (a port only as StudioPort) and switch features
-// off; any other name is refused.
+// image may name its listener (a port only as StudioPort, never the TLS pair)
+// and switch features off; any other name is refused.
 func StudioEnv(a Addrs, node string, l LimitSet, imageEnv map[string]string) ([]string, error) {
 	if err := l.Check(); err != nil {
 		return nil, err
@@ -57,6 +62,8 @@ func StudioEnv(a Addrs, node string, l LimitSet, imageEnv map[string]string) ([]
 	}
 	for name, v := range imageEnv {
 		switch {
+		case slices.Contains(tlsNames, name):
+			return nil, fmt.Errorf("studio env: the image may not set %q: Studio does not serve TLS", name)
 		case slices.Contains(portNames, name):
 			if v != strconv.Itoa(StudioPort) {
 				return nil, fmt.Errorf("studio env: the image sets %s=%q, not %d", name, v, StudioPort)

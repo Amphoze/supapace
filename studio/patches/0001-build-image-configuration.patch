@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 1/3] build: image configuration
+
+Server source maps off, the public files precompressed, no error-reporting build
+plugins, and a dump of the resolved replacement maps, the import.meta.env map and the
+plugin list for the build's gates.
+---
+ apps/studio/vite.config.ts | 61 +++++++++++++++++++-------------------
+ 1 file changed, 30 insertions(+), 31 deletions(-)
+
+diff --git a/apps/studio/vite.config.ts b/apps/studio/vite.config.ts
+index cedcd4b3..e5489a7e 100644
+--- a/apps/studio/vite.config.ts
++++ b/apps/studio/vite.config.ts
+@@ -427,6 +427,31 @@ export function sentryForFinalOutputs(
+   })
+ }
+ 
++// supapace: writes the resolved replacement map (per environment), the import.meta.env map and
++// the registered plugins to
++// .supapace/resolved-config.json, which the build's gates read instead of searching the bundles.
++function resolvedConfigDump(): Plugin {
++  return {
++    name: 'supapace-resolved-config',
++    apply: 'build',
++    configResolved(config) {
++      const environments = Object.fromEntries(
++        Object.entries(config.environments).map(([name, env]) => [name, env.define ?? {}])
++      )
++      const out = path.join(config.root, '.supapace')
++      fs.mkdirSync(out, { recursive: true })
++      fs.writeFileSync(
++        path.join(out, 'resolved-config.json'),
++        JSON.stringify(
++          { define: config.define ?? {}, environments, env: config.env, plugins: config.plugins.map((p) => p.name) },
++          null,
++          1
++        ) + '\n'
++      )
++    },
++  }
++}
++
+ export default defineConfig(({ command, mode }) => {
+   // Match Next's "always production-NODE_ENV during build" behaviour.
+   // `pnpm run e2e:setup:selfhosted` invokes the build with a shell
+@@ -771,8 +796,9 @@ export default defineConfig(({ command, mode }) => {
+       // function (`.vercel/output`, preset auto-detected from `VERCEL`) and
+       // the self-hosted node server (`.output`).
+       nitro({
+-        // Nitro controls both SSR and final server maps. Preserve source content for Sentry.
+-        sourcemap: true,
++        // supapace: no server source maps in the image; the public files are precompressed.
++        sourcemap: false,
++        compressPublicAssets: true,
+         experimental: { sourcemapMinify: false },
+         // `server.ts` is TanStack Start's SSR entry, not a Nitro entry;
+         // without this Nitro's scan picks it up as both and warns.
+@@ -814,35 +840,8 @@ export default defineConfig(({ command, mode }) => {
+         ...(basePath && { router: { basepath: basePath } }),
+       }),
+       viteReact(),
+-      // Sentry's TanStack Start plugin(s) MUST be last so source maps reflect
+-      // every prior transform. `sentryTanstackStart` returns an ARRAY of
+-      // plugins (route patterns, source-map upload, middleware auto-wrap), so
+-      // it's spread. Source-map UPLOAD is skipped gracefully without
+-      // SENTRY_AUTH_TOKEN (and under SKIP_ASSET_UPLOAD). We disable the
+-      // middleware auto-wrap because start.ts wires the Sentry global
+-      // middlewares explicitly.
+-      ...sentryForFinalOutputs({
+-        org: process.env.SENTRY_ORG ?? 'supabase',
+-        project: process.env.SENTRY_PROJECT ?? 'supabase-studio-tanstack',
+-        authToken: process.env.SENTRY_AUTH_TOKEN,
+-        autoInstrumentMiddleware: false,
+-        silent: true,
+-        sourcemaps: {
+-          disable: !shouldUploadSourceMaps,
+-          // Intermediate SSR maps must survive until Nitro composes the final server maps.
+-          // Skipped uploads retain private server maps for local diagnostics.
+-          filesToDeleteAfterUpload: [
+-            path.join(rootDir, '.output/public/**/*.map'),
+-            path.join(rootDir, '.vercel/output/static/**/*.map'),
+-            ...(shouldUploadSourceMaps
+-              ? [
+-                  path.join(rootDir, '.output/server/**/*.map'),
+-                  path.join(rootDir, '.vercel/output/functions/**/*.map'),
+-                ]
+-              : []),
+-          ],
+-        },
+-      }),
++      // supapace: no error-reporting build plugins; the build dumps its resolved configuration.
++      resolvedConfigDump(),
+     ],
+   }
+ })

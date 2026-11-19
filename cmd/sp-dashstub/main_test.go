@@ -47,7 +47,7 @@ func TestStubLimits_JSONAndNames(t *testing.T) {
 	if !slices.Equal(names.Fixed, dashcfg.FixedEnvNames()) || !slices.Equal(names.Listener, dashcfg.ListenerNames) {
 		t.Fatalf("names = %+v", names)
 	}
-	if !strings.HasPrefix(out, `{"fixed":[`) || !slices.Contains(names.Fixed, "SUPAPACE_LIMITS") || len(names.Listener) != 4 {
+	if !strings.HasPrefix(out, `{"fixed":[`) || !slices.Contains(names.Fixed, "SUPAPACE_LIMITS") || len(names.Listener) != 6 {
 		t.Fatalf("names output %q", out)
 	}
 	for _, args := range [][]string{{"limits", "--bogus"}, {"limits", "extra"}} {

@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seed <seed@localhost>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] seed: an unshimmed next/* import
+
+---
+ apps/studio/start.ts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/apps/studio/start.ts b/apps/studio/start.ts
+index 986e1be5..bebd706e 100644
+--- a/apps/studio/start.ts
++++ b/apps/studio/start.ts
+@@ -1,3 +1,4 @@
++import 'next/headers'
+ import {
+   sentryGlobalFunctionMiddleware,
+   sentryGlobalRequestMiddleware,

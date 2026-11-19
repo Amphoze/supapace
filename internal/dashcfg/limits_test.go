@@ -158,7 +158,7 @@ func TestStudioEnv_IsTheFixedSetPlusWhatTheImageMayDeclare(t *testing.T) {
 	if err != nil || !slices.Equal(envNames(env), fixed) {
 		t.Fatalf("fixed only: %v %v", envNames(env), err)
 	}
-	if !slices.Equal(ListenerNames, []string{"PORT", "HOST", "NITRO_PORT", "NITRO_HOST"}) {
+	if !slices.Equal(ListenerNames, []string{"PORT", "HOST", "NITRO_PORT", "NITRO_HOST", "NITRO_SSL_CERT", "NITRO_SSL_KEY"}) {
 		t.Fatalf("ListenerNames = %v", ListenerNames)
 	}
 	refused := []map[string]string{
@@ -175,6 +175,9 @@ func TestStudioEnv_IsTheFixedSetPlusWhatTheImageMayDeclare(t *testing.T) {
 		{"enabled_features_X": "false"},
 		{"PORT": "3001"},
 		{"NITRO_PORT": "80"},
+		// listener names the image may not set: Studio never serves TLS, the gateway does
+		{"NITRO_SSL_CERT": "/etc/cert.pem"},
+		{"NITRO_SSL_KEY": "/etc/key.pem"},
 		{"port": "3000"},
 		{"": "x"},
 	}

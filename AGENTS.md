@@ -3592,3 +3592,84 @@ Rules and limits
   in an unexported field of a printed struct, prints raw (fmt bypasses every method there).
 - Tests: the fake Docker looks an unmodelled verb or --format up in fakeVerbs (filled by a test
   file's init) before failing.
+
+### 2026-11-19 — Studio image build pipeline (studio/)
+The dashboard image is Supabase Studio (Apache-2.0) at the commit in `studio/PIN`, less the paths of
+`studio/delete.txt`, plus the patch series `studio/patches/NNNN-<topic>-<slug>.patch`.
+
+Sub-commands of `studio/build.sh`:
+- `image [--variant NAME] [--cpus N] [--memory SIZE]`: the whole pipeline to
+  `supapace-studio:local`, `$IMAGE_CACHE/supapace-studio.tar` and
+  `supapace-studio.build-record.json` beside it (also in the image at
+  `/opt/supapace/build-record.json`). `--variant NAME` adds `studio/test-patches/NNNN-NAME.patch`
+  and writes only `supapace-studio:NAME`, `supapace-studio-NAME.*` and `work-NAME/`; a missing
+  patch is an error. `IMAGE_CACHE` defaults to `~/.cache/supapace/images`.
+- `test`: vitest files the series adds, in the build container.
+- `prove [NAME]`: `bash studio/prove/X.sh supapace-studio:local` from the repository root, each
+  proof or the one named; results go into the archived record's `proofs`.
+- `paths`: `node studio/prove/paths.mjs SRV` with `paths.in` on stdin and `paths.json` on stdout;
+  SRV is the last product build's `.output`.
+- `export DIR`: a private clone's commits after the pin into `studio/patches/`.
+
+Running a build on a shared machine:
+- Host needs bash, git, docker, go and flock. The bundler only runs in containers of the pinned Node
+  base, `--memory 12g --cpus 4` by default; only the dependency install has a network.
+- One build at a time per host: `flock` on `/tmp/supapace-studio-build.lock` (released when the
+  process ends, also on a kill). A second build refuses at once; wait and retry. A lock file you
+  cannot open (another user's) also refuses.
+- Memory need: `MemAvailable` of 10 GiB for `image`, `prove` and `paths`, 4 GiB for `test`, checked
+  at start. Measured at 4 CPUs: peak about 8 GiB (cgroup peak up to 9.6 GiB with page cache), cold
+  about 12 minutes, warm 3 to 5.
+- What it leaves: under `$IMAGE_CACHE/studio`, the upstream clone (~0.6 GB), the dependency archive
+  `deps-<hash>.tar` (~2.1 GB; keyed by pin, Node base, lockfile and the series' manifest changes),
+  `work/` (~1.2 GB, the last product build), `work-NAME/` and `work-test/`; the image, its
+  archive and record; BuildKit cache. Its containers and images carry `supapace.build=studio`;
+  it removes its containers on exit. A killed build.sh can leave a running container with that
+  label: remove it before the next build. Never prune others' objects; `supapace.test=1`
+  clean-ups do not apply.
+- Outputs are replaced together. A hard kill while they are being replaced can leave the tag on the
+  new image and the archive and record on the previous one; the next `image` replaces all three.
+
+Gates, interface for later patches:
+- `bash studio/gates/NN-name.sh DIR`, run in name order on one input directory; each gate's header
+  names its files, and no listed input may be empty. A failing gate names what differs.
+- Seeds: `studio/gates/seeds/<gate>.<slug>.sh DIR` change a copy of DIR, and the gate must then fail
+  for that reason alone. A copy for `20-apply` needs a clean work tree of its own at
+  `DIR/base-commit` as `DIR/repo`. `*.patch` seeds need a build and are skipped by a selftest.
+  `seeds/gen.sh CLONE OUT` writes seeds that need an upstream value into the build's temporary
+  directory, never under `studio/`.
+- A package that adds a way of failing adds its seed in the same commit.
+
+Gates of this package:
+- `10-delete`: a delete-list path missing at the pin.
+- `20-apply`: a patch that does not apply or is misnamed; a work tree not clean or not at the base.
+- `30-dotenv`: a `.env*` file in the build tree or the image; image ENV names other than PATH,
+  NODE_VERSION, YARN_VERSION.
+- `40-compat`: upstream's `next/*` import check fired or is no longer registered.
+- `55-record`: the record's `bypass`, `mcp_chunk_importers`, `pages_with_project_data` or `listener`
+  differs from `studio/record.expect.json`, or a listener variable is not in
+  `sp-dashstub limits --names`.
+- `80-licence`: the image lacks LICENSE, NOTICE.supapace or THIRD-PARTY-NOTICES; a server-bundle
+  package has no notice; a modified file lacks its change notice (in its first three lines); or
+  NOTICE.supapace does not list a changed file.
+
+Files the gates read:
+- `apps/studio/.supapace/resolved-config.json` (written by the build): `define`, `environments` (the
+  define map per environment), `env` (the `import.meta.env` map) and `plugins` (names). Values are
+  the replacement text, JSON-encoded.
+- The build record: one member per line; 55 compares lines. `gates`, `proofs` and
+  `total_seconds` are filled into the archived record only. `output_sha256` hashes `.output`
+  without `nitro.json`, so two builds at one pin can be compared. Re-record
+  `record.expect.json` only for an intended change.
+
+The image:
+- Node base plus `.output`, with no source maps and no `.env*`.
+- Entrypoint `node apps/studio/.output/server/index.mjs`, with no shell.
+- Runs as a non-root uid with a read-only root and a tmpfs `/tmp`.
+- Label `supapace.studio.env`, a JSON object: `PORT` and one `ENABLED_FEATURES_<KEY>: "false"` per
+  line of `studio/features-off.txt` (KEY upper-cased, other characters `_`, as upstream derives it).
+- The MCP library sits in a chunk that only the MCP route loads, when it runs (patch 0003 is the one
+  upstream source edit of the build topic).
+
+The listener reads PORT, HOST, NITRO_PORT, NITRO_HOST, NITRO_SSL_CERT and NITRO_SSL_KEY;
+`dashcfg.StudioEnv` refuses the TLS pair from the label.
