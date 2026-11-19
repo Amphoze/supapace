@@ -998,15 +998,18 @@ func TestBoot_ManyHostileProjectsDoNotDelayOthers(t *testing.T) {
 			w.start()
 			stopAsking := make(chan struct{})
 			askErr := make(chan error, 1)
-			go func() { // the admin socket answers throughout
+			go func() { // the admin socket answers throughout, once it has first answered
 				defer close(askErr)
+				answered := false
 				for {
 					select {
 					case <-stopAsking:
 						return
 					default:
 					}
-					if _, err := ask(w.d.p.AdminSock()); err != nil && time.Since(start) > 200*time.Millisecond {
+					_, err := ask(w.d.p.AdminSock())
+					answered = answered || err == nil
+					if err != nil && (answered || time.Since(start) > bound) {
 						askErr <- err
 						return
 					}
