@@ -85,6 +85,7 @@ type Spec struct {
 	RepoQuotaMB int    // equals DiskQuotaMB
 	Stanza      string // "<ref>-<incarnation>"
 	StanzaPass  string `json:"-"` // the stanza's cipher passphrase; never printed
+	OpsSpec            // the operability fields (spec_ops.go)
 }
 
 // String and GoString keep the secrets out of every fmt verb and log line.

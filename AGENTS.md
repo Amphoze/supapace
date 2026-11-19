@@ -2355,3 +2355,61 @@ deadline inside the namespace, thread count stable after 1,000 dials.
   mechanisms; one of each pair suffices.
 - Suite helper daemonPids leaves out a process whose parent is a listed daemon: a child
   between fork and exec shows the daemon's executable and command line.
+
+### 2026-11-19 — `internal/poolcfg`: pooler constants, addresses, connection arithmetic
+
+Provides (imports internal/nodecfg and the standard library only; reads no clock, socket or file):
+- Constants: PoolerUID 65526, PlatformDBUID 65525 (each also the gid); PoolerName "sp-pooler",
+  PlatformDBName "sp-platform-db"; SessionPort 5432, TxnPort 6543, AdminPort 4000; PoolPortBase
+  24096 (the proxy's class "pooler": PoolPortBase + subnet index, clear of the meta range at every
+  slice count the dashboard admits); ManagerRole "supapace_pooler" (also the helper schema);
+  AuthQuery; RegistryDB, RegistryRole; SecretManagerPassword; DefaultPoolSize 5,
+  DefaultMaxClients 100; TierReserved 50; CancelsPerProject 2; ProxyFixedConns 112;
+  DefaultProxyMaxConns 2128; ScramIterMax 32768; SourceConnMax 64; EgressFlowMax 4096;
+  PoolerMemMB 1024, PlatformDBMemMB 256; SliceHold 25 h.
+- RestrictionsOffered (var, false, pinned by a test): network restrictions are not offered until
+  the address-preserving path is proven.
+- ClassValues, PoolClass: the proxy's class "pooler" as plain numbers (burst 70, one default
+  allowance; refusals in flight 48).
+- Addrs; For(c) (Addrs, error); Static(c) Addrs; PoolPort(i).
+- ValidLabel: 1-63 of [a-z0-9-], no dash at either end, not the shape of a project ref.
+  Zone "<label>.<domain>"; Host "<ref>.<label>.<domain>"; ConnString(...) =
+  postgresql://<login>.<ref>@<Host>:<port>/postgres?sslmode=verify-full (never a password).
+- ProxyWanted(studioDomain, poolerLabel): true when either is set.
+- Allowance(m) = m - TierReserved. MaxPoolSize(a) = the largest P with 2(2P+3) <= a, else 0.
+  MinMaxConnections(P) = TierReserved + 2(2P+3), saturating at both ends. Fits(m, P) is nil or
+  wraps ErrBudget (match with errors.Is), naming both figures, the largest pool that fits and the
+  max_connections P needs; it refuses P < 1. ProjectConns(a) = a + CancelsPerProject.
+- Tenant, Tenant.Body; ValidAllowList(c, list); OpenAllowList() = [0.0.0.0/0].
+
+Addresses: platform subnet base+7 (platform database), base+8 (pooler); ingress subnet base+3;
+pool ports PoolPortBase to PoolPortBase+slices-1. For refuses, with joined plain errors, a
+non-IPv4 platform or ingress subnet, an address outside its subnet, a gateway address that is
+one of the three, an allocation range holding a platform member, more than 41,440 slices, and a
+project uid range holding either uid. It assumes nodecfg validation passed.
+Static never fails or panics. It equals For where For accepts; otherwise every member For refuses
+is the zero value and a refused port range is 0-0, so it never names an address that belongs to
+something else. Renderers use Static and omit what is zero; init and servers use For and do
+nothing when it refuses. The ingress network has no allocation range: attach the pooler with
+--ip and treat "address in use" as a refusal.
+
+Figures: the default tier's connection budget at max_connections 120 gives allowance 70, the
+largest pool 16 (MinMaxConnections 120), a project's proxy share 72, and the ceiling
+28 x 72 + 112 = 2128. Tests recompute each from the budget's rows and rules.
+
+Tenant document: Body is exactly the registration JSON with one user (the manager, transaction
+mode) and no sni_hostname. It refuses a host that is not IPv4 unicast (private ranges are
+accepted), a port outside 1-65535, a pool size or client count below 1, an allow list that is
+empty, longer than 32 or not masked IPv4, and an empty password; no error carries the password.
+Callers substitute DefaultPoolSize, DefaultMaxClients and OpenAllowList() for zero values first.
+String, GoString, Format and json:"-" keep the password out of fmt, slog and JSON. %p of a value,
+or a Tenant in an unexported field of a printed struct, still prints it by reflection: never
+format those.
+ValidAllowList takes 1 to 32 canonical IPv4 prefixes and refuses overlap with the project block,
+the platform, ingress, Docker-pool and backup subnets, 0.0.0.0/8, loopback, link-local,
+multicast and 240.0.0.0/4.
+
+internal/agent: Spec embeds OpsSpec (spec_ops.go: IOLimits, APISpec, Rate, OpsSpec; standard
+library imports only, pinned by a test). Nothing reads a field yet. A zero OpsSpec renders the
+cluster and the REST container byte for byte as before (recorded digests); a change meant to
+alter a rendering re-records them. Spec is not serialized, so no stored form changes.
