@@ -3401,3 +3401,77 @@ Known limits
   header limit of 32 KiB: about 1,200 names).
 - The sp-dashstub flow model has no ended=0, no more and lists both script hashes on every
   answer; those are tested on the gateway only.
+
+### 2026-11-19 — Harness: repository filesystem, object-store stand-in, worker image, hold
+
+What it provides
+- `/var/lib/supapace/repo` in every test node: a loop XFS (8G sparse, `state/repo.img`) mounted
+  `loop,usrquota,nosuid,nodev,noexec` in bare and full mode, unmounted on stop.
+- `deploy/worker/Dockerfile`: pgBackRest 2.58.0 built from source on Alpine. The base comes by
+  digest (`worker_base`), the source archive by SHA-256 (`worker_source`) and is checked before it
+  is unpacked. Build and runtime packages are pinned. The final stage holds `/usr/bin/pgbackrest`
+  and its libraries only, names uid/gid 70 `postgres`, and has no `pgbackrest.conf`, no server
+  binaries and no set-uid file. `make images` builds it, archives it as `supapace-worker.tar`
+  named `supapace-worker:local` (with `PULL_ONLY=1` it stays in the local Docker), and keeps the
+  source archive in `$(IMAGE_CACHE)/src/` once its checksum matches.
+- `images.lock` entries `s3_standin`, `worker_base`, `worker_source`. `cache-images.sh` skips them
+  (none is loaded into a node).
+- `cache-images.sh --save IMAGE NAME ARCHIVE`: archives a locally built image under NAME, whatever
+  its own tag. Used for the gateway and the worker, so `GATEWAY_IMAGE=`/`WORKER_IMAGE=` overrides
+  still load as `…:local` in the node.
+- The object-store stand-in (`test/harness/s3/setup.sh`, run by `node-up`/`node-bare` unless
+  `SP_OFFSITE=0`):
+  - `$(NODE)-s3` on two networks `$(NODE)-net`, `$(NODE)-net2`, created `--internal` with
+    `com.docker.network.bridge.inhibit_ipv4=true`, so the workstation has no address on them;
+  - the node joins both; `s3.sp.test` is set by `--add-host` at `docker run`;
+  - TLS from a throw-away harness CA; data on tmpfs;
+  - buckets `sp-projects` and `sp-cp`: created with the object-lock header, then versioning
+    enabled, compliance lock 1 day, lifecycle (abort uploads after 1 day, noncurrent versions
+    expire 1 day later);
+  - identities: admin, projects-write/read (sp-projects only), cp-write/read (sp-cp only);
+  - `/var/lib/sp/s3/`: `endpoint`, `addrs` (the stand-in's two addresses), `ca.pem` and
+    `<role>.keys`; root, dir 0500, files 0400. The keys are random per setup;
+  - a full node then declares it: `node-init.sh declare-offsite`, the same function as at boot.
+    Region `us-east-1`, no prefixes, path style.
+- The lab slot: `S3_SLOT` (default: the cksum of the node name mod 250, plus 1; override 0..255).
+  The networks are 10.215.<slot>.0/25 and 10.215.<slot>.128/25, the stand-in at .10 and .138,
+  the node at .5 and .133. `make lab NODE=…` prints them. Only the Makefile derives them;
+  scripts take them from their command line or from the node's `addrs` file.
+- The supervisor hold: while `/run/sp-hold` exists, node-init does not start `supapaced` (it logs
+  `supapaced held` once). The daemon never reads the file. /run is fresh at every boot, and the
+  suite reset removes it. To hold: create the file, then stop the daemon.
+- Makefile:
+  - `standin-test`: `TestStandin_*` with `SUPAPACE_STANDIN_TEST=1`; it needs the stand-in image
+    pulled by `make images`;
+  - `harness-test`: `test/harness/harness-test.sh` against `$(NODE)`;
+  - `lab`: prints the lab slot and addresses;
+  - `reach` passes `SUPAPACE_STANDIN=1` when `$(NODE)-s3` exists;
+  - `node-down` removes the stand-in and exactly its two networks too.
+- `install-node.sh` refuses before writing anything unless `/var/lib/supapace/repo` is the top
+  mount, XFS, user quota enforced, `nosuid,nodev,noexec`, not the projects filesystem (same
+  mount source), and `BIN_DIR/supapace-arch` exists. It installs `supapace-arch` and writes
+  `fs.protected_hardlinks = 1` to `/etc/sysctl.d/90-supapace.conf`.
+
+Running a node on a shared Docker host
+- With the stand-in (the default):
+    make node-up NODE=sp-<id> [NODE_IMAGE=… GATEWAY_IMAGE=… WORKER_IMAGE=… IMAGE_CACHE=…]
+  Each node's lab slot follows its name. If two names collide, setup.sh fails with
+  "the lab slot S3_SLOT=<n> is in use"; run `make node-down NODE=sp-<id>`, then repeat with
+  `S3_SLOT=<another>` on every make line for that node. `make reach` then fails, rather than
+  skips, a test that needs the stand-in.
+- Without the stand-in: add `SP_OFFSITE=0` to `node-up`/`node-bare`. No lab networks are made;
+  tests that need the stand-in skip, and `make reach` sets no `SUPAPACE_STANDIN`.
+- Always end with `make node-down NODE=sp-<id>`: it removes the node, its volumes, the
+  stand-in and the node's two lab networks, nothing else.
+
+Rules and limits
+- The stand-in is never archived into the image cache and never loaded into a node; harness-test
+  checks both. Bump its digest in `images.lock` and in every `seaweedfs@sha256:` test pin together
+  (`standin-digest`).
+- The stand-in also serves non-TLS ports on its lab addresses. Only the node's root namespace
+  reaches them; jobs reach the declared address and port only (the node ruleset). Assert object
+  lock and identity scope through the endpoint only.
+- Pinned Alpine versions fail the worker build with apk's "unable to select" once Alpine moves a
+  package. Bump the pin; do not unpin.
+- A bare node loads no ruleset: there, any inner container reaches the stand-in.
+- Keep new test addresses out of 10.215.1.0-10.215.200.255 (the lab slots in common use).

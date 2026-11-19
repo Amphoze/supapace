@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # cache-images.sh DIR — pull every upstream image of internal/nodecfg/images.lock by
 # digest and docker-save it into DIR as <key>-<digest12>.tar; images already cached
-# are skipped. The harness base image ("node") is built from, not loaded into, the
-# node, so it is not cached.
+# are skipped. Never loaded into a node, so not cached: the harness base image
+# ("node", built from), the object-store stand-in ("s3_standin", run beside the
+# node) and the worker image's base and source ("worker_base", "worker_source",
+# built from).
 #
 # A digest-only image is saved without a name and would load into the node
 # untagged, unreachable by the reference the platform uses. So the fully qualified
@@ -14,11 +16,18 @@
 #
 # cache-images.sh --pull-only — pull every image by digest and save nothing: enough
 # where this machine's own Docker is the node's (a host install), with either store.
+#
+# cache-images.sh --save IMAGE NAME ARCHIVE — docker-save a locally built IMAGE into
+# ARCHIVE named NAME (a local name such as supapace-worker:local), whatever IMAGE's
+# own tag: the node loads it under the name the platform uses.
 set -euo pipefail
-pull_only=''
+pull_only='' save=''
 if [[ ${1:-} == --pull-only ]]; then
 	pull_only=1
 	shift
+elif [[ ${1:-} == --save ]]; then
+	[[ $# == 4 && $3 != */* ]] || { echo "usage: cache-images.sh --save IMAGE NAME ARCHIVE" >&2; exit 2; }
+	save=1
 fi
 dir=${1:-}
 if [[ -z $pull_only ]]; then
@@ -29,14 +38,50 @@ if [[ -z $pull_only ]]; then
 		exit 1
 	fi
 fi
-lock=$(dirname "$0")/../internal/nodecfg/images.lock
-[[ -n $pull_only ]] || mkdir -p "$dir"
 # A failed run leaves neither a partial archive nor its unpacked copy behind.
 tar='' tmp=''
 trap '[[ -z $tar ]] || rm -f "$tar.tmp"; [[ -z $tmp ]] || rm -rf "$tmp"' EXIT
 
+# name_archive ANNOTATION [TAG]: unpack $tar.tmp, set the image's io.containerd.image.name
+# annotation (replaced, or added when absent) and its reference name to TAG when given,
+# pack it again and move it into place.
+name_archive() {
+	tmp=$(mktemp -d)
+	tar -xf "$tar.tmp" -C "$tmp"
+	[[ -z ${2:-} ]] || sed -i "s|\"org.opencontainers.image.ref.name\":\"[^\"]*\"|\"org.opencontainers.image.ref.name\":\"$2\"|" "$tmp/index.json"
+	if grep -q '"io.containerd.image.name":' "$tmp/index.json"; then
+		sed -i "s|\"io.containerd.image.name\":\"[^\"]*\"|$1|" "$tmp/index.json"
+	else
+		sed -i "s|\"annotations\":{|\"annotations\":{$1,|" "$tmp/index.json"
+	fi
+	if ! grep -qF "$1" "$tmp/index.json"; then
+		echo "cache-images: cannot name the image in $tar" >&2
+		exit 1
+	fi
+	# shellcheck disable=SC2046 # docker save writes a few fixed top-level names
+	tar -cf "$tar.tmp" -C "$tmp" $(ls -A "$tmp")
+	rm -r "$tmp"
+	tmp=''
+	mv "$tar.tmp" "$tar"
+}
+
+if [[ -n $save ]]; then
+	tar=$4
+	docker save -o "$tar.tmp" "$2"
+	# NAME qualified as Docker qualified IMAGE's own name: the same repository prefix.
+	prefix=$(tar -xOf "$tar.tmp" index.json | sed -n 's|.*"io.containerd.image.name":"\([^"]*/\)[^"/]*".*|\1|p')
+	[[ -n $prefix ]] || { echo "cache-images: the archive of $2 names no image" >&2; exit 1; }
+	name_archive "\"io.containerd.image.name\":\"$prefix$3\"" "${3##*:}"
+	echo "saved    $2 as $3"
+	exit 0
+fi
+
+lock=$(dirname "$0")/../internal/nodecfg/images.lock
+[[ -n $pull_only ]] || mkdir -p "$dir"
+
 # images.lock keeps one entry per line: "key": {"tag": "…", "digest": "sha256:…", …}
-entries=$(sed -n 's/^ *"\([a-z_]*\)": *{"tag": *"\([^"]*\)", *"digest": *"\(sha256:[0-9a-f]\{64\}\)".*/\1 \2 \3/p' "$lock" | grep -v '^node ' || true)
+entries=$(sed -n 's/^ *"\([a-z_]*\)": *{"tag": *"\([^"]*\)", *"digest": *"\(sha256:[0-9a-f]\{64\}\)".*/\1 \2 \3/p' "$lock" |
+	grep -Ev '^(node|s3_standin|worker_base|worker_source) ' || true)
 if [[ $(wc -l <<<"$entries") -lt 3 ]]; then
 	echo "cache-images: cannot read the image entries of $lock" >&2
 	exit 1
@@ -58,18 +103,7 @@ while read -r key tag digest; do
 	fi
 	# pull -q prints the reference fully qualified, as the image store keeps it.
 	name=$(docker pull -q "$ref")
-	annotation="\"io.containerd.image.name\":\"$name\""
 	docker save -o "$tar.tmp" "$ref"
-	tmp=$(mktemp -d)
-	tar -xf "$tar.tmp" -C "$tmp"
-	sed -i "s|\"annotations\":{|\"annotations\":{$annotation,|" "$tmp/index.json"
-	if ! grep -qF "$annotation" "$tmp/index.json"; then
-		echo "cache-images: cannot name $ref in its archive" >&2
-		exit 1
-	fi
-	# shellcheck disable=SC2046 # docker save writes a few fixed top-level names
-	tar -cf "$tar.tmp" -C "$tmp" $(ls -A "$tmp")
-	rm -r "$tmp"
-	mv "$tar.tmp" "$tar"
+	name_archive "\"io.containerd.image.name\":\"$name\""
 	echo "saved    $ref"
 done <<<"$entries"

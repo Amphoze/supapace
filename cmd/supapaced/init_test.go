@@ -760,7 +760,7 @@ func installEnv(t *testing.T, mounts string, missing ...string) (root, calls str
 	root, bin, fake := t.TempDir(), t.TempDir(), t.TempDir()
 	calls = filepath.Join(t.TempDir(), "calls")
 	rec := "#!/bin/sh\necho \"${0##*/} $*\" >>" + calls + "\n"
-	for dir, names := range map[string][]string{bin: {"supapaced"}, fake: {"systemctl", "sysctl", "dockerd", "nft"}} {
+	for dir, names := range map[string][]string{bin: {"supapaced", "supapace-arch"}, fake: {"systemctl", "sysctl", "dockerd", "nft"}} {
 		for _, name := range names {
 			if slices.Contains(missing, name) {
 				continue
@@ -814,7 +814,11 @@ func runInstall(t *testing.T, script string, env []string, args ...string) (int,
 	return 0, string(out)
 }
 
-const goodMount = "/dev/loop0 /var/lib/supapace/projects xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota 0 0\n"
+const (
+	projectsMount = "/dev/loop0 /var/lib/supapace/projects xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota 0 0\n"
+	repoMount     = "/dev/loop1 /var/lib/supapace/repo xfs rw,nosuid,nodev,noexec,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota 0 0\n"
+	goodMount     = projectsMount + repoMount
+)
 
 // The install script against a scratch root, with stand-ins for supapaced
 // (ROOT does not redirect init's own writes) and the host tools.
@@ -830,8 +834,9 @@ func TestInstallNode_ScratchRoot(t *testing.T) {
 	}
 	files := map[string]string{
 		"etc/modprobe.d/supapace.conf":  "install br_netfilter /bin/false\n",
-		"etc/sysctl.d/90-supapace.conf": "kernel.core_pattern = core\n",
+		"etc/sysctl.d/90-supapace.conf": "kernel.core_pattern = core\nfs.protected_hardlinks = 1\n",
 		"usr/local/bin/supapaced":       "",
+		"usr/local/bin/supapace-arch":   "",
 	}
 	for rel, want := range files {
 		p := filepath.Join(root, rel)
@@ -873,22 +878,53 @@ func TestInstallNode_ScratchRoot(t *testing.T) {
 		t.Errorf("rerun calls:\n%s", got)
 	}
 
-	for name, mounts := range map[string]string{
-		"no xfs mount":      "",
-		"user quota off":    "/dev/loop0 /var/lib/supapace/projects xfs rw,uqnoenforce,prjquota 0 0\n",
-		"project quota off": "/dev/loop0 /var/lib/supapace/projects xfs rw,usrquota 0 0\n",
+	repo := func(opts string) string { return "/dev/loop1 /var/lib/supapace/repo xfs rw," + opts + " 0 0\n" }
+	const proj, rp = "/var/lib/supapace/projects", "/var/lib/supapace/repo"
+	for name, c := range map[string]struct{ mounts, refusal string }{
+		"no xfs mount":      {repoMount, proj + " is not an XFS mount"},
+		"user quota off":    {"/dev/loop0 /var/lib/supapace/projects xfs rw,uqnoenforce,prjquota 0 0\n" + repoMount, "user quota enforcement is off on " + proj},
+		"project quota off": {"/dev/loop0 /var/lib/supapace/projects xfs rw,usrquota 0 0\n" + repoMount, "project quota accounting is off on " + proj},
+		// The repository filesystem: XFS with user-quota enforcement, nosuid, nodev, noexec.
+		"no repository mount":                 {projectsMount, rp + " is not an XFS mount"},
+		"repository not xfs":                  {projectsMount + "/dev/loop1 /var/lib/supapace/repo ext4 rw,nosuid,nodev,noexec,usrquota 0 0\n", rp + " is not an XFS mount"},
+		"repository user quota off":           {projectsMount + repo("nosuid,nodev,noexec,uqnoenforce"), "user quota enforcement is off on " + rp},
+		"repository without nosuid":           {projectsMount + repo("nodev,noexec,usrquota"), rp + " is not mounted nosuid"},
+		"repository without nodev":            {projectsMount + repo("nosuid,noexec,usrquota"), rp + " is not mounted nodev"},
+		"repository without noexec":           {projectsMount + repo("nosuid,nodev,usrquota"), rp + " is not mounted noexec"},
+		"repository covered by another mount": {goodMount + "tmpfs /var/lib/supapace/repo tmpfs rw,nosuid,nodev,noexec 0 0\n", rp + " is not an XFS mount"},
+		// A bind mount of the projects filesystem: one user quota per uid would serve both limits.
+		"repository on the projects filesystem": {projectsMount + "/dev/loop0 /var/lib/supapace/repo xfs rw,nosuid,nodev,noexec,usrquota,prjquota 0 0\n", rp + " is on the projects filesystem"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			root, calls, env := installEnv(t, mounts)
+			root, calls, env := installEnv(t, c.mounts)
 			code, out := runInstall(t, script, env)
-			if code != 1 || !strings.Contains(out, "/var/lib/supapace/projects") {
-				t.Fatalf("exit %d, output %q; want a refusal naming the projects mount", code, out)
+			if code != 1 || !strings.Contains(out, c.refusal) {
+				t.Fatalf("exit %d, output %q; want the refusal %q", code, out, c.refusal)
 			}
 			absent(t, filepath.Join(root, "usr/local/bin/supapaced"))
 			absent(t, filepath.Join(root, "etc/modprobe.d"))
 			absent(t, calls)
 		})
 	}
+	// Control: the options in another order, and uquota for usrquota, are accepted.
+	t.Run("repository options in another order", func(t *testing.T) {
+		_, _, env := installEnv(t, projectsMount+repo("noexec,uquota,nodev,nosuid"))
+		if code, out := runInstall(t, script, env); code != 0 {
+			t.Fatalf("exit %d\n%s", code, out)
+		}
+	})
+
+	// The archive binary is installed with the daemon; without it nothing is written.
+	t.Run("supapace-arch missing", func(t *testing.T) {
+		root, calls, env := installEnv(t, goodMount, "supapace-arch")
+		code, out := runInstall(t, script, env)
+		if code != 1 || !strings.Contains(out, "supapace-arch") {
+			t.Fatalf("exit %d, output %q; want a refusal naming supapace-arch", code, out)
+		}
+		absent(t, filepath.Join(root, "usr/local/bin/supapaced"))
+		absent(t, filepath.Join(root, "etc/modprobe.d"))
+		absent(t, calls)
+	})
 
 	// Without nft the Docker drop-in's required unit cannot start, so Docker
 	// would not come back after the restart.

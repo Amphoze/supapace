@@ -60,6 +60,11 @@ The node's firewall tables and checks assume nothing else runs on the host:
 
   A project's disk limit is the XFS user quota of its uid: blocks and an inode limit of
   `max(65536, 256 × MiB)`.
+- **The repository filesystem:** before installing, create a second XFS filesystem for the
+  backup repositories, separate from the projects filesystem (not a bind mount of it), and
+  mount it at `/var/lib/supapace/repo` with `usrquota,nosuid,nodev,noexec` (fstab:
+  `<dev> /var/lib/supapace/repo xfs defaults,usrquota,nosuid,nodev,noexec 0 0`). The install
+  script refuses to run without it.
 - **Address space.** These ranges are fixed in this release and must not be used or routed by
   anything else on the host:
   - `10.212.0.0/21` the platform network (gateway `10.212.0.2`, PostgREST containers from
@@ -88,14 +93,18 @@ scripts/install-node.sh --domain example.test --dev
 
 The script, which is safe to rerun:
 
-1. checks for root, `bin/supapaced`, `systemctl`, `dockerd` and `nft`, and that
-   `/var/lib/supapace/projects` is the topmost mount, XFS with `usrquota` and `prjquota`
-   (or `pqnoenforce`);
+1. checks for root, `bin/supapaced`, `bin/supapace-arch`, `systemctl`, `dockerd` and `nft`,
+   that `/var/lib/supapace/projects` is the topmost mount, XFS with `usrquota` and `prjquota`
+   (or `pqnoenforce`), and that `/var/lib/supapace/repo` is the topmost mount, XFS of its own
+   with `usrquota`, `nosuid`, `nodev` and `noexec`;
 2. makes `/var/lib/supapace` root 0700;
 3. writes `/etc/modprobe.d/supapace.conf` (`install br_netfilter /bin/false`) and
-   `/etc/sysctl.d/90-supapace.conf` (`kernel.core_pattern = core`) and applies the latter;
+   `/etc/sysctl.d/90-supapace.conf` (`kernel.core_pattern = core` and
+   `fs.protected_hardlinks = 1`; do not override that setting in a later sysctl file) and
+   applies the latter;
    it warns when `br_netfilter` is already loaded (reboot to unload it);
-4. installs `supapaced` and `supapace` to `/usr/local/bin`;
+4. installs `supapaced`, `supapace-arch` (from BIN_DIR, built by `make build`) and `supapace`
+   to `/usr/local/bin`;
 5. runs `supapaced init` with your arguments (below);
 6. reloads systemd, enables `supapace-nft.service` and `supapaced.service`, restarts Docker;
 7. runs `supapaced nft check`.

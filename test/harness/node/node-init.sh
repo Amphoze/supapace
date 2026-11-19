@@ -1,17 +1,25 @@
 #!/bin/sh
 # Boot sequence of the test node (PID 1), in the order a real node boots:
 #   0  fresh /run (tmpfs, as on a real boot); boot counter
-#   1  loop-backed XFS with user and project quotas at /var/lib/supapace/projects
-#   2  supapaced init, first boot only                  (full)
+#   1  loop-backed XFS with user and project quotas at /var/lib/supapace/projects,
+#      and the repository filesystem (user quota, nosuid, nodev, noexec) at
+#      /var/lib/supapace/repo
+#   2  supapaced init, first boot only; the object-store stand-in declared  (full)
 #   3  supapaced nft load before dockerd; table record  (full)
 #   4  dockerd; docker load the cached images it lacks; /run/sp-node-ready
-#   5  supervisor loop: supapaced serve, again after 1 s (full)
+#   5  supervisor loop: supapaced serve, again after 1 s, never while
+#      /run/sp-hold exists (full)
 # SP_NODE_MODE=bare, or full without bin/supapaced, runs steps 0, 1 and 4 only.
+#
+# node-init.sh declare-offsite (docker exec, after the harness has copied the
+# stand-in's files in) runs only the declaration of step 2.
 set -eu
 
 BIN=/opt/supapace/bin
 STATE=/var/lib/sp
 PROJECTS=/var/lib/supapace/projects
+REPO=/var/lib/supapace/repo
+S3=$STATE/s3
 log() { echo "node-init: $*" >&2; }
 
 # docker stop (and a TERM during boot): the supervisor loop, then the daemon
@@ -28,16 +36,47 @@ stop() {
 		kill -TERM "$dockerd_pid" 2>/dev/null || :
 	fi
 	wait
+	! mountpoint -q "$REPO" || umount "$REPO" || :
 	! mountpoint -q "$PROJECTS" || umount "$PROJECTS" || :
 	exit 0
 }
-trap stop TERM INT
+
+# The object-store stand-in beside the node (make node-up) is declared when its
+# files are here and the node has no declaration yet, through the daemon's
+# own command. A daemon binary without `offsite` answers it with 2 (an unknown
+# subcommand): such a node runs without a declaration.
+declare_offsite() {
+	[ -e "$S3/endpoint" ] || return 0
+	s=0
+	out=$("$BIN/supapaced" offsite show 2>&1) || s=$?
+	case $s in
+	0) ;;
+	2)
+		log "supapaced has no offsite subcommand: the object-store stand-in is not declared"
+		return 0
+		;;
+	*)
+		log "supapaced offsite show failed: $out"
+		return 1
+		;;
+	esac
+	printf '%s\n' "$out" | grep -q '"state": "undeclared"' || return 0
+	"$BIN/supapaced" offsite set --endpoint "$(cat "$S3/endpoint")" --region us-east-1 --ca-file "$S3/ca.pem" \
+		--projects-bucket sp-projects --cp-bucket sp-cp \
+		--projects-write-keys "$S3/projects-write.keys" --projects-read-keys "$S3/projects-read.keys" \
+		--cp-write-keys "$S3/cp-write.keys" --cp-read-keys "$S3/cp-read.keys" >&2
+}
 
 mode=${SP_NODE_MODE:-full}
 if [ "$mode" = full ] && [ ! -x "$BIN/supapaced" ]; then
-	log "$BIN/supapaced absent, booting bare"
+	[ $# -gt 0 ] || log "$BIN/supapaced absent, booting bare"
 	mode=bare
 fi
+if [ "${1:-}" = declare-offsite ]; then
+	[ "$mode" != full ] || declare_offsite
+	exit
+fi
+trap stop TERM INT
 
 # 0. Nothing in /run survives a boot: not /run/supapace (boot record, test hooks),
 # not the pid files and sockets of a dockerd that was killed.
@@ -60,25 +99,30 @@ mknod_loops() {
 		[ -b "$n" ] || mknod "$n" b "$(cut -d: -f1 "$d/dev")" "$(cut -d: -f2 "$d/dev")"
 	done
 }
-mkdir -p "$PROJECTS"
+# mount_xfs IMAGE SIZE DIR OPTIONS: a sparse XFS image, made once, mounted at
+# DIR. A mount -o loop device is autoclear: released with this mount namespace.
+mount_xfs() {
+	mkdir -p "$3"
+	if [ ! -e "$1" ]; then
+		truncate -s "$2" "$1.tmp"
+		mkfs.xfs -q "$1.tmp"
+		mv "$1.tmp" "$1"
+	fi
+	try=1
+	until mountpoint -q "$3"; do
+		mknod_loops
+		losetup -f >/dev/null
+		mknod_loops
+		mount -o "loop,$4" "$1" "$3" && break
+		[ "$try" -lt 3 ] || { log "cannot mount $1"; exit 1; }
+		try=$((try + 1))
+		sleep 1
+	done
+}
+mkdir -p /var/lib/supapace
 chmod 0700 /var/lib/supapace
-img=$STATE/projects.img
-if [ ! -e "$img" ]; then
-	truncate -s 6G "$img.tmp"
-	mkfs.xfs -q "$img.tmp"
-	mv "$img.tmp" "$img"
-fi
-# A mount -o loop device is autoclear: released with this mount namespace.
-try=1
-until mountpoint -q "$PROJECTS"; do
-	mknod_loops
-	losetup -f >/dev/null
-	mknod_loops
-	mount -o loop,usrquota,prjquota "$img" "$PROJECTS" && break
-	[ "$try" -lt 3 ] || { log "cannot mount $img"; exit 1; }
-	try=$((try + 1))
-	sleep 1
-done
+mount_xfs "$STATE/projects.img" 6G "$PROJECTS" usrquota,prjquota
+mount_xfs "$STATE/repo.img" 8G "$REPO" usrquota,nosuid,nodev,noexec
 
 # 2, 3. Node configuration, then our tables before Docker's. init shows the
 # key escrow (the key-encryption key) on its output: that goes to a file only
@@ -88,6 +132,7 @@ if [ "$mode" = full ]; then
 		(umask 077 && "$BIN/supapaced" init --dev --no-systemd --ack-escrow --domain sp.test >"$STATE/init.out" 2>&1) ||
 			{ log "supapaced init failed; its output is in $STATE/init.out"; exit 1; }
 	fi
+	declare_offsite || { log "declaring the object-store stand-in failed"; exit 1; }
 	"$BIN/supapaced" nft load
 	nft list tables >"$STATE/boot/pre-dockerd.txt"
 fi
@@ -154,6 +199,12 @@ if [ "$mode" = full ]; then
 		if [ "$(wc -c <"$LOG")" -gt 8388608 ]; then
 			tail -c 4194304 "$LOG" >"$LOG.tmp" && cat "$LOG.tmp" >"$LOG"
 			rm -f "$LOG.tmp"
+		fi
+		# A harness test holds the daemon (a wiped-node drill); the daemon itself
+		# never reads this file.
+		if [ -e /run/sp-hold ]; then
+			echo "node-init: /run/sp-hold exists; supapaced held" | tee -a "$LOG" >&2 || :
+			while [ -e /run/sp-hold ]; do sleep 1; done
 		fi
 		# The shell reports a daemon killed by a signal on the waited command's
 		# stderr: that is /dev/null here, and the loop says what ended instead.

@@ -7,12 +7,16 @@
 # The arguments are passed to `supapaced init` (--no-systemd is refused: this
 # script exists to wire systemd). Binaries come from BIN_DIR (default bin/, as
 # built by `make build`). Before running it, mount the projects filesystem:
-# XFS at /var/lib/supapace/projects with usrquota,prjquota. Do not run it on a
+# XFS at /var/lib/supapace/projects with usrquota,prjquota; and the repository
+# filesystem: XFS at /var/lib/supapace/repo with usrquota,nosuid,nodev,noexec
+# (a file system of its own, so a full repository never fills the projects').
+# Do not run it on a
 # host before the daemon binary provides `serve`: Docker's drop-in pulls in
 # the daemon unit, which would otherwise restart every second.
 #
-# Steps: check the tools and the projects filesystem; block br_netfilter and
-# set kernel.core_pattern; install the binaries; supapaced init; enable the
+# Steps: check the tools and the two filesystems; block br_netfilter, set
+# kernel.core_pattern and fs.protected_hardlinks; install the binaries
+# (supapaced, supapace-arch, supapace when built); supapaced init; enable the
 # units; restart Docker (so its drop-in and daemon.json apply before the first
 # network exists, with our tables loaded before it); verify the tables. Safe
 # to rerun: every step leaves an installed node as it is.
@@ -27,6 +31,7 @@ umask 022
 ROOT=${ROOT:-}
 BIN_DIR=${BIN_DIR:-bin}
 PROJECTS=/var/lib/supapace/projects
+REPO=/var/lib/supapace/repo
 
 log() { echo "install-node: $*" >&2; }
 die() {
@@ -71,16 +76,22 @@ for a in "$@"; do
 done
 [ -n "$ROOT" ] || [ "$(id -u)" = 0 ] || die "must run as root"
 [ -x "$BIN_DIR/supapaced" ] || die "$BIN_DIR/supapaced not found; run make build"
+[ -x "$BIN_DIR/supapace-arch" ] || die "$BIN_DIR/supapace-arch not found; run make build"
 command -v systemctl >/dev/null || die "systemd is required"
 command -v dockerd >/dev/null || die "Docker is not installed"
 # Docker's drop-in requires the tables unit, which runs nft: without it Docker
 # would not start again.
 command -v nft >/dev/null || die "nftables (nft) is required"
 
+# xfs_opts PATH: the mount options of PATH when the mount on top (the last
+# entry for the path, the one that is used) is XFS; empty otherwise.
+xfs_opts() {
+	awk -v m="$1" '$2 == m { t = $3; o = $4 } END { if (t == "xfs") print o }' "$ROOT/proc/mounts"
+}
+
 # The disk limit of a project is its XFS user quota, so enforcement must be on;
-# project quota is used for accounting. The last entry for the path is the
-# mount on top, the one that is used.
-opts=$(awk -v m="$PROJECTS" '$2 == m { t = $3; o = $4 } END { if (t == "xfs") print o }' "$ROOT/proc/mounts")
+# project quota is used for accounting.
+opts=$(xfs_opts "$PROJECTS")
 [ -n "$opts" ] || die "$PROJECTS is not an XFS mount (or another mount covers it); mount it with usrquota,prjquota first"
 case ",$opts," in
 *,usrquota,* | *,uquota,*) ;;
@@ -90,21 +101,43 @@ case ",$opts," in
 *,prjquota,* | *,pquota,* | *,pqnoenforce,*) ;;
 *) die "project quota accounting is off on $PROJECTS (mount options: $opts)" ;;
 esac
+# The repositories: each project's limit is its user quota there too; nothing
+# on it is ever run, set-uid or a device.
+opts=$(xfs_opts "$REPO")
+[ -n "$opts" ] || die "$REPO is not an XFS mount (or another mount covers it); mount it with usrquota,nosuid,nodev,noexec first"
+case ",$opts," in
+*,usrquota,* | *,uquota,*) ;;
+*) die "user quota enforcement is off on $REPO (mount options: $opts)" ;;
+esac
+for o in nosuid nodev noexec; do
+	case ",$opts," in
+	*,$o,*) ;;
+	*) die "$REPO is not mounted $o (mount options: $opts)" ;;
+	esac
+done
+# A file system of its own: on the projects filesystem (a bind mount) one user
+# quota per uid would be both limits.
+mount_src() { awk -v m="$1" '$2 == m { s = $1 } END { print s }' "$ROOT/proc/mounts"; }
+[ "$(mount_src "$REPO")" != "$(mount_src "$PROJECTS")" ] ||
+	die "$REPO is on the projects filesystem; give the repositories a file system of their own"
 # root:root 0700: the script runs as root (only the tests' ROOT runs it as
 # another user, which then owns the scratch tree).
 chown "$(id -u):$(id -g)" "$ROOT/var/lib/supapace"
 chmod 0700 "$ROOT/var/lib/supapace"
 
 # br_netfilter would divert bridged frames into the routed chains; nothing on
-# a node may load it. Core files stay inside the crashing container.
+# a node may load it. Core files stay inside the crashing container. Protected
+# hard links: a process links only files it owns or can read and write.
 write "$ROOT/etc/modprobe.d/supapace.conf" 0644 "install br_netfilter /bin/false"
-write "$ROOT/etc/sysctl.d/90-supapace.conf" 0644 "kernel.core_pattern = core"
+write "$ROOT/etc/sysctl.d/90-supapace.conf" 0644 "kernel.core_pattern = core
+fs.protected_hardlinks = 1"
 sysctl -q -p "$ROOT/etc/sysctl.d/90-supapace.conf"
 if [ -e "$ROOT/sys/module/br_netfilter" ]; then
 	log "warning: br_netfilter is loaded; it is blocked from now on, reboot to unload it"
 fi
 
 install_bin supapaced
+install_bin supapace-arch
 if [ -x "$BIN_DIR/supapace" ]; then
 	install_bin supapace
 fi
