@@ -3007,3 +3007,57 @@ Engine facts (the harness's gate runs)
 - Limits: the store bounds no text size (the caller sanitises); queued jobs per subject are
   bounded by the scheduler, not here; a pick reads every job row of the lane's queued subjects,
   so its cost grows with the retained history (no index on subject).
+
+### 2026-11-19 — store: backup state, timelines and the record of uploaded objects
+
+- backup_state: EnsureBackupState(subject) inserts the row once. A project's incarnation is
+  "1"; the control plane's ("cp") is its database system identifier as an unsigned decimal,
+  read when the row is inserted and never changed. GetBackupState; MarkStanza
+  (stanza_created, plus timeline 1 recorded unless "cp"); SetSeeded; SetOffsitePurge;
+  PauseReplication; MarkForcedFull(day) - false when that UTC day's forced full was taken.
+  An unknown subject is ErrNotFound (match with errors.Is).
+- RecordPush: last_push_ok = At only when Complete; spool figures replaced; the newest
+  segment kept when none is reported (a malformed one is refused by the database); the quota
+  report stored with quota_at = At when not nil. Each gap (cause "quarantine" only; any
+  other cause is refused) is stored cleaned and cut to 256 bytes, with a notice of that
+  code. Notice(subject, code, detail) upserts: count + 1, last_at, detail (cleaned, 256
+  bytes). ListGaps returns the newest 64, newest first.
+- RecordUploads: one transaction under the subject's row lock. Hashes are 32 raw bytes,
+  not hex. Refused whole, nothing written: more than 2,048 rows or set labels, more than 4
+  info versions, a key outside 1-1,024 bytes or with a control byte, a version id with a
+  control byte, a size outside 0..SetFileMax, a hash that is not 32 bytes, a malformed set
+  label. First hash wins: a recorded row that has a hash never changes and raises nothing.
+  A row without one (rebuilt from a listing) takes hash, inode and ctime only from a
+  report under the same version id - a missing id never matches - and otherwise is left
+  as it is and raises notice offsite-differs (detail: the key, cut to 256 bytes). A key
+  repeated in one call: the first is kept. Info versions: one row per version id. Each
+  label in SetsComplete becomes replicated and gets listed_at = At (once) when the call
+  carries info versions or a backup.info / backup.info.copy version exists at or after
+  the set's stop. Day counters (UTC day of At, never moved back) add every reported row
+  and its bytes. last_repl_ok = At when Complete. Returns whether a non-zero budget is now
+  exceeded.
+- MergeListing(page, epoch): one transaction per page. ErrConflict once rebuild_epoch >=
+  epoch. A row with a hash keeps everything but seen_epoch; a row without takes the
+  listing's size, version id and time - the last listed for its key, i.e. its oldest
+  version - so pages must be merged once, in listing order, from the stored markers. A
+  listed .history of a timeline 1..2^31-1 that has no row is inserted abandoned (never
+  for "cp"). The last page raises record-not-in-store with the count of rows no page
+  listed, clears the markers, sets rebuild_pages to 0 and rebuild_epoch to epoch.
+- Lookups by name (HasArchiveObject, SegmentReplicated, NewestRecordedSegment) match any
+  archive id under archive/<stanza>/ and check each candidate with walname.RepoPath.
+  SegmentReplicated also needs last_repl_ok at or after that row's uploaded_at.
+  ObjectRows streams the record in byte order of the key.
+- Only RecordUploads and MergeListing insert object rows, and only MarkStanza,
+  BeginRecoveryAttempt and MergeListing insert timeline rows - each by one statement with
+  a column list. A source test pins this.
+- Timelines returns the admitted set: every row, never nil; an empty list admits none.
+  "cp" has none. For a restore: BeginRecoveryAttempt(ref, stanza, op, held) before each
+  recovery start returns the pending timeline, or ErrTimelineConflict with nothing
+  written; it refuses "cp". ConfirmTimeline(ref, op, tli) makes that pending timeline
+  recorded and sets params.t8_done in the same transaction. Anything else, including a
+  second call, is ErrConflict, so re-read the operation and skip the call once t8_done is
+  set.
+- LagCounts(push, repl): subjects - "cp" and every active or restarting project - whose
+  last complete push / replication is older than the threshold. A subject that has never
+  completed one is not counted. RepoQuotaTotals: sum and maximum of disk_quota_mb over
+  projects that are neither purged nor aborted.
