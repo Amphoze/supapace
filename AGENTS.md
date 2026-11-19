@@ -2971,3 +2971,39 @@ Engine facts (the harness's gate runs)
   key. Further sub-commands register in offsiteCommands from their own init().
 - init writes cp-stanza.sealed once, after the key escrow is acknowledged; a rerun with the
   file present does not load the key and reports nothing to change.
+
+### 2026-11-19 — store: persisted job queue
+- `internal/store/job.go`: table `backup_job`; two lanes, `push` (kinds push, replicate) and
+  `backup` (every other kind); at most one running job per subject (unique index
+  `backup_job_slot`, the per-project slot).
+- `SubmitJob(ctx, NewJob)`: queues a job no operation owns; a non-zero `OpID` is refused.
+- `SubmitJobAndPark(ctx, opID, NewJob)`: one transaction: inserts the job for opID and moves the
+  operation running -> waiting_job with attempts - 1. Not running: `ErrConflict`; unknown
+  operation or a subject without a `backup_state` row: `ErrNotFound`.
+- Both refuse a job whose lane is not its kind's lane.
+- `NextJob(ctx, lane)`: one update statement makes the next job running (runs + 1, started_at).
+  Each subject offers only its lowest eligible queued job. Order: subject `cp` first, then the
+  subject whose last job started longest ago, then the lowest id. A subject with a running job
+  is skipped; a project whose `slot_op` is set admits only that operation's jobs.
+  `ok=false` means nothing was picked: an empty lane OR a clash with the other lane's pick of
+  the same subject at the same moment. Ask again on the next turn; never retry in a loop.
+- `FinishJob(ctx, id, state, code, message, result)`: running -> done or failed only, else
+  `ErrConflict` (unknown id: `ErrNotFound`); a failure without a code is `ErrConflict` and
+  writes nothing. If the job's operation is waiting_job it becomes pending, due now; a failed
+  job counts one attempt and sets last_error "<code>: <message>", except for the codes
+  `interrupted` and `cancelled`, which count nothing. An operation in any other state is left
+  untouched. A result that is not valid JSON ends the job failed with code `crashed` (counted,
+  slot freed) and the call returns an error naming the job.
+- `LatestJob`, `CountJobs`, `CountInterruptedJobs`: an operation's jobs of one step with an id
+  above the operation's job floor only; the last counts those that ended `interrupted`.
+- `InterruptJobs`: every running job -> failed/interrupted, its operation resumed, not counted.
+  Call it only after every job container is gone.
+- `CancelJobs(op)`, `CancelSubjectJobs(subject)`: queued -> failed/cancelled; running jobs are
+  returned untouched for the caller to kill and record with FinishJob. No operation is changed:
+  cancel an operation's jobs only after it has left waiting_job.
+- `LastJob(subject, kind)`: the newest by id, any state; none after pruning is normal.
+- `PruneJobs(olderThan, limit)`: deletes up to limit done/failed jobs finished before olderThan,
+  referenced by no backup set, whose operation is not open. Repeat while it returns limit.
+- Limits: the store bounds no text size (the caller sanitises); queued jobs per subject are
+  bounded by the scheduler, not here; a pick reads every job row of the lane's queued subjects,
+  so its cost grows with the retained history (no index on subject).
