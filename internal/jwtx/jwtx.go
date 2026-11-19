@@ -24,8 +24,15 @@ import (
 	"unicode/utf8"
 )
 
-// Class is the class of a verification key: "anon", "service_role" or "issuer".
+// Class is the class of a verification key: "anon", "service_role" or
+// "issuer" for a project, ClassDashboard for the dashboard's sign-in issuer.
 type Class string
+
+// ClassDashboard is the class of a key that verifies ID tokens for dashboard
+// sign-in (VerifyID). CheckRole refuses it for every role, and KeyFromJWK and
+// ParseJWKS never produce it: it enters only through DashboardKeyFromJWK and
+// ParseDashboardJWKS.
+const ClassDashboard Class = "dashboard"
 
 // Key is a public verification key and the class that bounds its tokens' roles.
 type Key struct {
@@ -105,49 +112,7 @@ func Sign(priv *rsa.PrivateKey, kid string, claims map[string]any) (string, erro
 // signed it and its claims. It does not bind the role to the key's class;
 // callers follow it with CheckRole.
 func Verify(token string, keys []Key, now time.Time) (Key, Claims, error) {
-	if len(token) > maxToken || !inAlphabet(token, true) || strings.Count(token, ".") != 2 {
-		return Key{}, Claims{}, ErrMalformed
-	}
-	seg := strings.Split(token, ".")
-	hb, err1 := b64.DecodeString(seg[0])
-	pb, err2 := b64.DecodeString(seg[1])
-	sig, err3 := b64.DecodeString(seg[2])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return Key{}, Claims{}, ErrMalformed
-	}
-	h, err := decodeObject(hb)
-	if err != nil {
-		return Key{}, Claims{}, err
-	}
-	if a, _ := h["alg"].(string); a != alg {
-		return Key{}, Claims{}, ErrAlg
-	}
-	if _, ok := h["crit"]; ok {
-		return Key{}, Claims{}, ErrMalformed // no extension is understood
-	}
-	kid, _ := h["kid"].(string)
-	if kid == "" {
-		return Key{}, Claims{}, ErrNoKID
-	}
-	// A kid listed more than once is ambiguous: which class applies would
-	// depend on the order of keys.
-	var k Key
-	matches := 0
-	for _, c := range keys {
-		if c.KID == kid {
-			k = c
-			matches++
-		}
-	}
-	if matches != 1 || k.Pub == nil {
-		return Key{}, Claims{}, ErrUnknownKID
-	}
-	sum := sha256.Sum256([]byte(token[:len(seg[0])+1+len(seg[1])]))
-	if rsa.VerifyPKCS1v15(k.Pub, crypto.SHA256, sum[:], sig) != nil {
-		return Key{}, Claims{}, ErrSignature
-	}
-
-	p, err := decodeObject(pb)
+	k, p, err := verifySigned(token, keys)
 	if err != nil {
 		return Key{}, Claims{}, err
 	}
@@ -175,6 +140,59 @@ func Verify(token string, keys []Key, now time.Time) (Key, Claims, error) {
 		return Key{}, Claims{}, ErrMalformed
 	}
 	return k, Claims{Role: role, Sub: sub, Exp: exp, Raw: p}, nil
+}
+
+// verifySigned is the part of verification both entry points share: size and
+// alphabet, three segments, strict JSON, the algorithm, no crit, exactly one
+// supplied key with the token's kid, the signature, and then the payload as
+// one strict JSON object. It reads no claim.
+func verifySigned(token string, keys []Key) (Key, map[string]any, error) {
+	if len(token) > maxToken || !inAlphabet(token, true) || strings.Count(token, ".") != 2 {
+		return Key{}, nil, ErrMalformed
+	}
+	seg := strings.Split(token, ".")
+	hb, err1 := b64.DecodeString(seg[0])
+	pb, err2 := b64.DecodeString(seg[1])
+	sig, err3 := b64.DecodeString(seg[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return Key{}, nil, ErrMalformed
+	}
+	h, err := decodeObject(hb)
+	if err != nil {
+		return Key{}, nil, err
+	}
+	if a, _ := h["alg"].(string); a != alg {
+		return Key{}, nil, ErrAlg
+	}
+	if _, ok := h["crit"]; ok {
+		return Key{}, nil, ErrMalformed // no extension is understood
+	}
+	kid, _ := h["kid"].(string)
+	if kid == "" {
+		return Key{}, nil, ErrNoKID
+	}
+	// A kid listed more than once is ambiguous: which class applies would
+	// depend on the order of keys.
+	var k Key
+	matches := 0
+	for _, c := range keys {
+		if c.KID == kid {
+			k = c
+			matches++
+		}
+	}
+	if matches != 1 || k.Pub == nil {
+		return Key{}, nil, ErrUnknownKID
+	}
+	sum := sha256.Sum256([]byte(token[:len(seg[0])+1+len(seg[1])]))
+	if rsa.VerifyPKCS1v15(k.Pub, crypto.SHA256, sum[:], sig) != nil {
+		return Key{}, nil, ErrSignature
+	}
+	p, err := decodeObject(pb)
+	if err != nil {
+		return Key{}, nil, err
+	}
+	return k, p, nil
 }
 
 // inAlphabet reports whether s holds only base64url characters, and dots when

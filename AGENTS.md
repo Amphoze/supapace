@@ -2009,3 +2009,55 @@ Known limits
   Secrets still print under %d and in JSON; no code does either today.
 - A node.json hand-edited so another network covers 10.212.9.0/24 no longer loads; set
   backup_subnet explicitly.
+
+### 2026-11-20 — `internal/dashtok` and `jwtx.VerifyID`: dashboard tokens
+
+- `internal/dashtok` signs and verifies three Ed25519 token formats: the principal
+  assertion (`Assertion`: node, iss, sub, name, ref, role, purpose, iat, exp), the session
+  token (`Session`: iss, sub, name, ref or `_`, iat, exp) and the log-out ticket (`Ticket`:
+  iss, sub, refs, iat, exp). `SignAssertion`/`VerifyAssertion(k, token, node, now)`,
+  `SignSession`/`VerifySession(k, token, maxSeconds, now)`, `SignTicket`/`VerifyTicket`.
+- Envelope `v1.<P>.<S>`: P is the unpadded base64url of the payload JSON, S of the 64-byte
+  signature over `<label><P>`. Labels `supapace-assertion-v1.`, `supapace-session-v1.`,
+  `supapace-logout-v1.`, so no token verifies as another kind (`ErrSignature`).
+- Verification order: size (at most 4096 bytes); envelope (prefix `v1.`, two dots, non-empty
+  P, S of exactly 86 characters, base64url alphabet only, strict decoding with zero unused
+  bits); signature (RFC 8032, S < L); then the payload, which must be byte for byte the
+  canonical encoding of what it decodes to: listed members in order, no white space, no
+  escape but `\"` and `\\`, integers in plain decimal. Then member rules, times, node.
+- Member rules (signers and verifiers): iss and sub 1 to 255 bytes of printable ASCII; name
+  at most 128 bytes and node 1 to 255 bytes of UTF-8 without a control character, U+2028 or
+  U+2029; ref `^[a-z0-9]{20}$`; role owner, developer or read_only; purpose "" or "reveal";
+  a ticket holds 1 to 16 refs, never `_`.
+- Times: exp <= now is `ErrExpired`; iat > now + 5 is `ErrNotYet`; exp <= iat, or exp - iat
+  above the bound, is `ErrLifetime` (60 s for assertions and tickets, maxSeconds for
+  sessions; a bound <= 0 accepts nothing). Another node is `ErrNode`.
+- Errors, matched with `errors.Is`: `ErrMalformed` (size, envelope, JSON syntax, white
+  space), `ErrSignature` (also a public key not of 32 bytes), `ErrField` (members or
+  values; signers return it too), `ErrExpired`, `ErrNotYet`, `ErrLifetime`, `ErrNode`. A
+  refused verification returns the zero value.
+- Key files (`GenerateKey`, `ParsePrivate`, `ParsePublic`): the 32-byte seed or public key
+  as 43 base64url characters and one line end; a parser also accepts the 43 characters
+  alone. Signing with a private key of the wrong size returns an error, never panics.
+- `testdata/vectors.json` is shared with a second implementation: the public test key (seed
+  00..1f, never a node's key), three fixed accepted tokens, the login nonce vector and the
+  refused cases with the Go error name of each. Another verifier must refuse every refused
+  case; the error name is informational there. Regenerate the refused cases with
+  `go test ./internal/dashtok -run TestVectors_UpdateRefused -update`; the accepted tokens
+  are never regenerated.
+- A verifier in another language must not use a lenient base64 decoder (trailing bits,
+  skipped characters, the standard alphabet) and must compare the UTF-8 bytes of its
+  re-serialised payload with the payload bytes, never strings.
+- `jwtx.ClassDashboard` ("dashboard") is a fourth key class. `CheckRole` refuses it for
+  every role; `KeyFromJWK` and `ParseJWKS` still refuse it. Dashboard keys come only from
+  `DashboardKeyFromJWK(kid, n, e)` and `ParseDashboardJWKS`, with every check of those two;
+  `DashboardKeyFromJWK` takes no kty, so the caller checks it is "RSA".
+- `jwtx.VerifyID(token, keys, IDCheck{Issuer, ClientID, Nonce}, now)` checks an OpenID
+  Connect ID token with Verify's parser and signature code, then: key class dashboard
+  (`ErrKey`); iss exact, aud the client id or an array holding it with azp, a present azp
+  equal to the client id, sub 1 to 255 bytes of printable ASCII (`ErrClaim`); exp later
+  than now - 60 and iat no older than 600 s, both required (`ErrExpired`); iat and nbf at
+  most 60 s ahead (`ErrNotYetValid`); nonce equal, compared in constant time (`ErrNonce`);
+  name a string when present. A claim of the wrong type is `ErrMalformed`. An IDCheck with
+  an empty member accepts nothing. `IDClaims.Name` is untrusted and unbounded: clean and
+  cut it before it goes into a session.

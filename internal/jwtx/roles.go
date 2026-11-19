@@ -27,12 +27,15 @@ func ForbiddenUserRole(role string) bool {
 
 // CheckRole binds the claimed role to the class of the key that signed it: an
 // anon key carries only "anon", a service_role key only "service_role", an
-// issuer key only a role in userRoles that is not forbidden.
+// issuer key only a role in userRoles that is not forbidden. A dashboard key
+// carries none: it signs principals for sign-in, never a project's tokens.
 func CheckRole(k Key, c Claims, userRoles []string) error {
 	if c.Role == "" {
 		return ErrNoRole
 	}
 	switch k.Class {
+	case ClassDashboard:
+		return ErrRole
 	case "anon", "service_role":
 		if c.Role == string(k.Class) {
 			return nil
