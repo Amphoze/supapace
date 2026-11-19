@@ -1,0 +1,7 @@
+{
+  "key": "test-only-crypto-key_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG",
+  "plaintext": "postgresql://supabase_read_only_user:p%40ss%2Fw0rd@10.212.0.6:20003/postgres?sslmode=disable",
+  "ciphertext": "U2FsdGVkX18YLQmGEglYwEC3cl//dMwZ0s8O9UVxvswiT+J4WWzY+vDlXJHDHP/wNjkJxci6PMRrQpSFj0zfR0Pzr4nGG9kowWCQeZjc6GtCWdvct9BPENE1CIg26Wx91Vp1MPxeQcT7d+IlUtHfgw==",
+  "no_port_plaintext": "postgresql://postgres@10.212.0.6/postgres",
+  "no_port_ciphertext": "U2FsdGVkX1+DRkwRrxLFzjDdxvXs19Rh1bZY2kyu7GLkWVe7092WYl80htLAdoxTE97QEzSoJMy3X4SZ6ca0XA=="
+}

@@ -2180,3 +2180,36 @@ subcommands[name] = func(args []string, stdout, stderr io.Writer) int; an unknow
   can fail at R3 or R4 and roll back to the old quota, below the usage, leaving the project
   `restarting` (way out: a new restart with enough quota). A new restart after a failed one
   rolls back to that failed configuration. The quota is still set by R3 without a time bound.
+
+### 2026-11-20 — sp-dashstub socket and pgmeta: stand-ins for the dashboard socket
+cmd/sp-dashstub gains two sub-commands (register in init()); test-only, never run on a node.
+- socket --listen PATH --public FILE --node ID --table FILE [--mode answer|silent|refuse:CODE]
+  Serves POST /v1/resolve and /v1/keys on a Unix socket; the socket file is mode 0666 (the
+  directory decides who connects; the real socket is narrower, so a test that another uid is
+  refused cannot use this stub). Order: path 404 not_found, method 405 method_not_allowed, body
+  (chunked too) 400 bad_request, then refuse:peer, then dashtok.VerifyAssertion (401
+  bad_assertion), then any other refuse:CODE, then the ref in the table (404 not_here), then
+  (iss, sub, role) among the members (403 not_a_member). Every refusal is {"code":"..."}.
+  Refusal codes: peer 403, bad_assertion 401, rate_limited 429, not_here 404, not_a_member 403,
+  unavailable 503. Only peer answers before the assertion is checked, as on the real socket.
+- Table: one JSON object keyed by ref: {"members":[{iss,sub,role}], "resolve":{...},
+  "keys":{...}}. Unknown members and trailing data are refused. Answers are the typed
+  dashsock.ResolveAnswer / KeysAnswer as written, so a test may put a malformed string in one;
+  the stub drops dsn_rw unless RoleClass is "rw", and service_role_key unless owner + "reveal".
+  The table's state is not checked: use refuse:not_here to test a project that is not live.
+- silent: accepts, logs with status 0, never answers; holds the request until the client leaves.
+- Log: one JSON line per request appended to PATH.log: path, ref, sub, role, purpose, status
+  (ref/sub/role/purpose empty when the assertion failed). One write per line on an O_APPEND file;
+  a restart keeps earlier lines. A stale socket at PATH is removed; other files are not.
+- Limits applied: header 8 KiB (net/http allows 4 KiB more), header read 2 s. Not applied: 64
+  connections, the 800 ms whole request, per-ref rate, the peer check itself.
+- pgmeta --listen ADDR --crypto-key-file FILE [--delay-ms N] [--size BYTES] [--status CODE]
+  Answers /query and /generators/typescript with [{"login","port","n"}] (n = request number,
+  space-padded to --size) after --delay-ms, with --status; the delay ends when the client leaves.
+  The key is the file's bytes exactly as they are (a trailing line end is part of it). It decrypts
+  x-connection-encrypted: base64 of "Salted__", 8-byte salt, AES-256-CBC with PKCS#7; key and IV
+  from MD5 EVP_BytesToKey (crypto-js passphrase mode; openssl enc -aes-256-cbc -md md5 makes test
+  data). Unreadable, bad padding or no port: 400. Other paths: 404.
+- GET /_seen (not recorded itself): the last 1,000 requests, oldest first, [{n, method, path,
+  headers{name:[values]} with lower-case names, body_bytes}]. Go moves Host and Transfer-Encoding
+  out of the header map, so a test of "exactly these headers" must ignore transport headers.
