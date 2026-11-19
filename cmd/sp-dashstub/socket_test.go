@@ -677,15 +677,18 @@ func TestSocketStub_ReadWriteIdleTimeouts(t *testing.T) {
 	})
 
 	t.Run("client that never reads", func(t *testing.T) {
-		// An answer far larger than the socket's buffers.
-		big := strings.Replace(stubTable(), `"name": "alpha"`, `"name": "`+strings.Repeat("n", 32<<20)+`"`, 1)
+		// An answer far larger than the socket's buffers (a few hundred KiB),
+		// yet small enough for the reading control to finish inside the 2 s write
+		// bound on a loaded machine under the race detector.
+		const size = 8 << 20
+		big := strings.Replace(stubTable(), `"name": "alpha"`, `"name": "`+strings.Repeat("n", size)+`"`, 1)
 		h := startSocketServer(t, big, socketServer)
 		c := dial(h)
 		io.WriteString(c, rawRequest("POST", "/v1/resolve", tok(h)))
 		time.Sleep(3 * time.Second) // past the write bound, reading nothing
 		c.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, _ := io.Copy(io.Discard, c)
-		if n >= 32<<20 {
+		if n >= size {
 			t.Errorf("a client that did not read got the whole answer (%d bytes)", n)
 		}
 		// Control: a client that reads at once gets all of it.
@@ -696,7 +699,7 @@ func TestSocketStub_ReadWriteIdleTimeouts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if n, err := io.Copy(io.Discard, resp.Body); err != nil || n < 32<<20 {
+		if n, err := io.Copy(io.Discard, resp.Body); err != nil || n < size {
 			t.Errorf("reading client: %d bytes, %v", n, err)
 		}
 	})
