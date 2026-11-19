@@ -2520,3 +2520,51 @@ Referrer-Policy same-origin, never the sandbox; answers made before the switch (
 the origin-form 400) keep the as-built headers.
 Known limits: refusals of rules 5-10 are not logged yet; a request with no TLS server name passes
 the 421 check (as built); a refused non-regular table file is checked again on every tick.
+
+### 2026-11-19 — gateway: informational responses, body limit, CI failure excerpt
+
+- Informational (1xx) responses of the upstream. Before: relayed on both protocols, filtered,
+  at most 8 per request. Now:
+  - HTTP/1.1: relayed, filtered as before (no `Server`, `Set-Cookie2`, `Clear-Site-Data`, no
+    `Set-Cookie` with `Domain`) and capped at 8 — except to a client that sent
+    `Expect: 100-continue`, which gets none;
+  - HTTP/2: none relayed.
+  Every upstream 1xx still counts, relayed or not: the 9th ends the request with 502
+  `upstream_unavailable` and the upstream connection is not reused. A client waiting for
+  `100 Continue` gets it on both protocols: the server sends its own when the body is first
+  read.
+- Why. Over HTTP/2 the server writes a 1xx frame from the response's header map on another
+  goroutine and stops waiting for it when the client resets the stream or closes the
+  connection, while the proxy changes the map: a data race that outside the race detector can
+  end the process, and the gateway is shared by every project. Over HTTP/1.1 the server writes
+  its own `100 Continue` from the goroutine that first reads the body; a relayed 1xx could use
+  the connection's write buffer at the same moment and garble or lose the answer.
+- Body limit (8 MiB), unchanged for clients: a declared length over the limit is refused with
+  413 `body_too_large` before the upstream is dialled; a streamed body is cut at the limit
+  with the same 413. On HTTP/1.1 the connection is then closed after the answer — sending
+  side first, a short wait, then the socket — so a client that is still sending receives the
+  complete 413. Inside, the limit no longer holds the server's response writer (it set a
+  header from the upstream connection's writing goroutine); the handler tells the server
+  about the limit.
+- A client that has gone gets no response. An HTTP/1.1 client that half-closes its connection
+  after sending the request counts as gone and gets none either: the server library cancels
+  the request at end of input. Not new; stated because it surprises.
+- Caller rule (`internal/gateway/proxy.go`): hooks given to the upstream transport — trace
+  hooks, the request body's `Read` — run on the upstream connection's reading and writing
+  goroutines, not on the handler's. They must never touch the server's `ResponseWriter` or
+  its header map, and must never panic (a panic there ends the process). Use atomics, or
+  hand the result to the handler through the round trip's error.
+- Tests. `TestForward_InformationalThenClientReset`, `TestForward_InformationalThenClientCloses`
+  and `TestForward_BodyLimitWhileRelaying` detect a regression only under the race detector
+  (CI runs it); `TestForward_InformationalWhileExpectContinue` and
+  `TestServer_BodyLimitStillSending` also without it. The burst test closes idle connection
+  pools while it waits for goroutines to settle: a dial that outlives its request adds an
+  idle connection later.
+- CI, `unit` job: for a failing `go test -race -v` the step prints each complete race report,
+  each panic or fatal error (each cut at 400 lines), and the last 400 lines of each failing
+  test's own output, subtests included; with none of these, the last 100 lines of the log.
+  The exit status is unchanged.
+- Known limits. The upstream transport has no idle timeout yet: up to 16 idle upstream
+  connections per project stay open until the upstream closes them. The wait before the
+  connection is closed after a 413 is the server library's; `TestServer_BodyLimitStillSending`
+  fails if it goes away.

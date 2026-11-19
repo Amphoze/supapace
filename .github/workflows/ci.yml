@@ -113,7 +113,30 @@ jobs:
           grep -E -- '^(--- FAIL|FAIL|ok)' "$RUNNER_TEMP/test.log" || true
           grep -E -- '--- SKIP' "$RUNNER_TEMP/test.log" || true
           echo "::notice title=skipped tests::$(grep -c -- '--- SKIP' "$RUNNER_TEMP/test.log") skipped"
-          [ "$s" = 0 ] || { grep -B 30 -E -- '^--- FAIL' "$RUNNER_TEMP/test.log" || tail -n 100 "$RUNNER_TEMP/test.log"; exit "$s"; }
+          # On failure: each complete race report, each panic or fatal error, and the
+          # last 400 lines of each failing test's own output (subtests included); when
+          # there is none of these, the log's tail. Reports and panics are cut at 400.
+          [ "$s" = 0 ] || {
+            awk -v max=400 '
+              /^WARNING: DATA RACE$/ { r = 1; n = 0 }
+              r { if (++n <= max) print; if (n > 1 && /^==================$/) r = 0; f = 1; next }
+              /^(panic|fatal error): / { p = 1; n = 0 }
+              p { if (++n <= max) print; if (/^FAIL\t/) p = 0; f = 1; next }
+              /^=== (RUN|PAUSE|CONT|NAME) / { t = $3 }
+              /^ *--- (PASS|SKIP|FAIL): / {
+                lo = c[$3] > max ? c[$3] - max : 0
+                if ($2 == "FAIL:") {
+                  if (lo) print "[" lo " earlier lines]"
+                  for (i = lo + 1; i <= c[$3]; i++) print b[$3, i % max]
+                  print; f = 1
+                }
+                for (i = lo + 1; i <= c[$3]; i++) delete b[$3, i % max]
+                delete c[$3]; next
+              }
+              { b[t, ++c[t] % max] = $0 }
+              END { exit !f }' "$RUNNER_TEMP/test.log" || tail -n 100 "$RUNNER_TEMP/test.log"
+            exit "$s"
+          }
 
   # The node is a privileged Docker-in-Docker container with a loop-mounted XFS file
   # system (user and project quota) and nftables inside its own network namespace.

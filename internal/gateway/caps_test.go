@@ -502,10 +502,11 @@ func clientFor(t *testing.T, addr string, h2 bool) *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-// TestForward_InformationalFilteredAndBounded: over HTTP/1.1 and HTTP/2 a 1xx
-// response reaches the client without Server, Set-Cookie2 or Domain cookies,
-// and with its other headers; past maxInformational of them the request ends
-// in the gateway's 502 and the upstream connection is not reused.
+// TestForward_InformationalFilteredAndBounded: over HTTP/1.1 a 1xx response
+// reaches the client without Server, Set-Cookie2 or Domain cookies, and with
+// its other headers; HTTP/2 clients get no upstream 1xx. Over both, past
+// maxInformational of them the request ends in the gateway's 502 and the
+// upstream connection is not reused.
 func TestForward_InformationalFilteredAndBounded(t *testing.T) {
 	a, _, _ := keys()
 	e := newEnv(t, active())
@@ -539,23 +540,29 @@ func TestForward_InformationalFilteredAndBounded(t *testing.T) {
 		return res.StatusCode, got, nil
 	}
 	for _, h2 := range []bool{false, true} {
+		relayed := func(n int) int { // HTTP/2 clients get none
+			if h2 {
+				return 0
+			}
+			return n
+		}
 		c := clientFor(t, addr, h2)
 		hints.Store(1)
 		code, got, err := get(c)
-		if err != nil || code != 200 || len(got) != 1 {
+		if err != nil || code != 200 || len(got) != relayed(1) {
 			t.Fatalf("h2=%v: %d %v, %d informational responses", h2, code, err, len(got))
 		}
-		if h := got[0]; h.Get("Server") != "" || h.Get("Set-Cookie2") != "" ||
-			strings.Join(h.Values("Set-Cookie"), "|") != "y=2; Path=/" || h.Get("Link") != "</app.js>; rel=preload" {
+		if h := got; !h2 && (h[0].Get("Server") != "" || h[0].Get("Set-Cookie2") != "" ||
+			strings.Join(h[0].Values("Set-Cookie"), "|") != "y=2; Path=/" || h[0].Get("Link") != "</app.js>; rel=preload") {
 			t.Errorf("h2=%v: 103 header %v", h2, h)
 		}
 		hints.Store(maxInformational)
-		if code, got, err := get(c); err != nil || code != 200 || len(got) != maxInformational {
+		if code, got, err := get(c); err != nil || code != 200 || len(got) != relayed(maxInformational) {
 			t.Errorf("h2=%v: %d informational responses: %d %v, %d relayed", h2, maxInformational, code, err, len(got))
 		}
 		hints.Store(maxInformational + 1)
 		before := conns.Load()
-		if code, got, err := get(c); err != nil || code != 502 || len(got) != maxInformational {
+		if code, got, err := get(c); err != nil || code != 502 || len(got) != relayed(maxInformational) {
 			t.Errorf("h2=%v: %d informational responses: %d %v, %d relayed", h2, maxInformational+1, code, err, len(got))
 		}
 		hints.Store(1)
@@ -599,9 +606,9 @@ func TestForward_TrailersFiltered(t *testing.T) {
 
 // TestForward_SiblingSafeHeaders: projects share a parent domain, so no
 // response may act on sibling hosts: Clear-Site-Data is dropped from the
-// header, 1xx responses and trailers, and every final response, the
-// gateway's own refusals included, is sandboxed and not sniffed. The
-// upstream's Content-Type is kept.
+// header, 1xx responses (relayed over HTTP/1.1 only) and trailers, and every
+// final response, the gateway's own refusals included, is sandboxed and not
+// sniffed. The upstream's Content-Type is kept.
 func TestForward_SiblingSafeHeaders(t *testing.T) {
 	a, _, _ := keys()
 	e := newEnv(t, active())
@@ -630,7 +637,8 @@ func TestForward_SiblingSafeHeaders(t *testing.T) {
 			strings.Join(h.Values("X-Content-Type-Options"), "|") != "nosniff" || h.Get("Content-Type") != "text/html" {
 			t.Errorf("h2=%v: header %v trailer %v", h2, h, res.Trailer)
 		}
-		if len(hints) != 1 || hints[0].Get("Clear-Site-Data") != "" || hints[0].Get("Link") == "" {
+		// HTTP/2 clients get no upstream 1xx.
+		if h2 && len(hints) != 0 || !h2 && (len(hints) != 1 || hints[0].Get("Clear-Site-Data") != "" || hints[0].Get("Link") == "") {
 			t.Errorf("h2=%v: 1xx %v", h2, hints)
 		}
 	}

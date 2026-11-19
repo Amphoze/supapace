@@ -82,12 +82,15 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, name, ref stri
 		fail(w, http.StatusNotFound, "not_found")
 		return
 	}
-	b := &body{ReadCloser: http.MaxBytesReader(w, r.Body, maxBody)}
+	// The body is read on the upstream connection's writing goroutine: its
+	// limit must not reach the server's writer from there (see the 413 below).
+	b := &body{ReadCloser: http.MaxBytesReader(nil, r.Body, maxBody)}
 	r.Body = b
 	// The server sees b as the request's body and, after the handler, reads
 	// up to 256 KiB of an unread one before it answers unless the original is
 	// closed: a client waiting for 100-continue would never get the answer.
 	defer b.ReadCloser.Close()
+	sw := w // the server's writer
 	peer, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		peer = r.RemoteAddr
@@ -135,6 +138,10 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, name, ref stri
 			var ne net.Error
 			switch {
 			case errors.As(err, &tooLarge):
+				// Tell the server, on the handler's goroutine, that the body went
+				// over the limit: it then closes an HTTP/1.1 connection after the
+				// answer, leaving the client time to read it.
+				http.MaxBytesReader(sw, io.NopCloser(strings.NewReader("x")), 0).Read(make([]byte, 1))
 				fail(w, http.StatusRequestEntityTooLarge, "body_too_large")
 				return
 			case b.failed.Load() || r.Context().Err() != nil:
@@ -151,7 +158,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, name, ref stri
 			log.Printf("gateway: %s: upstream: %v", ref, err)
 		},
 	}
-	iw := &informational{ResponseWriter: w}
+	iw := &informational{ResponseWriter: w, drop: r.ProtoMajor == 2 || len(r.Header["Expect"]) > 0}
 	// The proxy relays each 1xx from its own trace hook, which runs before this
 	// one; an error here ends the upstream request and closes its connection.
 	ctx := httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
@@ -168,15 +175,23 @@ var errTooManyInformational = errors.New("too many 1xx responses")
 
 // informational applies filterResponse to the 1xx responses the proxy relays
 // and drops those past maxInformational; the request then ends in a 502.
+// Over HTTP/2 it relays none (they still count): the server writes a 1xx
+// frame from the handler's header map on another goroutine and may stop
+// waiting for it (stream reset, connection closed) while the proxy changes
+// the map. Nor does it relay any for a request that carries an Expect
+// header: the server writes its own 100 Continue under a lock from the
+// goroutine that first reads the body, and a relayed 1xx would be written
+// beside it without that lock. The server sends its own 100 Continue.
 type informational struct {
 	http.ResponseWriter
-	n int
+	n    int
+	drop bool
 }
 
 func (w *informational) WriteHeader(code int) {
 	if code >= 100 && code < 200 {
 		filterResponse(w.Header())
-		if w.n++; w.n > maxInformational {
+		if w.n++; w.n > maxInformational || w.drop {
 			return
 		}
 	}
