@@ -26,6 +26,9 @@
 //	sp-probe s3 SUB … --endpoint URL --keys FILE --bucket B
 //	                                            object-store calls for the harness
 //	                                            (s3.go)
+//	sp-probe mgmt --listen ADDR --log FILE --token FILE
+//	                                            Management API stand-in for the
+//	                                            upstream CLI (mgmt.go)
 //	sp-probe sys                                which system calls and socket types this
 //	                                            process may use (see below)
 //
@@ -237,6 +240,9 @@ func command(args []string, stdout io.Writer) verdict {
 	}
 	if args[0] == "s3" {
 		return s3Command(args[1:], stdout)
+	}
+	if args[0] == "mgmt" {
+		return mgmtCommand(args[1:], stdout)
 	}
 	fs := flag.NewFlagSet("sp-probe "+args[0], flag.ContinueOnError)
 	fs.SetOutput(io.Discard)

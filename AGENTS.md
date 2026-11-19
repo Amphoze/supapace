@@ -2249,3 +2249,34 @@ Tests: unit tests need no root. The reach-tagged tests run as root on a bare tes
 test/harness/experiments/e44.sh: own listener only, no host connection made from the namespace
 under concurrent load, restart between inspection and entry detected with no connection made,
 deadline inside the namespace, thread count stable after 1,000 dials.
+
+### 2026-11-20 — Management API contract: `sp-probe mgmt` and the upstream CLI pin
+
+- `test/harness/experiments/pins-cli.env` pins the upstream `supabase` CLI 3.0.0 by archive
+  SHA-256 (amd64, arm64). `e45.sh` verifies the archive in `IMAGE_CACHE` (fetching it when
+  absent or wrong), extracts `supabase-cli-3.0.0-<arch>` from it on every run, and runs
+  `projects list` only inside a throw-away container: no network, the caller's uid, no
+  capabilities, read-only root, the binary and a scratch directory as the only mounts. The run
+  image is built FROM scratch from the host's loader and the libraries the binary names (glibc;
+  read with readelf, never run on the host). Container name from `E45_NAME`; container, image,
+  scratch and partial files are removed on every exit. One PASS/FAIL line per try, each with a
+  named control; `RESULT` and `VERDICT` lines; exit 1 when a try failed. A pin bump: rerun
+  `e45.sh` and the contract test.
+- `docs/management-api.md` holds only what `e45.sh` observes: the host is set by a profile file
+  (`name`, `api_url`, `dashboard_url`, `project_host`; unknown keys, a non-http(s) URL or a
+  missing member refused) chosen by `--profile`, then `SUPABASE_PROFILE`, then
+  `~/.supabase/profile`; `SUPABASE_API_URL` does not redirect. `GET {api_url}/v1/projects`,
+  `Authorization: Bearer TOKEN`, error document `{"message":"..."}`, 401/404 -> exit 1, no
+  retry. Tokens must match `^sbp_(oauth_|v0_)?[a-f0-9]{40}$`; others are refused unsent.
+- `sp-probe mgmt --listen ADDR --log FILE --token FILE`: serves `GET /v1/projects` (exact target,
+  no query) for one bearer token: 200 one-project array; other or no Authorization 401
+  `{"message":"Unauthorized"}`; anything else 404. Per request, before answering, it appends
+  `request METHOD TARGET PROTO`, `header NAME` (sorted), `auth SCHEME` (1-32 letters before a
+  space, `?` otherwise, `-` absent), `answer STATUS`; a failed log write answers 500. Header
+  values are never logged; the target and header names are logged as received, so never carry
+  a secret in either. ReadHeaderTimeout 10 s, MaxHeaderBytes 64 KiB.
+- `TestMgmtContract_ProjectsList` reads the doc's table (any row of another call fails it) and
+  runs the CLI named by `SUPAPACE_CLI` per row in an empty home; without the variable it skips
+  with a message. It runs the third-party binary directly: only on a disposable machine or
+  inside a container.
+- Known limits: only `projects list` is checked; the control plane serves no part of this API.
