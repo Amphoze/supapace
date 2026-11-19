@@ -246,7 +246,7 @@ func installSetLocked(ctx context.Context, p nodecfg.Paths, rules, addrs []byte)
 	if err != nil {
 		return putBack(fmt.Errorf("nft: load: %w", err), true)
 	}
-	if prevAddrs, hadAddrs, err = readFile(p.OffsiteAddrs()); err != nil {
+	if prevAddrs, hadAddrs, err = readAddrs(p.OffsiteAddrs()); err != nil {
 		return putBack(err, true)
 	}
 	if !hadAddrs || !bytes.Equal(prevAddrs, addrs) || !ownFile(p.OffsiteAddrs()) {
@@ -315,6 +315,49 @@ func readFile(path string) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("nft: %w", err)
 	}
 	return b, true, nil
+}
+
+// readAddrs reads the previous addresses file for the comparison and the
+// put-back, opened as savedSetLocked opens it: no link followed, never
+// blocking, at most maxAddrsFile bytes. A link, FIFO, socket or device at the
+// path is removed without being read, and a file over the bound is not kept:
+// every reader refuses both, so they hold no set and read as absent — the
+// put-back then leaves no file (none). A directory stays an error.
+func readAddrs(path string) ([]byte, bool, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC|syscall.O_NOCTTY, 0)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, false, nil
+	case errors.Is(err, syscall.ELOOP), errors.Is(err, syscall.ENXIO): // a link; a socket
+		return nil, false, unlinkAddrs(path)
+	case err != nil:
+		return nil, false, fmt.Errorf("nft: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false, fmt.Errorf("nft: %w", err)
+	}
+	if !fi.Mode().IsRegular() && !fi.IsDir() {
+		return nil, false, unlinkAddrs(path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxAddrsFile+1))
+	if err != nil {
+		return nil, false, fmt.Errorf("nft: %w", err)
+	}
+	if len(b) > maxAddrsFile {
+		return nil, false, nil
+	}
+	return b, true, nil
+}
+
+// unlinkAddrs removes what is not a regular file at path, so that the write
+// (which refuses to replace one) can put a file there; never a directory.
+func unlinkAddrs(path string) error {
+	if err := syscall.Unlink(path); err != nil && !errors.Is(err, syscall.ENOENT) {
+		return fmt.Errorf("nft: removing %s: %w", path, err)
+	}
+	return nil
 }
 
 // ownFile reports whether path is a regular file, 0600, owned by this process's uid.

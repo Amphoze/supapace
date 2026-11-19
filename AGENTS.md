@@ -3251,3 +3251,40 @@ the bytes it reads":
 - TestDashTable_AtTheCaps_GatewayHeap (internal/gateway, run without -race) bounds the heap
   growth of one reload at the caps under 128 MiB (measured in a child process, GOGC=10); a
   reload allocates about 3.7 times the file size in short-lived garbage.
+
+### 2026-11-19 — supapaced: the endpoint resolver; InstallSet replaces a non-regular path
+
+Resolver (`cmd/supapaced/resolver.go`), started by the daemon's wiring:
+- `newResolver(cfg, paths, kek)`; set `r.onChange` before `go r.run(ctx)`.
+- `run(ctx)`: a round at once, then every 60 s, until ctx ends (it returns when the round in flight
+  ends; SavedSet waits take no context, up to 30 s each).
+- A round loads the off-site declaration. Undeclared means the empty set. Otherwise
+  `offsite.Resolve`: IPv4 only, sorted, deduplicated, at most 16, and refused whole when any
+  address fails `offsite.CheckAddrs`. Only that answer, or the empty set, is ever installed.
+- A failed declaration load or a failed or refused resolve installs nothing: the last set stays.
+- The set is installed with `nft.InstallSet` (on a context bounded at 50 s) when it differs from
+  `nft.SavedSet`, or when the saved set cannot be read (that install rewrites a refused file).
+- InstallSet errors: `nft.ErrUnverified` means a failed load (the package put the previous files
+  back); a context error means the lock was not obtained. Both are logged and retried next round.
+- The first round that reads the saved set checks it with `offsite.CheckAddrs` (an unreadable
+  interface list refuses). On a refusal it installs the resolved answer, or the empty set when
+  there is none. A refused set is never handed out, also while that install fails.
+- `current()` returns (declaration, state, saved set, error). The declaration and
+  `nft.SavedSet` are read at each call, never cached. A set that cannot be read (a refused file,
+  the lock not obtained within 30 s) or a declaration that does not load is an error and no set:
+  the caller keeps what it has. "Unknown" is never "empty".
+- `onChange(set)` runs on the loop goroutine, after any install. It is called only with a set
+  just read, whenever it differs from the one last handed out (a first set always differs). Keep
+  it short; never call an nft locking function from it while holding the lock.
+- An unreadable saved set is logged at most once a minute.
+
+nft (`InstallSet`, change): the previous addresses file is read as `SavedSet` opens it
+(`O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`, at most 64 KiB):
+- A link, FIFO, socket or device at the path is unlinked without being read or followed (a
+  link's target is never touched), then the new file is written.
+- A directory there is an error and is left as it is.
+- A regular file over 64 KiB, like the kinds above, holds no set.
+- A put-back after a later failure therefore leaves no addresses file (SavedSet: none). The
+  ruleset file and the tables go back to the previous ruleset, so the tables may hold addresses
+  no file names until the next install or start converges; the saved set never names an address
+  the tables lack.

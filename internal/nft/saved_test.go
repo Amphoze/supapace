@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -1037,4 +1038,200 @@ func TestInstallSet_RepairsTheAddressesFileMode(t *testing.T) {
 	}
 	install(t, p, elemA)
 	wantSaved(t, p, elemA)
+}
+
+// A path that is not a regular file is replaced, never read: a FIFO would block
+// a plain read, and a link would lead the read, or the write, elsewhere. Every
+// reader refuses such a path, so it holds no set: the put-back after a failure
+// leaves no addresses file (none), never the FIFO or the link again.
+func TestInstallSet_ANonRegularAddressesPathIsReplacedNotRead(t *testing.T) {
+	// installNoBlock is InstallSet, failing the test instead of hanging when
+	// the call blocks on what lies at the path.
+	installNoBlock := func(t *testing.T, p nodecfg.Paths, ss ...string) error {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- InstallSet(t.Context(), p, defaultConfig(t), set(ss...)) }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(time.Minute):
+			t.Fatal("InstallSet blocked on the addresses path")
+			return nil
+		}
+	}
+	// node is freshNode whose nft does not read the addresses path at a load
+	// (its own cat would block on a FIFO there).
+	node := func(t *testing.T) (nodecfg.Paths, string) {
+		p, dir, _ := freshNode(t)
+		t.Setenv("SPNFT_ADDRS", filepath.Join(dir, "none"))
+		return p, dir
+	}
+	wantRegular := func(t *testing.T, p nodecfg.Paths, ss ...string) {
+		t.Helper()
+		if fi, err := os.Lstat(p.OffsiteAddrs()); err != nil || !fi.Mode().IsRegular() {
+			t.Fatalf("the addresses path after InstallSet: %v, %v; want a regular file", fi, err)
+		}
+		wantSaved(t, p, ss...)
+		leftovers(t, p)
+	}
+	t.Run("fifo", func(t *testing.T) {
+		p, dir := node(t)
+		if err := syscall.Mkfifo(p.OffsiteAddrs(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := installNoBlock(t, p, elemA); err != nil {
+			t.Fatalf("InstallSet over a FIFO: %v", err)
+		}
+		wantRegular(t, p, elemA)
+		wantFile(t, "loaded tables", filepath.Join(dir, "loaded"), renderSet(t, elemA))
+	})
+	t.Run("link to a fifo", func(t *testing.T) {
+		p, _ := node(t)
+		target := filepath.Join(t.TempDir(), "fifo")
+		if err := syscall.Mkfifo(target, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, p.OffsiteAddrs()); err != nil {
+			t.Fatal(err)
+		}
+		if err := installNoBlock(t, p, elemA); err != nil {
+			t.Fatalf("InstallSet over a link: %v", err)
+		}
+		wantRegular(t, p, elemA)
+		if fi, err := os.Lstat(target); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+			t.Errorf("the link's target was replaced: %v, %v", fi, err)
+		}
+	})
+	t.Run("link to a file", func(t *testing.T) {
+		p, _ := node(t)
+		target := filepath.Join(t.TempDir(), "addrs")
+		if err := os.WriteFile(target, []byte(elemA+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, p.OffsiteAddrs()); err != nil {
+			t.Fatal(err)
+		}
+		if err := installNoBlock(t, p, elemA); err != nil {
+			t.Fatalf("InstallSet over a link: %v", err)
+		}
+		wantRegular(t, p, elemA)
+		wantFile(t, "the link's target", target, []byte(elemA+"\n"))
+	})
+	t.Run("larger than the bound", func(t *testing.T) {
+		p, _ := node(t)
+		big := bytes.Repeat([]byte(elemC+"\n"), maxAddrsFile/len(elemC)+1)
+		if err := os.WriteFile(p.OffsiteAddrs(), big, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := installNoBlock(t, p, elemA); err != nil {
+			t.Fatalf("InstallSet over an oversized file: %v", err)
+		}
+		wantRegular(t, p, elemA)
+	})
+	t.Run("put-back after a failure leaves no addresses file", func(t *testing.T) {
+		p, dir := node(t)
+		install(t, p, elemA)
+		if err := os.Remove(p.OffsiteAddrs()); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(p.OffsiteAddrs(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The checksum write fails (a directory in its place).
+		if err := os.Remove(p.NftSum()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(p.NftSum(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := installNoBlock(t, p, elemB); err == nil {
+			t.Fatal("InstallSet with an unwritable checksum file: nil error")
+		}
+		wantFile(t, "ruleset file", p.NftFile(), renderSet(t, elemA))
+		wantFile(t, "loaded tables", filepath.Join(dir, "loaded"), renderSet(t, elemA))
+		wantFile(t, "addresses file (put back as none)", p.OffsiteAddrs(), []byte("<absent>"))
+		wantSaved(t, p)
+		leftovers(t, p)
+	})
+}
+
+// The other kinds a previous addresses path can be: a socket and a device are
+// removed without being read and replaced; an oversized file is put back as
+// none after a failure (never its content); a directory stays an error and is
+// left as it is.
+func TestInstallSet_OtherPreviousAddressesPaths(t *testing.T) {
+	node := func(t *testing.T) (nodecfg.Paths, string) {
+		p, dir, _ := freshNode(t)
+		t.Setenv("SPNFT_ADDRS", filepath.Join(dir, "none"))
+		return p, dir
+	}
+	failSum := func(t *testing.T, p nodecfg.Paths) {
+		t.Helper()
+		os.Remove(p.NftSum())
+		if err := os.Mkdir(p.NftSum(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("socket", func(t *testing.T) {
+		p, _ := node(t)
+		l, err := net.Listen("unix", p.OffsiteAddrs())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		if err := InstallSet(t.Context(), p, defaultConfig(t), set(elemA)); err != nil {
+			t.Fatalf("InstallSet over a socket: %v", err)
+		}
+		wantSaved(t, p, elemA)
+	})
+	t.Run("device", func(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("creating a device node needs root")
+		}
+		p, _ := node(t)
+		// the null device's numbers: harmless if opened
+		if err := syscall.Mknod(p.OffsiteAddrs(), syscall.S_IFCHR|0o600, 1<<8|3); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallSet(t.Context(), p, defaultConfig(t), set(elemA)); err != nil {
+			t.Fatalf("InstallSet over a device: %v", err)
+		}
+		wantSaved(t, p, elemA)
+	})
+	t.Run("oversized file, put back as none", func(t *testing.T) {
+		p, dir := node(t)
+		install(t, p, elemA)
+		big := bytes.Repeat([]byte(elemC+"\n"), maxAddrsFile/len(elemC)+1)
+		if err := os.WriteFile(p.OffsiteAddrs(), big, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		failSum(t, p)
+		if err := InstallSet(t.Context(), p, defaultConfig(t), set(elemB)); err == nil {
+			t.Fatal("InstallSet with an unwritable checksum file: nil error")
+		}
+		wantFile(t, "addresses file (put back as none)", p.OffsiteAddrs(), []byte("<absent>"))
+		wantFile(t, "loaded tables", filepath.Join(dir, "loaded"), renderSet(t, elemA))
+		leftovers(t, p)
+	})
+	t.Run("directory: an error, left as it is", func(t *testing.T) {
+		p, _ := node(t)
+		install(t, p, elemA)
+		os.Remove(p.OffsiteAddrs())
+		if err := os.Mkdir(p.OffsiteAddrs(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		inner := filepath.Join(p.OffsiteAddrs(), "keep")
+		if err := os.WriteFile(inner, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallSet(t.Context(), p, defaultConfig(t), set(elemB)); err == nil {
+			t.Fatal("InstallSet over a directory: nil error")
+		}
+		if _, err := os.Stat(inner); err != nil {
+			t.Errorf("the directory's content was touched: %v", err)
+		}
+		if err := Check(t.Context(), p); err != nil {
+			t.Errorf("Check after the refused install: %v", err)
+		}
+	})
 }
