@@ -53,10 +53,23 @@ func TestBatch_SplitMessagesJudgedWhole(t *testing.T) {
 			p := relayTo(t, metaClass(), run)
 			p.read(t, len(login))
 			s := <-ch
-			go trickle(s, c.msg, c.cuts...)
-			if c.cuts[0] < 5 {
+			rest, cuts := c.msg, c.cuts
+			if cuts[0] < 5 {
+				// The first piece alone, then a pause in which the server writes
+				// nothing more: a byte that reaches the client now is the relay's
+				// doing, whatever the machine's speed.
+				if !write(s, rest[:cuts[0]]) {
+					t.Fatal("the server could not write")
+				}
 				nothingFor(t, p.client, 25*time.Millisecond)
+				rest = rest[cuts[0]:]
+				shifted := make([]int, 0, len(cuts)-1)
+				for _, x := range cuts[1:] {
+					shifted = append(shifted, x-cuts[0])
+				}
+				cuts = shifted
 			}
+			go trickle(s, rest, cuts...)
 			if got := p.read(t, len(c.msg)); !bytes.Equal(got, c.msg) {
 				t.Fatalf("got %q", got)
 			}
