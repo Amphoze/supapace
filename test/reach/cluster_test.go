@@ -256,7 +256,8 @@ func waitDone(t testing.TB, what string, id int64) Op {
 // drift made acting as the platform's administrative role is reported by its
 // frozen check name while `project check` stays ok and a restart completes,
 // the platform's session is untouched by a superuser-owned login trigger and
-// by database-level session settings.
+// by database-level session settings; (7c) a job the tenant role schedules
+// with pg_cron runs.
 func TestReach07_Roles(t *testing.T) {
 	A, _ := fixtureAB(t)
 	t.Run("7a_image_parity", func(t *testing.T) { imageParity(t, A) })
@@ -266,6 +267,38 @@ func TestReach07_Roles(t *testing.T) {
 			func() checkJSON { c, _ := checkProject(t, S.Ref); return c },
 			func() { restartWait(t, S.Ref) })
 	})
+	t.Run("7c_scheduled_job", func(t *testing.T) { scheduledJob(t, A) })
+}
+
+// scheduledJob: as postgres, pg_cron is created and a job scheduled every
+// second; within 60 s a run of it has succeeded and its row is in the table.
+// Fails on a failed run (the reason is in the message) or when no run
+// succeeds in time.
+func scheduledJob(t *testing.T, p Project) {
+	// A is kept between runs: a killed run may have left the extension.
+	clean := func() {
+		sqlAs(t, p, "postgres", "drop extension if exists pg_cron; drop table if exists public.reach_t7c")
+	}
+	clean()
+	t.Cleanup(clean)
+	mustSQL(t, p, "postgres", `create extension pg_cron; create table public.reach_t7c(who text);
+select cron.schedule('reach_t7c', '1 seconds', $$insert into public.reach_t7c values (current_user)$$)`)
+	last := func() string {
+		return mustSQL(t, p, "postgres", `select d.status || ': ' || coalesce(d.return_message, '') from cron.job_run_details d join cron.job j using (jobid)
+where j.jobname = 'reach_t7c' and d.status in ('succeeded', 'failed') order by d.runid desc limit 1`)
+	}
+	var got string
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(time.Second) {
+		if got = last(); got != "" || time.Now().After(deadline) {
+			break
+		}
+	}
+	if !strings.HasPrefix(got, "succeeded: ") {
+		t.Fatalf("scheduled job: last run %q, want succeeded", got)
+	}
+	if who := mustSQL(t, p, "postgres", "select string_agg(distinct who, ',') from public.reach_t7c"); who != "postgres" {
+		t.Fatalf("scheduled job wrote rows as %q, want postgres", who)
+	}
 }
 
 // paritySQL are the nine statements of the image-parity check, each with the

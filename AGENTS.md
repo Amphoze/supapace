@@ -2061,3 +2061,27 @@ Known limits
   name a string when present. A claim of the wrong type is `ErrMalformed`. An IDCheck with
   an empty member accepts nothing. `IDClaims.Name` is untrusted and unbounded: clean and
   cut it before it goes into a session.
+
+### 2026-11-20 — pgconf: scheduled jobs run in background workers
+- Every project cluster's override file now sets `cron.use_background_workers = on` and
+  `max_worker_processes = 38`; both are platform-set (not in `GUCAllowList`, refused by
+  `Overrides` and `OverridesPinned`; postmaster context, so no session, role or database
+  setting changes them). pg_cron jobs run in a background worker as the job's role, with
+  that role's rights and no connection or password; `pg_hba.conf` is unchanged.
+- Worker pool: 3 idle image workers (pg_cron launcher, pg_net worker, logical replication
+  launcher) + up to 32 running jobs (`cron.max_running_jobs`, still 1-32; pg_cron refuses
+  more than `max_worker_processes` - 1) + 3 spare = 38. Before, the pool was 8 and a
+  `cron.max_running_jobs` above 7 silently fell back to 5. Keep the pool >= 35 + spare.
+- The pool is shared with parallel query and maintenance workers and logical replication.
+  `max_parallel_workers*` have user context, so a session can use up to 35 workers in one
+  query (was 5); memory, CPU and pids stay bounded by the cluster container (512m, 1 CPU,
+  512 pids: worst case about 457 processes). Shared memory grows by about 1 MB.
+- Existing projects: adoption hashes the files as on disk, so a running cluster is still
+  adopted after an upgrade and its check reports nothing; the new file is rendered when the
+  container is re-created (`project restart`, a node reboot, a stopped container).
+- Tests: `TestCron_JobsRunInBackgroundWorkers` (pinned image; control without the setting;
+  a second role's rights); reach `TestReach07_Roles/7c_scheduled_job`.
+- Known limits: a job that finds no free worker (for example while parallel queries use the
+  pool) is recorded as failed and not retried; jobs run only in `cron.database_name`
+  (`postgres`); jobs that exhaust the container's memory make its server restart in a loop
+  until they are unscheduled (that project only).

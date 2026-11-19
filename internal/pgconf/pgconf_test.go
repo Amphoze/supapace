@@ -139,6 +139,7 @@ func TestOverrides_RejectsUnlistedGUC(t *testing.T) {
 		"", "Max_Connections", "MAX_CONNECTIONS", "max_connections ", " max_connections",
 		"max_connections=1", "max_connections\n", "include", "include_dir", "hba_file",
 		"listen_addresses", "password_encryption", "cron.max_running_jobs\x00",
+		"cron.use_background_workers", "max_worker_processes",
 	} {
 		_, err := Overrides(map[string]string{name: "1"}, 512)
 		if !errors.Is(err, ErrGUCNotAllowed) {

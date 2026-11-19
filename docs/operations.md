@@ -148,6 +148,13 @@ Applies a new configuration and restarts the project's containers (about 8 s; cl
 `effective_cache_size`, `work_mem`, `maintenance_work_mem`, `archive_timeout` (30–3600 s),
 `cron.max_running_jobs` (1–32). Without `--set` it restarts with the current configuration.
 
+Scheduled jobs (`pg_cron`) run in background workers, as the role that scheduled them and
+with that role's rights; they need no connection or password. `cron.max_running_jobs` is the
+number of jobs that run at once (default 2); a job due while that many run waits for one to
+end. Parallel queries draw on the same pool of background workers; a job that finds none
+free is recorded as failed and runs again at its next scheduled time. A project running
+before this release takes this up at its next restart.
+
 ```
 $ supapace project restart qg6zivyo8iazv6bzkb5r --set max_connections=120 --set disk_quota_mb=4096
 operation 2: pending, before its first step

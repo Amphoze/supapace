@@ -32,6 +32,15 @@ var GUCAllowList = []string{
 }
 
 // defaults is the override file, in order. Values are rendered verbatim.
+//
+// Scheduled jobs run in background workers as the job's role
+// (cron.use_background_workers): the scheduler has no password, and over
+// loopback pg_hba.conf asks for one. max_worker_processes covers the image's
+// three idle workers (pg_cron's launcher, pg_net's worker, the logical
+// replication launcher), up to 32 running jobs (cron.max_running_jobs; pg_cron
+// refuses more than max_worker_processes - 1) and 3 to spare for parallel
+// maintenance and replication workers: 3 + 32 + 3 = 38. Neither name is
+// allow-listed.
 var defaults = [][2]string{
 	{"listen_addresses", "'*'"},
 	{"max_connections", "120"},
@@ -43,6 +52,7 @@ var defaults = [][2]string{
 	{"maintenance_work_mem", "64MB"},
 	{"autovacuum_work_mem", "32MB"},
 	{"autovacuum_max_workers", "2"},
+	{"max_worker_processes", "38"},
 	{"max_wal_size", "1GB"},
 	{"max_slot_wal_keep_size", "2GB"},
 	{"wal_level", "logical"},
@@ -53,6 +63,7 @@ var defaults = [][2]string{
 	{"max_wal_senders", "10"},
 	{"password_encryption", "'scram-sha-256'"},
 	{"cron.max_running_jobs", "2"},
+	{"cron.use_background_workers", "on"},
 	{"random_page_cost", "1.1"},
 	{"huge_pages", "off"},
 	{"max_parallel_workers_per_gather", "0"},
