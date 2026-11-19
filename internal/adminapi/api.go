@@ -15,7 +15,9 @@
 // containment_failed while the node's containment is not verified; reads are
 // always served. A create the placement would refuse for room is refused at once
 // with node_full; a restart to a disk quota below the project's usage plus
-// store.QuotaHeadroomMB with quota_below_usage. Projects and keys carry the project's URL and the path of
+// store.QuotaHeadroomMB with quota_below_usage; a restore target outside the
+// backups' window with out_of_window and the window. The backups document is
+// read from the store alone. Projects and keys carry the project's URL and the path of
 // the CA certificate that signed the gateway's (read from node.json and the
 // node's TLS files at each request).
 package adminapi
@@ -54,7 +56,10 @@ import (
 // Ops is what the API needs from the daemon beyond the store: the saga
 // runner's submissions, the agent's checks and the containment flag.
 type Ops interface {
-	// Submit queues a restart or delete; kind is "restart" or "delete".
+	// Submit queues a restart, delete or restore. A restore's params are
+	// {"to","timeline","from"}: to is latest, an RFC 3339 time or
+	// lsn:<hex>/<hex>; timeline 0 and from "" when the request named none.
+	// A target outside the window is a *store.WindowError.
 	// For a restart, params is
 	// {"base_generation": N, "config": {"disk_quota_mb","mem_mb","guc"}}: the
 	// merged target configuration and the project generation it was merged
@@ -158,6 +163,8 @@ func New(st *store.Store, kek secrets.KEK, ops Ops, domain string, p nodecfg.Pat
 	m.HandleFunc("GET /v1/projects/{ref}/keys", read(a.keys))
 	m.HandleFunc("POST /v1/projects/{ref}/check", read(a.check))
 	m.HandleFunc("POST /v1/projects/{ref}/restart", a.mutation(a.restart))
+	m.HandleFunc("GET /v1/projects/{ref}/backups", read(a.backups))
+	m.HandleFunc("POST /v1/projects/{ref}/restore", a.mutation(a.restore))
 	m.HandleFunc("DELETE /v1/projects/{ref}", a.mutation(a.delete))
 	m.HandleFunc("POST /v1/projects/{ref}/purge", a.mutation(a.purge))
 	m.HandleFunc("POST /v1/projects/{ref}/abort", a.mutation(a.abort))
@@ -198,9 +205,23 @@ func conflict(format string, args ...any) error {
 
 // toError maps an error to its status and synchronous error body. An
 // internal error answers with a fixed message; the error itself is logged.
-func toError(r *http.Request, err error) (int, errorJSON) {
+func toError(r *http.Request, err error) (int, any) {
 	var ae *apiError
+	var we *store.WindowError
 	switch {
+	case errors.As(err, &we):
+		var w windowJSON // a bound that is not known is null
+		if !we.From.IsZero() {
+			w.Earliest = optStamp(&we.From)
+		}
+		if !we.To.IsZero() {
+			w.Latest = optStamp(&we.To)
+		}
+		msg := clean(we.Error(), maxMessage, "the target is outside the restorable window")
+		if ref := r.PathValue("ref"); refRE.MatchString(ref) {
+			msg += "; see 'supapace project backups " + ref + "'"
+		}
+		return http.StatusConflict, outOfWindowJSON{errorJSON{"out_of_window", msg}, w}
 	case errors.As(err, &ae):
 		return ae.status, errorJSON{ae.Code, clean(ae.Message, maxMessage, ae.Code)}
 	case errors.Is(err, store.ErrBadRef):
@@ -305,6 +326,44 @@ func decode(r *http.Request, v any) error {
 		}
 		return badRequest("request body: trailing data")
 	}
+	// After Decode: the body is one well-formed document of bounded depth.
+	if err := uniqueMembers(json.NewDecoder(bytes.NewReader(b)), true); err != nil {
+		return badRequest("request body: %v", err)
+	}
+	return nil
+}
+
+// uniqueMembers refuses a member named twice in one object and, at the top
+// level, a member name that is not lower case (the decoder would match it
+// case-insensitively, and keep the last of two). A syntax error is left to the
+// decoder.
+func uniqueMembers(dec *json.Decoder, top bool) error {
+	t, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+	d, ok := t.(json.Delim)
+	if !ok {
+		return nil
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		if d == '{' {
+			k, err := dec.Token()
+			if err != nil {
+				return nil
+			}
+			s, _ := k.(string)
+			if seen[s] || top && s != strings.ToLower(s) {
+				return fmt.Errorf("member %.64q is repeated or not in lower case", s)
+			}
+			seen[s] = true
+		}
+		if err := uniqueMembers(dec, false); err != nil {
+			return err
+		}
+	}
+	dec.Token() // the closing delimiter
 	return nil
 }
 
@@ -375,6 +434,7 @@ type operationJSON struct {
 	LastError  string `json:"last_error"`
 	CreatedAt  string `json:"created_at"`
 	UpdatedAt  string `json:"updated_at"`
+	Result     any    `json:"result"` // null until a step records one
 }
 
 // endpointJSON is where a client reaches a project: its URL and, when the
@@ -479,7 +539,7 @@ func optStamp(t *time.Time) *string {
 func toOperation(o store.Operation) operationJSON {
 	return operationJSON{ID: o.ID, Ref: o.Ref, Kind: o.Kind, State: o.State, Step: o.Step, Attempts: o.Attempts,
 		Epoch: o.Epoch, Generation: o.Generation, LastError: tidy(pgsock.Sanitize(o.LastError, maxMessage)),
-		CreatedAt: stamp(o.CreatedAt), UpdatedAt: stamp(o.UpdatedAt)}
+		CreatedAt: stamp(o.CreatedAt), UpdatedAt: stamp(o.UpdatedAt), Result: cleanResult(o.Result)}
 }
 
 func toProject(p store.Project, domain string, ca *string) projectJSON {
@@ -506,8 +566,23 @@ func (a *api) create(r *http.Request) (any, error) {
 		IssuerJWKS  json.RawMessage `json:"issuer_jwks"`
 		UserRoles   []string        `json:"user_roles"`
 		DiskQuotaMB *int            `json:"disk_quota_mb"`
+		UploadMB    *int            `json:"upload_mb_per_day"`
+		UploadObj   *int            `json:"upload_objects_per_day"`
+		Layout      *int            `json:"layout"`
 	}
 	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	layout := DefaultLayout
+	if req.Layout != nil {
+		// The suite's fixture for a project without backups on a node whose
+		// default has them.
+		if *req.Layout != 1 || !a.devNode() {
+			return nil, badRequest("layout: only 1 (a project without backups) is accepted, and only on a development node")
+		}
+		layout = 1
+	}
+	if err := uploadSettings(req.UploadMB, req.UploadObj); err != nil {
 		return nil, err
 	}
 	if !nameRE.MatchString(req.Name) {
@@ -551,7 +626,13 @@ func (a *api) create(r *http.Request) (any, error) {
 		return nil, err
 	}
 	np := store.NewProject{Ref: req.Ref, Name: req.Name, UserRoles: req.UserRoles, Params: params,
-		Config: store.ProjectConfig{DiskQuotaMB: quota, MemMB: clusterMemMB, GUC: map[string]string{}}}
+		Config: store.ProjectConfig{DiskQuotaMB: quota, MemMB: clusterMemMB, GUC: map[string]string{}, Layout: stored(layout),
+			UploadMBPerDay: deref(req.UploadMB), UploadObjectsPerDay: deref(req.UploadObj)}}
+	// A node just recovered holds only the control plane's read credential:
+	// projects created now could not reach the off-site store.
+	if a.offsite() == "partial" {
+		return nil, conflict("off-site store partly declared; run 'supapaced offsite set' on this node to give the projects' bucket its credentials")
+	}
 	// The worker's placement decides; this refuses a create it would refuse
 	// before a ref is burned. Creates through this API are serialised so two
 	// cannot both pass on the same room.
@@ -600,7 +681,7 @@ func (a *api) create(r *http.Request) (any, error) {
 	return nil, errors.New("no free ref after repeated draws")
 }
 
-var projectStates = []string{"provisioning", "active", "restarting", "deleting", "deleted", "purged", "aborted"}
+var projectStates = []string{"provisioning", "active", "restarting", "restoring", "deleting", "deleted", "purged", "aborted"}
 
 // refExists is the refusal for a ref that is, or once was, a project's.
 func refExists(ref string) error {
@@ -740,8 +821,13 @@ func (a *api) restart(r *http.Request) (any, error) {
 	var req struct {
 		Set         map[string]string `json:"set"`
 		DiskQuotaMB *int              `json:"disk_quota_mb"`
+		UploadMB    *int              `json:"upload_mb_per_day"`
+		UploadObj   *int              `json:"upload_objects_per_day"`
 	}
 	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	if err := uploadSettings(req.UploadMB, req.UploadObj); err != nil {
 		return nil, err
 	}
 	p, err := a.st.GetProject(r.Context(), ref)
@@ -749,6 +835,13 @@ func (a *api) restart(r *http.Request) (any, error) {
 		return nil, err
 	}
 	next := p.Config
+	next.Layout = stored(max(layoutOf(p.Config), DefaultLayout))
+	if req.UploadMB != nil {
+		next.UploadMBPerDay = *req.UploadMB
+	}
+	if req.UploadObj != nil {
+		next.UploadObjectsPerDay = *req.UploadObj
+	}
 	next.GUC = maps.Clone(p.Config.GUC)
 	if next.GUC == nil {
 		next.GUC = map[string]string{}
@@ -861,6 +954,7 @@ func (a *api) abort(r *http.Request) (any, error) {
 		if p, gerr := a.st.GetProject(r.Context(), ref); gerr == nil && p.State != "provisioning" {
 			next := map[string]string{"active": "; an active project is removed with delete",
 				"restarting": "; a project left restarting by a failed restart takes a new restart or a delete",
+				"restoring":  "; a project left restoring by a failed restore takes a new restore or a delete",
 				"deleted":    "; a deleted project is removed for good with purge"}[p.State]
 			return nil, conflict("project is %s; abort applies only to a create in progress%s", p.State, next)
 		}

@@ -6,7 +6,7 @@
 // stdout holds exactly one JSON document: the body of the last API response
 // received, byte for byte (an explicit help request prints the usage there
 // instead). Progress and errors go to stderr. Exit status: 0 success; 1 an
-// API error, an operation that ended failed or aborted (for `project abort`,
+// API error, an operation that ended failed, aborted or superseded (for `project abort`,
 // aborted is the success), a check with "ok": false, or an unreachable
 // daemon; 2 usage; 130 interrupted while waiting.
 package main
@@ -45,6 +45,8 @@ progress and errors go to stderr. Flags may come before or after REF or ID.
 Projects:
   project create --name NAME --issuer-jwks FILE [--ref REF]
                  [--user-role ROLE]... [--disk-quota SIZE] [--no-wait]
+                 [--upload-per-day SIZE] [--upload-objects-per-day N]
+                 [--layout N]
       --name NAME          1 to 64 letters, digits, spaces, '.', '_' or '-',
                            starting with a letter or digit
       --issuer-jwks FILE   the issuer's public JSON Web Key Set: 1 to 16 RSA
@@ -62,6 +64,16 @@ Projects:
                            grant editor to authenticator;)
       --disk-quota SIZE    MiB, or a number with suffix m, g or t
                            (default 8g, at least 1g, at most 16t)
+      --upload-per-day SIZE
+                           what the project's backups may copy to the
+                           off-site store per day: whole MiB, or a number
+                           with suffix m, g or t (default: twice the disk
+                           quota; 0 is the default)
+      --upload-objects-per-day N
+                           the files they may copy per day (default: one per
+                           512 KiB of the daily size, at least 7500)
+      --layout N           1: a project without backups. Accepted on a
+                           development node only, for tests
       User tokens: there is no shared secret. The issuer signs each token
       with RS256 and a private key of the set; the header carries
       "alg":"RS256" and that key's "kid"; the claims carry "role"
@@ -71,8 +83,8 @@ Projects:
       it as "Authorization: Bearer TOKEN" with the anon key as apikey.
   project list [--state STATE]...
       --state STATE        only projects in STATE (repeatable): provisioning,
-                           active, restarting, deleting, deleted, purged or
-                           aborted
+                           active, restarting, restoring, deleting, deleted,
+                           purged or aborted
   project show REF         the project's record, url and disk_used_bytes
                            (what its disk quota charges); its state is the
                            lifecycle state, not health (see project check)
@@ -97,8 +109,38 @@ Projects:
       its usage plus 1280 MiB (crash recovery replays up to 1 GiB of WAL).
       A restart whose stop/start step or health check fails is
       rolled back to the previous configuration (aborted, rolled_back).
+      upload_per_day=SIZE and upload_objects_per_day=N set the daily
+      off-site budget of --upload-per-day and --upload-objects-per-day of
+      project create (0: the default).
       A project left restarting by a failed restart accepts a new restart
       with other settings, or a delete.
+  project backups REF      the project's backups: full backup sets, the
+                           window a restore may target, the last push of
+                           WAL and the last copy to the off-site store,
+                           quota use, gaps, notices and restores. Figures
+                           under push are as the project's last push job
+                           reported them. Times are UTC. A project without
+                           backups (layout 1) answers with empty lists
+  project restore REF --to TARGET [--timeline N] [--from local|offsite]
+                  [--no-wait]
+      --to TARGET          latest (the end of the archive), a time in RFC
+                           3339 with its offset (2026-11-18T10:43:32Z), or a
+                           WAL position (0/16B3748); it must lie in the
+                           window that project backups shows
+      --timeline N         the timeline to follow (default: the newest
+                           recorded one)
+      --from local|offsite read the backup from the node's repository
+                           (default) or from the off-site store; a backup
+                           older than the project's seeding from the
+                           off-site store is read from there only
+      The project's data is replaced; the project is unavailable while it
+      is restoring. Changes made after the target are no longer in the
+      project. To return to the state before the restore: project restore
+      REF --to latest --timeline N, N being previous_timeline in the
+      operation's result. A restore that fails after the project stopped
+      serving leaves it restoring: retry it (op retry), restore again, or
+      delete the project; one that fails earlier leaves the project as it
+      was (see project show REF).
   project delete REF [--no-wait]
   project purge REF [--no-wait]    purge a deleted project now
   project abort REF [--no-wait]    abort a create that has not completed
@@ -117,9 +159,9 @@ Node:
 
 Exit status:
   0    success
-  1    an API error; an operation that ended failed or aborted (for project
-       abort, aborted is the success); a check with "ok": false; the daemon
-       could not be reached
+  1    an API error; an operation that ended failed, aborted or superseded
+       (for project abort, aborted is the success); a check with "ok":
+       false; the daemon could not be reached
   2    usage, or an argument that cannot be read
   130  interrupted while waiting (the operation continues on the node)
 `
@@ -204,6 +246,9 @@ func (l *list) Set(v string) error { *l = append(*l, v); return nil }
 
 var quotaRE = regexp.MustCompile(`^([0-9]{1,9})([mMgGtT]?)$`)
 
+// wholeMiB is the refusal of a size that is not a whole number of MiB.
+const wholeMiB = "want whole MiB: a number with an optional m, g or t suffix (512m, 16g; 0 for the default)"
+
 // parseQuota reads a size with an optional m, g or t suffix as MiB.
 func parseQuota(s string) (int, error) {
 	m := quotaRE.FindStringSubmatch(s)
@@ -237,7 +282,8 @@ func readJWKS(path string) (json.RawMessage, error) {
 var arity = map[string][2]int{
 	"project create": {0, 0}, "project list": {0, 0}, "project show": {1, 1}, "project keys": {1, 1},
 	"project check": {1, 1}, "project restart": {1, 1}, "project delete": {1, 1}, "project purge": {1, 1},
-	"project abort": {1, 1}, "op list": {0, 1}, "op show": {1, 1}, "op retry": {1, 1}, "node check": {0, 0},
+	"project abort": {1, 1}, "project backups": {1, 1}, "project restore": {1, 1}, "op list": {0, 1},
+	"op show": {1, 1}, "op retry": {1, 1}, "node check": {0, 0},
 }
 
 func isHelp(s string) bool { return s == "help" || s == "-h" || s == "-help" || s == "--help" }
@@ -261,11 +307,24 @@ func parse(args []string) (c call, err error) {
 	fs.SetOutput(io.Discard)
 	var noWait bool
 	switch verb {
-	case "project create", "project restart", "project delete", "project purge", "project abort", "op retry":
+	case "project create", "project restart", "project delete", "project purge", "project abort", "project restore",
+		"op retry":
 		fs.BoolVar(&noWait, "no-wait", false, "")
 	}
 	var name, jwks, ref string
-	var quota *int
+	var quota, uploadMB, uploadObj, layout, timeline *int
+	var to, from string
+	// intFlag reads an integer flag into *p.
+	intFlag := func(name string, p **int) {
+		fs.Func(name, "", func(s string) error {
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				return errors.New("want an integer")
+			}
+			*p = &n
+			return nil
+		})
+	}
 	var roles, sets, states list
 	switch verb {
 	case "project create":
@@ -284,8 +343,28 @@ func parse(args []string) (c call, err error) {
 			quota = &mb
 			return err
 		})
+		fs.Func("upload-per-day", "", func(s string) error {
+			mb, err := parseQuota(s)
+			if err != nil {
+				return errors.New(wholeMiB)
+			}
+			uploadMB = &mb
+			return nil
+		})
+		intFlag("upload-objects-per-day", &uploadObj)
+		intFlag("layout", &layout)
 	case "project restart":
 		fs.Var(&sets, "set", "")
+	case "project restore":
+		fs.Func("to", "", func(s string) error {
+			if s == "" {
+				return errors.New("empty target")
+			}
+			to = s
+			return nil
+		})
+		intFlag("timeline", &timeline)
+		fs.StringVar(&from, "from", "", "")
 	case "project list":
 		fs.Var(&states, "state", "")
 	}
@@ -350,7 +429,11 @@ func parse(args []string) (c call, err error) {
 			IssuerJWKS  json.RawMessage `json:"issuer_jwks"`
 			UserRoles   []string        `json:"user_roles,omitempty"`
 			DiskQuotaMB *int            `json:"disk_quota_mb,omitempty"`
-		}{Name: name, Ref: ref, IssuerJWKS: set, UserRoles: roles, DiskQuotaMB: quota}
+			UploadMB    *int            `json:"upload_mb_per_day,omitempty"`
+			UploadObj   *int            `json:"upload_objects_per_day,omitempty"`
+			Layout      *int            `json:"layout,omitempty"`
+		}{Name: name, Ref: ref, IssuerJWKS: set, UserRoles: roles, DiskQuotaMB: quota, UploadMB: uploadMB,
+			UploadObj: uploadObj, Layout: layout}
 		return call{method: "POST", path: "/v1/projects", body: body, wait: wait("done"), roles: roles}, nil
 	case "project list":
 		if len(states) == 0 {
@@ -367,22 +450,38 @@ func parse(args []string) (c call, err error) {
 		body := struct {
 			Set         map[string]string `json:"set,omitempty"`
 			DiskQuotaMB *int              `json:"disk_quota_mb,omitempty"`
+			UploadMB    *int              `json:"upload_mb_per_day,omitempty"`
+			UploadObj   *int              `json:"upload_objects_per_day,omitempty"`
 		}{}
+		// The settings that are members of their own, not database settings.
+		ints := map[string]**int{"disk_quota_mb": &body.DiskQuotaMB, "upload_per_day": &body.UploadMB,
+			"upload_objects_per_day": &body.UploadObj}
 		for _, s := range sets {
 			k, v, ok := strings.Cut(s, "=")
 			if !ok || k == "" {
 				return call{}, usagef("--set %q: want key=value", s)
 			}
-			if _, dup := body.Set[k]; dup || k == "disk_quota_mb" && body.DiskQuotaMB != nil {
-				return call{}, usagef("--set %s given twice", k)
-			}
-			if k == "disk_quota_mb" {
+			if p, isInt := ints[k]; isInt {
+				if *p != nil {
+					return call{}, usagef("--set %s given twice", k)
+				}
+				if k == "upload_per_day" {
+					n, err := parseQuota(v)
+					if err != nil {
+						return call{}, usagef("--set upload_per_day=%q: %s", v, wholeMiB)
+					}
+					*p = &n
+					continue
+				}
 				n, err := strconv.Atoi(v)
 				if err != nil {
-					return call{}, usagef("--set disk_quota_mb=%q: want an integer (MiB)", v)
+					return call{}, usagef("--set %s=%q: want an integer", k, v)
 				}
-				body.DiskQuotaMB = &n
+				*p = &n
 				continue
+			}
+			if _, dup := body.Set[k]; dup {
+				return call{}, usagef("--set %s given twice", k)
 			}
 			if body.Set == nil {
 				body.Set = map[string]string{}
@@ -390,6 +489,18 @@ func parse(args []string) (c call, err error) {
 			body.Set[k] = v
 		}
 		return call{method: "POST", path: project + "/restart", body: body, wait: wait("done")}, nil
+	case "project backups":
+		return call{method: "GET", path: project + "/backups"}, nil
+	case "project restore":
+		if to == "" {
+			return call{}, usagef("project restore: --to is required")
+		}
+		body := struct {
+			To       string `json:"to"`
+			Timeline *int   `json:"timeline,omitempty"`
+			From     string `json:"from,omitempty"`
+		}{to, timeline, from}
+		return call{method: "POST", path: project + "/restore", body: body, wait: wait("done")}, nil
 	case "project delete":
 		return call{method: "DELETE", path: project, wait: wait("done")}, nil
 	case "project purge":
@@ -542,7 +653,7 @@ func run(args []string, c client, stdout, stderr io.Writer) int {
 			return 1
 		}
 		switch op.State {
-		case "done", "failed", "aborted":
+		case "done", "failed", "aborted", "superseded":
 			stdout.Write(b)
 			if op.State == cl.wait {
 				cl.created(stderr, b)
@@ -604,6 +715,11 @@ func summary(w io.Writer, op operation) {
 		why = "no error recorded"
 	}
 	fmt.Fprintf(w, "supapace: operation %d %s %s: %s\n", op.ID, op.State, after(op.Step), why)
+	if op.State == "superseded" {
+		fmt.Fprintf(w, "supapace: a later operation of the project replaced it, and it is not retried; "+
+			"see 'supapace op list %s'\n", op.Ref)
+		return
+	}
 	if op.State != "failed" {
 		return
 	}
@@ -618,6 +734,10 @@ func summary(w io.Writer, op operation) {
 	switch {
 	case op.Kind == "create":
 		fmt.Fprintf(w, "supapace: or give the project up with 'supapace project abort %s'\n", op.Ref)
+	case op.Kind == "restore":
+		fmt.Fprintf(w, "supapace: or restore again with other options: 'supapace project restore %s --to TARGET'; "+
+			"a project left restoring (see 'supapace project show %s') can also be removed: 'supapace project delete %s'\n",
+			op.Ref, op.Ref, op.Ref)
 	case op.Kind == "restart" && strings.Contains(op.LastError, "; the project stays restarting at generation "):
 		fmt.Fprintf(w, "supapace: or replace it with other settings: 'supapace project restart %s --set KEY=VALUE', "+
 			"or remove the project: 'supapace project delete %s'\n", op.Ref, op.Ref)

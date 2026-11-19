@@ -198,12 +198,13 @@ func TestAPI_HostileBodies(t *testing.T) {
 	bodies := []string{
 		"\x00", "\xff\xfe", "{", "}", `"x"`, `1e999`, `{"name":"\ud800"}`, strings.Repeat("[", 100000),
 		strings.Repeat(`{"a":`, 20000), `{"set":{"max_connections":null}}`, `{"set":[]}`, `{"disk_quota_mb":1e30}`,
-		`{"disk_quota_mb":"8192"}`, `{"set":{"max_connections":"200"},"set":{"fsync":"off"}}`,
+		`{"disk_quota_mb":"8192"}`, `{"to":"latest\u0000"}`, `{"to":["latest"]}`, `{"set":{"max_connections":"200"},"set":{"fsync":"off"}}`,
 		`{"name":"a","issuer_jwks":{"keys":[` + strings.Repeat(`{},`, 30000) + `{}]}}`,
 	}
 	routes := []struct{ method, path string }{
 		{"POST", "/v1/projects"},
 		{"POST", "/v1/projects/" + demoRef + "/restart"},
+		{"POST", "/v1/projects/" + demoRef + "/restore"},
 		{"DELETE", "/v1/projects/" + demoRef},
 		{"POST", "/v1/projects/" + demoRef + "/check"},
 		{"POST", "/v1/projects/" + demoRef + "/abort"},

@@ -174,6 +174,10 @@ func (f *fakeOps) Submit(ctx context.Context, kind, ref string, params json.RawM
 	}
 	// The store refuses a restart whose merge base is no longer the
 	// project's generation; a delete is based on the current one.
+	if kind == "restore" {
+		id, _, err := f.st.SubmitRestore(ctx, ref, params)
+		return id, err
+	}
 	var rp restartShape
 	if kind == "restart" {
 		dec := json.NewDecoder(bytes.NewReader(params))
@@ -648,7 +652,8 @@ func sameShape(t *testing.T, name string, got []byte) {
 	compare(t, name, "", g, w)
 }
 
-var stamps = map[string]bool{"created_at": true, "updated_at": true, "deleted_at": true, "purge_after": true}
+var stamps = map[string]bool{"created_at": true, "updated_at": true, "deleted_at": true, "purge_after": true,
+	"finished_at": true}
 
 func compare(t *testing.T, file, path string, got, want any) {
 	t.Helper()
@@ -739,6 +744,7 @@ type (
 		LastError  string `json:"last_error"`
 		CreatedAt  string `json:"created_at"`
 		UpdatedAt  string `json:"updated_at"`
+		Result     any    `json:"result"`
 	}
 	keysShape struct {
 		Ref              string  `json:"ref"`

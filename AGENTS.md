@@ -3475,3 +3475,68 @@ Rules and limits
   package. Bump the pin; do not unpin.
 - A bare node loads no ruleset: there, any inner container reaches the stand-in.
 - Keep new test addresses out of 10.215.1.0-10.215.200.255 (the lab slots in common use).
+
+### 2026-11-19 — admin API and CLI: backup state and restore requests
+
+- Routes: GET /v1/projects/{ref}/backups (a read: served in every project state and while
+  containment is failed; not_found, bad_ref) and POST /v1/projects/{ref}/restore (a mutation:
+  containment_failed 503 first) -> 202 {"ref","operation_id"}.
+- Request bodies, every route that takes one (create, restart, restore): one JSON object, no
+  unknown member, no member repeated at any depth, every top-level member name in lower case,
+  nothing after it; else 400 bad_request ("request body: member \"X\" is repeated or not in lower
+  case"). Names inside restart's "set" (setting names) keep their case. Clients of later routes
+  must comply. check, delete, purge, abort and op retry refuse any body.
+- Restore body {"to", "timeline", "from"}: to is required - "latest", an RFC 3339 time with its
+  offset, or a WAL position X/Y or lsn:X/Y (1-8 hex digits each); at most 64 bytes. timeline
+  1..2147483647 and from "local" | "offsite" are optional. All is checked before the store is
+  touched. Ops.Submit(ctx, "restore", ref, params) always gets the three members: timeline 0
+  and from "" when not given (an explicit "from":"" is refused); a position as lsn:X/Y, a time
+  as given (parse it with time.RFC3339; render the instant, never the text).
+- Errors added: out_of_window (409) when Submit returns a *store.WindowError (match with
+  errors.As); the body also has "window":{"from","to"}, null for a bound that is not known, and
+  the message ends "; see 'supapace project backups REF'". Other Submit conflicts pass through
+  with their reason.
+- Backups document, read from the store only (nothing asks the host, a project or a job): ref,
+  stanza (<ref>-<incarnation>), incarnation, layout, sets, window {from: the oldest set's stop,
+  to: the last complete push}, push (as the project's last push job reported it), quota (the
+  quota report of the last push, MB; null before one), replication (declared, last_ok, lags,
+  paused_until, rebuilding, bytes/objects today - 0 when the stored day is not today UTC -
+  budgets from bklimit.Budgets, objects recorded), info_versions, timelines, gaps, notices,
+  restores. Lists are [] never null; at most 64 sets, 16 info versions, 64 gaps, 32 notices and
+  16 restores (from the ref's newest 200 operations), newest first. Every stored text is cleaned
+  (pgsock.Sanitize) and cut. Layout 1, or layout 2 before its backup-state row: stanza,
+  incarnation, push, quota and replication null, lists empty (layout 2 still lists restores).
+- Operations carry "result": the stored result, every string and member name cleaned, numbers
+  kept exactly; null when there is none.
+- DefaultLayout (var, 1): the layout a create gets and a restart raises a project to; a restart
+  never lowers it, and a raise cannot be undone. Layout 1 is stored as 0 (the member omitted).
+  "layout": 1 at create is accepted only on a development node (the dev-mode marker, a regular
+  file beside node.json); any other value is bad_request. Only tests and the literal write it.
+- Create and restart accept the top-level members upload_mb_per_day and
+  upload_objects_per_day, each 0 (the default) to 16777216; a restart keeps them unless given.
+- A create is refused (409 conflict "off-site store partly declared; run 'supapaced offsite
+  set' on this node to give the projects' bucket its credentials") while the off-site
+  declaration is partial. The state comes from an optional capability of Ops,
+  interface{ Offsite() string }, asserted at use; absent, or an answer other than undeclared,
+  partial or declared, counts as undeclared. The Ops interface itself is unchanged.
+- restoring is a listed project state (project list --state restoring).
+- CLI, new commands and flags:
+    project backups REF
+    project restore REF --to TARGET [--timeline N] [--from local|offsite] [--no-wait]
+    project create ... [--upload-per-day SIZE] [--upload-objects-per-day N] [--layout N]
+    project restart REF --set upload_per_day=SIZE --set upload_objects_per_day=N
+  SIZE is whole MiB with an optional m, g or t suffix (case-insensitive; 0 = the default),
+  sent as upload_mb_per_day; anything else exits 2 with "want whole MiB: a number with an
+  optional m, g or t suffix (512m, 16g; 0 for the default)". --layout 1 is for tests on a
+  development node. The restore help states that changes after the target leave the project,
+  and the way back: project restore REF --to latest --timeline N, N being previous_timeline
+  in the operation's result.
+- A restore waits like every mutation (Ctrl-C: exit 130, the operation continues). superseded
+  is a final state: exit 1 with "supapace: a later operation of the project replaced it, and
+  it is not retried; see 'supapace op list REF'". A failed restore prints "supapace: retry it
+  with 'supapace op retry N'" and "supapace: or restore again with other options: 'supapace
+  project restore REF --to TARGET'; a project left restoring (see 'supapace project show REF')
+  can also be removed: 'supapace project delete REF'". A restore that fails before the project
+  stops serving leaves it as it was.
+- Known limits: restores older than the ref's newest 200 operations are not listed; timelines
+  are not capped; an operation's result has no size bound of its own (the daemon writes it).
