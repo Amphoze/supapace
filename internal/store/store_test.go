@@ -225,8 +225,8 @@ func TestMigrate_Idempotent(t *testing.T) {
 	if n := count(t, s, "select count(*) from cp_meta"); n != 1 {
 		t.Fatalf("cp_meta rows = %d", n)
 	}
-	if n := count(t, s, "select count(*) from information_schema.tables where table_schema = 'public'"); n != 7 {
-		t.Fatalf("tables = %d, want 7", n)
+	if n, want := count(t, s, "select count(*) from information_schema.tables where table_schema = 'public'"), len(schemaTables(t)); n != want {
+		t.Fatalf("tables = %d, want %d", n, want)
 	}
 }
 

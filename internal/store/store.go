@@ -33,15 +33,20 @@ const (
 	lockClassNode    = 7302
 )
 
-// maxConns bounds the pool. Every held or waiting LockRef pins one connection.
-const maxConns = 8
+// maxConns bounds the pool. Every held or waiting LockRef pins one connection:
+// the adoption round holds up to four, the worker one, an index-file stream
+// one, and the rest is shared by everything else.
+const maxConns = 16
 
 type Store struct{ pool *pgxpool.Pool }
 
 type ProjectConfig struct {
-	DiskQuotaMB int               `json:"disk_quota_mb"`
-	MemMB       int               `json:"mem_mb"`
-	GUC         map[string]string `json:"guc"`
+	DiskQuotaMB         int               `json:"disk_quota_mb"`
+	MemMB               int               `json:"mem_mb"`
+	GUC                 map[string]string `json:"guc"`
+	Layout              int               `json:"layout,omitempty"`                 // 0 or 1: as built; 2: with backups
+	UploadMBPerDay      int               `json:"upload_mb_per_day,omitempty"`      // 0: 2 × disk_quota_mb
+	UploadObjectsPerDay int               `json:"upload_objects_per_day,omitempty"` // 0: the default budget
 }
 
 type Project struct {
@@ -71,6 +76,7 @@ type Operation struct {
 	NotBefore              time.Time
 	LastError              string
 	CreatedAt, UpdatedAt   time.Time
+	Result                 json.RawMessage // null until a step records one
 }
 
 type Placement struct{ UID, GID, SubnetIndex int }
@@ -209,4 +215,22 @@ func wrap(err error) error {
 		return ErrNotFound
 	}
 	return err
+}
+
+// WALPosition is the database's current WAL insert position.
+func (s *Store) WALPosition(ctx context.Context) (lsn string, err error) {
+	err = s.pool.QueryRow(ctx, "select pg_current_wal_insert_lsn()::text").Scan(&lsn)
+	return lsn, wrap(err)
+}
+
+// SwitchWAL names the WAL segment that holds lsn, then switches to a new
+// segment so that one is complete and can be archived.
+func (s *Store) SwitchWAL(ctx context.Context, lsn string) (segment string, err error) {
+	if err := s.pool.QueryRow(ctx, "select pg_walfile_name($1::pg_lsn)", lsn).Scan(&segment); err != nil {
+		return "", wrap(err)
+	}
+	if _, err := s.pool.Exec(ctx, "select pg_switch_wal()"); err != nil {
+		return "", wrap(err)
+	}
+	return segment, nil
 }

@@ -2413,3 +2413,63 @@ internal/agent: Spec embeds OpsSpec (spec_ops.go: IOLimits, APISpec, Rate, OpsSp
 library imports only, pinned by a test). Nothing reads a field yet. A zero OpsSpec renders the
 cluster and the REST container byte for byte as before (recorded digests); a change meant to
 alter a rendering re-records them. Spec is not serialized, so no stored form changes.
+
+### 2026-11-19 — store: schema version 2, restore operations, parking guards, new epoch
+
+- Migrations: Migrate applies schema.sql on an empty database (cp_meta at version 1), then every
+  file of `migrations` above the stored version, setting schema_ver after each, all in one
+  transaction under the migration lock; a stored version above schemaVersion (or below 1) is
+  refused naming both. schemaVersion = 1 + len(migrations). A new version is one embedded file
+  migration_<n>.sql plus one list element; tests compare with schemaVersion and with the tables
+  the files create (schemaTables), never with literal numbers. A failing file rolls back all.
+- Version 2 (migration_2.sql): project state restoring; operation states waiting_job and
+  superseded; operation kind restore; operation.result (jsonb); project.slot_op; the
+  operation_open index covers waiting_job; tables backup_state, backup_job, backup_set,
+  backup_timeline, backup_gap, backup_notice, offsite_object, offsite_info_version. Nothing
+  writes a job, backup or off-site row yet.
+- openStates = pending, running, waiting_job, aborting: one open operation per ref, used by the
+  submit and retry check and by NextOperation's "oldest open of its ref". readyStates (no
+  waiting_job) is what NextOperation picks: a parked operation owns its ref but is never run.
+  cmd/supapaced/boot.go's adoption list does not yet include waiting_job (nothing parks before
+  layout 2); it must before any layout-2 project exists.
+- Admission (one rule, under the project row lock, for SubmitOperation and SubmitRestore):
+  active takes each kind; restarting takes a restart or a delete when the newest of its restart
+  and restore operations is failed (supersedes nothing); restarting or restoring takes a restore
+  when the ref's newest operation is a failed restore or restart; restoring takes a delete when
+  the newest is a failed restore. The last two supersede that operation in the same transaction:
+  state superseded (final, never retried), slot_op null, its queued jobs failed with code
+  cancelled. A restoring project whose newest operation is a failed delete takes only op retry
+  of it. Refusals are ErrConflict naming the open operation, else "<kind> needs ...; it is
+  <state>", followed by "; operation N (kind) failed; op retry N continues it" when the ref's
+  newest operation is failed. Match ErrConflict with errors.Is, not the text.
+- RetryOperation: a failed operation back to pending with attempts 0 while no other operation of
+  the ref is open; a restore only while it is the ref's newest operation (its set and target
+  were chosen at its submit; restores keep the generation), else ErrConflict naming the newer
+  one. The check runs under the project row lock that every submit takes. It also sets
+  params.job_floor to max(backup_job.id) (0 if none).
+- SubmitRestore(ctx, ref, params) (id, superseded, err): kind restore, pending, the project's
+  generation and epoch; the project state is not changed. SetProjectRestoring(ref, opID):
+  active|restarting|restoring -> restoring while opID is an open restore of ref.
+  FinishRestore(id, result): a running restore -> done with result, its restoring project
+  active, slot cleared, one transaction; anything else ErrConflict and nothing written (a second
+  call after a commit is ErrConflict). Generation and applied_gen are untouched by restores.
+- SetSlot(ref, opID): free -> opID, same opID no-op, another -> ErrConflict; ClearSlot frees it
+  only if opID holds it. Neither checks that opID exists.
+- RaiseJobFloor(id, count): running only; floor and optional attempt + 1 in one statement;
+  returns both; other params members kept (re-read the operation afterwards). Requeue(id,
+  notBefore): running -> pending, attempts - 1, last_error kept. SetOperationResult: running
+  only (ErrConflict otherwise). RequestAbort accepts a create in waiting_job.
+- EnterNewEpoch(ctx, uidFloor) (epoch, err), one transaction: epoch + 1; next_uid =
+  greatest(next_uid, max(uid) + 1, uidFloor); queued and running jobs failed with code
+  recovered; every open operation but a purge failed with "recovered: the node was recovered
+  while this operation was open" (the create of a provisioning project aborted); a running purge
+  pending, other purges untouched; provisioning projects aborted with their slice released and
+  backup_state.offsite_purge set where a row exists; every slot cleared. Keys, generations,
+  configuration and operation params are untouched. Each call adds one to the epoch.
+- WALPosition and SwitchWAL run on the control plane's own database: the insert position; then
+  pg_walfile_name(lsn) and pg_switch_wal(). The segment is complete afterwards only if WAL was
+  written at or after lsn (with nothing written since the last switch the server does not switch).
+- WindowError{From, To}: a restore target outside the window; match with errors.As.
+- admit counts restoring projects. The pool holds 16 connections. ProjectConfig gains layout,
+  upload_mb_per_day and upload_objects_per_day, omitted when zero: older stored configurations
+  read and write back unchanged.

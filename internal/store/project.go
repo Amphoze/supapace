@@ -241,7 +241,8 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 
 // admit is the admission rule: a project needing mem MiB and pids fits when
 // the projects counted against the node's ceilings leave room for it. Counted
-// are the projects other than ref in provisioning, active, restarting or
+// are the projects other than ref in provisioning, active, restarting,
+// restoring (it holds its cluster's memory) or
 // deleting — placed ones only, or with unplaced also those not placed yet.
 // ErrNodeFull carries the figures.
 func admit(ctx context.Context, q interface {
@@ -249,7 +250,7 @@ func admit(ctx context.Context, q interface {
 }, node, ref string, unplaced bool, mem, pids, memAlloc, pidsAlloc int64) error {
 	var n, usedMem, usedPids int64
 	if err := q.QueryRow(ctx, `select count(*), coalesce(sum(mem_mb), 0), coalesce(sum(pids), 0) from project
-			where node_id = $1 and ref <> $2 and (uid is not null or $3) and state in ('provisioning', 'active', 'restarting', 'deleting')`,
+			where node_id = $1 and ref <> $2 and (uid is not null or $3) and state in ('provisioning', 'active', 'restarting', 'restoring', 'deleting')`,
 		node, ref, unplaced).Scan(&n, &usedMem, &usedPids); err != nil {
 		return err
 	}
@@ -336,4 +337,74 @@ func (s *Store) BeginRestart(ctx context.Context, ref string, target int64, cfg 
 		}
 		return fmt.Errorf("%w: project is %s at generation %d", ErrConflict, state, gen)
 	})
+}
+
+// SetSlot gives the project's backup slot to operation opID: free → opID;
+// held by opID already → no change; held by another → ErrConflict.
+func (s *Store) SetSlot(ctx context.Context, ref string, opID int64) error {
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		var slot *int64
+		if err := tx.QueryRow(ctx, "select slot_op from project where ref = $1 for update", ref).Scan(&slot); err != nil {
+			return err
+		}
+		switch {
+		case slot == nil:
+			_, err := tx.Exec(ctx, "update project set slot_op = $2 where ref = $1", ref, opID)
+			return err
+		case *slot != opID:
+			return fmt.Errorf("%w: operation %d holds the project's backup slot", ErrConflict, *slot)
+		}
+		return nil
+	})
+}
+
+// ClearSlot frees the project's backup slot if opID holds it.
+func (s *Store) ClearSlot(ctx context.Context, ref string, opID int64) error {
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockProject(ctx, tx, ref); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, "update project set slot_op = null where ref = $1 and slot_op = $2", ref, opID)
+		return err
+	})
+}
+
+// recoveredError is the last_error of an operation the new epoch ended.
+const recoveredError = "recovered: the node was recovered while this operation was open"
+
+// EnterNewEpoch is the first write to a recovered control-plane database, in
+// one transaction: the epoch + 1; the uid counter raised above every recorded
+// uid and to at least uidFloor, never lowered; every queued or running job
+// failed (code recovered); every open operation but a purge failed — the
+// create of a provisioning project aborted — with recoveredError; a running
+// purge back to pending, every other purge as it is (destroying a deleted
+// project's keys stays an obligation); every provisioning project aborted
+// with its slice released and its off-site prefix marked for purging; every
+// slot freed. It returns the new epoch.
+func (s *Store) EnterNewEpoch(ctx context.Context, uidFloor int) (epoch int64, err error) {
+	err = s.tx(ctx, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, "update cp_meta set epoch = epoch + 1 returning epoch").Scan(&epoch); err != nil {
+			return err
+		}
+		for _, st := range []struct {
+			q    string
+			args []any
+		}{
+			{"update node set next_uid = greatest(next_uid, (select max(uid) + 1 from project), $1)", []any{uidFloor}},
+			{"update backup_job set state = 'failed', code = 'recovered', finished_at = now() where state in ('queued', 'running')", nil},
+			{`update operation o set last_error = $1, updated_at = now(), state = case when o.kind = 'create' and
+				exists (select 1 from project p where p.ref = o.ref and p.state = 'provisioning') then 'aborted' else 'failed' end
+			where o.kind <> 'purge' and o.state in ` + openStates, []any{recoveredError}},
+			{"update operation set state = 'pending', updated_at = now() where kind = 'purge' and state = 'running'", nil},
+			{"update backup_state set offsite_purge = true where subject in (select ref from project where state = 'provisioning')", nil},
+			{"update project set state = 'aborted', subnet_index = null where state = 'provisioning'", nil},
+			{"update project set slot_op = null where slot_op is not null", nil}, // kept last
+		} {
+			if _, err := tx.Exec(ctx, st.q, st.args...); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return epoch, err
 }

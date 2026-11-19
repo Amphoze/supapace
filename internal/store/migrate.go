@@ -2,7 +2,7 @@ package store
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"fmt"
 	"net/netip"
 
@@ -14,10 +14,20 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
-const schemaVersion = 1
+//go:embed migration_*.sql
+var migrationFiles embed.FS
 
-// Migrate creates the schema once, with cp_meta at epoch 1; on a database that
-// already carries this schema version it does nothing.
+// migrations names the numbered migrations: element i takes the schema from
+// version i+1 to i+2. A new version is a new file and one more element.
+var migrations = [...]string{"migration_2.sql"}
+
+// schemaVersion is the version this build migrates to.
+const schemaVersion = 1 + len(migrations)
+
+// Migrate creates the schema once, with cp_meta at epoch 1, and then applies
+// every migration above the stored version, all in one transaction under one
+// lock; on a database already at schemaVersion it does nothing. A stored
+// version above schemaVersion is refused.
 func (s *Store) Migrate(ctx context.Context) error {
 	return s.tx(ctx, func(tx pgx.Tx) error {
 		// Serialise concurrent first runs; the check below then sees the winner's schema.
@@ -28,21 +38,36 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if err := tx.QueryRow(ctx, "select to_regclass('cp_meta') is not null").Scan(&present); err != nil {
 			return err
 		}
+		v := 1
 		if present {
-			var v int
 			if err := tx.QueryRow(ctx, "select schema_ver from cp_meta").Scan(&v); err != nil {
 				return err
 			}
-			if v != schemaVersion {
+			if v > schemaVersion || v < 1 {
 				return fmt.Errorf("store: schema version %d, this build knows %d", v, schemaVersion)
 			}
-			return nil
+		} else {
+			if _, err := tx.Exec(ctx, schemaSQL); err != nil {
+				return fmt.Errorf("store: schema: %w", err)
+			}
+			if _, err := tx.Exec(ctx, "insert into cp_meta (epoch, schema_ver) values (1, 1)"); err != nil {
+				return err
+			}
 		}
-		if _, err := tx.Exec(ctx, schemaSQL); err != nil {
-			return fmt.Errorf("store: schema: %w", err)
+		for ; v < schemaVersion; v++ {
+			name := migrations[v-1]
+			sql, err := migrationFiles.ReadFile(name)
+			if err != nil {
+				return fmt.Errorf("store: %s: %w", name, err)
+			}
+			if _, err := tx.Exec(ctx, string(sql)); err != nil {
+				return fmt.Errorf("store: %s: %w", name, err)
+			}
+			if _, err := tx.Exec(ctx, "update cp_meta set schema_ver = $1", v+1); err != nil {
+				return err
+			}
 		}
-		_, err := tx.Exec(ctx, "insert into cp_meta (epoch, schema_ver) values (1, $1)", schemaVersion)
-		return err
+		return nil
 	})
 }
 
