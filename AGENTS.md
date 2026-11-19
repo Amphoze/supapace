@@ -2213,3 +2213,39 @@ cmd/sp-dashstub gains two sub-commands (register in init()); test-only, never ru
 - GET /_seen (not recorded itself): the last 1,000 requests, oldest first, [{n, method, path,
   headers{name:[values]} with lower-case names, body_bytes}]. Go moves Host and Transfer-Encoding
   out of the header map, so a test of "exactly these headers" must ignore transport headers.
+
+### 2026-11-20 — `internal/nsdial`: a TCP dial from inside a container's network namespace
+
+Provides:
+- `Target{PID int; StartTicks uint64}`: a container's init process: the pid Docker's inspection
+  reports, and that process's start time in clock ticks (field 22 of /proc/<pid>/stat).
+- `TargetOf(pid int) (Target, error)`: the pid with its start time read from /proc. A process that
+  is gone is an error wrapping ErrChanged. The one reader of a start time: build every Target, and
+  every recheck's result, with it; do not parse /proc/<pid>/stat elsewhere.
+- `DialTCP(ctx, t, recheck, addr netip.AddrPort) (net.Conn, error)`: one TCP connection made from
+  inside t's network namespace.
+- `ErrChanged`: the process behind the Target is not the one inspected (gone, or pid reused).
+  Match with errors.Is; it may be wrapped with the underlying /proc error.
+
+Order: open /proc/<pid>/ns/net; compare the pid's start time with t; call recheck (the caller
+inspects the container again, usually TargetOf of a fresh inspection's pid) and require the same
+Target; refuse a non-root caller; then enter. Any mismatch returns ErrChanged and makes no
+connection. An error from recheck is returned as is.
+
+The entry runs on a goroutine that locks its OS thread and never unlocks it: setns, then a dial
+of an address literal (no name is resolved), then the goroutine exits and the runtime ends the
+thread. No other goroutine ever runs on a thread that entered a namespace. The returned connection
+keeps its namespace and may be used from any goroutine. Multipath TCP is off for this dial
+whatever GODEBUG says: its first use would run process-wide probes inside the namespace.
+
+Caller rules:
+- Always pass a context with a deadline; without one a filtered port waits out the kernel's SYN
+  retries.
+- The peer is whatever the namespace's owner routes the address to; authenticate it if the
+  namespace is not the platform's own.
+- Linux amd64 and arm64, root only; elsewhere both functions return an error.
+
+Tests: unit tests need no root. The reach-tagged tests run as root on a bare test node through
+test/harness/experiments/e44.sh: own listener only, no host connection made from the namespace
+under concurrent load, restart between inspection and entry detected with no connection made,
+deadline inside the namespace, thread count stable after 1,000 dials.
