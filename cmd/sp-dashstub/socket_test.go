@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -177,7 +178,7 @@ func (h *socketHarness) logLines() []socketLogLine {
 
 func wantCode(t *testing.T, what string, status int, body []byte, wantStatus int, code string) {
 	t.Helper()
-	if status != wantStatus || string(body) != `{"code":"`+code+`"}`+"\n" {
+	if status != wantStatus || string(body) != `{"code":"`+code+`"}` {
 		t.Errorf("%s: %d %s, want %d %s", what, status, body, wantStatus, code)
 	}
 }
@@ -479,4 +480,258 @@ func TestSocketStub_ReplacesStaleSocketOnly(t *testing.T) {
 	if b, _ := os.ReadFile(file); string(b) != "keep" {
 		t.Fatal("regular file changed")
 	}
+}
+
+// raw writes one request exactly as given and reads the answer.
+func (h *socketHarness) raw(req string) (int, []byte) {
+	h.t.Helper()
+	c, err := net.Dial("unix", h.sock)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.WriteString(c, req); err != nil {
+		h.t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return resp.StatusCode, b
+}
+
+func rawRequest(method, target string, headers ...string) string {
+	return method + " " + target + " HTTP/1.1\r\nHost: dash\r\nContent-Length: 0\r\n" + strings.Join(headers, "") + "\r\n"
+}
+
+func TestSocketStub_PathIsTheRawTarget(t *testing.T) {
+	h := startSocket(t, stubTable())
+	tok := dashsock.HeaderAssertion + ": " + h.assertion(dashtok.Assertion{Sub: "u-owner", Ref: refA, Role: "owner"}) + "\r\n"
+	for _, target := range []string{
+		"/v1/resolve?x=1", "/v1/resolve?", "/v1/%72esolve", "/v1%2Fresolve", "/v1/keys/",
+		"http://dash/v1/resolve", "http://dash/v1/keys", "//v1/keys", "/v1/./keys",
+	} {
+		st, body := h.raw(rawRequest("POST", target, tok))
+		wantCode(t, target, st, body, 404, "not_found")
+	}
+	// Control: the exact targets are answered.
+	for _, target := range []string{"/v1/resolve", "/v1/keys"} {
+		if st, body := h.raw(rawRequest("POST", target, tok)); st != 200 {
+			t.Errorf("%s: %d %s", target, st, body)
+		}
+	}
+}
+
+func TestSocketStub_TwoAssertionHeaders(t *testing.T) {
+	h := startSocket(t, stubTable())
+	tok := h.assertion(dashtok.Assertion{Sub: "u-owner", Ref: refA, Role: "owner"})
+	one := dashsock.HeaderAssertion + ": " + tok + "\r\n"
+	for name, hdrs := range map[string][]string{
+		"the same token twice":  {one, one},
+		"a good and a bad one":  {one, dashsock.HeaderAssertion + ": v1.x.y\r\n"},
+		"a bad and a good one":  {dashsock.HeaderAssertion + ": v1.x.y\r\n", one},
+		"two spellings of name": {one, strings.ToLower(dashsock.HeaderAssertion) + ": " + tok + "\r\n"},
+	} {
+		st, body := h.raw(rawRequest("POST", "/v1/keys", hdrs...))
+		wantCode(t, name, st, body, 401, "bad_assertion")
+	}
+	if l := h.logLines(); len(l) != 4 || l[0].Sub != "" {
+		t.Errorf("log = %+v", l)
+	}
+	// Control: one header is answered.
+	if st, body := h.raw(rawRequest("POST", "/v1/keys", one)); st != 200 {
+		t.Errorf("one header: %d %s", st, body)
+	}
+}
+
+// The header block, request line and final blank line included, may be 8,192
+// bytes and no more.
+func TestSocketStub_HeaderBoundIsExact(t *testing.T) {
+	h := startSocket(t, stubTable())
+	tok := dashsock.HeaderAssertion + ": " + h.assertion(dashtok.Assertion{Sub: "u-owner", Ref: refA, Role: "owner"}) + "\r\n"
+	sized := func(n int) string {
+		base := rawRequest("POST", "/v1/keys", tok, "X-Pad: \r\n")
+		pad := n - len(base)
+		return rawRequest("POST", "/v1/keys", tok, "X-Pad: "+strings.Repeat("a", pad)+"\r\n")
+	}
+	if r := sized(8192); len(r) != 8192 {
+		t.Fatalf("built %d bytes", len(r))
+	}
+	if st, body := h.raw(sized(8192)); st != 200 {
+		t.Errorf("8,192 bytes: %d %s", st, body)
+	}
+	if st, _ := h.raw(sized(8193)); st != 431 {
+		t.Errorf("8,193 bytes: %d", st)
+	}
+}
+
+func TestSocketStub_PeerRefusalBeforeTransport(t *testing.T) {
+	h := startSocket(t, stubTable(), "--mode", "refuse:peer")
+	for name, req := range map[string]string{
+		"bad path":   rawRequest("POST", "/v1/other"),
+		"bad method": rawRequest("GET", "/v1/keys"),
+		"a body":     "POST /v1/keys HTTP/1.1\r\nHost: dash\r\nContent-Length: 2\r\n\r\n{}",
+		"query":      rawRequest("POST", "/v1/keys?x"),
+	} {
+		st, body := h.raw(req)
+		wantCode(t, name, st, body, 403, "peer")
+	}
+	// Control: in another refusal mode the transport checks come first.
+	h2 := startSocket(t, stubTable(), "--mode", "refuse:unavailable")
+	st, body := h2.raw(rawRequest("GET", "/v1/keys"))
+	wantCode(t, "refuse:unavailable, bad method", st, body, 405, "method_not_allowed")
+}
+
+func TestSocketStub_AnswerBytesExact(t *testing.T) {
+	h := startSocket(t, stubTable())
+	var table map[string]stubProject
+	if err := json.Unmarshal([]byte(stubTable()), &table); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal(table[refA].Resolve)
+	if _, body := h.post("/v1/resolve", "u-owner", "owner", ""); !bytes.Equal(body, want) {
+		t.Errorf("resolve:\n got %q\nwant %q", body, want)
+	}
+	k := table[refA].Keys
+	k.ServiceRoleKey = ""
+	want, _ = json.Marshal(k)
+	if _, body := h.post("/v1/keys", "u-owner", "owner", ""); !bytes.Equal(body, want) {
+		t.Errorf("keys:\n got %q\nwant %q", body, want)
+	}
+}
+
+// startSocketServer serves the stub on a server built by mk, so that a test
+// can compare the stand-in's server with one that lacks its timeouts.
+func startSocketServer(t *testing.T, table string, mk func(http.Handler) *http.Server) *socketHarness {
+	h := startSocket(t, table)
+	sock := filepath.Join(h.dir, "second.sock")
+	l, err := listenUnix(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var errb bytes.Buffer
+	s, _, err := newSocketStub([]string{"--listen", sock, "--public", filepath.Join(h.dir, "assert.pub"),
+		"--node", node1, "--table", filepath.Join(h.dir, "table.json")}, &errb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := mk(s)
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close(); s.log.Close() })
+	h.sock = sock
+	return h
+}
+
+// closedWithin reports whether the server closes c within d (reading and
+// discarding what it sends), and how long it took.
+func closedWithin(c net.Conn, d time.Duration) (bool, time.Duration) {
+	start := time.Now()
+	c.SetReadDeadline(start.Add(d))
+	_, err := io.Copy(io.Discard, c)
+	ne, ok := err.(net.Error)
+	return !(ok && ne.Timeout()), time.Since(start)
+}
+
+func noTimeouts(h http.Handler) *http.Server {
+	s := socketServer(h)
+	s.ReadTimeout, s.WriteTimeout, s.IdleTimeout = 0, 0, 0
+	return s
+}
+
+func TestSocketStub_ReadWriteIdleTimeouts(t *testing.T) {
+	tok := func(h *socketHarness) string {
+		return dashsock.HeaderAssertion + ": " + h.assertion(dashtok.Assertion{Sub: "u-owner", Ref: refA, Role: "owner"}) + "\r\n"
+	}
+	dial := func(h *socketHarness) net.Conn {
+		c, err := net.Dial("unix", h.sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+
+	t.Run("declared body never sent", func(t *testing.T) {
+		req := func(h *socketHarness) string {
+			return "POST /v1/keys HTTP/1.1\r\nHost: dash\r\nContent-Length: 5\r\n" + tok(h) + "\r\n"
+		}
+		h := startSocketServer(t, stubTable(), socketServer)
+		c := dial(h)
+		io.WriteString(c, req(h))
+		if closed, d := closedWithin(c, 6*time.Second); !closed {
+			t.Errorf("connection held for %v", d)
+		}
+		// Control: without the timeouts the same connection is still open.
+		h0 := startSocketServer(t, stubTable(), noTimeouts)
+		c0 := dial(h0)
+		io.WriteString(c0, req(h0))
+		if closed, d := closedWithin(c0, 3*time.Second); closed {
+			t.Errorf("control closed after %v", d)
+		}
+	})
+
+	t.Run("client that never reads", func(t *testing.T) {
+		// An answer far larger than the socket's buffers.
+		big := strings.Replace(stubTable(), `"name": "alpha"`, `"name": "`+strings.Repeat("n", 32<<20)+`"`, 1)
+		h := startSocketServer(t, big, socketServer)
+		c := dial(h)
+		io.WriteString(c, rawRequest("POST", "/v1/resolve", tok(h)))
+		time.Sleep(3 * time.Second) // past the write bound, reading nothing
+		c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		n, _ := io.Copy(io.Discard, c)
+		if n >= 32<<20 {
+			t.Errorf("a client that did not read got the whole answer (%d bytes)", n)
+		}
+		// Control: a client that reads at once gets all of it.
+		c2 := dial(h)
+		io.WriteString(c2, rawRequest("POST", "/v1/resolve", tok(h)))
+		c2.SetReadDeadline(time.Now().Add(10 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(c2), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err := io.Copy(io.Discard, resp.Body); err != nil || n < 32<<20 {
+			t.Errorf("reading client: %d bytes, %v", n, err)
+		}
+	})
+
+	t.Run("idle connection", func(t *testing.T) {
+		h := startSocketServer(t, stubTable(), socketServer)
+		c := dial(h)
+		io.WriteString(c, rawRequest("POST", "/v1/keys", tok(h)))
+		r := bufio.NewReader(c)
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(r, nil)
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("%v %v", resp, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		start := time.Now()
+		c.SetReadDeadline(start.Add(6 * time.Second))
+		_, err = r.ReadByte()
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Errorf("idle connection held for %v", time.Since(start))
+		}
+		// Control: without the timeouts an idle connection stays open.
+		h0 := startSocketServer(t, stubTable(), noTimeouts)
+		c0 := dial(h0)
+		io.WriteString(c0, rawRequest("POST", "/v1/keys", tok(h0)))
+		r0 := bufio.NewReader(c0)
+		c0.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err = http.ReadResponse(r0, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		c0.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, err = r0.ReadByte(); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Errorf("control: %v", err)
+		}
+	})
 }

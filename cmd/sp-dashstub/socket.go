@@ -81,10 +81,12 @@ func socket(args []string, stdout, stderr io.Writer) int {
 	return 1
 }
 
-// socketServer bounds the request header as the daemon's socket does: 8 KiB
-// (net/http adds its own slack), read within 2 s.
+// socketServer bounds a request as the daemon's socket does: the header block,
+// request line included, at 8 KiB (net/http reads 4 KiB beyond MaxHeaderBytes),
+// and reads, writes and idle connections at 2 s each.
 func socketServer(h http.Handler) *http.Server {
-	return &http.Server{Handler: h, ReadHeaderTimeout: 2 * time.Second, MaxHeaderBytes: 8 << 10}
+	return &http.Server{Handler: h, MaxHeaderBytes: 4 << 10, ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second}
 }
 
 // newSocketStub parses the flags, the key and the table, and opens the log.
@@ -156,7 +158,10 @@ func listenUnix(path string) (net.Listener, error) {
 
 func (s *socketStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	line := socketLogLine{Path: r.URL.Path}
-	a, aerr := dashtok.VerifyAssertion(s.pub, r.Header.Get(dashsock.HeaderAssertion), s.node, time.Now())
+	a, aerr := dashtok.Assertion{}, errors.New("not exactly one assertion header")
+	if v := r.Header.Values(dashsock.HeaderAssertion); len(v) == 1 {
+		a, aerr = dashtok.VerifyAssertion(s.pub, v[0], s.node, time.Now())
+	}
 	if aerr == nil {
 		line.Ref, line.Sub, line.Role, line.Purpose = a.Ref, a.Sub, a.Role, a.Purpose
 	}
@@ -170,26 +175,27 @@ func (s *socketStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.write(line)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(answer)
+	b, _ := json.Marshal(answer)
+	w.Write(b)
 }
 
-// answer applies the transport rules, then checks 2, 4 and 5; a refusal mode
-// answers in the place of its check.
+// answer applies the peer refusal mode, the transport rules, then checks 2, 4
+// and 5; a refusal mode answers in the place of its check. The path is the
+// request target exactly as received.
 func (s *socketStub) answer(r *http.Request, a dashtok.Assertion, aerr error) (int, any) {
 	refuse := func(status int, code string) (int, any) { return status, map[string]string{"code": code} }
+	if s.mode == "peer" {
+		return refuse(403, "peer")
+	}
 	switch {
-	case r.URL.Path != "/v1/resolve" && r.URL.Path != "/v1/keys":
+	case r.RequestURI != "/v1/resolve" && r.RequestURI != "/v1/keys":
 		return refuse(404, "not_found")
 	case r.Method != http.MethodPost:
 		return refuse(405, "method_not_allowed")
 	case r.ContentLength != 0:
 		return refuse(400, "bad_request")
 	}
-	// A refusal mode answers where its check stands: peer before the
-	// assertion, every other code after it.
-	if s.mode == "peer" {
-		return refuse(403, "peer")
-	}
+	// Every refusal mode but peer answers after the assertion is checked.
 	if aerr != nil {
 		return refuse(401, "bad_assertion")
 	}
@@ -207,7 +213,7 @@ func (s *socketStub) answer(r *http.Request, a dashtok.Assertion, aerr error) (i
 	if !member {
 		return refuse(403, "not_a_member")
 	}
-	if r.URL.Path == "/v1/resolve" {
+	if r.RequestURI == "/v1/resolve" {
 		if dashsock.RoleClass(a.Role) != "rw" {
 			p.Resolve.DSNRW = ""
 		}

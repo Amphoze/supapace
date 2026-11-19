@@ -2186,23 +2186,25 @@ cmd/sp-dashstub gains two sub-commands (register in init()); test-only, never ru
 - socket --listen PATH --public FILE --node ID --table FILE [--mode answer|silent|refuse:CODE]
   Serves POST /v1/resolve and /v1/keys on a Unix socket; the socket file is mode 0666 (the
   directory decides who connects; the real socket is narrower, so a test that another uid is
-  refused cannot use this stub). Order: path 404 not_found, method 405 method_not_allowed, body
-  (chunked too) 400 bad_request, then refuse:peer, then dashtok.VerifyAssertion (401
-  bad_assertion), then any other refuse:CODE, then the ref in the table (404 not_here), then
+  refused cannot use this stub). Order: refuse:peer (403 peer, before anything is parsed
+  further), then the request target exactly as received (a query string, a percent-encoded or
+  absolute-form target is 404 not_found), method 405 method_not_allowed, body (chunked too) 400
+  bad_request, then dashtok.VerifyAssertion (401 bad_assertion; not exactly one assertion header
+  is also 401), then any other refuse:CODE, then the ref in the table (404 not_here), then
   (iss, sub, role) among the members (403 not_a_member). Every refusal is {"code":"..."}.
   Refusal codes: peer 403, bad_assertion 401, rate_limited 429, not_here 404, not_a_member 403,
   unavailable 503. Only peer answers before the assertion is checked, as on the real socket.
-- Table: one JSON object keyed by ref: {"members":[{iss,sub,role}], "resolve":{...},
-  "keys":{...}}. Unknown members and trailing data are refused. Answers are the typed
-  dashsock.ResolveAnswer / KeysAnswer as written, so a test may put a malformed string in one;
-  the stub drops dsn_rw unless RoleClass is "rw", and service_role_key unless owner + "reveal".
-  The table's state is not checked: use refuse:not_here to test a project that is not live.
+  Bodies are JSON with no trailing line end.
 - silent: accepts, logs with status 0, never answers; holds the request until the client leaves.
 - Log: one JSON line per request appended to PATH.log: path, ref, sub, role, purpose, status
-  (ref/sub/role/purpose empty when the assertion failed). One write per line on an O_APPEND file;
-  a restart keeps earlier lines. A stale socket at PATH is removed; other files are not.
-- Limits applied: header 8 KiB (net/http allows 4 KiB more), header read 2 s. Not applied: 64
-  connections, the 800 ms whole request, per-ref rate, the peer check itself.
+  (ref/sub/role/purpose empty when the assertion failed). The path is the parsed URL path, not
+  the target: a refused "/v1/keys?x" is logged as /v1/keys with its status. One write per line
+  on an O_APPEND file; a restart keeps earlier lines. A stale socket at PATH is removed; other
+  files are not.
+- Limits applied: header block 8,192 bytes, request line and final blank line counted (8,193 is
+  431; net/http's MaxHeaderBytes is set to 4 KiB because it reads 4 KiB beyond it), header read,
+  whole-request read, write and idle connection 2 s each. Not applied: 64 connections, the 800 ms
+  whole request, per-ref rate, the peer check itself.
 - pgmeta --listen ADDR --crypto-key-file FILE [--delay-ms N] [--size BYTES] [--status CODE]
   Answers /query and /generators/typescript with [{"login","port","n"}] (n = request number,
   space-padded to --size) after --delay-ms, with --status; the delay ends when the client leaves.
@@ -2213,6 +2215,9 @@ cmd/sp-dashstub gains two sub-commands (register in init()); test-only, never ru
 - GET /_seen (not recorded itself): the last 1,000 requests, oldest first, [{n, method, path,
   headers{name:[values]} with lower-case names, body_bytes}]. Go moves Host and Transfer-Encoding
   out of the header map, so a test of "exactly these headers" must ignore transport headers.
+2026-11-20: the socket stand-in now answers refuse:peer first, compares the raw request target,
+  refuses any count of assertion headers but one, writes bodies without a line end and bounds
+  header (exactly 8,192 bytes), read, write and idle time.
 
 ### 2026-11-20 — `internal/nsdial`: a TCP dial from inside a container's network namespace
 
