@@ -12,41 +12,55 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/Amphoze/supapace/internal/gateway"
 )
 
-const (
-	dir    = "/etc/supapace/gateway"
-	routes = dir + "/routes.json"
-	cert   = dir + "/tls/cert.pem"
-	key    = dir + "/tls/key.pem"
-)
+const dir = "/etc/supapace/gateway"
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	// ponytail: the certificate is read once; a renewed one takes a container restart.
-	c, err := tls.LoadX509KeyPair(cert, key)
+	g, c, err := start(context.Background(), dir)
 	if err != nil {
 		log.Fatalf("gateway: tls: %v", err)
 	}
-	tbl := gateway.NewTable(routes)
-	if err := tbl.Reload(); err != nil {
-		log.Printf("gateway: no route table yet (503 until one is read): %v", err)
-	}
-	go tbl.Watch(context.Background(), time.Second)
-
 	lim := gateway.NewLimiter(gateway.MaxConns, gateway.MaxConnsPerSource)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	tlsLn, plainLn, err := listeners(lim, ":8443", ":8080")
 	if err != nil {
 		log.Fatalf("gateway: %v", err)
 	}
-	if err := run(ctx, stop, 10*time.Second, gateway.New(tbl), c, tlsLn, plainLn); err != nil {
+	if err := run(ctx, stop, 10*time.Second, g, c, tlsLn, plainLn); err != nil {
 		log.Fatalf("gateway: %v", err)
 	}
+}
+
+// start reads the gateway directory: the first TLS pair (an error, on which
+// the process exits), the route table and, with dash/domain, the dashboard's
+// files, which never stop the gateway. Both tables are watched until ctx ends.
+func start(ctx context.Context, dir string) (*gateway.Gateway, tls.Certificate, error) {
+	// ponytail: the certificates are read once; a renewed one takes a container restart.
+	c, err := tls.LoadX509KeyPair(filepath.Join(dir, "tls", "cert.pem"), filepath.Join(dir, "tls", "key.pem"))
+	if err != nil {
+		return nil, c, err
+	}
+	tbl := gateway.NewTable(filepath.Join(dir, "routes.json"))
+	if err := tbl.Reload(); err != nil {
+		log.Printf("gateway: no route table yet (503 until one is read): %v", err)
+	}
+	go tbl.Watch(ctx, time.Second)
+	g := gateway.New(tbl)
+	if d := gateway.LoadDashboard(dir); d != nil {
+		if err := d.Reload(); err != nil {
+			log.Printf("gateway: no dashboard table yet (503 until one is read): %v", err)
+		}
+		go d.Watch(ctx, time.Second)
+		g.SetDashboard(d)
+	}
+	return g, c, nil
 }
 
 // listeners opens the HTTPS and the plain listener, both behind lim.
@@ -69,6 +83,9 @@ func run(ctx context.Context, stop func(), grace time.Duration, h http.Handler, 
 	tlsLn, plainLn net.Listener) error {
 	https := gateway.NewServer(h)
 	https.TLSConfig.Certificates = []tls.Certificate{c}
+	if g, ok := h.(*gateway.Gateway); ok {
+		https.TLSConfig.GetCertificate = g.Certificate // the studio pair by server name
+	}
 	plain := gateway.NewServer(gateway.Redirect())
 	errc := make(chan error, 2)
 	go func() { errc <- https.ServeTLS(tlsLn, "", "") }()

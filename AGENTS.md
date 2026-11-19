@@ -2473,3 +2473,50 @@ alter a rendering re-records them. Spec is not serialized, so no stored form cha
 - admit counts restoring projects. The pool holds 16 connections. ProjectConfig gains layout,
   upload_mb_per_day and upload_objects_per_day, omitted when zero: older stored configurations
   read and write back unchanged.
+
+### 2026-11-19 — gateway: dashboard host classes, the dashboard table, the request rules
+
+With `dash/domain` in the gateway directory the gateway serves a second class of hosts: the studio
+domain (the apex) and one label under it (a project's dashboard). Without the file nothing changes.
+
+Provides (internal/gateway):
+- LoadDashboard(dir) *Dashboard: reads dash/domain, tls-studio/{cert,key}.pem, dash/assert.key.
+  No domain file: nil. Any of them failing: logged, a Dashboard that serves nothing; the project
+  API is served as before, studio hosts are unknown hosts, /-/health carries
+  X-Supapace-Dashboard: unavailable (ok when loaded; absent without a domain file). Restart to
+  retry. The first TLS pair still stops the process.
+- (*Gateway).SetDashboard(d): call before serving.
+- (*Gateway).Certificate: a GetCertificate hook; the studio pair for the domain and every name
+  under it, nil otherwise (the first pair answers).
+- (*Dashboard).Reload / Watch(ctx, every): dashboard.json is opened once per check and re-read
+  when the open file's inode, size or mtime changed. A missing file unloads the table (every
+  studio host 503). A file over maxDashFile (64 MiB) is refused by its size before anything is
+  allocated, and again if more arrives while it is read; otherwise it is read into one buffer of
+  its size. The path is opened without blocking; anything but a regular file (a FIFO, a device,
+  a directory) is refused before it is read. A bad file, another studio_domain, a key whose kty
+  is not RSA or that
+  jwtx.DashboardKeyFromJWK refuses: error, the last good table stays, logged once per message,
+  not read again until it changes. Refusals of rules 0-4 are counted and logged once a minute
+  per ref, never per request.
+
+Order on a studio host: server name must equal the host (421) -> no table 503 -> label not a
+ref of the table 404 -> rule 0 (400) -> apex or /-/auth/ (exact, raw) to the sign-in seam ->
+rules 2-10 -> slots (project 429, dashboard 503, gateway-wide 503) -> the forward seam.
+Rule 0 refuses a raw "#" anywhere in the request target (path or query), and, in either reading
+of the path (segments decoded one by one; the path decoded whole), an empty segment, ".", "..",
+a backslash, a byte outside 0x20-0x7e, a broken escape, or readings that differ. "%23" is an
+ordinary character in the path and in the query. Rules 2, 3, 7 read
+lower-cased segments. An API path is /api itself or anything under /api/; /api/ai and /api/mcp
+are refused with or without further segments. The read_only and reveal exceptions match the
+path as sent, exactly. A host with a dot in its label, capitals, a trailing dot or a
+non-numeric port is not a studio host.
+
+Seams (unexported): dashAuth, dashForward func(w, r, *dashRequest); nil answers 503.
+dashRequest: Table, Ref ("_" on the apex), Path, Lower, Session, Role, Purpose, Keys (issuer
+keys as dashboard keys), Dash. The forward seam runs holding all three slots; r.Body is already
+capped. writeDash(w, status, code) writes a refusal with the dashboard headers and no-store.
+Every serveDash answer carries nosniff, the dashboard CSP (dashCSP), COOP, CORP and
+Referrer-Policy same-origin, never the sandbox; answers made before the switch (/-/health, 505,
+the origin-form 400) keep the as-built headers.
+Known limits: refusals of rules 5-10 are not logged yet; a request with no TLS server name passes
+the 421 check (as built); a refused non-regular table file is checked again on every tick.

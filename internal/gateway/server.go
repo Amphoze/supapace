@@ -47,6 +47,8 @@ type Gateway struct {
 	mu         sync.Mutex
 	projectCap int
 	byProject  map[string]int // proxied requests in flight per ref; no zero entries
+
+	dash *Dashboard // nil without a studio domain
 }
 
 func New(t *Table) *Gateway {
@@ -94,7 +96,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/-/health":
 		w.Header().Set("Content-Type", "application/json")
 		sandbox(w.Header())
+		if g.dash != nil {
+			w.Header().Set("X-Supapace-Dashboard", g.dash.health())
+		}
 		fmt.Fprintf(w, `{"generation":%d}`, g.table.Generation())
+		return
+	}
+	// Studio hosts are classified whether or not a route table is loaded.
+	if name, label, ok := g.dash.studioHost(r.Host); ok {
+		g.serveDash(w, r, name, label)
 		return
 	}
 	tb := g.table.cur.Load()
