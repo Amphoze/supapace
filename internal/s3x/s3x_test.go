@@ -669,13 +669,19 @@ func TestResponse_StalledServerTimesOut(t *testing.T) {
 		}
 	}()
 	f := newFake(t)
-	f.hook = func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }
+	// The stalled handlers end without an answer: a handler that returned when its request
+	// ended would send a 200 at the moment the client gives up, and the client may still read it.
+	f.hook = func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		panic(http.ErrAbortHandler)
+	}
 	g := newFakeWith(t, f.ca, 0)
 	g.hook = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "10")
 		w.Write([]byte("abc"))
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
+		panic(http.ErrAbortHandler)
 	}
 	for name, addr := range map[string]netip.AddrPort{"accepts only": netip.MustParseAddrPort(l.Addr().String()), "no answer": f.addr(),
 		"body stalls": g.addr()} {
