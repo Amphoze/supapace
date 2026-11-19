@@ -3717,3 +3717,35 @@ an idle upstream connection, which holds one of the project PostgREST's slots, i
 Caller rules: files added to the gateway for these features (`gatewayAdditions` in
 rate_test.go) give the upstream transport no hook, wrap no request body, and start no goroutine
 (`go`, `time.AfterFunc`); `TestGatewayAdditions_UseNoTransportHook` checks each listed file.
+
+### 2026-11-19 — gateway: forwarding to Studio, the response filter, the access line
+
+dashproxy.go assigns dashForward = forwardDash; it is reached only from serveDash, after rule 0,
+rules 2-10 and the three slots.
+- Methods: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS; any other is 405 method_not_allowed.
+- Target: forwarded as sent (url.URL.Opaque), never re-encoded. Rule 0 refuses a raw "#" or a
+  raw space anywhere in the target (an HTTP/2 path may hold a space).
+- Host and X-Forwarded-Host are <ref>.<studio domain> as configured; a client's HTTP/2 host
+  field is never written. X-Forwarded-Proto https; X-Forwarded-For the peer address.
+- Removed: Authorization, apikey, x-connection-encrypted, Forwarded, X-Forwarded-*, X-Real-IP,
+  X-Supapace-Assertion, the method-override and URL-rewrite headers, every __Host-sp-* cookie
+  (any letter case), Accept-Encoding on an API path; hop-by-hop headers as ReverseProxy does.
+- Added: X-Supapace-Assertion, signed per request from the verified session, the table's role
+  and rule 9's purpose; 30 s lifetime. A signing failure is 503 unavailable.
+- Transport of its own (newDashTransport): dial 5 s, header wait row 2, StudioConns conns,
+  32 idle kept for 4 s (below Studio's 5 s keep-alive), 32 KiB response header, no compression.
+- Deadlines: at entry read and write = now + row 2 + row 1; at Studio's header both = now +
+  row 1. Go's own ReadTimeout does not run once an HTTP/1.1 request is read, but closes an
+  HTTP/2 body at 60 s: the entry read deadline is what lets a slow upload through.
+- Failures: no connection 502, no header within row 2 504, header over the bound 502, body over
+  the cap 413 (told to the server from the handler; the cap's reader holds no writer), client
+  gone: abort. An unsolicited 101 is 502; Upgrade never reaches Studio (rule 10).
+- Response (dashfilter.go): drop Server, Clear-Site-Data, Set-Cookie2, Access-Control-*, and
+  Set-Cookie with Domain or a __Host-sp- name; no-store on API paths and on any status but
+  2xx/304; then dashHeaders last. Trailers filtered and may not reuse a set name. 1xx filtered,
+  relayed on HTTP/1.1 only, never to an Expect client, counted (the ninth is 502).
+- Access line: one per forwarded request and per refusal of rules 5-10 (the 302, the refusal
+  path, the slot refusals, the forwarder's 405), via log.Print after the logger's prefix:
+  {"t","ref","iss","sub","role","method","path","status","ms"}. Path without query, at most
+  256 bytes; method at most 16 bytes; control characters removed; ms is 0 for a refusal.
+  Never a query, cookie, token, header or body.

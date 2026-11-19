@@ -136,25 +136,6 @@ func (s *signIn) origin(ref string) string {
 	return "https://" + ref + "." + s.d.domain
 }
 
-// crossOrigin is the dashboard's same-origin rule: a Sec-Fetch-Site that is
-// present and neither same-origin nor none, unless the request is a
-// top-level navigation by GET to something that is not an API path.
-func crossOrigin(r *http.Request, lower []string) bool {
-	for _, v := range r.Header.Values("Sec-Fetch-Site") {
-		if v != "same-origin" && v != "none" && !(r.Method == http.MethodGet && !apiPath(lower) &&
-			r.Header.Get("Sec-Fetch-Mode") == "navigate" && r.Header.Get("Sec-Fetch-Dest") == "document") {
-			return true
-		}
-	}
-	return false
-}
-
-// navigation reports whether a GET is a navigation, as the session rule
-// reads one.
-func navigation(r *http.Request) bool {
-	return r.Header.Get("Sec-Fetch-Mode") == "navigate" || strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
-}
-
 func setCookie(w http.ResponseWriter, name, value string, maxAge int, sameSite http.SameSite) {
 	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", MaxAge: maxAge, Secure: true, HttpOnly: true, SameSite: sameSite})
 }

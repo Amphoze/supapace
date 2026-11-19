@@ -301,6 +301,9 @@ func writeDash(w http.ResponseWriter, status int, code string) {
 // sign-in host, rule 1) or the request rules and the forwarder.
 func (g *Gateway) serveDash(w http.ResponseWriter, r *http.Request, name, label string) {
 	d := g.dash
+	if label == dashcfg.SignInLabel {
+		w.Header().Set("Origin-Agent-Cluster", "?1") // every answer of the sign-in host, the refusals below too
+	}
 	if !sniAgrees(r, name) {
 		writeDash(w, http.StatusMisdirectedRequest, "misdirected")
 		return
@@ -336,7 +339,7 @@ func (g *Gateway) serveDash(w http.ResponseWriter, r *http.Request, name, label 
 	if !d.rules(w, r, dt, dr, raw) {
 		return
 	}
-	release, ok := g.dashSlots(w, ref)
+	release, ok := g.dashSlots(w, r, dr)
 	if !ok {
 		return
 	}
@@ -370,10 +373,11 @@ func call(h func(http.ResponseWriter, *http.Request, *dashRequest), w http.Respo
 }
 
 // dashSlots takes, in this order, a slot of the project, of the dashboard and
-// of the gateway; a refusal is answered here.
-func (g *Gateway) dashSlots(w http.ResponseWriter, ref string) (release func(), ok bool) {
-	d := g.dash
+// of the gateway; a refusal is answered and logged here.
+func (g *Gateway) dashSlots(w http.ResponseWriter, r *http.Request, dr *dashRequest) (release func(), ok bool) {
+	d, ref := g.dash, dr.Ref
 	if !d.acquire(ref) {
+		accessLine(r, dr, http.StatusTooManyRequests, 0)
 		writeDash(w, http.StatusTooManyRequests, "too_many_requests")
 		return nil, false
 	}
@@ -381,6 +385,7 @@ func (g *Gateway) dashSlots(w http.ResponseWriter, ref string) (release func(), 
 	case d.slots <- struct{}{}:
 	default:
 		d.release(ref)
+		accessLine(r, dr, http.StatusServiceUnavailable, 0)
 		writeDash(w, http.StatusServiceUnavailable, "unavailable")
 		return nil, false
 	}
@@ -389,6 +394,7 @@ func (g *Gateway) dashSlots(w http.ResponseWriter, ref string) (release func(), 
 	default:
 		<-d.slots
 		d.release(ref)
+		accessLine(r, dr, http.StatusServiceUnavailable, 0)
 		writeDash(w, http.StatusServiceUnavailable, "unavailable")
 		return nil, false
 	}

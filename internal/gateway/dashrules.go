@@ -21,6 +21,8 @@ func (d *Dashboard) rules(w http.ResponseWriter, r *http.Request, dt *dashTable,
 	refuse := func(rule, status int, code string) bool {
 		if rule <= 4 {
 			d.count(dr.Ref, rule)
+		} else {
+			accessLine(r, dr, status, 0)
 		}
 		writeDash(w, status, code)
 		return false
@@ -45,8 +47,7 @@ func (d *Dashboard) rules(w http.ResponseWriter, r *http.Request, dt *dashTable,
 	// 5. A session of this ref, of the table's issuer, not revoked.
 	s, ok := d.session(r, dt, dr.Ref, time.Now())
 	if !ok {
-		if r.Header.Get("Sec-Fetch-Mode") == "navigate" ||
-			r.Method == http.MethodGet && strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html") {
+		if navigation(r) {
 			if d.unpresented(r, dr.Ref, time.Now()) {
 				dr.Unpresented = true
 				call(dashAuth, w, r, dr)
@@ -56,6 +57,7 @@ func (d *Dashboard) rules(w http.ResponseWriter, r *http.Request, dt *dashTable,
 			h.Set("Location", "/-/auth/login?return="+url.QueryEscape(r.RequestURI))
 			h.Set("Cache-Control", "no-store")
 			dashHeaders(h)
+			accessLine(r, dr, http.StatusFound, 0)
 			w.WriteHeader(http.StatusFound)
 			return false
 		}
@@ -69,12 +71,8 @@ func (d *Dashboard) rules(w http.ResponseWriter, r *http.Request, dt *dashTable,
 	}
 	dr.Role = role
 	// 7. Same origin, but for a top-level navigation to a page.
-	api := apiPath(lp)
-	for _, v := range r.Header.Values("Sec-Fetch-Site") {
-		if v != "same-origin" && v != "none" && !(r.Method == http.MethodGet && !api &&
-			r.Header.Get("Sec-Fetch-Mode") == "navigate" && r.Header.Get("Sec-Fetch-Dest") == "document") {
-			return refuse(7, http.StatusForbidden, "cross_origin")
-		}
+	if crossOrigin(r, lp) {
+		return refuse(7, http.StatusForbidden, "cross_origin")
 	}
 	// 8. read_only writes nothing but its two statement paths, spelled exactly.
 	switch r.Method {
@@ -102,7 +100,7 @@ func (d *Dashboard) rules(w http.ResponseWriter, r *http.Request, dt *dashTable,
 	if r.ContentLength > limit {
 		return refuse(10, http.StatusRequestEntityTooLarge, "body_too_large")
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	r.Body = http.MaxBytesReader(nil, r.Body, limit) // read on the transport's goroutine: no writer (forwardDash answers the 413)
 	return true
 }
 
@@ -142,6 +140,26 @@ func (d *Dashboard) unpresented(r *http.Request, ref string, now time.Time) bool
 	}
 	at, err := strconv.ParseInt(n, 10, 64)
 	return err == nil && at <= now.Unix() && now.Unix()-at <= sessionPageWindow
+}
+
+// navigation reports whether r is a navigation, as rule 5 reads one:
+// Sec-Fetch-Mode navigate, or a GET that accepts text/html.
+func navigation(r *http.Request) bool {
+	return r.Header.Get("Sec-Fetch-Mode") == "navigate" ||
+		r.Method == http.MethodGet && strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
+}
+
+// crossOrigin is rule 7: a Sec-Fetch-Site that is present and neither
+// same-origin nor none, unless the request is a top-level navigation by GET
+// to something that is not an API path. lp is the lower-cased segments.
+func crossOrigin(r *http.Request, lp []string) bool {
+	for _, v := range r.Header.Values("Sec-Fetch-Site") {
+		if v != "same-origin" && v != "none" && !(r.Method == http.MethodGet && !apiPath(lp) &&
+			r.Header.Get("Sec-Fetch-Mode") == "navigate" && r.Header.Get("Sec-Fetch-Dest") == "document") {
+			return true
+		}
+	}
+	return false
 }
 
 // apiPath reports whether lp, the lower-cased segments, is an API path: /api

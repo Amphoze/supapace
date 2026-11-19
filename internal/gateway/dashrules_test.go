@@ -123,10 +123,10 @@ func TestDashSession_Refusals(t *testing.T) {
 	good := e.session(t, refA, issuer, subOwnerA, now-10, 3600)
 
 	// No session: a navigation is redirected with its return path.
-	nav := rawReq("GET", dhostA, "/project/"+refA+"/sql?tab=1&x=a b")
+	nav := rawReq("GET", dhostA, "/project/"+refA+"/sql?tab=1&x=a%20b")
 	nav.Header.Set("Sec-Fetch-Mode", "navigate")
 	w := e.dexpect(t, "navigation", nav, 302, "")
-	if loc := w.Header().Get("Location"); loc != "/-/auth/login?return=%2Fproject%2F"+refA+"%2Fsql%3Ftab%3D1%26x%3Da+b" {
+	if loc := w.Header().Get("Location"); loc != "/-/auth/login?return=%2Fproject%2F"+refA+"%2Fsql%3Ftab%3D1%26x%3Da%2520b" {
 		t.Errorf("Location %q", loc)
 	}
 	html := rawReq("GET", dhostA, "/x")

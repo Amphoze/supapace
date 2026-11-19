@@ -20,7 +20,7 @@ import (
 // that a URL parser resolves no further, and is ASCII, so lower-casing it
 // means the same everywhere.
 func readPath(target string) (segs []string, ok bool) {
-	if strings.IndexByte(target, '#') >= 0 {
+	if strings.ContainsAny(target, "# ") {
 		return nil, false
 	}
 	raw, _, _ := strings.Cut(target, "?")

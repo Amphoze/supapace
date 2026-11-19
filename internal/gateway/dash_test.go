@@ -524,11 +524,18 @@ func TestDashRefusals_CountedNotLoggedPerRequest(t *testing.T) {
 		e.do(owner("/api/ai/x"))  // rule 3
 		e.do(sw)                  // rule 4
 		e.do(rawReq("GET", signInH, "/a/../b"))
-		e.do(rawReq("GET", dhostA, "/api/x")) // rule 5: not counted here
+		e.do(rawReq("GET", dhostA, "/api/x")) // rule 5: not counted here, an access line
 	}
-	if buf.Len() != 0 {
-		t.Fatalf("refusals logged per request: %q", buf.String())
+	perRequest := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	for _, l := range perRequest {
+		if !strings.Contains(l, `"path":"/api/x","status":401,`) {
+			t.Fatalf("refusals of rules 0-4 logged per request: %q", l)
+		}
 	}
+	if len(perRequest) != 50 {
+		t.Fatalf("%d access lines for 50 refusals of rule 5", len(perRequest))
+	}
+	buf.Reset()
 	e.d.logRefusals()
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	if len(lines) != 2 {
