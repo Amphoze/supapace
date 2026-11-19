@@ -9,6 +9,21 @@ table bridge supapace
 delete table bridge supapace
 
 define GATEWAY_IP = {{.GatewayIP}}
+{{- if .RestAddrs}}
+define REST_ADDRS = {{.RestAddrs}}
+{{- end}}
+{{- if .StudioIP}}
+define STUDIO_IP = {{.StudioIP}}
+{{- end}}
+{{- if .PgMetaIPs}}
+define PGMETA_IPS = { {{range $i, $e := .PgMetaIPs}}{{if $i}}, {{end}}{{$e}}{{end}} }
+{{- end}}
+{{- if .PgcapIP}}
+define PGCAP_IP = {{.PgcapIP}}
+{{- end}}
+{{- if .MetaPorts}}
+define META_PORTS = {{.MetaPorts}}
+{{- end}}
 
 table inet supapace {
 	# the declared off-site endpoint's addresses and port, as the agent last
@@ -58,9 +73,24 @@ table bridge supapace {
 		meta ibrname "spp*" ether type arp accept comment "B1"
 		meta ibrname "spp*" ether type ip ct state established,related accept comment "B2"
 		meta ibrname "spp*" ether type ip ip daddr & 0.0.0.63 == 0.0.0.2 tcp dport 5432 ct state new accept comment "B3"
-		# platform bridge: only the gateway opens connections
+		# platform bridge: ARP, then a closed list of new connections (the gateway
+		# to a PostgREST's and to Studio's port, Studio to postgres-meta,
+		# postgres-meta to the proxy's meta ports); every other new connection is
+		# dropped, whatever its source
 		meta ibrname "spl0" ether type arp accept comment "B4"
-		meta ibrname "spl0" ether type ip ip saddr != $GATEWAY_IP ct state != { established, related } drop comment "B8"
+{{- if .RestAddrs}}
+		meta ibrname "spl0" ether type ip ip saddr $GATEWAY_IP ip daddr $REST_ADDRS tcp dport 3000 ct state new accept comment "B11"
+{{- end}}
+{{- if .StudioIP}}
+		meta ibrname "spl0" ether type ip ip saddr $GATEWAY_IP ip daddr $STUDIO_IP tcp dport 3000 ct state new accept comment "B12"
+{{- if .PgMetaIPs}}
+		meta ibrname "spl0" ether type ip ip saddr $STUDIO_IP ip daddr $PGMETA_IPS tcp dport 8080 ct state new accept comment "B13"
+{{- end}}
+{{- end}}
+{{- if and .PgMetaIPs .PgcapIP .MetaPorts}}
+		meta ibrname "spl0" ether type ip ip saddr $PGMETA_IPS ip daddr $PGCAP_IP tcp dport $META_PORTS ct state new accept comment "B14"
+{{- end}}
+		meta ibrname "spl0" ether type ip ct state != { established, related } drop comment "B8"
 		meta ibrname "spl0" ether type ip accept comment "B6"
 		# backup bridge: replication jobs never reach each other
 		meta ibrname "spb0" drop comment "B10"

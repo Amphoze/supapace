@@ -10,12 +10,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 )
 
@@ -31,6 +34,11 @@ table bridge supapace
 delete table bridge supapace
 
 define GATEWAY_IP = 10.212.0.2
+define REST_ADDRS = 10.212.0.16-10.212.4.15
+define STUDIO_IP = 10.212.0.3
+define PGMETA_IPS = { 10.212.0.4, 10.212.0.5 }
+define PGCAP_IP = 10.212.0.6
+define META_PORTS = 20000-21023
 
 table inet supapace {
 	# the declared off-site endpoint's addresses and port, as the agent last
@@ -77,9 +85,16 @@ table bridge supapace {
 		meta ibrname "spp*" ether type arp accept comment "B1"
 		meta ibrname "spp*" ether type ip ct state established,related accept comment "B2"
 		meta ibrname "spp*" ether type ip ip daddr & 0.0.0.63 == 0.0.0.2 tcp dport 5432 ct state new accept comment "B3"
-		# platform bridge: only the gateway opens connections
+		# platform bridge: ARP, then a closed list of new connections (the gateway
+		# to a PostgREST's and to Studio's port, Studio to postgres-meta,
+		# postgres-meta to the proxy's meta ports); every other new connection is
+		# dropped, whatever its source
 		meta ibrname "spl0" ether type arp accept comment "B4"
-		meta ibrname "spl0" ether type ip ip saddr != $GATEWAY_IP ct state != { established, related } drop comment "B8"
+		meta ibrname "spl0" ether type ip ip saddr $GATEWAY_IP ip daddr $REST_ADDRS tcp dport 3000 ct state new accept comment "B11"
+		meta ibrname "spl0" ether type ip ip saddr $GATEWAY_IP ip daddr $STUDIO_IP tcp dport 3000 ct state new accept comment "B12"
+		meta ibrname "spl0" ether type ip ip saddr $STUDIO_IP ip daddr $PGMETA_IPS tcp dport 8080 ct state new accept comment "B13"
+		meta ibrname "spl0" ether type ip ip saddr $PGMETA_IPS ip daddr $PGCAP_IP tcp dport $META_PORTS ct state new accept comment "B14"
+		meta ibrname "spl0" ether type ip ct state != { established, related } drop comment "B8"
 		meta ibrname "spl0" ether type ip accept comment "B6"
 		# backup bridge: replication jobs never reach each other
 		meta ibrname "spb0" drop comment "B10"
@@ -153,9 +168,12 @@ func TestRender_NoProjectIndexNoContainerAddress(t *testing.T) {
 		t.Fatalf("ruleset holds the masked cluster match %d times, want 1", strings.Count(got, mask))
 	}
 	rest := strings.Replace(got, mask, "", 1)
+	// The node's static platform addresses, each once: the gateway, the two ends
+	// of the PostgREST range, Studio, the two postgres-meta instances, the proxy.
 	quads := quadRE.FindAllString(rest, -1)
-	if len(quads) != 1 || quads[0] != "10.212.0.2" {
-		t.Errorf("addresses in the ruleset: %q, want only the gateway's 10.212.0.2, once", quads)
+	want := []string{"10.212.0.2", "10.212.0.16", "10.212.4.15", "10.212.0.3", "10.212.0.4", "10.212.0.5", "10.212.0.6"}
+	if !slices.Equal(quads, want) {
+		t.Errorf("addresses in the ruleset: %q, want the static platform addresses %q, each once", quads, want)
 	}
 	for _, l := range strings.Split(rest, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(l), "#") {
@@ -253,7 +271,7 @@ func TestRender_EveryRuleHasUniqueComment(t *testing.T) {
 		"I1": "inet supapace/input", "I2": "inet supapace/input",
 		"F1": "inet supapace/forward", "F5": "inet supapace/forward", "F6": "inet supapace/forward", "F7": "inet supapace/forward", "F2": "inet supapace/forward", "F3": "inet supapace/forward", "F4": "inet supapace/forward",
 	}
-	for _, l := range []string{"B1", "B2", "B3", "B4", "B6", "B8", "B9", "B10"} {
+	for _, l := range []string{"B1", "B2", "B3", "B4", "B11", "B12", "B13", "B14", "B6", "B8", "B9", "B10"} {
 		want[l] = "bridge supapace/forward"
 	}
 	seen := map[string]bool{}
@@ -272,8 +290,10 @@ func TestRender_EveryRuleHasUniqueComment(t *testing.T) {
 	if len(rs) != len(want) {
 		t.Errorf("%d rules, want %d", len(rs), len(want))
 	}
-	// B8 sits before B6, which accepts the rest of the platform bridge; B9 is last.
-	if got := strings.Join(order, " "); got != "I1 I2 F1 F5 F7 F2 F3 F6 F4 B1 B2 B3 B4 B8 B6 B10 B9" {
+	// The closed list B11–B14 sits before B8, which drops every other new
+	// connection; B8 before B6, which accepts the rest of the platform bridge; B9
+	// is last.
+	if got := strings.Join(order, " "); got != closedListOrder {
 		t.Errorf("rule order %q", got)
 	}
 }
@@ -295,11 +315,234 @@ func TestRender_B8MatchesNotEstablishedOrRelated(t *testing.T) {
 	if !strings.Contains(b8, "ct state != { established, related } drop") || strings.Contains(b8, "ct state new") {
 		t.Errorf("B8 = %q, want a drop of every state but established and related", b8)
 	}
-	if !strings.HasPrefix(b8, `meta ibrname "spl0" ether type ip ip saddr != $GATEWAY_IP ct state`) {
-		t.Errorf("B8 = %q, want it limited to the platform bridge and to sources other than the gateway", b8)
+	if !strings.HasPrefix(b8, `meta ibrname "spl0" ether type ip ct state`) {
+		t.Errorf("B8 = %q, want it limited to the platform bridge, on every source", b8)
 	}
 	if strings.Contains(b8, "dport") {
 		t.Errorf("B8 = %q, want it on every port", b8)
+	}
+}
+
+// closedListOrder is the label order of the whole ruleset.
+const closedListOrder = "I1 I2 F1 F5 F7 F2 F3 F6 F4 B1 B2 B3 B4 B11 B12 B13 B14 B8 B6 B10 B9"
+
+// closedListRecorded are the defines and the four flow rules of the default node.
+var closedListRecorded = []string{
+	"define REST_ADDRS = 10.212.0.16-10.212.4.15",
+	"define STUDIO_IP = 10.212.0.3",
+	"define PGMETA_IPS = { 10.212.0.4, 10.212.0.5 }",
+	"define PGCAP_IP = 10.212.0.6",
+	"define META_PORTS = 20000-21023",
+	`		meta ibrname "spl0" ether type ip ip saddr $GATEWAY_IP ip daddr $REST_ADDRS tcp dport 3000 ct state new accept comment "B11"`,
+	`		meta ibrname "spl0" ether type ip ip saddr $GATEWAY_IP ip daddr $STUDIO_IP tcp dport 3000 ct state new accept comment "B12"`,
+	`		meta ibrname "spl0" ether type ip ip saddr $STUDIO_IP ip daddr $PGMETA_IPS tcp dport 8080 ct state new accept comment "B13"`,
+	`		meta ibrname "spl0" ether type ip ip saddr $PGMETA_IPS ip daddr $PGCAP_IP tcp dport $META_PORTS ct state new accept comment "B14"`,
+}
+
+func labelOrder(t *testing.T, s string) string {
+	t.Helper()
+	var order []string
+	for _, r := range rules(t, s) {
+		order = append(order, r.label)
+	}
+	return strings.Join(order, " ")
+}
+
+func TestRender_ClosedList_Recorded(t *testing.T) {
+	c := defaultConfig(t)
+	got := render(t, c)
+	if o := labelOrder(t, got); o != closedListOrder {
+		t.Errorf("rule order %q, want %q", o, closedListOrder)
+	}
+	if dashcfg.StudioPort != 3000 || dashcfg.PgMetaPort != 8080 {
+		t.Errorf("B12 and B13 name ports 3000 and 8080; dashcfg has Studio at %d, postgres-meta at %d", dashcfg.StudioPort, dashcfg.PgMetaPort)
+	}
+	for _, l := range closedListRecorded {
+		if n := strings.Count(got, "\n"+l+"\n"); n != 1 {
+			t.Errorf("line %q appears %d times, want 1", l, n)
+		}
+	}
+	// The inputs are dashcfg.Static's: another platform subnet and project block
+	// move every one.
+	o := defaultConfig(t)
+	o.PlatformSubnet, o.PlatformIPRange, o.GatewayIP = "10.215.208.0/21", "10.215.214.0/23", "10.215.208.2"
+	o.ProjectBlock = "10.213.0.0/17"
+	if err := o.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	a := dashcfg.Static(o)
+	other := render(t, o)
+	for _, l := range []string{
+		fmt.Sprintf("define REST_ADDRS = %s-%s", a.RestLo, a.RestHi),
+		fmt.Sprintf("define STUDIO_IP = %s", a.Studio),
+		fmt.Sprintf("define PGMETA_IPS = { %s, %s }", a.PgMeta0, a.PgMeta1),
+		fmt.Sprintf("define PGCAP_IP = %s", a.Pgcap),
+		fmt.Sprintf("define META_PORTS = %d-%d", a.MetaPortLo, a.MetaPortHi),
+	} {
+		if !strings.Contains(other, "\n"+l+"\n") || strings.Contains(got, "\n"+l+"\n") {
+			t.Errorf("define %q does not follow dashcfg.Static", l)
+		}
+	}
+	// The same text on a node with and without a studio domain: the closed list
+	// is static. The member is set wherever the configuration carries one.
+	d := defaultConfig(t)
+	v := reflect.ValueOf(&d).Elem()
+	set := false
+	for i := 0; i < v.NumField(); i++ {
+		if strings.HasPrefix(v.Type().Field(i).Tag.Get("json"), "studio_domain") {
+			v.Field(i).SetString("studio.sp.test")
+			set = true
+		}
+	}
+	if !set {
+		t.Log("the node configuration carries no studio domain")
+	}
+	if render(t, d) != got {
+		t.Error("the ruleset depends on the studio domain")
+	}
+}
+
+func TestRender_B8MatchesEverySource(t *testing.T) {
+	b8 := ruleText(t, "B8")
+	for _, m := range []string{"saddr", "daddr", "dport", "$"} {
+		if strings.Contains(b8, m) {
+			t.Errorf("B8 = %q matches %q, want every source, destination and port", b8, m)
+		}
+	}
+	// Every rule of the platform bridge that accepts a new connection is before
+	// B8 and names a source, a destination and a port: the list is closed.
+	var spl0 []string
+	for _, r := range rules(t, render(t, defaultConfig(t))) {
+		if strings.HasPrefix(r.text, `meta ibrname "spl0" `) {
+			spl0 = append(spl0, r.label)
+			if r.label == "B4" || r.label == "B8" || r.label == "B6" {
+				continue
+			}
+			if !strings.Contains(r.text, " ip saddr $") || !strings.Contains(r.text, " ip daddr $") ||
+				!strings.Contains(r.text, " tcp dport ") || !strings.HasSuffix(r.text, ` ct state new accept comment "`+r.label+`"`) {
+				t.Errorf("platform rule %q is not one flow: a source, a destination, a port, new connections", r.text)
+			}
+		}
+	}
+	if got := strings.Join(spl0, " "); got != "B4 B11 B12 B13 B14 B8 B6" {
+		t.Errorf("platform bridge rules %q, want B4, the list, B8, B6", got)
+	}
+}
+
+// zeroCase is a set of zero dashboard inputs and the rules and defines that the
+// rendering must then leave out; sets maps a define to its remaining text.
+type zeroCase struct {
+	name    string
+	zero    func(*dashcfg.Addrs)
+	gone    []string // labels
+	defines []string // define names left out
+	sets    map[string]string
+}
+
+var zeroCases = []zeroCase{
+	{"studio", func(a *dashcfg.Addrs) { a.Studio = netip.Addr{} }, []string{"B12", "B13"}, []string{"STUDIO_IP"}, nil},
+	{"postgres-meta 0", func(a *dashcfg.Addrs) { a.PgMeta0 = netip.Addr{} }, nil, nil, map[string]string{"PGMETA_IPS": "{ 10.212.0.5 }"}},
+	{"postgres-meta 1", func(a *dashcfg.Addrs) { a.PgMeta1 = netip.Addr{} }, nil, nil, map[string]string{"PGMETA_IPS": "{ 10.212.0.4 }"}},
+	{"both postgres-meta", func(a *dashcfg.Addrs) { a.PgMeta0, a.PgMeta1 = netip.Addr{}, netip.Addr{} }, []string{"B13", "B14"}, []string{"PGMETA_IPS"}, nil},
+	{"proxy", func(a *dashcfg.Addrs) { a.Pgcap = netip.Addr{} }, []string{"B14"}, []string{"PGCAP_IP"}, nil},
+	{"meta ports", func(a *dashcfg.Addrs) { a.MetaPortLo, a.MetaPortHi = 0, 0 }, []string{"B14"}, []string{"META_PORTS"}, nil},
+	{"postgrest range", func(a *dashcfg.Addrs) { a.RestLo, a.RestHi = netip.Addr{}, netip.Addr{} }, []string{"B11"}, []string{"REST_ADDRS"}, nil},
+	{"postgrest range end", func(a *dashcfg.Addrs) { a.RestHi = netip.Addr{} }, []string{"B11"}, []string{"REST_ADDRS"}, nil},
+	{"postgrest range start", func(a *dashcfg.Addrs) { a.RestLo = netip.Addr{} }, []string{"B11"}, []string{"REST_ADDRS"}, nil},
+	{"studio and both postgres-meta", func(a *dashcfg.Addrs) { a.Studio, a.PgMeta0, a.PgMeta1 = netip.Addr{}, netip.Addr{}, netip.Addr{} },
+		[]string{"B12", "B13", "B14"}, []string{"STUDIO_IP", "PGMETA_IPS"}, nil},
+	{"every input", func(a *dashcfg.Addrs) { *a = dashcfg.Addrs{} }, []string{"B11", "B12", "B13", "B14"},
+		[]string{"REST_ADDRS", "STUDIO_IP", "PGMETA_IPS", "PGCAP_IP", "META_PORTS"}, nil},
+	{"one slice", func(a *dashcfg.Addrs) { a.RestHi, a.MetaPortHi = a.RestLo, a.MetaPortLo }, nil, nil,
+		map[string]string{"REST_ADDRS": "10.212.0.16", "META_PORTS": "20000"}},
+}
+
+// zeroRender renders the default node with zc's inputs zeroed.
+func zeroRender(t testing.TB, zc zeroCase) []byte {
+	t.Helper()
+	c := nodecfg.Default("sp.test")
+	a := dashcfg.Static(c)
+	zc.zero(&a)
+	b, err := renderAddrs(netip.MustParseAddr(c.GatewayIP), a, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+var emptySetRE = regexp.MustCompile(`\{\s*\}`)
+
+func TestRender_ZeroInputOmitsTheRule(t *testing.T) {
+	full := map[string]string{}
+	for _, r := range rules(t, render(t, defaultConfig(t))) {
+		full[r.label] = r.text
+	}
+	for _, zc := range zeroCases {
+		t.Run(zc.name, func(t *testing.T) {
+			got := string(zeroRender(t, zc))
+			left := map[string]bool{}
+			for _, r := range rules(t, got) {
+				left[r.label] = true
+				if r.text != full[r.label] {
+					t.Errorf("rule %s = %q, want it as on the default node", r.label, r.text)
+				}
+			}
+			for l := range full {
+				if left[l] == slices.Contains(zc.gone, l) {
+					t.Errorf("rule %s present %v, want %v", l, left[l], !left[l])
+				}
+			}
+			for _, d := range zc.defines {
+				if strings.Contains(got, "define "+d+" ") || strings.Contains(got, "$"+d+" ") {
+					t.Errorf("%s still defined or named", d)
+				}
+			}
+			for d, v := range zc.sets {
+				if !strings.Contains(got, "\ndefine "+d+" = "+v+"\n") {
+					t.Errorf("define %s is not %q", d, v)
+				}
+			}
+			if strings.Contains(got, "invalid IP") || emptySetRE.MatchString(got) || strings.Contains(got, " = \n") {
+				t.Errorf("the text holds an invalid address or an empty set:\n%s", got)
+			}
+			nftCheck(t, []byte(got))
+		})
+	}
+	// Through the configuration: a gateway at Studio's address leaves Studio zero.
+	c := defaultConfig(t)
+	c.GatewayIP = "10.212.0.3"
+	if dashcfg.Static(c).Studio.IsValid() {
+		t.Fatal("dashcfg.Static kept a Studio address equal to the gateway's")
+	}
+	got := render(t, c)
+	if strings.Contains(got, `"B12"`) || strings.Contains(got, `"B13"`) || strings.Contains(got, "STUDIO_IP") || !strings.Contains(got, `"B11"`) {
+		t.Errorf("gateway at Studio's address: the rendering keeps a Studio rule or loses B11:\n%s", got)
+	}
+	nftCheck(t, []byte(got))
+}
+
+// nftCheck parses text with nft -c in a network namespace of an unprivileged
+// user namespace, where the host allows one; the bare-node proof loads the
+// same renderings as root.
+func nftCheck(t *testing.T, text []byte) {
+	t.Helper()
+	bin := "/usr/sbin/nft"
+	if _, err := os.Stat(bin); err != nil {
+		if bin, err = exec.LookPath("nft"); err != nil {
+			t.Log("nft is not installed: the text is not parsed here")
+			return
+		}
+	}
+	if exec.Command("unshare", "-rn", bin, "list", "tables").Run() != nil {
+		t.Log("no unprivileged network namespace with nft here: the text is not parsed here")
+		return
+	}
+	f := filepath.Join(t.TempDir(), "ruleset.nft")
+	if err := os.WriteFile(f, text, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("unshare", "-rn", bin, "-c", "-f", f).CombinedOutput(); err != nil {
+		t.Errorf("nft -c: %v: %s", err, out)
 	}
 }
 
@@ -691,6 +934,61 @@ func TestRender_Elements_SortedStable(t *testing.T) {
 	for _, bad := range []netip.AddrPort{{}, netip.MustParseAddrPort("[2001:db8::1]:443"), netip.MustParseAddrPort("192.0.2.1:0")} {
 		if _, err := RenderWith(c, []netip.AddrPort{bad}); err == nil {
 			t.Errorf("element %q accepted", bad)
+		}
+	}
+}
+
+// The meta ports the template names are a valid range or nothing, for every
+// slice count: dashcfg.Static gives 0–0 or MetaPortBase ≤ lo ≤ hi ≤ 65535, and
+// the rendering has no reversed or out-of-range ports (the renderer keeps no
+// check of its own; this test is what guards a change of Static).
+func TestRender_MetaPortsAlwaysAValidRange(t *testing.T) {
+	re := regexp.MustCompile(`(?m)^define META_PORTS = (\d+)(?:-(\d+))?$`)
+	for _, block := range []string{"10.212.0.0/14", "10.213.0.0/16", "10.213.0.0/20", "10.213.0.0/24"} {
+		bits := netip.MustParsePrefix(block).Bits()
+		for prefix := bits; prefix <= 30; prefix++ {
+			c := defaultConfig(t)
+			c.ProjectBlock, c.SlicePrefix = block, prefix
+			a := dashcfg.Static(c)
+			if a.MetaPortLo != 0 && (a.MetaPortLo != dashcfg.MetaPortBase || a.MetaPortHi < a.MetaPortLo || a.MetaPortHi > 65535) ||
+				a.MetaPortLo == 0 && a.MetaPortHi != 0 {
+				t.Errorf("block /%d slices /%d: meta ports %d-%d", bits, prefix, a.MetaPortLo, a.MetaPortHi)
+			}
+			got := render(t, c)
+			m := re.FindStringSubmatch(got)
+			if m == nil {
+				if a.MetaPortLo != 0 || strings.Contains(got, "META_PORTS") {
+					t.Errorf("block /%d slices /%d: META_PORTS %v, Static %d-%d", bits, prefix, m, a.MetaPortLo, a.MetaPortHi)
+				}
+				continue
+			}
+			lo, _ := strconv.Atoi(m[1])
+			hi := lo
+			if m[2] != "" {
+				hi, _ = strconv.Atoi(m[2])
+				if hi <= lo {
+					t.Errorf("block /%d slices /%d: range %s-%s", bits, prefix, m[1], m[2])
+				}
+			}
+			if lo != a.MetaPortLo || hi != a.MetaPortHi || hi > 65535 {
+				t.Errorf("block /%d slices /%d: rendered %d-%d, Static %d-%d", bits, prefix, lo, hi, a.MetaPortLo, a.MetaPortHi)
+			}
+		}
+	}
+}
+
+// The studio-domain clause of TestRender_ClosedList_Recorded finds the field
+// by its JSON name. A field of another name would leave that clause testing
+// nothing: fail loudly instead, so the clause is updated with the field.
+func TestRender_StudioDomainFieldIsTheOneTheRecordedTestSets(t *testing.T) {
+	ty := reflect.TypeOf(nodecfg.Config{})
+	for i := 0; i < ty.NumField(); i++ {
+		tag := ty.Field(i).Tag.Get("json")
+		if strings.Contains(strings.ToLower(tag+ty.Field(i).Name), "studio") && !strings.HasPrefix(tag, "studio_domain") {
+			t.Errorf("node configuration field %s (json %q) names a studio setting the recorded test does not set", ty.Field(i).Name, tag)
+		}
+		if strings.HasPrefix(tag, "studio_domain") && ty.Field(i).Type.Kind() != reflect.String {
+			t.Errorf("field %s is not a string: the recorded test sets it with SetString", ty.Field(i).Name)
 		}
 	}
 }

@@ -356,7 +356,7 @@ func TestLoad_ThenCheckPasses(t *testing.T) {
 	load(t, p)
 	// Every rule is installed with its label, once.
 	for _, c := range []struct{ family, chain, labels string }{
-		{"inet", "input", "I1 I2"}, {"inet", "forward", "F1 F5 F7 F2 F3 F6 F4"}, {"bridge", "forward", "B1 B2 B3 B4 B8 B6 B10 B9"},
+		{"inet", "input", "I1 I2"}, {"inet", "forward", "F1 F5 F7 F2 F3 F6 F4"}, {"bridge", "forward", "B1 B2 B3 B4 B11 B12 B13 B14 B8 B6 B10 B9"},
 	} {
 		m := labels(t, c.family, c.chain)
 		var got []string
@@ -387,6 +387,7 @@ func TestCheck_FailsAfterRuleDeleted(t *testing.T) {
 		{"inet", "input", "I1"}, {"inet", "input", "I2"},
 		{"inet", "forward", "F1"}, {"inet", "forward", "F5"}, {"inet", "forward", "F7"}, F2, {"inet", "forward", "F3"}, {"inet", "forward", "F6"}, F4,
 		{"bridge", "forward", "B1"}, {"bridge", "forward", "B2"}, {"bridge", "forward", "B3"}, {"bridge", "forward", "B4"},
+		{"bridge", "forward", "B11"}, {"bridge", "forward", "B12"}, {"bridge", "forward", "B13"}, {"bridge", "forward", "B14"},
 		B8, {"bridge", "forward", "B6"}, {"bridge", "forward", "B10"}, {"bridge", "forward", "B9"},
 	} {
 		withDeleted(t, p, []ruleRef{r}, func() {
@@ -580,11 +581,12 @@ func TestBridge_PlatformPorts(t *testing.T) {
 	api, admin := restIP+":3000", restIP+":3001" // nothing listens on 3001
 	listen(t, rest, api)
 	expect(t, "gateway -> :3000", gw, api, "connected")
-	expect(t, "gateway -> :3001 (closed: refused, not dropped)", gw, admin, "refused")
+	expect(t, "gateway -> :3001, not on the list", gw, admin, "timeout")
 	expect(t, "second member -> :3000", second, api, "timeout")
 	expect(t, "second member -> :3001", second, admin, "timeout")
 	withDeleted(t, p, []ruleRef{B8}, func() {
 		expect(t, "second member -> :3000 with B8 deleted", second, api, "connected")
+		expect(t, "gateway -> :3001 with B8 deleted (closed: refused)", gw, admin, "refused")
 		expect(t, "second member -> :3001 with B8 deleted", second, admin, "refused")
 	})
 	expect(t, "second member -> :3000, restored", second, api, "timeout")
@@ -602,12 +604,13 @@ func TestBridge_PlatformMemberInitiatesNothing(t *testing.T) {
 	// No other member may open the gateway's port, so its listener is proven
 	// from the gateway's own namespace.
 	expect(t, "gateway -> its own :8443", gw, gwPort, "connected")
-	expect(t, "gateway -> third member :4000 (allowed peer)", gw, thirdPort, "connected")
+	expect(t, "gateway -> third member :4000, not on the list", gw, thirdPort, "timeout")
 	expect(t, "second member -> gateway :8443", second, gwPort, "timeout")
 	expect(t, "second member -> third member :4000", second, thirdPort, "timeout")
 	withDeleted(t, p, []ruleRef{B8}, func() {
 		expect(t, "second member -> gateway :8443 with B8 deleted", second, gwPort, "connected")
 		expect(t, "second member -> third member :4000 with B8 deleted", second, thirdPort, "connected")
+		expect(t, "gateway -> third member :4000 with B8 deleted", gw, thirdPort, "connected")
 	})
 	expect(t, "second member -> third member :4000, restored", second, thirdPort, "timeout")
 }

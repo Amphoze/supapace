@@ -3749,3 +3749,40 @@ rules 2-10 and the three slots.
   {"t","ref","iss","sub","role","method","path","status","ms"}. Path without query, at most
   256 bytes; method at most 16 bytes; control characters removed; ms is 0 for a refusal.
   Never a query, cookie, token, header or body.
+
+### 2026-11-19 — nft: the platform bridge's closed list
+
+The bridge chain's rules for the platform bridge (spl0), in order:
+- B4: ARP.
+- B11: gateway -> port 3000 of the fixed PostgREST range (PlatformAddr(0)..PlatformAddr(n-1)).
+- B12: gateway -> Studio's port 3000.
+- B13: Studio -> port 8080 of the two postgres-meta instances.
+- B14: postgres-meta -> the wire proxy's meta ports (MetaPortBase..MetaPortBase+slices-1).
+- B8: drops every other new, invalid or untracked IPv4 connection, whatever its source.
+- B6: accepts the rest (replies of accepted flows).
+- B9: drops everything else (IPv6 and other non-IP frames included).
+B11–B14 are TCP, `ct state new`, each naming a source, a destination and a port. Full label order:
+`I1 I2 F1 F5 F7 F2 F3 F6 F4 B1 B2 B3 B4 B11 B12 B13 B14 B8 B6 B10 B9`.
+
+Rendering:
+- `Render`/`RenderWith` keep their signatures. The inputs now include `dashcfg.Static(c)`, which
+  never fails, so the ruleset of a node without a studio domain renders as on any node. The rules
+  for absent containers match nothing; the node check refuses anything at those addresses.
+- A zero input renders nowhere: its define and every rule naming it are left out, and a set keeps
+  its valid member (B12 needs Studio; B13 needs Studio and one postgres-meta; B14 needs the proxy,
+  a port range and one postgres-meta; B11 needs both PostgREST ends, always valid for a validated
+  node.json).
+- A one-value range (a node of one slice) is rendered as the single address or port, since nft
+  refuses `a-a`.
+- Ports 3000 and 8080 are literals in the template; a test ties them to `dashcfg.StudioPort` and
+  `dashcfg.PgMetaPort`. Ranges are rendered from `dashcfg.Static` without further checks; a test
+  guards `Static`'s meta-port range (0-0 or 20000 <= lo <= hi <= 65535).
+
+Caller rules and limits:
+- `internal/nft` imports `internal/dashcfg`; dashcfg must never import nft.
+- A new platform flow is a new row before B8, never a weakening of B8.
+- The source-address rows rely on every platform member being capability-less (node check and
+  start gate); the ruleset pins no address or MAC to a port.
+- Bridged frames never reach the inet forward chain while bridge-nf is off; Load keeps it off and
+  Check reports ErrBridgeNF.
+- The saved off-site set, the lock, InstallSet and EnsureRules are unchanged.
