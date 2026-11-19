@@ -32,7 +32,7 @@ import (
 // frozenNames is the closed set of check names a report may carry.
 var frozenNames = []string{"presence", "superuser", "attributes", "memberships-reserved",
 	"memberships-dangerous", "role-settings", "schema-acl", "event-triggers", "auth-functions",
-	"configuration", "source-file", "hba", "service-passwords"}
+	"configuration", "source-file", "hba", "service-passwords", "service-logins"}
 
 func TestLoadBaseline_Schema(t *testing.T) {
 	b, err := LoadBaseline()
@@ -122,7 +122,7 @@ func TestAssert_NamesAreFrozen(t *testing.T) {
 	// Every name constant the package declares is in the set, and every
 	// report goes through one of them.
 	fset := token.NewFileSet()
-	for _, f := range []string{"assert.go"} {
+	for _, f := range []string{"assert.go", "pooler.go"} {
 		file, err := parser.ParseFile(fset, f, nil, 0)
 		if err != nil {
 			t.Fatal(err)

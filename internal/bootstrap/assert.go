@@ -31,11 +31,12 @@ const (
 	checkSourceFile          = "source-file"
 	checkHBA                 = "hba"
 	checkServicePasswords    = "service-passwords"
+	checkServiceLogins       = "service-logins"
 )
 
 var checkNames = []string{checkPresence, checkSuperuser, checkAttributes, checkMembershipsReserved,
 	checkMembershipsDanger, checkRoleSettings, checkSchemaACL, checkEventTriggers, checkAuthFunctions,
-	checkConfiguration, checkSourceFile, checkHBA, checkServicePasswords}
+	checkConfiguration, checkSourceFile, checkHBA, checkServicePasswords, checkServiceLogins}
 
 // allowedSourceFiles are the files a setting may come from: the image's main
 // file and its includes, the image's include-directory files and the

@@ -310,7 +310,10 @@ func TestRekey_OnlyAllowedStatements(t *testing.T) {
 		})
 	}
 	walk("Rekey")
+	// The pooler manager's statement is the re-key's; the read-only login's
+	// prefix is reached through verifierStatement, which admits it.
 	allowed := []string{"sqlPasswordSupabaseAdmin", "sqlPasswordPostgres", "sqlPasswordAuthenticator",
+		"sqlPasswordPooler", "sqlPasswordReadOnly",
 		"sqlRoleExists", "sqlCreateBackup", "sqlGrantBackupSettings", "sqlGrantBackupFuncs"}
 	got := slices.Sorted(func(yield func(string) bool) {
 		for s := range stmts {
@@ -643,7 +646,7 @@ func TestBaseline_ParsesWithItsTwoNewMembers(t *testing.T) {
 	}
 }
 
-// imageAnswer answers the two reads of the image's settings as a cluster of
+// imageAnswer answers the two reads of the image's settings, and the canary's read, as a cluster of
 // the given lists would.
 func imageAnswer(preload, settings []string) func(string) ([]uint32, [][]string) {
 	return func(sql string) ([]uint32, [][]string) {
@@ -656,6 +659,9 @@ func imageAnswer(preload, settings []string) func(string) ([]uint32, [][]string)
 				rows = append(rows, []string{s})
 			}
 			return []uint32{25}, rows
+		case sqlCanaryRelation:
+			// No relation under the canary's name yet; the schema as the platform made it.
+			return []uint32{25, 16, 25}, [][]string{{"", "f", canarySchemaACL}}
 		}
 		return nil, nil
 	}
@@ -1065,5 +1071,85 @@ func TestRecoveryAndTimelineReads_OneRow(t *testing.T) {
 		if _, err := ReadTimeline(context.Background(), conn); err == nil {
 			t.Errorf("timeline read, %d rows: no error", n)
 		}
+	}
+}
+
+// TestRekey_PoolerEntrySkippedWhenRoleAbsent: with a manager password and no
+// manager role, the re-key sets the three verifiers and creates no role; with
+// the role present, it sets the manager's verifier as well.
+func TestRekey_PoolerEntrySkippedWhenRoleAbsent(t *testing.T) {
+	c := startCluster(t)
+	c.withPooler()
+	adm := c.dial("supabase_admin")
+	for _, r := range platformLogins {
+		c.exec(adm, "alter role "+r+" password 't-other-"+rnd(8)+"'")
+	}
+	if err := Rekey(context.Background(), adm, c.secrets); err != nil {
+		t.Fatalf("rekey: %v", err)
+	}
+	if !c.storedIsPlatforms(adm) {
+		t.Fatal("the stored verifiers are not the platform's")
+	}
+	const manager = "select coalesce(string_agg(coalesce(rolpassword, '-'), ','), 'absent') from pg_catalog.pg_authid where rolname = 'supapace_pooler'"
+	if got := c.str(adm, manager); got != "absent" {
+		t.Fatalf("the re-key made the manager: %s", got)
+	}
+	c.wantBackupRole(adm)
+	if err := EnsurePoolerLogin(context.Background(), adm, c.secrets); err != nil {
+		t.Fatal(err)
+	}
+	c.exec(adm, "alter role supapace_pooler password 't-other-"+rnd(8)+"'")
+	if err := Rekey(context.Background(), adm, c.secrets); err != nil {
+		t.Fatalf("control rekey: %v", err)
+	}
+	want, _ := pgsock.ScramVerifier(c.secrets.PoolerPassword, c.secrets.ScramSalts["supapace_pooler"])
+	if got := c.str(adm, manager); got != want {
+		t.Fatalf("control: the manager stores %q", got)
+	}
+}
+
+// TestRekey_EmptyPoolerPasswordSendsExactlyTheEarlierList: without a manager
+// password the re-key sends the three verifier statements and the backup
+// role's statements, nothing else; with one, the manager's statement follows
+// the three.
+func TestRekey_EmptyPoolerPasswordSendsExactlyTheEarlierList(t *testing.T) {
+	s := testSecrets(t)
+	var want []string
+	for i, p := range []string{sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator} {
+		pw := []string{s.SupabaseAdminPassword, s.PostgresPassword, s.AuthenticatorPassword}[i]
+		v, _ := pgsock.ScramVerifier(pw, s.ScramSalts[platformLogins[i]])
+		st, err := verifierStatement(p, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, st)
+	}
+	tail := []string{sqlRoleExists, sqlGrantBackupSettings, sqlGrantBackupFuncs}
+	answer := func(sql string) ([]uint32, [][]string) {
+		if sql == sqlRoleExists {
+			return []uint32{16}, [][]string{{"t"}}
+		}
+		return nil, nil
+	}
+	conn, rec := recordingConn(t, answer)
+	if err := Rekey(context.Background(), conn, s); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.statements(); !slices.Equal(got, append(slices.Clone(want), tail...)) {
+		t.Fatalf("sent\n%q", got)
+	}
+	s.PoolerPassword = rnd(32)
+	s.ScramSalts["supapace_pooler"] = make([]byte, 16)
+	v, _ := pgsock.ScramVerifier(s.PoolerPassword, s.ScramSalts["supapace_pooler"])
+	pst, err := verifierStatement(sqlPasswordPooler, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, rec = recordingConn(t, answer)
+	if err := Rekey(context.Background(), conn, s); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.statements(); !slices.Equal(got, append(append(want, pst), tail...)) {
+		t.Fatalf("control, with a manager password: sent\n%q", got)
 	}
 }

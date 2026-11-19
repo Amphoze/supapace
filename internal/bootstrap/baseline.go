@@ -3,7 +3,7 @@ package bootstrap
 import (
 	"bytes"
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,6 +89,25 @@ var baselineJSON []byte
 
 // LoadBaseline parses the embedded baseline of the pinned image.
 func LoadBaseline() (Baseline, error) { return parseBaseline(baselineJSON) }
+
+//go:embed baseline_*.json
+var baselineFiles embed.FS
+
+// BaselineFor parses the embedded baseline of the image version version
+// (file baseline_<version>.json). An unknown version is an error naming the
+// versions there are. LoadBaseline stays the locked image's.
+func BaselineFor(version string) (Baseline, error) {
+	b, err := baselineFiles.ReadFile("baseline_" + version + ".json")
+	if err != nil {
+		ents, _ := baselineFiles.ReadDir(".")
+		var have []string
+		for _, e := range ents {
+			have = append(have, strings.TrimSuffix(strings.TrimPrefix(e.Name(), "baseline_"), ".json"))
+		}
+		return Baseline{}, fmt.Errorf("bootstrap: no baseline for version %s; there are: %s", q(version), strings.Join(have, ", "))
+	}
+	return parseBaseline(b)
+}
 
 var (
 	digestRE  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)

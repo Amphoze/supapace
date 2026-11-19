@@ -15,19 +15,36 @@ import (
 // the verifiers of s on a cluster started from a restored data directory
 // (one session as supabase_admin). It computes the verifiers before sending
 // anything, then sends exactly: the three password statements, in that order
-// and before any other statement; the backup role's existence read and its
-// creation when absent; its two grants. Each statement also restores the
+// and before any other statement; when s.PoolerPassword is set, the pooler
+// manager's password statement, skipped when that role does not exist (the
+// re-key creates no role); the backup role's existence read and its creation
+// when absent; its two grants. Each statement also restores the
 // role's login right, connection limit and expiry. Rekey is idempotent.
 //
 // A later identity is re-keyed by appending its password statement to the
-// list verifiers returns; the session keeps this shape.
+// list verifiers returns, or, when its role may be absent, to the list after
+// them, where SQLSTATE 42704 (no such role) is a skip; the session keeps this
+// shape.
 func Rekey(ctx context.Context, c *pgx.Conn, s Secrets) error {
 	vs, err := verifiers(s)
 	if err != nil {
 		return err
 	}
+	pv, err := poolerVerifier(s)
+	if err != nil {
+		return err
+	}
 	if err := setVerifiers(ctx, c, vs); err != nil {
 		return err
+	}
+	for _, v := range pv {
+		err := setVerifier(ctx, c, v.prefix, v.verifier)
+		if se := (*pgsock.ServerError)(nil); errors.As(err, &se) && se.Code == "42704" {
+			err = nil // the role does not exist: nothing to re-key
+		}
+		if err != nil {
+			return fmt.Errorf("bootstrap: password of %s: %w", v.role, err)
+		}
 	}
 	return ensureBackupRole(ctx, c)
 }

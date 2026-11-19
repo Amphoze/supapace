@@ -3840,3 +3840,104 @@ always with the three extension pins: not for the control plane). Passwords are 
 Limits: no control-plane set-up; no ruleset on a bare node; the restore prints unknown user and
 group warnings (project ids are not in the worker's passwd); set -e does not apply inside a
 function run by check.
+
+### 2026-11-19 — bootstrap: pooler manager and helper, canary table, session statements
+
+internal/bootstrap gains the pooler's manager role with its lookup helper, the backup canary's
+table and four bounded session calls. Every statement is a package constant; the one built at
+run time is still setVerifier's, through verifierStatement.
+
+Provides
+- Secrets.PoolerPassword: empty means nothing of the manager is sent or expected. Its salt is
+  ScramSalts["supapace_pooler"] (pgsock.ScramSalt). It must differ from the three platform
+  passwords. A shared password or a missing salt is refused by Run, Rekey and
+  EnsurePoolerLogin before any statement.
+- EnsurePoolerLogin(ctx, conn, s): a session as supabase_admin. Sends, in this order: create
+  role supapace_pooler (SQLSTATE 42710, it exists, is success); the manager's password
+  statement (login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls
+  connection limit -1 valid until 'infinity' and the verifier: every attribute is set each
+  time); schema supapace_pooler (owner supabase_admin, nothing for PUBLIC, USAGE for the
+  manager); function supapace_pooler.get_auth(text), owner supabase_admin, EXECUTE for the
+  manager alone; then two reads of what it made. It stops at the first statement the server
+  refuses. Idempotent: the attributes, owners, body and grants it sets are set back.
+- The read-back requires: the seven compared attributes; no membership that names the manager
+  (as member, as granted role or as grantor); the schema's access list exactly
+  {supabase_admin=UC/supabase_admin,supapace_pooler=U/supabase_admin}; the helper's owner,
+  body, security definer, its one SET clause, and EXECUTE held by supabase_admin and the
+  manager only. A difference is an error naming the first one. A membership, an extra entry of
+  the schema or a grant of EXECUTE to another role is refused, never taken back: the call
+  fails until an operator removes it as supabase_admin.
+- supapace_pooler.get_auth(text) returns (username, password): the SCRAM verifier of one login
+  role, for the pooler's lookup. Security definer, empty search_path, every type, relation and
+  function in its body written with its schema, so nothing a calling session defines is used.
+  No row for a superuser, a role without the login right, an expired role, a password that is
+  not SCRAM-SHA-256, a pg_ role, or one of supabase_admin, supabase_auth_admin,
+  supabase_storage_admin, supabase_realtime_admin, supabase_replication_admin,
+  supabase_etl_admin, supabase_privileged_role, dashboard_user, pgbouncer, authenticator,
+  supapace_backup, anon, authenticated, service_role. The manager's own row is returned: the
+  pooler reads it when a project is registered. The list is reservedMembers plus
+  authenticator and the three API roles, minus supabase_read_only_user; a test holds it there.
+- Run: after the auth functions, the manager and helper when PoolerPassword is set, and the
+  canary table always.
+- Rekey: with PoolerPassword set, the manager's password statement follows the three. SQLSTATE
+  42704 (no such role) on it is a skip: the re-key creates no role. This package built that
+  skip: the entries whose role may be absent are a second list, sent in a loop after the three
+  mandatory ones, and a later optional entry joins that list. On one of the three 42704 stays
+  an error, and so does any other refusal of an optional entry. Nothing reports a skip.
+- sqlPasswordReadOnly: the read-only login's password statement, in the one form of the three.
+  This package owns the constant; a later package that sets that role's password uses it and
+  declares no second one.
+- EnsureCanary(ctx, conn): schema supapace (owner supabase_admin, set back each time, nothing
+  for PUBLIC) and table supapace._backup_canary (id smallint primary key check (id = 1),
+  written_at timestamptz not null) owned by supabase_admin. It reads what holds the table's
+  name first: a table another role owns is dropped with everything that depends on it and
+  made again; a relation of another kind is refused with an error and nothing is written.
+  It requires the schema's access list to be exactly {supabase_admin=UC/supabase_admin}:
+  another entry is refused with an error, never taken back.
+  WriteCanary(ctx, conn) calls it, then upserts row 1 with the server's time. The row is that
+  cluster's evidence about itself and gates nothing.
+- RekeyLogin(ctx, conn, role, verifier) (RekeyResult, error): role is postgres or
+  supabase_read_only_user; another role or a malformed verifier sends nothing. First the
+  password statement (it also sets login, connection limit -1 and no expiry), then
+  pg_terminate_backend for every backend the server lists under that role name, pooled
+  connections and the role's background workers included. Never narrow that statement. For
+  supabase_read_only_user it then removes the large objects that role owns: 10,000 a
+  statement, at most 10 statements. A refused password statement or termination is the call's
+  error. A failed removal is not: the call succeeds, is not repeated, and says so in the
+  result. Repeating the call with the same verifier is safe.
+- RekeyResult{Terminated, LargeObjects, LargeObjectsLeft, LargeObjectsError}: counts as the
+  server answered them; LargeObjectsLeft when a batch was full at the end or the removal
+  failed; LargeObjectsError is that failure's cause, the server's code and message, sanitised
+  and at most 256 bytes, or "more than 10000 rows".
+- SetReadOnlySignal(ctx, conn, on): alter database postgres set default_transaction_read_only
+  = on, or reset. It reaches sessions opened afterwards only; platform sessions are not reached.
+- CreateRestorePoint(ctx, conn, name) (lsn, error): exactly one row in the form X/X (upper-case
+  hex), else an error. Read the timeline with ReadTimeline in the same session.
+- AssertServices(ctx, conn, pooler): with pooler true, one row per difference of the read-back
+  above under the check name service-logins. With false it reads nothing. The frozen set of
+  check names gains service-logins.
+- BaselineFor(version) (Baseline, error): the embedded baseline_<version>.json. An unknown
+  version is an error naming the versions there are. LoadBaseline stays the locked image's.
+
+Caller rules
+- One fresh pgsock session as supabase_admin (the superuser startup list) per call;
+  RekeyLogin and EnsurePoolerLogin first in it. After any error the session is finished.
+- The statements outside function bodies rely on that session's startup search_path
+  (pg_catalog first): never send them over a connection that pgsock.Dial did not open. A test
+  holds that settings of the role and of the database do not reach such a session.
+- Errors wrap pgsock's: test a bound with pgsock.IsBudget and a server refusal with errors.As
+  to *pgsock.ServerError. Server text in errors and findings is sanitised and capped.
+- Everything read back is the cluster's word: use it for that project only.
+
+Known limits
+- The schema's access list is compared as text: the same two entries in another order are a
+  difference. Settings on the manager role and grants to it elsewhere are not read back.
+- A function of another signature under the helper's name fails the call (SQLSTATE 42P13).
+- A type that is no relation under the canary's name fails EnsureCanary (SQLSTATE 42710).
+- The termination reaches the sessions the server lists when it runs.
+- A batch of large objects that does not finish inside the statement bound is not removed.
+- WriteCanary's owner statement waits for the table's lock; under a reader's lock it ends at
+  the statement bound with a budget error.
+- After RekeyLogin of supabase_read_only_user the check service-passwords reports that role
+  until servicePasswordRoles no longer lists it.
+- Tests: the cluster tests need the pinned image and skip without it.

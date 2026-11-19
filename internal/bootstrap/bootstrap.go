@@ -32,11 +32,14 @@ import (
 )
 
 // Secrets are a project's database secrets. ScramSalts maps each of
-// supabase_admin, postgres and authenticator to its salt (pgsock.ScramSalt).
+// supabase_admin, postgres and authenticator (and supapace_pooler when
+// PoolerPassword is set) to its salt (pgsock.ScramSalt). An empty
+// PoolerPassword: nothing of the pooler's manager role is sent or expected.
 type Secrets struct {
 	SupabaseAdminPassword, PostgresPassword, AuthenticatorPassword string
 	PgsodiumRootKey                                                string
 	ScramSalts                                                     map[string][]byte
+	PoolerPassword                                                 string
 }
 
 // ErrAssertion is what a caller returns when a blocking assertion has
@@ -51,11 +54,11 @@ var ErrImageSettings = errors.New("bootstrap: the image's settings differ from t
 var verifierRE = regexp.MustCompile(`^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$`)
 
 // verifierStatement returns prefix completed with v, after checking that
-// prefix is one of the three sqlPassword… constants and v is a SCRAM-SHA-256
+// prefix is one of the sqlPassword… constants and v is a SCRAM-SHA-256
 // verifier with 4096 iterations and nothing else.
 func verifierStatement(prefix, v string) (string, error) {
 	switch prefix {
-	case sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator:
+	case sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator, sqlPasswordReadOnly, sqlPasswordPooler:
 	default:
 		return "", errors.New("bootstrap: not a password statement")
 	}
@@ -68,8 +71,10 @@ func verifierStatement(prefix, v string) (string, error) {
 // Run bootstraps a freshly initialised cluster over c (a session as
 // supabase_admin in the first-boot phase). Before its first change it
 // compares the image's preloaded libraries and settings with the embedded
-// baseline and fails with ErrImageSettings when they differ. Every step is
-// idempotent.
+// baseline and fails with ErrImageSettings when they differ. After the auth
+// functions it makes the pooler's manager role and helper when
+// s.PoolerPassword is set, and the backup canary's table always. Every step
+// is idempotent.
 func Run(ctx context.Context, c *pgx.Conn, s Secrets) error {
 	bl, err := LoadBaseline()
 	if err != nil {
@@ -80,6 +85,10 @@ func Run(ctx context.Context, c *pgx.Conn, s Secrets) error {
 
 func run(ctx context.Context, c *pgx.Conn, s Secrets, bl Baseline) error {
 	vs, err := verifiers(s)
+	if err != nil {
+		return err
+	}
+	pv, err := poolerVerifier(s)
 	if err != nil {
 		return err
 	}
@@ -133,7 +142,12 @@ func run(ctx context.Context, c *pgx.Conn, s Secrets, bl Baseline) error {
 	if err != nil {
 		return fmt.Errorf("bootstrap: auth functions: %w", err)
 	}
-	return nil
+	for _, v := range pv {
+		if err := ensurePoolerLogin(ctx, c, v); err != nil {
+			return err
+		}
+	}
+	return EnsureCanary(ctx, c)
 }
 
 // roleExists reports whether the role name exists.
