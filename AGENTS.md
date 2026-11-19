@@ -3145,3 +3145,44 @@ rules 2-4 and before any slot. Anything else gets the 302 to /-/auth/login as be
 Every answer the gateway writes on S, sign-in.S and dashboard hosts carries
 Strict-Transport-Security: max-age=31536000, never includeSubDomains (dashHeaders); project
 API answers do not. A seam that writes its own answer must call dashHeaders to keep it.
+
+### 2026-11-19 — internal/pooler: the connection pooler's admin client
+
+- pooler.New(dial, apiSecret) *Client: each call opens one connection with dial (the caller's;
+  in the daemon a dial into the pooler's network namespace, 127.0.0.1 and the admin port, made
+  again for every call) and signs an HS256 token whose only claim is exp, 60 s ahead. The secret
+  slice is kept, not copied: do not change it while the client is in use. An empty secret is
+  refused before any dial.
+- Health(ctx); PutTenant(ctx, ref, poolcfg.Tenant) — register or update, PUT
+  /api/tenants/<ref> with Tenant.Body(); Terminate(ctx, ref) — GET .../terminate, nil when there
+  is no tenant; Delete(ctx, ref) — Terminate, then DELETE, nil when there is no tenant, and no
+  DELETE when the terminate failed (a delete alone leaves pools and sessions running);
+  ClearBans(ctx, ref, addrs) — DELETE .../network_bans with {"ipv4_addresses":[...]}.
+- ClearBans with no address reads the tenant's ban list and clears every entry that is an IPv4
+  address in canonical form (the pinned pooler has no clear-all; its ban keys are the peer's
+  IPv4 address or "undefined"). A list over the read bound (about 1,000 entries) is
+  ErrTooLarge, which matches neither ErrRefused nor ErrUnavailable, and nothing is cleared: name
+  the addresses. A non-IPv4 or zero address in addrs is refused before
+  any dial. An absent tenant is ErrRefused (404) for ClearBans, unlike Terminate and Delete.
+- ref must match ^[a-z0-9]{20}$; anything else is refused before any dial.
+- Bounds per request, dial included: Health 5 s, PutTenant 30 s (registration logs in to the
+  cluster), Terminate and each of Delete's two requests 75 s, each ClearBans request 30 s. The
+  caller's context still applies; its end closes the connection on every path.
+- Answers are hostile: at most 64 KiB is read, status line and headers included; only the status
+  is used and every body but the ban list is discarded unparsed (tenant answers hold the
+  manager's password in clear). 2xx is nil. 4xx is ErrRefused, the message being the status
+  alone ("pooler: the call was refused: status 403"). Dial failure, deadline, 5xx, 1xx, 3xx, a
+  malformed or cut answer are ErrUnavailable; no redirect is followed. Match with errors.Is; a
+  dial error stays matchable under ErrUnavailable. No error carries a byte of an answer, the
+  token or the secret.
+- At the pinned pooler, terminate answers 200 for any ref and reports its own fan-out failures
+  only in the body, which is not read: success means the call ran. Terminate and delete cut
+  client sessions and stop pools but send the cluster no cancel: a statement already running on
+  a pooled server connection runs to its end (and commits) before its backend goes. To end it,
+  terminate the backend in the cluster (by role name: pooled backends log in as the role), or
+  stop the cluster.
+- The pooler's admin token is accepted by anything that verifies HS256 with the same secret:
+  keep the admin secret distinct from every other secret, and leave the pooler's claim
+  validators unset (a required role would refuse every call).
+- pooler_reach_test.go (tag reach): one admin call per run against a running pooler through the
+  namespace dial, driven by a lab script; secrets come from files named in the environment.
