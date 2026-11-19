@@ -2579,3 +2579,85 @@ window generating the shared RSA keys with no activation accepted. The invariant
 unchanged. New `TestSetRoute_FlagReadUnderLock` holds the route lock, waits until an activation
 is parked on it, sets the flag and requires ErrContainment: it fails if the flag is read before
 the lock is taken, which the stress test does not catch. No product code changed.
+
+### 2026-11-19 — the pooler lab (test/harness/experiments: pool-lab.sh, lib-pool.sh, e40–e43, e48)
+Scripts that start the shared connection pooler (Supavisor) by digest beside three clusters inside
+a bare test node, under the node's own tables, and print one line per criterion. No Go code.
+
+Run one: `make build && make node-bare NODE=<node>`, then
+  test/harness/experiments/pool-lab.sh <node> test/harness/experiments/e4N.sh
+Needs about 3.5 GB of memory for the node. The pooler's archive goes into
+$IMAGE_CACHE/pool/ (the node's boot never loads that directory). Environment: IMAGE_CACHE,
+LAB_PREFIX (default sp-test-<node without "sp-">), OUT_SUBNET (default 192.0.2.32/27; a
+documentation range, one lab per subnet on a host). `make node-down NODE=<node>` at the end.
+
+pool-lab.sh (host side, bash):
+- checks the kit's cluster flags against clusterRunArgs in internal/agent/cluster.go;
+- fetches the pooler's image index by digest (pins-pool.env) and checks it. The first run writes
+  both per-architecture digests into pins-pool.env; later runs refuse an index that names others;
+- pulls and saves the image once, then loads it into the node and addresses it there by the manifest
+  digest of the host's architecture;
+- refuses to start when <prefix>-out, <prefix>-client or the kit directory in the node
+  (/var/lib/sp-exp/pool) already exists;
+- creates the lab bridge <prefix>-out, a client container on it (the "outside") and the node's
+  connection to it, all labelled supapace.test=1;
+- copies the kit and the script into the node and runs them there. A script line
+  "@@outside <base64>" is run in the outside client, with the command on its standard input
+  (a step that reads stdin in the foreground would eat the rest of its own command);
+- on every exit path: stops the run in the node by its recorded pid (TERM, KILL after 30 s), removes
+  the node's lab objects by name prefix and label, then its own objects. Each removal is guarded by
+  a flag set after the create succeeded and by the test label;
+- loads no kernel module and calls no sudo.
+Exit codes: the script's; 2 usage, node not running, unsupported machine; 1 a refusal above or a pin
+mismatch; 130/143 on a signal.
+
+lib-pool.sh (in the node, POSIX sh) — the functions scripts and later work call:
+- lab_up: node tables loaded and verified; networks spi0, spl0, spp0..spp3; clusters 0..2 in the
+  agent's two phases with the manager role supapace_pooler and its helper; registry database on
+  slice 3; certificates; the pooler; a node-local client; tenants 0..2 registered.
+- the pooler container: uid 65526, no capabilities, read-only root, tmpfs /tmp, nofile 16384 with
+  RLIMIT_NOFILE=16384, command `sh -c '/app/bin/migrate && exec /app/bin/server'`, published
+  0.0.0.0:5432 and 0.0.0.0:6543 on the ingress address. Joined to the four slices (the lab has no
+  wire proxy).
+- register I [ALLOW|EMPTY] [EXTRA_JSON] [EXTERNAL_ID] [AUTH_QUERY]: PUT of the tenant document;
+  prints the HTTP status only. POOL and MAXC set the pool size and the client cap.
+- terminate REF; admin METHOD PATH [BODYFILE]: status only, the body is discarded unread.
+- pq I LOGIN PORT ADDR SQL [TENANT] (node-local, verify-full) and pq_out I LOGIN PORT SQL (from
+  outside): status returned, the answer on one line in PQ. Any FATAL/ERROR/timeout/refused text
+  counts as a failure even with status 0.
+- hold/held, backends, asadmin I (SQL on stdin as the cluster's admin), helper NAME CONDITION,
+  probe_start/probe_wait (prints transactions, failed, tps, pgbench status, aborted clients),
+  pooler_oom, pooler_mem_mib, pooler_cpu_ms, outside CMD (sets OUT, returns the status).
+- res WORD CRITERION FIGURE with PASS/FAIL/RECORDED/UNRUN/CONTROL; control NAME OK FIGURE (a failed
+  control fails the run); finish NAME (exit status 1 on any FAIL); die exits 3.
+- Slices: the kit addresses 10.213.0.<index x 64>/26 and refuses an index of 4 or more. More
+  clusters need the node's own slice arithmetic first.
+- Secrets are random per run, root 0600 under $KIT/s, and passed by environment, file or stdin only.
+  A sampler reads every process's command line in the node twice a second and adds a criterion line:
+  "no lab secret on any process command line". Limits: a process living under about 0.5 s may be
+  missed; only the node's process table; command lines, not environments. The release cookie is
+  left out because the pinned image's start script passes it to the VM as an argument (recorded).
+- EXIT trap lab_down removes the node's lab objects and the kit directory. A script with its own
+  EXIT trap calls lab_down itself.
+
+The scripts (exit 0 when no line fails, 1 on a FAIL, 3 on a lab error):
+- e40.sh: the source address the pooler sees for a remote client, a node-local client and the node
+  connecting to its own lab-bridge address, read from the pooler's address-not-allowed refusal; then
+  an allow_list of the remote client alone. At this pin the node's connection to its own address
+  shows that address, so the run fails on that line.
+- e41.sh: a per-source connection limit (table inet supapace_limit, L1 to L4) beside the node's
+  tables:
+  - one source at its limit;
+  - a reload of the main tables under 200 active connections;
+  - the terse listing while the set changes;
+  - a full set with and without the companion rule;
+  - the spe0 count.
+  Needs the kernel module nft_connlimit, which nothing here loads. Without it the wrapper says so
+  and the script runs only the controls that need no limit rule, prints UNRUN for every criterion
+  and exits 4. UNRUN means not measured, never a pass.
+- e42.sh: the hardened pooler: identity, read-only root, both modes with verify-full, distribution
+  on loopback with the image's cookie refused, nothing on a project bridge, shard listeners,
+  lockouts, an oversized auth-query result and an expensive verifier (no OOM kill, a neighbour's
+  probe loses nothing).
+- e43.sh: recorded only: an empty allow_list as a disable; txn_mode_leak_action.
+- e48.sh: recorded only: a second tenant <ref>-ro of one cluster for the read-only login.
