@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -10,14 +11,18 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Baseline is what a fresh, unbootstrapped cluster of the pinned image holds:
 // its roles (every role not starting pg_), the distinct (member, role) pairs
 // involving one of them, role settings, the four platform schemas, event
 // triggers, the paths of the image's files, the settings a fresh cluster
-// already takes from postgresql.auto.conf, and the size of a fresh data
-// directory.
+// already takes from postgresql.auto.conf, the size of a fresh data
+// directory, the preloaded libraries in the file's order, and the sorted names
+// of the settings imageSetting selects (those of a library loaded only by
+// session_preload_libraries left out).
 type Baseline struct {
 	Image          string         `json:"image"`
 	Digest         string         `json:"digest"`
@@ -30,6 +35,9 @@ type Baseline struct {
 	Files          Files          `json:"files"`
 	AutoConf       []string       `json:"auto_conf"`
 	FreshClusterMB int            `json:"fresh_cluster_mb"`
+
+	Preload         []string `json:"preload"`
+	SessionSettings []string `json:"session_settings"`
 }
 
 // Role holds the seven compared attributes of a role.
@@ -83,9 +91,10 @@ var baselineJSON []byte
 func LoadBaseline() (Baseline, error) { return parseBaseline(baselineJSON) }
 
 var (
-	digestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	nameRE   = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
-	pathRE   = regexp.MustCompile(`^(/[A-Za-z0-9._-]+)+$`)
+	digestRE  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	nameRE    = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+	settingRE = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}(\.[a-z_][a-z0-9_]{0,62})?$`)
+	pathRE    = regexp.MustCompile(`^(/[A-Za-z0-9._-]+)+$`)
 )
 
 func parseBaseline(b []byte) (Baseline, error) {
@@ -150,5 +159,118 @@ func (bl Baseline) validate() error {
 			return fmt.Errorf("file path %q", p)
 		}
 	}
+	if len(bl.Preload) == 0 || len(bl.SessionSettings) == 0 {
+		return errors.New("preload or session_settings empty")
+	}
+	for i, l := range bl.Preload {
+		if !nameRE.MatchString(l) || slices.Contains(bl.Preload[:i], l) {
+			return fmt.Errorf("preload %q", l)
+		}
+	}
+	for i, n := range bl.SessionSettings {
+		if !settingRE.MatchString(n) || !imageSetting(n) || i > 0 && bl.SessionSettings[i-1] >= n {
+			return fmt.Errorf("session setting %q", n)
+		}
+	}
 	return nil
+}
+
+// imageSetting reports whether the comparison of the image's settings covers
+// the setting name: one with a prefix (a library's), or a server setting
+// named log_*, debug_print_* or track_*.
+func imageSetting(name string) bool {
+	return strings.Contains(name, ".") || strings.HasPrefix(name, "log_") ||
+		strings.HasPrefix(name, "debug_print_") || strings.HasPrefix(name, "track_")
+}
+
+// maxImageNames is how many differing names the error of the comparison
+// names.
+const maxImageNames = 8
+
+// readImageSettings reads the preloaded libraries, in the setting's order,
+// and the sorted names of the settings imageSetting selects, leaving out
+// those of a library this session loaded through session_preload_libraries:
+// the comparison is then the same whether or not the platform's session
+// loads one.
+func readImageSettings(ctx context.Context, c *pgx.Conn) (preload, settings []string, err error) {
+	var shared, session string
+	n := 0
+	err = querySQL(ctx, c, sqlPreload, nil, func(rows pgx.Rows) error {
+		n++
+		return rows.Scan(&shared, &session)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if n != 1 {
+		return nil, nil, errors.New("preload settings not read")
+	}
+	preload, sessionLibs := splitList(shared), splitList(session)
+	n = 0
+	err = querySQL(ctx, c, sqlImageSettings, nil, func(rows pgx.Rows) error {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		prefix, _, _ := strings.Cut(name, ".")
+		if n++; n <= maxSettings && imageSetting(name) && !(slices.Contains(sessionLibs, prefix) && !slices.Contains(preload, prefix)) {
+			settings = append(settings, name)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if n > maxSettings {
+		return nil, nil, fmt.Errorf("more than %d settings", maxSettings)
+	}
+	slices.Sort(settings) // the server orders by its collation
+	return preload, settings, nil
+}
+
+// splitList splits a list setting at commas and trims each element; empty
+// elements are dropped.
+func splitList(s string) []string {
+	var out []string
+	for _, e := range strings.Split(s, ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// imageDiff returns the names in which preload (its order too) and settings
+// differ from the baseline's, each once.
+func imageDiff(bl Baseline, preload, settings []string) []string {
+	var d []string
+	add := func(n string) {
+		if n != "" && !slices.Contains(d, n) {
+			d = append(d, n)
+		}
+	}
+	for i := range max(len(bl.Preload), len(preload)) {
+		var a, b string
+		if i < len(bl.Preload) {
+			a = bl.Preload[i]
+		}
+		if i < len(preload) {
+			b = preload[i]
+		}
+		if a != b {
+			add(a)
+			add(b)
+		}
+	}
+	for _, n := range settings {
+		if !slices.Contains(bl.SessionSettings, n) {
+			add(n)
+		}
+	}
+	for _, n := range bl.SessionSettings {
+		if !slices.Contains(settings, n) {
+			add(n)
+		}
+	}
+	return d
 }

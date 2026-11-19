@@ -1904,3 +1904,50 @@ needStandin(t).
 
 Known limits: the pinned stand-in accepts any region, refuses a key segment over 255 bytes
 (500), answers a.b/./c and ../ names with 400, and its write right includes delete.
+
+### 2026-11-19 — bootstrap: inheriting backup grant, re-key session, image-settings check
+
+internal/bootstrap gains the re-key of a cluster started from a restored data directory, a
+drift check that takes the expected command-line names, and a check of the image's settings
+at first boot.
+
+- Rekey(ctx, conn, s): one session as supabase_admin. Computes the three verifiers before it
+  sends anything, then sends exactly: the password statements of supabase_admin, postgres,
+  authenticator (in that order, the session's first statements, each one simple-query
+  message), the backup role's existence read, its creation when absent, its two grants.
+  Idempotent. A later identity is added by appending to the list verifiers() returns.
+- Password statement (first boot and re-key): alter role <role> with login connection limit -1
+  valid until 'infinity' password '<verifier>'. On a fresh cluster this changes nothing in
+  effect; rolvaliduntil reads infinity instead of NULL afterwards.
+- GrantBackup(ctx, conn): grant pg_read_all_settings to supapace_backup with inherit true; also
+  turns an existing plain grant into an inheriting one.
+- InRecovery(ctx, conn) (bool, error): pg_is_in_recovery(); exactly one row. The answer is the
+  cluster's: use it for the recovery poll only, in a session of its own.
+- ReadTimeline(ctx, conn) (int, error): first 8 hex digits of the current WAL file's name;
+  exactly one row of 8 upper-case hex digits, not zero, else an error.
+- ResetStatementStats(ctx, conn) (reset bool, err error): clears the statement statistics of
+  supabase_admin only, through extensions.pg_stat_statements_reset. SQLSTATE 42883 or 3F000
+  (function or schema not there) is reset=false, nil. Other errors expose *pgsock.ServerError
+  through errors.As. The function is the cluster's: send it last, treat errors as best effort.
+- AssertPins(ctx, conn, bl, conf, cmdline): Assert with the names expected to read source
+  "command line" (pass pgconf.PinnedNames(layout)); an extra or missing name is a source-file
+  finding. Assert is AssertPins with the two preload names, unchanged for its callers.
+- The drift check reports supapace_backup's membership in pg_read_all_settings without the
+  inherit option under memberships-reserved. servicePasswordRoles is the one list of service
+  roles without a password: remove a role from it when the platform gives it one.
+- Run's order: verifiers computed, image settings compared, passwords, realtime admin role,
+  backup role, auth functions. ErrImageSettings (match with errors.Is): the preloaded
+  libraries (in order) or the setting names differ from the baseline; the text names up to
+  eight sanitised names, then "and N more". Nothing is changed before the comparison.
+- Baseline gains "preload" (shared_preload_libraries in the file's order) and
+  "session_settings" (byte-sorted names: every name with a prefix, and log_*, debug_print_*,
+  track_*). The names of a library loaded only through session_preload_libraries are left out,
+  so the comparison is the same whether or not a session loads that library.
+- Bounds: at most 1,024 settings read (more is an error); membership reads limited to 256 rows.
+- Image bump: regenerate both members with readImageSettings on a fresh cluster of the new
+  image (byte-sorted), after the recovery experiments have been re-run against it.
+- Known limits: a library added only to session_preload_libraries is not detected (sessions that
+  send it empty do not load it). The statements after the password statements may call
+  functions of the restored database (the reset's function, those the reads use); nothing
+  secret is sent after the password statements.
+- Tests: about 95 s with -race; the cluster tests need the pinned image and skip without it.

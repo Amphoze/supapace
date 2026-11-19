@@ -5,23 +5,38 @@ package bootstrap
 // cannot take as a parameter: it is appended to a sqlPassword… prefix only
 // after verifierStatement has checked it.
 
-// First boot.
+// First boot and re-key. A password statement also restores the login right,
+// an unlimited connection limit and no expiry: on a fresh cluster the three
+// roles already hold these in effect (an unset expiry reads infinity afterwards).
 const (
-	sqlPasswordSupabaseAdmin = "alter role supabase_admin password '"
-	sqlPasswordPostgres      = "alter role postgres password '"
-	sqlPasswordAuthenticator = "alter role authenticator password '"
+	sqlPasswordSupabaseAdmin = "alter role supabase_admin with login connection limit -1 valid until 'infinity' password '"
+	sqlPasswordPostgres      = "alter role postgres with login connection limit -1 valid until 'infinity' password '"
+	sqlPasswordAuthenticator = "alter role authenticator with login connection limit -1 valid until 'infinity' password '"
 
 	sqlRoleExists = "select exists (select from pg_catalog.pg_roles where rolname = $1)"
 
 	sqlCreateRealtimeAdmin = "create role supabase_realtime_admin nologin noinherit"
 	sqlCreateBackup        = "create role supapace_backup login nosuperuser noinherit nocreatedb nocreaterole noreplication"
-	sqlGrantBackupSettings = "grant pg_read_all_settings to supapace_backup"
+	sqlGrantBackupSettings = "grant pg_read_all_settings to supapace_backup with inherit true"
 	sqlGrantBackupFuncs    = "grant execute on function pg_catalog.pg_backup_start(text, boolean), " +
 		"pg_catalog.pg_backup_stop(boolean), pg_catalog.pg_switch_wal(), " +
 		"pg_catalog.pg_create_restore_point(text) to supapace_backup"
 
+	// The image's settings, read before the first statement of Run.
+	sqlPreload       = "select pg_catalog.current_setting('shared_preload_libraries'), pg_catalog.current_setting('session_preload_libraries')"
+	sqlImageSettings = "select name::text from pg_catalog.pg_settings limit 1025"
+
 	sqlSetRoleAuthAdmin = "set role supabase_auth_admin"
 	sqlResetRole        = "reset role"
+)
+
+// The re-key's caller, after the re-key: the timeline, then the reset of the
+// platform login role's statement statistics. The recovery read runs in a
+// session of its own.
+const (
+	sqlInRecovery          = "select pg_catalog.pg_is_in_recovery()"
+	sqlTimeline            = "select pg_catalog.substr(pg_catalog.pg_walfile_name(pg_catalog.pg_current_wal_lsn()), 1, 8)"
+	sqlResetStatementStats = "select extensions.pg_stat_statements_reset('supabase_admin'::pg_catalog.regrole)"
 )
 
 // The auth helper functions. Their bodies run under the caller's search_path,
@@ -76,9 +91,9 @@ const (
 	sqlRoles = `select rolname::text, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls,
 	  rolcanlogin, rolconnlimit from pg_catalog.pg_roles where rolname::text = any($1::text[]) order by 1 limit 257`
 	sqlSuperusers  = "select rolname::text from pg_catalog.pg_roles where rolsuper order by 1 limit 257"
-	sqlMembersFrom = `select distinct m.rolname::text, r.rolname::text from pg_catalog.pg_auth_members a
+	sqlMembersFrom = `select m.rolname::text, r.rolname::text, pg_catalog.bool_or(a.inherit_option) from pg_catalog.pg_auth_members a
 	  join pg_catalog.pg_roles m on m.oid = a.member join pg_catalog.pg_roles r on r.oid = a.roleid
-	  where m.rolname::text = any($1::text[]) order by 1, 2 limit 257`
+	  where m.rolname::text = any($1::text[]) group by 1, 2 order by 1, 2 limit 257`
 	sqlMembersOf = `select distinct m.rolname::text, r.rolname::text from pg_catalog.pg_auth_members a
 	  join pg_catalog.pg_roles m on m.oid = a.member join pg_catalog.pg_roles r on r.oid = a.roleid
 	  where r.rolname::text = any($1::text[]) order by 1, 2 limit 257`

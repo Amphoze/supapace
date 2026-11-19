@@ -55,9 +55,11 @@ var allowedSourceFiles = []string{
 }
 
 // commandLinePins are the settings that read source "command line" in a
-// platform session. hba_file and ident_file, also passed on the command line,
-// read source "override"; local_preload_libraries, passed there too, reads
-// "client" because the platform session sets it in its startup packet.
+// platform session of a cluster started without the pinned settings; Assert
+// expects these, AssertPins takes its list from the caller. hba_file and
+// ident_file, also passed on the command line, read source "override";
+// local_preload_libraries, passed there too, reads "client" because the
+// platform session sets it in its startup packet.
 var commandLinePins = []string{"session_preload_libraries", "shared_preload_libraries"}
 
 // platformRoles are the roles bootstrap creates, with their attributes.
@@ -86,7 +88,9 @@ var (
 	settingsRoles = []string{"supabase_admin", "supabase_auth_admin", "supabase_storage_admin",
 		"supabase_read_only_user", "supabase_replication_admin", "supabase_etl_admin", "dashboard_user",
 		"pgbouncer", "supabase_privileged_role", "supabase_realtime_admin", "supapace_backup"}
-	// servicePasswordRoles have no password after bootstrap.
+	// servicePasswordRoles have no password after bootstrap. This list is the
+	// one place that says so: a role the platform later gives a password is
+	// removed from it.
 	servicePasswordRoles = []string{"pgbouncer", "supabase_auth_admin", "supabase_storage_admin",
 		"supabase_replication_admin", "supabase_etl_admin", "supabase_read_only_user"}
 	authFunctions = []string{"email", "jwt", "role", "uid"}
@@ -128,8 +132,16 @@ func deref[T any](p *T) (v T) {
 // Assert compares the cluster behind c with want and with renderedConf (the
 // bytes of the platform's override file). It returns one finding (OK false)
 // per difference, nothing when there is none; the error is reserved for a
-// failed session or query. It reads with plain SQL only.
+// failed session or query. It reads with plain SQL only. It expects the two
+// preload settings on the command line, as AssertPins with those names.
 func Assert(ctx context.Context, c *pgx.Conn, want Baseline, renderedConf []byte) ([]nodecfg.CheckResult, error) {
+	return AssertPins(ctx, c, want, renderedConf, commandLinePins)
+}
+
+// AssertPins is Assert with cmdline, the names of the settings expected to
+// read source "command line": a setting from the command line not named there,
+// or one named there and not from the command line, is a source-file finding.
+func AssertPins(ctx context.Context, c *pgx.Conn, want Baseline, renderedConf []byte, cmdline []string) ([]nodecfg.CheckResult, error) {
 	r := &report{n: map[string]int{}}
 	for _, step := range []struct {
 		name string
@@ -142,7 +154,9 @@ func Assert(ctx context.Context, c *pgx.Conn, want Baseline, renderedConf []byte
 		{checkConfiguration, func(ctx context.Context, c *pgx.Conn, want Baseline, r *report) error {
 			return assertConfiguration(ctx, c, want, renderedConf, r)
 		}},
-		{checkSourceFile, assertSourceFiles},
+		{checkSourceFile, func(ctx context.Context, c *pgx.Conn, want Baseline, r *report) error {
+			return assertSourceFiles(ctx, c, want, cmdline, r)
+		}},
 	} {
 		if err := step.fn(ctx, c, want, r); err != nil {
 			return nil, fmt.Errorf("bootstrap: assert %s: %w", step.name, err)
@@ -247,8 +261,9 @@ func pairs(dst *[]Membership) func(pgx.Rows) error {
 }
 
 // assertMemberships: the distinct memberships held by the reserved platform
-// roles equal the baseline's plus the one bootstrap grants; every membership
-// in a dangerous role is one of the baseline's.
+// roles equal the baseline's plus the one bootstrap grants, which must carry
+// the inherit option; every membership in a dangerous role is one of the
+// baseline's.
 func assertMemberships(ctx context.Context, c *pgx.Conn, want Baseline, r *report) error {
 	expect := []Membership{grantedMembership}
 	for _, m := range want.Memberships {
@@ -259,8 +274,25 @@ func assertMemberships(ctx context.Context, c *pgx.Conn, want Baseline, r *repor
 	cmp := func(a, b Membership) int { return strings.Compare(a.Member+"\x00"+a.Role, b.Member+"\x00"+b.Role) }
 	slices.SortFunc(expect, cmp)
 	var got []Membership
-	if err := querySQL(ctx, c, sqlMembersFrom, []any{reservedMembers}, pairs(&got)); err != nil {
+	inherits := false
+	err := querySQL(ctx, c, sqlMembersFrom, []any{reservedMembers}, func(rows pgx.Rows) error {
+		var m Membership
+		var inherit bool
+		if err := rows.Scan(&m.Member, &m.Role, &inherit); err != nil {
+			return err
+		}
+		if m == grantedMembership {
+			inherits = inherit
+		}
+		got = append(got, m)
+		return nil
+	})
+	if err != nil {
 		return err
+	}
+	if slices.Contains(got, grantedMembership) && !inherits {
+		r.add(checkMembershipsReserved, "%s is a member of %s without the inherit option",
+			grantedMembership.Member, grantedMembership.Role)
 	}
 	if len(got) > maxRows {
 		r.add(checkMembershipsReserved, "more than %d memberships held by platform roles", maxRows)
@@ -582,9 +614,9 @@ func assertConfiguration(ctx context.Context, c *pgx.Conn, want Baseline, render
 }
 
 // assertSourceFiles: every setting from a configuration file comes from an
-// allowed file; exactly the preload lists come from the command line;
+// allowed file; exactly the names of cmdline come from the command line;
 // hba_file and ident_file are the pinned paths, set on the command line.
-func assertSourceFiles(ctx context.Context, c *pgx.Conn, want Baseline, r *report) error {
+func assertSourceFiles(ctx context.Context, c *pgx.Conn, want Baseline, cmdline []string, r *report) error {
 	n := 0
 	reported := map[string]bool{}
 	err := querySQL(ctx, c, sqlConfigFileSettings, nil, func(rows pgx.Rows) error {
@@ -642,11 +674,11 @@ func assertSourceFiles(ctx context.Context, c *pgx.Conn, want Baseline, r *repor
 		cl = cl[:maxRows]
 	}
 	for _, name := range cl {
-		if !slices.Contains(commandLinePins, name) {
+		if !slices.Contains(cmdline, name) {
 			r.add(checkSourceFile, "%s is set on the command line", q(name))
 		}
 	}
-	for _, name := range commandLinePins {
+	for _, name := range cmdline {
 		if !slices.Contains(cl, name) {
 			r.add(checkSourceFile, "%s is not set on the command line", name)
 		}

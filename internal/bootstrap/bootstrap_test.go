@@ -784,6 +784,20 @@ func rnd(n int) string {
 // network, the image's own pg_hba, the platform's rendered files), runs Run
 // over the socket and returns the cluster.
 func startCluster(t *testing.T) *cluster {
+	c := newCluster(t, 1)
+	c.run()
+	conn := c.dial("supabase_admin")
+	if err := Run(context.Background(), conn, c.secrets); err != nil {
+		c.logs()
+		t.Fatalf("run: %v", err)
+	}
+	return c
+}
+
+// newCluster prepares a cluster's directories, rendered files and secrets
+// without starting it. Layout 2 renders the override file without the pinned
+// settings and passes those on the command line.
+func newCluster(t *testing.T, layout int) *cluster {
 	img := requireDocker(t)
 	t.Parallel()
 	clusterSlots <- struct{}{}
@@ -833,7 +847,14 @@ func startCluster(t *testing.T) *cluster {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.conf, err = pgconf.Overrides(nil, 512); err != nil {
+	if layout == 2 {
+		if c.conf, err = pgconf.OverridesPinned(nil, 512); err != nil {
+			t.Fatal(err)
+		}
+		if c.extraArgs, err = pgconf.Pins(nil); err != nil {
+			t.Fatal(err)
+		}
+	} else if c.conf, err = pgconf.Overrides(nil, 512); err != nil {
 		t.Fatal(err)
 	}
 	if c.hba, err = pgconf.HBA(nodecfg.Default("sp.test").Slice(0)); err != nil {
@@ -873,12 +894,6 @@ func startCluster(t *testing.T) *cluster {
 		if c.secrets.ScramSalts[r], err = pgsock.ScramSalt(dek, c.ref, r); err != nil {
 			t.Fatal(err)
 		}
-	}
-	c.run()
-	conn := c.dial("supabase_admin")
-	if err := Run(context.Background(), conn, c.secrets); err != nil {
-		c.logs()
-		t.Fatalf("run: %v", err)
 	}
 	return c
 }
