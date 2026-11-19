@@ -52,7 +52,7 @@ type Assertion struct {
 	Exp     int64  `json:"exp"`
 }
 
-// Session is the session token's payload. Ref is "_" on the apex.
+// Session is the session token's payload. Ref is "_" on the sign-in host.
 type Session struct {
 	Iss  string `json:"iss"`
 	Sub  string `json:"sub"`
@@ -62,13 +62,17 @@ type Session struct {
 	Exp  int64  `json:"exp"`
 }
 
-// Ticket is the log-out ticket's payload: the refs still to visit, in order.
+// Ticket is the log-out ticket's payload: the refs still to visit, in order,
+// and whether the principal has more project origins than the first ticket
+// of the chain listed.
 type Ticket struct {
 	Iss  string   `json:"iss"`
 	Sub  string   `json:"sub"`
 	Refs []string `json:"refs"`
+	More bool     `json:"more"`
 	Iat  int64    `json:"iat"`
-	Exp  int64    `json:"exp"`
+
+	Exp int64 `json:"exp"`
 }
 
 var (

@@ -32,7 +32,8 @@ type IDClaims struct {
 // VerifyID checks an OpenID Connect ID token for dashboard sign-in. It shares
 // Verify's parse and signature code, then requires: a key of ClassDashboard;
 // iss equal to want.Issuer; aud equal to want.ClientID, or an array holding
-// it with azp equal to it (a present azp always equal to it); exp and iat
+// it, with azp when the array has more than one member (a present azp always
+// equal to the client id); exp and iat
 // present, with 60 s of leeway, iat at most 600 s old; a present nbf no more
 // than 60 s ahead; nonce equal to want.Nonce; sub 1 to 255 bytes of printable
 // ASCII; name, when present, a string. It does not read role. A check with an
@@ -85,7 +86,7 @@ func VerifyID(token string, keys []Key, want IDCheck, now time.Time) (IDClaims, 
 			}
 			found = found || s == want.ClientID
 		}
-		if !found || !hasAzp {
+		if !found || len(aud) > 1 && !hasAzp {
 			return IDClaims{}, ErrClaim
 		}
 	case nil:
@@ -123,13 +124,6 @@ func VerifyID(token string, keys []Key, want IDCheck, now time.Time) (IDClaims, 
 		return IDClaims{}, ErrNotYetValid
 	}
 
-	nonce, _, err := str("nonce")
-	if err != nil {
-		return IDClaims{}, err
-	}
-	if subtle.ConstantTimeCompare([]byte(nonce), []byte(want.Nonce)) != 1 {
-		return IDClaims{}, ErrNonce
-	}
 	sub, _, err := str("sub")
 	if err != nil {
 		return IDClaims{}, err
@@ -140,6 +134,14 @@ func VerifyID(token string, keys []Key, want IDCheck, now time.Time) (IDClaims, 
 	name, _, err := str("name")
 	if err != nil {
 		return IDClaims{}, err
+	}
+	// The nonce last: ErrNonce means a token that is valid in everything else.
+	nonce, _, err := str("nonce")
+	if err != nil {
+		return IDClaims{}, err
+	}
+	if subtle.ConstantTimeCompare([]byte(nonce), []byte(want.Nonce)) != 1 {
+		return IDClaims{}, ErrNonce
 	}
 	return IDClaims{Sub: sub, Name: name, Iat: iat, Exp: exp}, nil
 }

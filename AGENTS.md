@@ -3288,3 +3288,116 @@ nft (`InstallSet`, change): the previous addresses file is read as `SavedSet` op
   ruleset file and the tables go back to the previous ruleset, so the tables may hold addresses
   no file names until the next install or start converges; the saved set never names an address
   the tables lack.
+
+### 2026-11-19 — gateway: dashboard sign-in, log-out chain and project picker
+
+The gateway answers the sign-in host (sign-in.S) and /-/auth/ on every dashboard host itself
+(internal/gateway: dashauth.go, dashlogout.go, dashpages.go; init assigns dashAuth). Nothing
+of it reaches Studio. It keeps no state, takes no slot, opens no connection and logs nothing.
+
+Endpoints
+- GET /-/auth/login?return=<path>[&retry=1] (both host kinds): makes an attempt, sets its
+  cookie, 302 to the issuer's authorize_url with response_type=id_token,
+  response_mode=form_post, scope=openid, client_id, nonce, state and
+  redirect_uri=https://sign-in.S/-/auth/callback. A request showing 16 or more login cookies
+  has every one cleared first. A parameter counts only when the query parses and holds it once.
+- POST /-/auth/callback (sign-in host only): reads no cookie and verifies nothing; answers
+  the relay page, which posts id_token and state unchanged to
+  https://<target>/-/auth/session?at=<gateway clock>. The target is "_" (the sign-in host) or
+  a ref of the table.
+- POST /-/auth/session (both): checks in order — the state's form and that its target is this
+  host (else the 400 page, the cookie not read); the attempt's cookie, exactly once and holding
+  43 base64url characters; the token (jwtx.VerifyID with the table's keys, issuer and client
+  id, nonce = SHA-256 of the cookie's value). Success: sets the session cookie and answers a
+  200 page that navigates to the return path. No cookie, the cookie twice, or
+  errors.Is(err, jwtx.ErrNonce): a binding failure — the retry page (200, to
+  /-/auth/login?...&retry=1) for n 0, the final 401 page for n 1. Any other token error: the
+  401 page at once. The cookie is cleared on every answer that read it.
+- GET /-/auth/logout (both): with this host's session it clears it and redirects to the first
+  of the principal's other projects (ref order, at most 16) with a signed ticket in t; without
+  a session it clears the cookies it was shown and redirects to
+  https://sign-in.S/-/auth/signed-out?ended=0, never an error. With t (dashboard hosts only):
+  the ticket must verify, name this host first and only refs of the table; the hop clears its
+  session cookie without needing one and passes on a ticket for the rest with the same iat,
+  exp and more; the last hop redirects to the signed-out page, with ?more=1 when more is true.
+- GET /-/auth/signed-out (sign-in host only): clears that host's session cookie and the login
+  cookies shown, on every visit. more=1 and ended=0, each written exactly so and once, select a
+  fixed sentence; nothing of the query is rendered.
+- GET / (sign-in host): the picker — the session's principal's projects from the table, each a
+  link to its origin, and a log-out link. Without a session: a navigation is 302 to
+  /-/auth/login, anything else 401 login_required.
+- A navigation without a session whose Referer is this host's own session address of the last
+  minute (dashRequest.Unpresented; the picker tests it itself) gets a 401 page of its own
+  words with a link to sign in again. Nothing follows it by itself.
+
+Formats
+- Attempt: id a = 8 random bytes (11 base64url characters), secret R = 32 random bytes (43).
+  Cookie __Host-sp-login-<a>=<R>; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=None.
+  nonce = unpadded base64url of SHA-256 over R's 43 characters.
+- State: v1.<target>.<a>.<n>.<p>, at most 1,404 characters; target a ref or "_"; n 0 or 1; p
+  the return path in strict unpadded base64url, not empty. Not signed and not secret.
+- Session cookie: __Host-sp-session=<dashtok session>; Path=/; Max-Age=<session_seconds>;
+  HttpOnly; Secure; SameSite=Strict. Clearing either cookie: same attributes, Max-Age=0.
+- A login cookie is a name of __Host-sp-login- and exactly 11 base64url characters; no other
+  name is counted, read or cleared.
+- Return path (returnPath, applied at the login, in every state read and for the 401 link):
+  begins with one "/", no "//", no backslash, no byte 0x00-0x20 or 0x7f, at most 1,024 bytes;
+  the part before "?" or "#" passes readPath; its first segment, decoded once and lower-cased,
+  is neither "-" nor "api". Anything else becomes "/". Query and fragment are kept.
+- dashtok.Ticket gained More (payload {"iss","sub","refs","more","iat","exp"}); a ticket
+  lives 60 s and is refused from its 60th second; the vector file holds two accepted tickets
+  and the old five-member token as a refused case.
+- jwtx.VerifyID needs azp only when aud is an array of more than one member; a present azp
+  must be the client id.
+
+Answers
+- Pages are constant html/template pages: relay, session and retry (one template), refusal,
+  signed-out, picker. The relay page and the navigating page have one constant script each;
+  no other answer has a script. The only request-derived strings a page shows are the return
+  path (an attribute and a refresh address), a project's name and the display name, all
+  escaped.
+- Every answer: the dashboard headers (dashHeaders), Cache-Control: no-store and
+  Content-Security-Policy: default-src 'none'; script-src <that page's script hash, or
+  'none'>; style-src <hash>; frame-ancestors 'none'; base-uri 'none'; form-action 'none' —
+  on the relay page form-action is the one origin it posts to. Answers of the sign-in host add
+  Origin-Agent-Cluster: ?1. A new page or script must go through signIn.page/headers.
+- Refusals that are not pages (JSON code): 401 login_required, 403 cross_origin, 404
+  not_found, 503 unavailable (no table, no issuer, an authorize_url that is not https with a
+  host and without a fragment). Pages: 400 (state, fields, ticket, body), 401 (three
+  wordings), 405 (any other method on the two posts, never a redirect).
+
+Rules and bounds
+- The two posts take application/x-www-form-urlencoded bodies of at most 16 KiB
+  (dashcfg.Limits.SignInBodyBytes), id_token and state each exactly once; every other field
+  is ignored, but error on the callback refuses. The query of a post is never parsed. The
+  token is at most 8 KiB of its alphabet.
+- The two posts are exempt from the same-origin rule and check no Origin. Every other request
+  with a Sec-Fetch-Site that is neither same-origin nor none is 403, unless it is a GET
+  navigation to a document. Other methods on the GET endpoints are 404.
+- The handler reads the current table once per request and uses that snapshot throughout; a
+  table replaced between two requests of an attempt is judged per request.
+- The display name is cleaned before it is signed: invalid UTF-8, control characters, U+2028
+  and U+2029 removed, cut to 128 bytes at a rune boundary.
+- end_session_url is linked on the signed-out page only when it begins https://.
+
+Tests
+- internal/gateway/testdata/signin.json holds the cases that need no signature; the tests of
+  sp-dashstub flow read the same file. Placeholders: {A} {B} {D} {S} {c*N} {now+N} {now-N}.
+- dashauth_fuzz_test.go: FuzzReturnPath and FuzzParseState.
+- TestLogin_CookieStateAndRedirect replaces crypto/rand.Reader for one request: the tests of
+  this package must stay serial.
+
+Known limits
+- No count and no log line for sign-in answers: why a sign-in was refused is not visible to
+  an operator yet.
+- A ticket is not single use and names no browser: inside its minute it ends the sessions of
+  its refs in any browser that follows it. A project that leaves the table inside that minute
+  ends the chain at the next hop; the hosts not yet visited keep their sessions.
+- An ID token is not single use either: what binds it is the attempt's cookie, cleared when
+  read.
+- The answers the host switch makes before the handler on the sign-in host (421, 503 without
+  a table, the path rule's 400) carry the dashboard policy and no Origin-Agent-Cluster.
+- A request showing very many login cookies gets one clearing line for each (bounded by the
+  header limit of 32 KiB: about 1,200 names).
+- The sp-dashstub flow model has no ended=0, no more and lists both script hashes on every
+  answer; those are tested on the gateway only.

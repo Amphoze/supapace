@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -9,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +20,7 @@ import (
 
 const (
 	tStudio = "studio.test"
+
 	tSignIn = "sign-in." + tStudio
 	tIssuer = "issuer.test"
 	tA      = "aaaaaaaaaaaaaaaaaaaa"
@@ -25,6 +29,75 @@ const (
 )
 
 func tFlow() *flowModel { return newFlow(tStudio, tIssuer, []string{tC, tA, tB}) }
+
+// signInTable is the gateway's table of sign-in cases that need no
+// signature: this model's tests and the gateway's read the one file.
+type signInTable struct {
+	Comment     string                      `json:"comment"`
+	ReturnPaths []struct{ In, Want string } `json:"return_paths"`
+	Forged      []string                    `json:"forged_return_paths"`
+	Callback    []struct {
+		Name   string
+		Form   url.Values
+		Status int
+		Target string
+	} `json:"callback"`
+	Fields []struct {
+		Name, Body        string
+		Callback, Session int
+	} `json:"fields"`
+	OtherMethods []string `json:"other_methods"`
+	Referers     []struct {
+		Referer string
+		Marked  bool
+	} `json:"session_page_referers"`
+	CookieNames []struct {
+		Name  string
+		Login bool
+	} `json:"login_cookie_names"`
+	CookieCounts []struct{ Shown, Cleared int } `json:"login_cookie_counts"`
+}
+
+func loadSignIn(t *testing.T) signInTable {
+	t.Helper()
+	b, err := os.ReadFile("../../internal/gateway/testdata/signin.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v signInTable
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.ReturnPaths) == 0 || len(v.Forged) == 0 || len(v.Callback) == 0 || len(v.Fields) == 0 ||
+		len(v.OtherMethods) == 0 || len(v.Referers) == 0 || len(v.CookieNames) == 0 || len(v.CookieCounts) == 0 {
+		t.Fatal("the sign-in table has an empty section")
+	}
+	return v
+}
+
+var (
+	repeatRE = regexp.MustCompile(`\{(.)\*([0-9]+)\}`)
+	clockRE  = regexp.MustCompile(`\{now(?:([+-])([0-9]+))?\}`)
+)
+
+// expand fills the placeholders of a string of the table: {A} and {B} refs of
+// the model, {D} a ref it does not have, {S} the studio domain, {c*N} a
+// character N times, {now}, {now+N} and {now-N} the clock.
+func expand(s string, now int64) string {
+	s = repeatRE.ReplaceAllStringFunc(s, func(m string) string {
+		p := repeatRE.FindStringSubmatch(m)
+		n, _ := strconv.Atoi(p[2])
+		return strings.Repeat(p[1], n)
+	})
+	s = clockRE.ReplaceAllStringFunc(s, func(m string) string {
+		p := clockRE.FindStringSubmatch(m)
+		d, _ := strconv.ParseInt(p[1]+p[2], 10, 64)
+		return strconv.FormatInt(now+d, 10)
+	})
+	return strings.NewReplacer("{A}", tA, "{B}", tB, "{D}", "dddddddddddddddddddd", "{S}", tStudio).Replace(s)
+}
 
 // jar is a minimal cookie jar keyed by host: what a browser that keeps every
 // cookie would send.
@@ -240,27 +313,25 @@ func TestFlow_Login_CookieStateAndRedirect(t *testing.T) {
 func TestFlow_Login_SixteenCookiesClearedFirst(t *testing.T) {
 	h := tFlow()
 	host := "https://" + tA + "." + tStudio
-	var cookies []string
-	for i := range 16 {
-		cookies = append(cookies, fmt.Sprintf("__Host-sp-login-x%010d=v", i))
-	}
-	r := tReq(h, "GET", host+"/-/auth/login", nil, "Cookie", strings.Join(cookies, "; ")+"; other=1")
-	sc := r.Header.Values("Set-Cookie")
-	if len(sc) != 17 {
-		t.Fatalf("Set-Cookie %q", sc)
-	}
-	for i, l := range sc[:16] {
-		if l != fmt.Sprintf("__Host-sp-login-x%010d=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None", i) {
-			t.Errorf("clear %d: %q", i, l)
+	// The table's counts: fifteen are kept, sixteen and more cleared first.
+	for _, c := range loadSignIn(t).CookieCounts {
+		var cookies []string
+		for i := range c.Shown {
+			cookies = append(cookies, fmt.Sprintf("__Host-sp-login-x%010d=v", i))
 		}
-	}
-	if !strings.Contains(sc[16], "Max-Age=600") {
-		t.Errorf("new cookie %q", sc[16])
-	}
-	// Control: fifteen are kept.
-	r = tReq(h, "GET", host+"/-/auth/login", nil, "Cookie", strings.Join(cookies[:15], "; "))
-	if n := len(r.Header.Values("Set-Cookie")); n != 1 {
-		t.Fatalf("fifteen cookies: %d Set-Cookie", n)
+		r := tReq(h, "GET", host+"/-/auth/login", nil, "Cookie", strings.Join(append(cookies, "other=1"), "; "))
+		sc := r.Header.Values("Set-Cookie")
+		if len(sc) != c.Cleared+1 {
+			t.Fatalf("%d login cookies: Set-Cookie %q", c.Shown, sc)
+		}
+		for i, l := range sc[:c.Cleared] {
+			if l != fmt.Sprintf("__Host-sp-login-x%010d=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None", i) {
+				t.Errorf("%d login cookies, clear %d: %q", c.Shown, i, l)
+			}
+		}
+		if !strings.Contains(sc[c.Cleared], "Max-Age=600") {
+			t.Errorf("%d login cookies: new cookie %q", c.Shown, sc[c.Cleared])
+		}
 	}
 }
 
@@ -366,18 +437,9 @@ func TestFlow_Session_Refusals(t *testing.T) {
 func TestFlow_ReturnPath_BothEnds(t *testing.T) {
 	h := tFlow()
 	host := tA + "." + tStudio
-	for in, want := range map[string]string{
-		"/a/b?c=d": "/a/b?c=d", "": "/", "a": "/", "//evil.test/": "/", "/a//b": "/", `/a\b`: "/",
-		"/a\x01": "/", "/" + strings.Repeat("a", 1024): "/", "/" + strings.Repeat("a", 1023): "/" + strings.Repeat("a", 1023),
-		"https://evil.test/": "/",
-		"/-/auth/logout":     "/", "/-": "/", "/-?x=1": "/", "/api/x": "/", "/API/x": "/", "/Api": "/", "/api#f": "/",
-		"/%2d/auth/logout": "/", "/%61pi/x": "/", "/%2D": "/", "/a\x7f": "/", "/a\x1f": "/",
-		"/x/../-/auth/logout": "/", "/./-/auth/logout": "/", "/%2e/-/auth/logout": "/", "/x/%2e%2e/api/v1/projects?reveal=true": "/",
-		"/a/": "/", "/%zz": "/", "/a%2fb": "/", "/caf%C3%A9": "/", "/a%5cb": "/", "/a%00": "/", "/a%7F": "/", "/x/.%2E/y": "/",
-		"/": "/", "/a/b": "/a/b", "/a%20b": "/a%20b", "/api%20": "/api%20", "/-%20": "/-%20", "/a b": "/", "/api ": "/", "/- ": "/", "/a?c=/x#y": "/a?c=/x#y", "/a?c=%20#y": "/a?c=%20#y", "/a?c= x": "/",
-		"/-x/y": "/-x/y", "/apix": "/apix",
-		"/a?u=//x": "/", "/a?x=\\": "/", "/a?x=\x7f": "/", "/a#x//y": "/", "/x/api": "/x/api", "/p?q=%2F-%2F#frag": "/p?q=%2F-%2F#frag",
-	} {
+	tb := loadSignIn(t)
+	for _, c := range tb.ReturnPaths {
+		in, want := expand(c.In, 0), expand(c.Want, 0)
 		r := tReq(h, "GET", "https://"+host+"/-/auth/login?return="+url.QueryEscape(in), nil)
 		loc, _ := url.Parse(r.Header.Get("Location"))
 		s := strings.Split(loc.Query().Get("state"), ".")
@@ -387,8 +449,8 @@ func TestFlow_ReturnPath_BothEnds(t *testing.T) {
 		}
 	}
 	// A hand-made state whose path is bad: followed as "/".
-	for _, bad := range []string{"/-/auth/logout", "/x/../-/auth/logout", "/./-/auth/logout", "/%2e/-/auth/logout",
-		"/x/%2e%2e/api/v1/projects?reveal=true", "//evil.test/x", "/api"} {
+	for _, c := range tb.Forged {
+		bad := expand(c, 0)
 		r := tReq(h, "GET", "https://"+host+"/-/auth/login", nil)
 		c := strings.SplitN(r.Header.Get("Set-Cookie"), ";", 2)[0]
 		_, f := tForm(t, tBody(t, tReq(h, "GET", r.Header.Get("Location"), nil)))
@@ -414,28 +476,30 @@ func TestFlow_Callback_RelaysAndRefuses(t *testing.T) {
 	if len(r.Header.Values("Set-Cookie")) != 0 {
 		t.Errorf("callback sets a cookie")
 	}
-	if action, _ := tForm(t, tBody(t, tReq(h, "POST", cb, url.Values{"id_token": {"x"}, "state": {"v1._.AAAAAAAAAAA.0.Lw"}}))); !strings.HasPrefix(action, "https://"+tSignIn+"/-/auth/session?at=") {
-		t.Errorf("relay for the sign-in host posts to %q", action)
-	}
-	for name, f := range map[string]url.Values{
-		"target not a ref of the table": {"id_token": {"x"}, "state": {"v1.dddddddddddddddddddd.AAAAAAAAAAA.0.Lw"}},
-		"target the studio domain":      {"id_token": {"x"}, "state": {"v1." + tStudio + ".AAAAAAAAAAA.0.Lw"}},
-		"n not 0 or 1":                  {"id_token": {"x"}, "state": {"v1." + tA + ".AAAAAAAAAAA.2.Lw"}},
-		"a not 11 base64url":            {"id_token": {"x"}, "state": {"v1." + tA + ".AAAA.0.Lw"}},
-		"p padded":                      {"id_token": {"x"}, "state": {"v1." + tA + ".AAAAAAAAAAA.0.Lw=="}},
-		"state too long":                {"id_token": {"x"}, "state": {"v1." + tA + ".AAAAAAAAAAA.0." + strings.Repeat("A", 1400)}},
-		"no state":                      {"id_token": {"x"}},
-		"issuer error":                  {"error": {"access_denied"}, "state": {st}},
-		"token alphabet":                {"id_token": {"x y"}, "state": {st}},
-		"token too long":                {"id_token": {strings.Repeat("a", 8193)}, "state": {st}},
-		"body above 16 KiB":             {"id_token": {"x"}, "state": {st}, "pad": {strings.Repeat("p", 16<<10)}},
-	} {
-		if r := tReq(h, "POST", cb, f); r.StatusCode != 400 || r.Header.Get("Location") != "" {
-			t.Errorf("%s: %d", name, r.StatusCode)
+	// The table's cases: what is relayed, and to which host, and what is refused.
+	for _, c := range loadSignIn(t).Callback {
+		form := url.Values{}
+		for k, vs := range c.Form {
+			for _, v := range vs {
+				form.Add(k, expand(v, 0))
+			}
 		}
-	}
-	if r := tReq(h, "POST", cb, url.Values{"id_token": {strings.Repeat("a", 8192)}, "state": {st}}); r.StatusCode != 200 {
-		t.Errorf("control: %d", r.StatusCode)
+		r := tReq(h, "POST", cb, form)
+		if r.StatusCode != c.Status || r.Header.Get("Location") != "" {
+			t.Errorf("%s: %d, want %d", c.Name, r.StatusCode, c.Status)
+			continue
+		}
+		if c.Status != 200 {
+			continue
+		}
+		origin := "https://" + tSignIn
+		if target := expand(c.Target, 0); target != "_" {
+			origin = "https://" + target + "." + tStudio
+		}
+		action, f := tForm(t, tBody(t, r))
+		if !strings.HasPrefix(action, origin+"/-/auth/session?at=") || f.Get("id_token") != form.Get("id_token") || f.Get("state") != form.Get("state") || len(f) != 2 {
+			t.Errorf("%s: the relay posts %v to %q", c.Name, f, action)
+		}
 	}
 	if r := tReq(h, "POST", "https://"+tA+"."+tStudio+"/-/auth/callback", url.Values{"id_token": {"x"}, "state": {st}}); r.StatusCode != 404 {
 		t.Errorf("callback on a project host: %d", r.StatusCode)
@@ -790,20 +854,21 @@ func TestFlow_SessionNotPresented(t *testing.T) {
 	ref := func(at string) []string {
 		return append(nav("same-origin"), "Referer", "https://"+host+"/-/auth/session"+at)
 	}
-	for at, want := range map[string]int{
-		fmt.Sprintf("?at=%d", now): 401, fmt.Sprintf("?at=%d", now-60): 401,
-		fmt.Sprintf("?at=%d", now-61): 302, fmt.Sprintf("?at=%d", now+1): 302, "": 302, "?at=": 302, "?at=+5": 302,
-		fmt.Sprintf("?at=%d.0", now): 302, fmt.Sprintf("?at=0%d", now): 302, fmt.Sprintf("?at=%d&x=1", now): 302,
-	} {
-		if r := tReq(m, "GET", "https://"+host+"/p", nil, ref(at)...); r.StatusCode != want {
-			t.Errorf("Referer at %q: %d, want %d", at, r.StatusCode, want)
+	// The table's forms of the mark: 401 for the session page's own address
+	// of the last minute, the redirect to sign-in for every other.
+	for _, c := range loadSignIn(t).Referers {
+		want, hdr := 302, nav("same-origin")
+		if c.Marked {
+			want = 401
+		}
+		if referer := expand(c.Referer, now); referer != "" {
+			hdr = append(hdr, "Referer", referer)
+		}
+		if r := tReq(m, "GET", "https://"+host+"/p", nil, hdr...); r.StatusCode != want {
+			t.Errorf("Referer %q: %d, want %d", c.Referer, r.StatusCode, want)
 		}
 	}
-	for _, other := range []string{"https://" + tB + "." + tStudio + "/-/auth/session", "https://" + host + "/-/auth/sessions", "https://" + host + "/x"} {
-		if r := tReq(m, "GET", "https://"+host+"/p", nil, append(nav("same-origin"), "Referer", other+fmt.Sprintf("?at=%d", now))...); r.StatusCode != 302 {
-			t.Errorf("Referer %q: %d", other, r.StatusCode)
-		}
-	}
+
 	// The sign-in host's picker the same way; and a valid session is served whatever the Referer.
 	if r := tReq(m, "GET", "https://"+tSignIn+"/", nil, append(nav("same-origin"), "Referer", fmt.Sprintf("https://%s/-/auth/session?at=%d", tSignIn, now))...); r.StatusCode != 401 {
 		t.Errorf("picker: %d", r.StatusCode)
@@ -820,34 +885,23 @@ func TestFlow_SessionNotPresented(t *testing.T) {
 
 func TestFlow_FieldsExactlyOnce_OtherMethods405(t *testing.T) {
 	h := tFlow()
+	tb := loadSignIn(t)
 	cb := "https://" + tSignIn + "/-/auth/callback"
-	st := "v1." + tA + ".AAAAAAAAAAA.0.Lw"
-	for name, body := range map[string]string{
-		"id_token twice": "id_token=a&id_token=a&state=" + st,
-		"state twice":    "id_token=a&state=" + st + "&state=" + st,
-		"error":          "id_token=a&state=" + st + "&error=x",
-		"empty error":    "id_token=a&state=" + st + "&error=",
-	} {
-		r := httptest.NewRequest("POST", cb, strings.NewReader(body))
-		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		if w.Code != 400 || w.Header().Get("Location") != "" {
-			t.Errorf("callback, %s: %d", name, w.Code)
-		}
-		r = httptest.NewRequest("POST", "https://"+tA+"."+tStudio+"/-/auth/session", strings.NewReader(strings.Replace(body, "&error=x", "", 1)))
-		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		w = httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		if name != "error" && name != "empty error" && w.Code != 400 {
-			t.Errorf("session, %s: %d", name, w.Code)
+	// The table's bodies, at the callback and at a project host's session
+	// endpoint (where, without the attempt's cookie, a body that is taken
+	// gives the retry page).
+	for _, c := range tb.Fields {
+		for u, want := range map[string]int{cb: c.Callback, "https://" + tA + "." + tStudio + "/-/auth/session": c.Session} {
+			r := httptest.NewRequest("POST", u, strings.NewReader(expand(c.Body, 0)))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != want || w.Header().Get("Location") != "" {
+				t.Errorf("%s, %s: %d, want %d", c.Name, u, w.Code, want)
+			}
 		}
 	}
-	// Other fields are ignored (control).
-	if r := tReq(h, "POST", cb, url.Values{"id_token": {"a"}, "state": {st}, "session_state": {"x"}}); r.StatusCode != 200 {
-		t.Errorf("an extra field: %d", r.StatusCode)
-	}
-	for _, m := range []string{"GET", "HEAD", "PUT", "DELETE", "OPTIONS"} {
+	for _, m := range tb.OtherMethods {
 		for _, u := range []string{cb, "https://" + tSignIn + "/-/auth/session", "https://" + tA + "." + tStudio + "/-/auth/session"} {
 			if r := tReq(h, m, u, nil); r.StatusCode != 405 || r.Header.Get("Location") != "" {
 				t.Errorf("%s %s: %d", m, u, r.StatusCode)
@@ -905,18 +959,28 @@ func TestFlow_Session_OrderAndDuplicates(t *testing.T) {
 func TestFlow_LoginCookieNames(t *testing.T) {
 	h := tFlow()
 	host := "https://" + tA + "." + tStudio
-	var cookies []string
+	tb := loadSignIn(t)
+	var cookies, others, want []string
 	for i := range 16 {
-		cookies = append(cookies, fmt.Sprintf("__Host-sp-login-x%09d=v", i)) // 10 characters
+		others = append(others, fmt.Sprintf("__Host-sp-login-x%09d=v", i)) // 10 characters
 	}
-	cookies = append(cookies, "__Host-sp-login-AAAAAAAAAAAA=v", "__Host-sp-login-AAAAAAAAAA.=v", "__host-sp-login-AAAAAAAAAAA=v")
-	r := tReq(h, "GET", host+"/-/auth/login", nil, "Cookie", strings.Join(cookies, "; "))
+	for _, c := range tb.CookieNames {
+		cookies = append(cookies, c.Name+"=v")
+		if c.Login {
+			want = append(want, c.Name+"=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None")
+		} else {
+			others = append(others, c.Name+"=v")
+		}
+	}
+	// Sixteen and more names that are no login cookies: none counted, none cleared.
+	r := tReq(h, "GET", host+"/-/auth/login", nil, "Cookie", strings.Join(others, "; "))
 	if n := len(r.Header.Values("Set-Cookie")); n != 1 {
 		t.Errorf("names that are not login cookies were counted or cleared: %q", r.Header.Values("Set-Cookie"))
 	}
-	r = tReq(h, "GET", host+"/-/auth/logout", nil, "Cookie", strings.Join(cookies, "; ")+"; __Host-sp-login-AAAAAAAAAAA=v")
-	if got := strings.Join(r.Header.Values("Set-Cookie"), "|"); got != "__Host-sp-login-AAAAAAAAAAA=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None" {
-		t.Errorf("log-out cleared %q", got)
+	// A log-out clears the table's login cookies and no other name.
+	r = tReq(h, "GET", host+"/-/auth/logout", nil, "Cookie", strings.Join(append(others, cookies...), "; "))
+	if got := r.Header.Values("Set-Cookie"); len(want) == 0 || strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("log-out cleared %q, want %q", got, want)
 	}
 }
 

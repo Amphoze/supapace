@@ -136,8 +136,14 @@ const (
 	wantPublic    = "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
 	wantAssertion = "v1.eyJub2RlIjoibG9jYWwiLCJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwibmFtZSI6IkFkYSIsInJlZiI6ImFiY2RlZmdoaWowMTIzNDU2Nzg5Iiwicm9sZSI6Im93bmVyIiwicHVycG9zZSI6IiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDMwfQ.u-NX6bjeGRKmR--hl925dkQF5L7xolUDIL8IutaHHDCM6Bro_nbKj2SLogjhJNIpFWCN9tYXjYm7E0cEslruCQ"
 	wantSession   = "v1.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwibmFtZSI6IkFkYSIsInJlZiI6ImFiY2RlZmdoaWowMTIzNDU2Nzg5IiwiaWF0IjoxODAwMDAwMDAwLCJleHAiOjE4MDAwMjg4MDB9.yKaMO7c58uqlh301A_Ww5vuECs9uP4mpBbgtH_Wqd4VOg9H_D6OOrXtfl5Ojte-1zRV2AovaZ_5NnrYo_WIHBw"
-	wantTicket    = "v1.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwicmVmcyI6WyJhYmNkZWZnaGlqMDEyMzQ1Njc4OSIsImJjZGVmZ2hpajAxMjM0NTY3ODlhIl0sImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDYwfQ.QEl0ba6GAYbQ6effdDziYy-qPSMm2P6o01VS19DNzM5k8dfMMud0WhosA9U4ZdNkmRQtLn7Kk1bKMW4Lb728Ag"
-	wantNonce     = "6oZqdX5MOLq_qBJ8vppAnT4fk6AP8UiP9zX8-Rev_9A"
+	wantTicket    = "v1.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwicmVmcyI6WyJhYmNkZWZnaGlqMDEyMzQ1Njc4OSIsImJjZGVmZ2hpajAxMjM0NTY3ODlhIl0sIm1vcmUiOmZhbHNlLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDA2MH0._twk6vOk39Ukg4_cltvF3UvSglLnsFJ5G3PPGxyEWs6vtRG_RZKki4Mdv8dxAiG1-9MlebgAkTLHX9Ly-_L8Dg"
+	// The same ticket with "more" true.
+	wantTicketMore = "v1.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwicmVmcyI6WyJhYmNkZWZnaGlqMDEyMzQ1Njc4OSIsImJjZGVmZ2hpajAxMjM0NTY3ODlhIl0sIm1vcmUiOnRydWUsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDYwfQ.FzJMQqoZVmU_zNwNyPult2o0eT3fW1Nl7yMkBH0ubs-8y_3CE-iQJyOWK0-kep4nO-DQ6piMnloWKfYMgmVKDA"
+	// The ticket of the five-member format, validly signed: refused since
+	// the member "more" is required.
+	oldTicket = "v1.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwicmVmcyI6WyJhYmNkZWZnaGlqMDEyMzQ1Njc4OSIsImJjZGVmZ2hpajAxMjM0NTY3ODlhIl0sImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDYwfQ.QEl0ba6GAYbQ6effdDziYy-qPSMm2P6o01VS19DNzM5k8dfMMud0WhosA9U4ZdNkmRQtLn7Kk1bKMW4Lb728Ag"
+
+	wantNonce = "6oZqdX5MOLq_qBJ8vppAnT4fk6AP8UiP9zX8-Rev_9A"
 )
 
 func TestVectors_SignGivesExactlyTheVector(t *testing.T) {
@@ -150,14 +156,16 @@ func TestVectors_SignGivesExactlyTheVector(t *testing.T) {
 	if !bytes.Equal(priv.Seed(), seed) || !bytes.Equal(priv.Public().(ed25519.PublicKey), pub) {
 		t.Fatal("private file, public file and seed disagree")
 	}
-	want := map[string]string{"assertion": wantAssertion, "session": wantSession, "ticket": wantTicket}
+	// In file order: the ticket twice, "more" false and then true.
+	want := []string{wantAssertion, wantSession, wantTicket, wantTicketMore}
+	kinds := []string{"assertion", "session", "ticket", "ticket"}
 	labels := map[string]string{"assertion": "supapace-assertion-v1.", "session": "supapace-session-v1.", "ticket": "supapace-logout-v1."}
-	if len(v.Tokens) != 3 {
-		t.Fatalf("%d tokens, want 3", len(v.Tokens))
+	if len(v.Tokens) != len(want) {
+		t.Fatalf("%d tokens, want %d", len(v.Tokens), len(want))
 	}
-	for _, tc := range v.Tokens {
-		if tc.Token != want[tc.Kind] || tc.Label != labels[tc.Kind] {
-			t.Fatalf("%s: vector file token or label differs from the fixed one", tc.Kind)
+	for i, tc := range v.Tokens {
+		if tc.Kind != kinds[i] || tc.Token != want[i] || tc.Label != labels[tc.Kind] {
+			t.Fatalf("token %d (%s): vector file kind, token or label differs from the fixed one", i, tc.Kind)
 		}
 		if p := strings.Split(tc.Token, ".")[1]; base64.RawURLEncoding.EncodeToString([]byte(tc.Payload)) != p {
 			t.Fatalf("%s: payload does not encode to the token's", tc.Kind)
@@ -223,9 +231,13 @@ func TestVerify_RefusesEveryListedCase(t *testing.T) {
 	}
 	for _, kind := range []string{"assertion", "session", "ticket"} {
 		cases := requiredCases
-		if kind == "assertion" {
+		switch kind {
+		case "assertion":
 			cases = append(cases[:len(cases):len(cases)], "node")
+		case "ticket":
+			cases = append(cases[:len(cases):len(cases)], "more-missing", "more-null", "more-zero", "more-string", "more-after-iat")
 		}
+
 		for _, c := range cases {
 			if !seen[kind+"/"+c] {
 				t.Errorf("vector file lacks %s/%s", kind, c)
@@ -253,7 +265,7 @@ func TestVerify_NoKindPassesAsAnother(t *testing.T) {
 			}
 		}
 	}
-	if n != 6 {
+	if n != 8 {
 		t.Fatalf("%d cross checks", n)
 	}
 }
@@ -454,7 +466,7 @@ func TestTicket_AtMostSixteenRefs(t *testing.T) {
 		{"seventeen", refsN(17), ErrField},
 		{"none", []string{}, ErrField},
 		{"null", nil, ErrField},
-		{"apex is not a hop", []string{ref1, "_"}, ErrField},
+		{"the sign-in host is not a hop", []string{ref1, "_"}, ErrField},
 		{"bad ref", []string{"ABCDEFGHIJ0123456789"}, ErrField},
 	} {
 		tk := baseTicket()
@@ -494,6 +506,59 @@ func TestTicket_AtMostSixteenRefs(t *testing.T) {
 		}
 		if _, err := VerifyTicket(vPub, tok, at(t0)); !errors.Is(err, c.want) || (err == nil) != (c.want == nil) {
 			t.Errorf("%s: got %v, want %v", c.name, err, c.want)
+		}
+	}
+}
+
+// TestTicket_MoreIsRequiredAndKept: the ticket's "more" is a boolean, always
+// present, between refs and iat. Both values round-trip and give the two
+// fixed vectors; a payload without it, with a further member, with anything
+// but true or false there, or with it out of its place is refused.
+func TestTicket_MoreIsRequiredAndKept(t *testing.T) {
+	for more, want := range map[bool]string{false: wantTicket, true: wantTicketMore} {
+		tk := baseTicket()
+		tk.More = more
+		tok, err := SignTicket(vPriv, tk)
+		if err != nil || tok != want {
+			t.Fatalf("more %v: Sign = %q, %v\nwant %q", more, tok, err, want)
+		}
+		got, err := VerifyTicket(vPub, tok, at(t0+10))
+		if err != nil || got.More != more || !equal(got, tk) {
+			t.Fatalf("more %v: Verify = %+v, %v", more, got, err)
+		}
+	}
+	const good = `{"iss":"https://issuer.test","sub":"user-1","refs":["abcdefghij0123456789","bcdefghij0123456789a"],"more":false,"iat":1800000000,"exp":1800000060}`
+	if tok := signRaw(logoutLabel, good); tok != wantTicket {
+		t.Fatalf("control: the payload does not sign to the vector: %q", tok)
+	}
+	if _, err := VerifyTicket(vPub, oldTicket, at(t0+10)); !errors.Is(err, ErrField) {
+		t.Errorf("the five-member ticket under a valid signature: got %v, want ErrField", err)
+	}
+	const refs = `"refs":["abcdefghij0123456789","bcdefghij0123456789a"]`
+	for name, payload := range map[string]string{
+		"without more":    strings.Replace(good, `"more":false,`, "", 1),
+		"a seventh":       strings.Replace(good, `}`, `,"all":true}`, 1),
+		"more null":       strings.Replace(good, `"more":false`, `"more":null`, 1),
+		"more 0":          strings.Replace(good, `"more":false`, `"more":0`, 1),
+		"more 1":          strings.Replace(good, `"more":false`, `"more":1`, 1),
+		"more a string":   strings.Replace(good, `"more":false`, `"more":"true"`, 1),
+		"more after iat":  strings.Replace(good, `"more":false,"iat":1800000000`, `"iat":1800000000,"more":false`, 1),
+		"more before":     strings.Replace(good, refs+`,"more":false`, `"more":false,`+refs, 1),
+		"more twice":      strings.Replace(good, `"more":false`, `"more":false,"more":false`, 1),
+		"more, then true": strings.Replace(good, `"more":false`, `"more":false,"more":true`, 1),
+		"More":            strings.Replace(good, `"more"`, `"More"`, 1),
+		"more capital":    strings.Replace(good, `"more":false`, `"more":False`, 1),
+	} {
+		if payload == good {
+			t.Fatalf("%s: the case changes nothing", name)
+		}
+		_, err := VerifyTicket(vPub, signRaw(logoutLabel, payload), at(t0+10))
+		want := ErrField
+		if name == "more capital" { // not JSON
+			want = ErrMalformed
+		}
+		if !errors.Is(err, want) {
+			t.Errorf("%s: got %v, want %v", name, err, want)
 		}
 	}
 }
@@ -680,7 +745,12 @@ func TestVectors_UpdateRefused(t *testing.T) {
 	v := loadVectors(t)
 	v.Refused = nil
 	labels := map[string]string{"assertion": assertionLabel, "session": sessionLabel, "ticket": logoutLabel}
+	done := map[string]bool{}
 	for _, tc := range v.Tokens {
+		if done[tc.Kind] { // the cases derive from each kind's first token
+			continue
+		}
+		done[tc.Kind] = true
 		label := labels[tc.Kind]
 		add := func(c, tok string, now int64, e string) {
 			v.Refused = append(v.Refused, vecRefused{Kind: tc.Kind, Case: c, Token: tok, Now: now, Error: e})
@@ -769,6 +839,16 @@ func TestVectors_UpdateRefused(t *testing.T) {
 			add("name-line-separator-raw", signRaw(label, strings.Replace(p, `"name":"Ada"`, "\"name\":\"A\u2028da\"", 1)), now, "ErrField")
 			add("name-line-separator-escaped", signRaw(label, strings.Replace(p, `"name":"Ada"`, `"name":"A\u2028da"`, 1)), now, "ErrField")
 		}
+		if tc.Kind == "ticket" {
+			// "more" is required, a boolean, in its place: the ticket of the
+			// five-member format is refused under its valid signature.
+			add("more-missing", oldTicket, now, "ErrField")
+			add("more-null", signRaw(label, with(map[string]string{"more": "null"})), now, "ErrField")
+			add("more-zero", signRaw(label, with(map[string]string{"more": "0"})), now, "ErrField")
+			add("more-string", signRaw(label, with(map[string]string{"more": `"true"`})), now, "ErrField")
+			iatText := `"iat":` + strconv.FormatInt(iat, 10)
+			add("more-after-iat", signRaw(label, strings.Replace(p, `"more":false,`+iatText, iatText+`,"more":false`, 1)), now, "ErrField")
+		}
 		// A validly signed token of exactly 4096 bytes passes the size check
 		// and is refused for its extra member; one byte more is refused first.
 		for _, size := range []int{4096, 4097} {
@@ -855,7 +935,7 @@ func TestSign_LargestPayloadFits(t *testing.T) {
 	name := strings.Repeat("\\", 128)
 	a := Assertion{Node: long, Iss: long, Sub: long, Name: name, Ref: ref1,
 		Role: "read_only", Purpose: "reveal", Iat: math.MinInt64 + 1, Exp: math.MinInt64 + 2}
-	tk := Ticket{Iss: long, Sub: long, Refs: refsN(16), Iat: math.MinInt64, Exp: math.MinInt64}
+	tk := Ticket{Iss: long, Sub: long, Refs: refsN(16), More: false, Iat: math.MinInt64, Exp: math.MinInt64} // "false" is the longer value
 	for _, tok := range []func() (string, error){
 		func() (string, error) { return SignAssertion(vPriv, a) },
 		func() (string, error) { return SignTicket(vPriv, tk) },

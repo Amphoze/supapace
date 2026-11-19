@@ -8,7 +8,7 @@ import (
 // FuzzVerify feeds arbitrary strings to the three verifiers and the two key
 // file parsers: none may panic, and whatever one accepts re-signs to itself.
 func FuzzVerify(f *testing.F) {
-	v := []string{wantAssertion, wantSession, wantTicket, "", "v1..", "v1.e30." + wantTicket[len(wantTicket)-86:]}
+	v := []string{wantAssertion, wantSession, wantTicket, wantTicketMore, oldTicket, "", "v1..", "v1.e30." + wantTicket[len(wantTicket)-86:]}
 	for _, s := range v {
 		f.Add(s)
 	}
@@ -41,6 +41,8 @@ func FuzzPayload(f *testing.F) {
 	for _, s := range []string{
 		`{"node":"local","iss":"https://issuer.test","sub":"user-1","name":"Ada","ref":"abcdefghij0123456789","role":"owner","purpose":"","iat":1800000000,"exp":1800000030}`,
 		`{"iss":"https://issuer.test","sub":"user-1","name":"Ada","ref":"abcdefghij0123456789","iat":1800000000,"exp":1800028800}`,
+		`{"iss":"https://issuer.test","sub":"user-1","refs":["abcdefghij0123456789","bcdefghij0123456789a"],"more":false,"iat":1800000000,"exp":1800000060}`,
+		`{"iss":"https://issuer.test","sub":"user-1","refs":["abcdefghij0123456789","bcdefghij0123456789a"],"more":true,"iat":1800000000,"exp":1800000060}`,
 		`{"iss":"https://issuer.test","sub":"user-1","refs":["abcdefghij0123456789","bcdefghij0123456789a"],"iat":1800000000,"exp":1800000060}`,
 		`{"iss":"https://issuer.test","\u017fub":"user-1","name":"A\u2028da","ref":"abcdefghij0123456789","iat":-0,"exp":1800028800}`,
 		`{"iss":"https://issuer.test","sub":"user-1","SUB":"user-2","name":"A\ud800","ref":"abcdefghij0123456789","iat":1e9,"exp":1800028800}`,
