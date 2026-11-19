@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -33,9 +34,11 @@ var (
 	pgDial             = pgsock.Dial
 	pgProcStart        = pgsock.ProcStart
 	bootstrapRun       = bootstrap.Run
-	bootstrapAssert    = bootstrap.Assert
+	bootstrapAssert    = bootstrap.AssertPins
 	bootstrapAssertHBA = bootstrap.AssertHBA
-	archiverFailures   = queryArchiverFailures
+
+	bootstrapGrantBackup         = bootstrap.GrantBackup
+	bootstrapResetStatementStats = bootstrap.ResetStatementStats
 
 	readyPoll  = time.Second       // between two login attempts while a cluster starts
 	phaseAWait = 120 * time.Second // the first-boot server must answer within this
@@ -71,6 +74,8 @@ func (a *Agent) clusterSpec(s Spec) error {
 //   - "A-done": the first phase-B start — the container is started on
 //     proj-<ref> with the platform's pg_hba, the assertion blocks, and
 //     state.json becomes "B" with the postmaster's pid and start time;
+//   - "R" (a recovery start): never adopted; any pg-<ref> is removed and a
+//     normal start records "B";
 //   - "B": a running container is adopted, untouched, only when its labels
 //     (generation, epoch, phase, image, configuration hash recomputed from the
 //     files on disk), state.json, its pid and that pid's start time all agree
@@ -98,7 +103,7 @@ func (a *Agent) EnsureCluster(ctx context.Context, s Spec) error {
 		return err
 	}
 	if have {
-		return a.clusterPhaseB(ctx, s, st) // the reader admits A-done and B only
+		return a.clusterPhaseB(ctx, s, st) // the reader admits A-done, B and R
 	}
 	if !s.FirstBoot {
 		return fmt.Errorf("agent: %s: no state file, and this is not the project's create: refusing a first boot, which would empty its data directory", s.Ref)
@@ -130,7 +135,7 @@ func (a *Agent) clusterPhaseA(ctx context.Context, s Spec) error {
 	}
 	err = bootstrapRun(ctx, conn, s.Secrets)
 	if err == nil {
-		err = a.blockingAssert(ctx, conn, s.Ref, false)
+		err = a.blockingAssert(ctx, conn, s, false)
 	}
 	closeSession(conn)
 	if err != nil {
@@ -144,6 +149,13 @@ func (a *Agent) clusterPhaseA(ctx context.Context, s Spec) error {
 
 func (a *Agent) clusterPhaseB(ctx context.Context, s Spec, st State) error {
 	first := st.Phase == PhaseADone
+	// A running cluster sees a new archive binary through its tools mount:
+	// it is put in place before the adoption, which it does not affect.
+	if s.Layout == 2 {
+		if err := a.ensureArchBinary(s.Ref); err != nil {
+			return err
+		}
+	}
 	c, err := dockerInspectContainer(ctx, clusterName(s.Ref))
 	if err != nil {
 		return err
@@ -208,7 +220,7 @@ func (a *Agent) clusterPhaseB(ctx context.Context, s Spec, st State) error {
 	if err != nil {
 		return err
 	}
-	err = a.blockingAssert(ctx, conn, s.Ref, true)
+	err = a.blockingAssert(ctx, conn, s, true)
 	closeSession(conn)
 	if err != nil {
 		return fmt.Errorf("agent: %s: first start: %w", s.Ref, err)
@@ -220,7 +232,7 @@ func (a *Agent) clusterPhaseB(ctx context.Context, s Spec, st State) error {
 // the desired epoch: the caller's checks) describes, at the desired
 // generation, image and configuration.
 func (a *Agent) clusterAdoptable(s Spec, st State, c *dockerx.Container) bool {
-	if !c.Running || st.Generation != s.Generation || st.PMPid != c.Pid {
+	if !c.Running || st.Phase != PhaseB || st.Generation != s.Generation || st.PMPid != c.Pid {
 		return false
 	}
 	args, err := a.clusterRunArgs(s, true)
@@ -361,13 +373,14 @@ func closeSession(c *pgx.Conn) {
 }
 
 // clusterAssert runs the assertion (and with hba AssertHBA) against the rendered
-// files as they are on disk.
-func (a *Agent) clusterAssert(ctx context.Context, conn *pgx.Conn, ref string, hba bool) ([]nodecfg.CheckResult, error) {
+// files as they are on disk, with the names the layout sets on the command
+// line (layout 0 is rendered as layout 1).
+func (a *Agent) clusterAssert(ctx context.Context, conn *pgx.Conn, s Spec, hba bool) ([]nodecfg.CheckResult, error) {
 	bl, err := clusterBaseline()
 	if err != nil {
 		return nil, err
 	}
-	r := a.p.RenderDir(ref)
+	r := a.p.RenderDir(s.Ref)
 	var out []nodecfg.CheckResult
 	if hba {
 		rendered, err := os.ReadFile(filepath.Join(r, "pg_hba.conf"))
@@ -384,13 +397,13 @@ func (a *Agent) clusterAssert(ctx context.Context, conn *pgx.Conn, ref string, h
 	if err != nil {
 		return nil, err
 	}
-	f, err := bootstrapAssert(ctx, conn, bl, conf)
+	f, err := bootstrapAssert(ctx, conn, bl, conf, pgconf.PinnedNames(max(s.Layout, 1)))
 	return append(out, f...), err
 }
 
 // blockingAssert is the create-time assertion: any finding is ErrAssertion.
-func (a *Agent) blockingAssert(ctx context.Context, conn *pgx.Conn, ref string, hba bool) error {
-	findings, err := a.clusterAssert(ctx, conn, ref, hba)
+func (a *Agent) blockingAssert(ctx context.Context, conn *pgx.Conn, s Spec, hba bool) error {
+	findings, err := a.clusterAssert(ctx, conn, s, hba)
 	if err != nil {
 		return err
 	}
@@ -408,10 +421,10 @@ func (a *Agent) blockingAssert(ctx context.Context, conn *pgx.Conn, ref string, 
 }
 
 // CheckCluster runs, in one session to the recorded postmaster, the
-// operational facts — the SCRAM login within its bounds and
-// pg_stat_archiver.failed_count = 0 — and the assertion. The error is the
-// operational verdict; the findings are the project's drift and gate
-// nothing.
+// operational fact — the SCRAM login within its bounds — and the assertion
+// with the names the layout pins. The error is the operational verdict (or a
+// failed statement); the findings are the project's drift and gate nothing.
+// Nothing the server says about its archiving is read.
 func (a *Agent) CheckCluster(ctx context.Context, s Spec) ([]nodecfg.CheckResult, error) {
 	if err := a.clusterSpec(s); err != nil {
 		return nil, err
@@ -431,27 +444,11 @@ func (a *Agent) CheckCluster(ctx context.Context, s Spec) ([]nodecfg.CheckResult
 		return nil, fmt.Errorf("agent: %s: %w", s.Ref, err)
 	}
 	defer closeSession(conn)
-	var opErr error
-	n, err := archiverFailures(ctx, conn)
-	if err != nil { // the session is finished: no further statement on it
-		return nil, fmt.Errorf("agent: %s: archiver: %w", s.Ref, err)
-	}
-	if n != 0 {
-		opErr = fmt.Errorf("agent: %s: pg_stat_archiver.failed_count is %d", s.Ref, n)
-	}
-	drift, err := a.clusterAssert(ctx, conn, s.Ref, true)
+	drift, err := a.clusterAssert(ctx, conn, s, true)
 	if err != nil {
-		err = fmt.Errorf("agent: %s: %w", s.Ref, err)
+		return drift, fmt.Errorf("agent: %s: %w", s.Ref, err)
 	}
-	return drift, errors.Join(opErr, err)
-}
-
-func queryArchiverFailures(ctx context.Context, c *pgx.Conn) (int64, error) {
-	sctx, cancel := pgsock.Stmt(ctx, pgsock.DefaultBudget)
-	defer cancel()
-	var n int64
-	err := c.QueryRow(sctx, "select failed_count from pg_catalog.pg_stat_archiver").Scan(&n)
-	return n, pgsock.Clean(err)
+	return drift, nil
 }
 
 // VerifyCluster is CheckCluster with the drift logged (WARN, per finding):
@@ -497,7 +494,7 @@ func (a *Agent) removeCluster(ctx context.Context, ref string) error {
 	return err
 }
 
-// labelPhase carries a cluster container's phase, A or B.
+// labelPhase carries a cluster container's phase: A, B or R (a recovery start).
 const labelPhase = "supapace.phase"
 
 // clusterLabels are the labels of a cluster container but the configuration
@@ -524,7 +521,10 @@ func (a *Agent) removeRefusedCluster(ctx context.Context, ref string, refusal er
 }
 
 // clusterRunArgs is the `docker create` argv of pg-<ref> in phase A or B; in
-// phase B it carries the configuration label (clusterConfigLabel).
+// phase B it carries the configuration label (clusterConfigLabel). Layout 2
+// adds the spool and restore-spool mounts after the tools mount and the
+// pinned settings (pgconf.Pins) after the image's; layouts 0 and 1 are
+// rendered as before archiving existed.
 func (a *Agent) clusterRunArgs(s Spec, phaseB bool) ([]string, error) {
 	bl, err := clusterBaseline()
 	if err != nil {
@@ -569,6 +569,14 @@ func (a *Agent) clusterRunArgs(s Spec, phaseB bool) ([]string, error) {
 		"-v", r+"/conf.d:"+f.IncludeDir+":ro",
 		"-v", r+"/supautils.conf:"+f.SupautilsConf+":ro",
 		"-v", r+"/tools:/opt/supapace/tools:ro")
+	if s.Layout == 2 {
+		args = append(args, "-v", pd+"/spool:/opt/supapace/spool", "-v", pd+"/rspool:/opt/supapace/rspool")
+		pins, err := pgconf.Pins(s.GUC)
+		if err != nil {
+			return nil, err
+		}
+		cmdline = append(cmdline, pins...)
+	}
 	if phaseB {
 		args = append(args, "-v", r+"/pg_hba.conf:"+f.HBAFile+":ro", "-v", r+"/pg_ident.conf:"+f.IdentFile+":ro")
 	}
@@ -651,6 +659,11 @@ func (a *Agent) renderCluster(s Spec) error {
 			return err
 		}
 	}
+	if s.Layout == 2 {
+		if err := a.ensureArchBinary(s.Ref); err != nil {
+			return err
+		}
+	}
 	key := filepath.Join(r, "pgsodium_root.key")
 	fi, err := os.Lstat(key)
 	switch {
@@ -689,7 +702,12 @@ func (a *Agent) renderConfD(dir string, s Spec) error {
 	if err := pgconf.SortsLast(names); err != nil {
 		return err
 	}
-	if want[pgconf.OverrideFile], err = pgconf.Overrides(s.GUC, s.MemMB); err != nil {
+	// Layout 2 sets the archive and connection settings on the command line.
+	overrides := pgconf.Overrides
+	if s.Layout == 2 {
+		overrides = pgconf.OverridesPinned
+	}
+	if want[pgconf.OverrideFile], err = overrides(s.GUC, s.MemMB); err != nil {
 		return err
 	}
 	if err := ensureDir(dir, 0o755, -1, -1); err != nil {
@@ -740,4 +758,81 @@ func labelValue(args []string, key string) string {
 		}
 	}
 	return ""
+}
+
+// archBinary is the archive binary's name, beside the daemon's executable and
+// in a project's tools directory.
+const archBinary = "supapace-arch"
+
+// ensureArchBinary copies the archive binary from beside the daemon's
+// executable into the project's tools directory (root 0555), through a
+// temporary name and a rename, when it differs from the copy there.
+// The configuration label does not cover it: a running cluster sees the new
+// file through its read-only tools mount and stays adoptable.
+func (a *Agent) ensureArchBinary(ref string) error {
+	exe, err := daemonExe()
+	if err != nil {
+		return fmt.Errorf("agent: own executable: %w", err)
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(exe), archBinary))
+	if err != nil {
+		return fmt.Errorf("agent: archive binary: %w", err)
+	}
+	r := a.p.RenderDir(ref)
+	tools := filepath.Join(r, "tools")
+	for _, d := range []string{filepath.Dir(r), r, tools} {
+		if err := ensureDir(d, 0o755, -1, -1); err != nil {
+			return err
+		}
+	}
+	if have, err := os.ReadFile(filepath.Join(tools, archBinary)); err == nil && bytes.Equal(have, src) {
+		return nil
+	}
+	return writeFile(a.p, tools, archBinary, src, 0o555, os.Geteuid(), os.Getegid())
+}
+
+// RenderCluster writes the project's platform files (the archive binary
+// among them at layout 2) without starting anything: the restore's first
+// step on a node that holds nothing of the project.
+func (a *Agent) RenderCluster(ctx context.Context, s Spec) error {
+	if err := a.clusterSpec(s); err != nil {
+		return err
+	}
+	return a.renderCluster(s)
+}
+
+// GrantBackupRole gives the backup role its inheriting grant in one SCRAM
+// session as the platform's superuser to the recorded postmaster, then
+// resets the statement statistics in the same session: a cluster created
+// before backups still holds its first boot's statements there. The reset is
+// best effort and logged; the grant's error is the call's.
+func (a *Agent) GrantBackupRole(ctx context.Context, s Spec) error {
+	if err := a.clusterSpec(s); err != nil {
+		return err
+	}
+	st, have, err := a.readState(s.Ref)
+	if err != nil {
+		return err
+	}
+	if err := checkState(st, have, s); err != nil {
+		return err
+	}
+	if !have || st.Phase != PhaseB {
+		return fmt.Errorf("agent: %s: cluster not started in phase B", s.Ref)
+	}
+	conn, err := pgDial(ctx, a.clusterTarget(s, st, false))
+	if err != nil {
+		return fmt.Errorf("agent: %s: %w", s.Ref, err)
+	}
+	defer closeSession(conn)
+	if err := bootstrapGrantBackup(ctx, conn); err != nil {
+		return fmt.Errorf("agent: %s: backup role grant: %w", s.Ref, err)
+	}
+	switch reset, err := bootstrapResetStatementStats(ctx, conn); {
+	case err != nil:
+		slog.Warn("statement statistics not reset", "ref", s.Ref, "error", pgsock.Sanitize(err.Error(), 256))
+	case !reset:
+		slog.Info("statement statistics not reset: the function is not there", "ref", s.Ref)
+	}
+	return nil
 }

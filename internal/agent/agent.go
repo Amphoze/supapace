@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,7 +71,7 @@ type Spec struct {
 	DiskQuotaMB, MemMB, Pids int
 	GUC                      map[string]string
 	UserRoles                []string
-	Secrets                  bootstrap.Secrets
+	Secrets                  bootstrap.Secrets `json:"-"`
 	Keys                     []jwtx.Key
 	// HealthWait bounds the wait for a SCRAM login after a networked start or
 	// an adoption: zero means 120 s, negative means no wait — except the first
@@ -88,12 +89,16 @@ type Spec struct {
 	OpsSpec            // the operability fields (spec_ops.go)
 }
 
-// String and GoString keep the secrets out of every fmt verb and log line.
+// String, GoString and Format keep the secrets out of every fmt verb and log
+// line; JSON leaves them out. A Spec held in an unexported field of a printed
+// struct is printed by reflection, raw: never print such a struct.
 func (s Spec) String() string {
 	return fmt.Sprintf("agent.Spec{Ref:%s Epoch:%d Generation:%d SubnetIndex:%d}", s.Ref, s.Epoch, s.Generation, s.SubnetIndex)
 }
 
 func (s Spec) GoString() string { return s.String() }
+
+func (s Spec) Format(f fmt.State, _ rune) { io.WriteString(f, s.String()) }
 
 var refRE = regexp.MustCompile(`^[a-z0-9]{20}$`)
 

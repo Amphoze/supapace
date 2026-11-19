@@ -12,13 +12,15 @@ import (
 	"time"
 
 	"github.com/Amphoze/supapace/internal/dockerx"
+	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/nodefs"
 	"github.com/Amphoze/supapace/internal/pgsock"
 )
 
 // The task containers — the phase-A data wipe, the restart's configuration
-// check and the purge of a project's tree — run the cluster image at the
-// project's uid with the hardening of every container, no network and no
+// check, the purge of a project's tree, the spool directories of a project
+// made before them and the purges of its repository directories — run the cluster image at the
+// project's uid (a repository's fetch/ at the replicator's) with the hardening of every container, no network and no
 // restart policy, detached and named task-<ref>-<kind>. They attach to
 // nothing, so they are not gated. Each is polled, and removed by name when
 // it ends or when its deadline passes (stopping the CLI client would not
@@ -26,6 +28,8 @@ import (
 var (
 	daemonExe             = os.Executable // the tree-removal helper (`supapaced rmtree`), mounted read-only
 	removeEmptyProjectDir = nodefs.RemoveEmptyProjectDir
+	removeEmptyRepoDirs   = nodefs.RemoveEmptyRepoDirs
+	removeEmptyFetchDir   = nodefs.RemoveEmptyFetchDir
 	dockerRunOutput       = dockerx.RunOutput // docker logs: the task's stdout and stderr
 
 	taskPoll    = time.Second
@@ -276,4 +280,170 @@ func (a *Agent) PurgeDir(ctx context.Context, s Spec) error {
 		return taskFailed("purge", s, code, out)
 	}
 	return removeEmptyProjectDir(a.p, s.Ref)
+}
+
+// WipeData empties the project's data directory at the project's uid, as
+// the first boot does (wipeData).
+func (a *Agent) WipeData(ctx context.Context, s Spec) error {
+	if err := checkTaskSpec(s); err != nil {
+		return err
+	}
+	return a.wipeData(ctx, s)
+}
+
+func checkTaskSpec(s Spec) error {
+	if err := checkRef(s.Ref); err != nil {
+		return err
+	}
+	if s.UID <= 0 || s.GID <= 0 {
+		return fmt.Errorf("agent: %s: spec lacks the project's ids", s.Ref)
+	}
+	return nil
+}
+
+// EnsureSpoolDirs creates the spool directories of a project directory made
+// before them (spool, rspool, rspool/req, rspool/out, mode 0700) by a task
+// at the project's uid mounting the project directory: root creates nothing
+// inside it. Existing directories are left as they are. Without the project
+// directory nothing is launched (a mount of a missing path would create it
+// as root).
+func (a *Agent) EnsureSpoolDirs(ctx context.Context, s Spec) error {
+	if err := checkTaskSpec(s); err != nil {
+		return err
+	}
+	pd := a.p.ProjectDir(s.Ref)
+	if fi, err := os.Lstat(pd); err != nil || !fi.IsDir() {
+		return fmt.Errorf("agent: %s: project directory missing or not a directory", s.Ref)
+	}
+	code, out, err := a.runTask(ctx, s, "spool", []string{"-v", pd + ":/p"}, "mkdir",
+		"-p", "-m", "0700", "/p/spool", "/p/rspool", "/p/rspool/req", "/p/rspool/out")
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return taskFailed("spool", s, code, out)
+	}
+	return nil
+}
+
+// PurgeRepo removes the project's repository directories: repo/ is emptied
+// by a task at the project's uid and fetch/ by one at the replicator's uid
+// (with the project's group), each mounting <repo>/<ref> — root's, so
+// neither can replace an entry of it — then root removes repo/, fetch/ and
+// <repo>/<ref> once empty, non-recursively. Both of the uid's quotas are
+// cleared first (a full quota could keep the helper from emptying), so the
+// call refuses while any job container of the project exists, or its
+// cluster or PostgREST container. An absent directory is done: nothing is
+// launched for it. Without <repo>/<ref> (a node that holds nothing of the
+// project) nothing is launched; at layout 2 the repository quota is still
+// cleared, which fails on an absent or untrusted repository root, and at
+// layouts 0 and 1 (nodes without a repository filesystem) nothing at all is
+// done.
+func (a *Agent) PurgeRepo(ctx context.Context, s Spec) error {
+	if err := checkTaskSpec(s); err != nil {
+		return err
+	}
+	if err := a.refuseWhileContainers(ctx, s.Ref); err != nil {
+		return err
+	}
+	if present, err := dirPresent(a.p.RepoDir(s.Ref)); err != nil || !present {
+		if err == nil && s.Layout == 2 {
+			// nodefs refuses an absent or untrusted repository root: an
+			// unmounted repository filesystem is not a purged repository.
+			err = repoSetQuota(a.p.RepoRoot(), s.UID, 0)
+		}
+		return err
+	}
+	if err := setQuota(a.p, s.UID, 0); err != nil {
+		return err
+	}
+	if err := repoSetQuota(a.p.RepoRoot(), s.UID, 0); err != nil {
+		return err
+	}
+	if _, err := a.purgeRepoDir(ctx, s, "repo", s.UID); err != nil {
+		return err
+	}
+	if _, err := a.purgeRepoDir(ctx, s, "fetch", nodecfg.ReplicatorUID); err != nil {
+		return err
+	}
+	return removeEmptyRepoDirs(a.p, s.Ref)
+}
+
+// RemoveFetch removes the project's fetch/ only: emptied by a task at the
+// replicator's uid, then removed by root non-recursively. repo/ and
+// <repo>/<ref> are never touched — the next push needs both. Absent, it is
+// done.
+func (a *Agent) RemoveFetch(ctx context.Context, s Spec) error {
+	if err := checkTaskSpec(s); err != nil {
+		return err
+	}
+	launched, err := a.purgeRepoDir(ctx, s, "fetch", nodecfg.ReplicatorUID)
+	if err != nil || !launched {
+		return err
+	}
+	return removeEmptyFetchDir(a.p, s.Ref)
+}
+
+// purgeRepoDir empties <repo>/<ref>/<dir> at uid (and the project's gid) by
+// the tree-removal helper; launched is false when the directory is absent.
+func (a *Agent) purgeRepoDir(ctx context.Context, s Spec, dir string, uid int) (launched bool, err error) {
+	rd := a.p.RepoDir(s.Ref)
+	if present, err := dirPresent(filepath.Join(rd, dir)); err != nil || !present {
+		return false, err
+	}
+	flags, err := helperMount()
+	if err != nil {
+		return false, err
+	}
+	ts := s
+	ts.UID = uid
+	kind := "purge-" + dir
+	code, out, err := a.runTask(ctx, ts, kind, append(flags, "-v", rd+":/r"), "/supapaced", "rmtree", "--keep-root", "/r/"+dir)
+	if err != nil {
+		return true, err
+	}
+	if code != 0 {
+		return true, taskFailed(kind, s, code, out)
+	}
+	return true, nil
+}
+
+// dirPresent: false when path (or a parent) does not exist; an error when
+// it is anything but a directory.
+func dirPresent(path string) (bool, error) {
+	fi, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, err
+	case !fi.IsDir():
+		return false, fmt.Errorf("agent: %s is not a directory", path)
+	}
+	return true, nil
+}
+
+// refuseWhileContainers refuses while a job container of the project, in
+// any state, or its cluster or PostgREST container exists. A failed read is
+// an error.
+func (a *Agent) refuseWhileContainers(ctx context.Context, ref string) error {
+	jobs, err := dockerListContainers(ctx, labelRole+"=job")
+	if err != nil {
+		return err
+	}
+	for _, c := range jobs {
+		if c.Labels[labelRef] == ref {
+			return fmt.Errorf("agent: %s: job container %s exists; refusing to purge the repository", ref, c.Name)
+		}
+	}
+	for _, name := range []string{clusterName(ref), postgrestName(ref)} {
+		c, err := dockerInspectContainer(ctx, name)
+		if err != nil {
+			return err
+		}
+		if c != nil {
+			return fmt.Errorf("agent: %s: %s still exists; refusing to purge the repository", ref, name)
+		}
+	}
+	return nil
 }

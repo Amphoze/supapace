@@ -3540,3 +3540,55 @@ Rules and limits
   stops serving leaves it as it was.
 - Known limits: restores older than the ref's newest 200 operations are not listed; timelines
   are not capped; an operation's result has no size bound of its own (the daemon writes it).
+
+### 2026-11-19 — agent: layout-2 cluster, repository directories, quota use, purges
+- Layout 2 (Spec.Layout == 2) cluster, first boot and networked start alike: mounts
+  P/spool -> /opt/supapace/spool and P/rspool -> /opt/supapace/rspool (rw) right after the
+  tools mount; command = postgres -D /etc/postgresql + pgconf.CommandLine(image) +
+  pgconf.Pins(GUC), the pins last (the last -c wins, and the command line outranks every
+  configuration file); override file from pgconf.OverridesPinned. Layouts 0 and 1 render argv,
+  files and label byte for byte as before; testdata/layout1.golden pins them (it changes with
+  the image fixture of internal/pgconf; regenerate with -update-golden only on purpose).
+- Archive binary: supapace-arch beside the daemon's executable is copied to
+  <render>/tools/supapace-arch (root 0555, temporary name + rename, only when the bytes differ)
+  at every layout-2 ensure, before the adoption check, and by RenderCluster. It is not in the
+  configuration label: a new binary keeps a running cluster adoptable. Missing source = error,
+  the running cluster untouched.
+- State phases: A-done, B, R (PhaseR, a recovery start). Only state B with a matching container
+  is adopted; a container labelled supapace.phase=R is never adopted and is removed first; a
+  normal start after state R records B. StopCluster removes pg-<ref> whatever its phase.
+- CheckCluster/VerifyCluster: the verdict is the SCRAM login only; drift rows come from
+  bootstrap.AssertPins with pgconf.PinnedNames(max(layout, 1)) — advisory, the cluster's word.
+  The archiver statistics are no longer read.
+- EnsureDir: layout 2 -> nodefs.CreateProjectDirL2. EnsureSpoolDirs: a task at the project's
+  uid (mkdir -p -m 0700 of spool, rspool, rspool/req, rspool/out; project dir mounted at /p);
+  root creates nothing in the project tree; an existing directory of any owner is accepted, so
+  it must run before any layout-2 start of a directory made at layout 1.
+- SetQuota: disk quota, and at layout 2 the repository quota (nodefs.SetQuotaAt(RepoRoot, uid,
+  RepoQuotaMB)); layout 2 with RepoQuotaMB <= 0 is refused before anything is set.
+  EnsureRepoDir: nodefs.EnsureRepoDir with the spec's ref, ids and RepoQuotaMB.
+- DiskUsage: layout 2 = the larger of the uid's use on the projects and the repository
+  filesystem (via QuotaUse); otherwise as built. QuotaUse(ctx, uid): both quota reports, each
+  tool bounded by ctx (errors.Is(err, ctx.Err())). RepoSpace(ctx): statfs of the repository
+  root, size and space available to users, MiB.
+- HostState: ProjectDir (a real directory, not a link), StateFile, ClusterRunning, QuotaFull
+  (disk quota used within 4 KiB of a non-zero hard limit). Reads both quota reports, so it
+  fails on a node without a repository filesystem.
+- GrantBackupRole: state B required; one SCRAM superuser session to the recorded postmaster:
+  bootstrap.GrantBackup (its error is the call's), then bootstrap.ResetStatementStats, best
+  effort (WARN on error, INFO when absent). WipeData: the first boot's wipe, exported.
+  RenderCluster: renders the platform files without starting anything.
+- PurgeRepo: refuses while a job container of the ref (any state) or pg-<ref>/postgrest-<ref>
+  exists, or the container listing fails. An absent <repo>/<ref> launches nothing: at layout
+  0 or 1 it is done; at layout 2 the repository quota is still cleared through nodefs, which
+  fails on an absent or untrusted repository root (an unmounted repository is not purged).
+  Otherwise clears the disk and repository quotas first, empties repo/ by task
+  task-<ref>-purge-repo at u:g and fetch/ by task-<ref>-purge-fetch at 65530:g (each mounts
+  <repo>/<ref> at /r, rmtree --keep-root), then nodefs.RemoveEmptyRepoDirs. A non-directory
+  where a repository directory belongs is an error.
+- RemoveFetch: fetch/ only — the 65530:g task, then nodefs.RemoveEmptyFetchDir; repo/ and the
+  subject stay; absent = done. No job refusal: callers keep it from overlapping a fetch job.
+- Spec: Secrets is json:"-"; Format prints String(). Known limit: %p of a Spec value, or a Spec
+  in an unexported field of a printed struct, prints raw (fmt bypasses every method there).
+- Tests: the fake Docker looks an unmodelled verb or --format up in fakeVerbs (filled by a test
+  file's init) before failing.

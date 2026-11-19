@@ -36,18 +36,18 @@ type clPG struct {
 	f  *fakeHost
 	mu sync.Mutex
 
-	dialErrs   []error // returned by successive dials; then dialAlways
-	dialAlways error
-	onDial     func(pgsock.Target)
-	targets    []pgsock.Target
-	starts     map[int]uint64 // pid → start time; absent: pid × 10
-	startErrs  map[int]error
-	runErr     error
-	findings   []nodecfg.CheckResult
-	hbaFinds   []nodecfg.CheckResult
-	archiver   int64
-	assertConf []byte
-	assertHBA  []byte
+	dialErrs    []error // returned by successive dials; then dialAlways
+	dialAlways  error
+	onDial      func(pgsock.Target)
+	targets     []pgsock.Target
+	starts      map[int]uint64 // pid → start time; absent: pid × 10
+	startErrs   map[int]error
+	runErr      error
+	findings    []nodecfg.CheckResult
+	hbaFinds    []nodecfg.CheckResult
+	assertConf  []byte
+	assertNames []string // the command-line names the last assertion was given
+	assertHBA   []byte
 
 	taskExit map[string]string // task kind → exit code printed by the poll ("0" when absent)
 	taskOut  map[string]string // task kind → logs, stdout
@@ -90,11 +90,12 @@ func clFakePG(t *testing.T, f *fakeHost) *clPG {
 			f.record("bootstrap run")
 			return pg.runErr
 		}),
-		swap(&bootstrapAssert, func(ctx context.Context, c *pgx.Conn, want bootstrap.Baseline, conf []byte) ([]nodecfg.CheckResult, error) {
+		swap(&bootstrapAssert, func(ctx context.Context, c *pgx.Conn, want bootstrap.Baseline, conf []byte, names []string) ([]nodecfg.CheckResult, error) {
 			f.record("assert")
 			pg.mu.Lock()
 			defer pg.mu.Unlock()
 			pg.assertConf = slices.Clone(conf)
+			pg.assertNames = slices.Clone(names)
 			return slices.Clone(pg.findings), nil
 		}),
 		swap(&bootstrapAssertHBA, func(ctx context.Context, c *pgx.Conn, hba []byte) ([]nodecfg.CheckResult, error) {
@@ -103,10 +104,6 @@ func clFakePG(t *testing.T, f *fakeHost) *clPG {
 			defer pg.mu.Unlock()
 			pg.assertHBA = slices.Clone(hba)
 			return slices.Clone(pg.hbaFinds), nil
-		}),
-		swap(&archiverFailures, func(ctx context.Context, c *pgx.Conn) (int64, error) {
-			f.record("archiver")
-			return pg.archiver, nil
 		}),
 		swap(&readyPoll, time.Millisecond),
 		swap(&taskPoll, time.Millisecond),
@@ -1403,7 +1400,7 @@ func TestVerifyCluster_PassesRenderedConfToAssert(t *testing.T) {
 		t.Fatalf("target %v", tg)
 	}
 	calls := f.calls()
-	if !slices.Contains(calls, "archiver") || len(f.mutations()) != 0 {
+	if !slices.Contains(calls, "assert") || len(f.mutations()) != 0 {
 		t.Fatalf("calls %q", calls)
 	}
 }
@@ -1434,16 +1431,11 @@ func TestVerifyCluster_DriftLoggedNotFailed(t *testing.T) {
 func TestCheckCluster_OperationalFacts(t *testing.T) {
 	a, f, s, pg := clSetup(t)
 	clToPhaseB(t, a, f, s)
-	pg.archiver = 3
 	pg.findings = []nodecfg.CheckResult{{Name: "superuser", Detail: "x"}}
 	drift, err := a.CheckCluster(context.Background(), s)
-	if err == nil || !strings.Contains(err.Error(), "failed_count") || len(drift) != 1 {
-		t.Fatalf("archiver failures: %v %v", drift, err)
+	if err != nil || len(drift) != 1 {
+		t.Fatalf("drift is not the verdict: %v %v", drift, err)
 	}
-	if err := a.VerifyCluster(context.Background(), s); err == nil {
-		t.Fatal("VerifyCluster passed with archiver failures")
-	}
-	pg.archiver = 0
 	pg.dialErrs = []error{pgsock.ErrPeer}
 	if err := a.VerifyCluster(context.Background(), s); !errors.Is(err, pgsock.ErrPeer) {
 		t.Fatalf("peer: %v", err)
@@ -2043,15 +2035,15 @@ func TestEnsureCluster_WipeNeedsProjectDir(t *testing.T) {
 func TestCheckCluster_NoStatementAfterAFailedOne(t *testing.T) {
 	a, f, s, _ := clSetup(t)
 	clToPhaseB(t, a, f, s)
-	defer swap(&archiverFailures, func(ctx context.Context, c *pgx.Conn) (int64, error) {
-		f.record("archiver")
-		return 0, pgsock.ErrBudget
+	defer swap(&bootstrapAssertHBA, func(ctx context.Context, c *pgx.Conn, hba []byte) ([]nodecfg.CheckResult, error) {
+		f.record("assert hba")
+		return nil, pgsock.ErrBudget
 	})()
 	f.resetLog()
 	if _, err := a.CheckCluster(context.Background(), s); !errors.Is(err, pgsock.ErrBudget) {
 		t.Fatalf("got %v", err)
 	}
-	if calls := f.calls(); slices.Contains(calls, "assert") || slices.Contains(calls, "assert hba") {
+	if calls := f.calls(); slices.Contains(calls, "assert") || !slices.Contains(calls, "assert hba") {
 		t.Fatalf("the assertion ran on a failed session: %q", calls)
 	}
 }
@@ -2103,7 +2095,7 @@ func TestEnsureCluster_RecreateRecordsBeforeWaiting(t *testing.T) {
 func TestCheckCluster_AssertionErrorReported(t *testing.T) {
 	a, f, s, _ := clSetup(t)
 	clToPhaseB(t, a, f, s)
-	defer swap(&bootstrapAssert, func(ctx context.Context, c *pgx.Conn, want bootstrap.Baseline, conf []byte) ([]nodecfg.CheckResult, error) {
+	defer swap(&bootstrapAssert, func(ctx context.Context, c *pgx.Conn, want bootstrap.Baseline, conf []byte, _ []string) ([]nodecfg.CheckResult, error) {
 		return nil, pgsock.ErrBudget
 	})()
 	if _, err := a.CheckCluster(context.Background(), s); !errors.Is(err, pgsock.ErrBudget) {

@@ -16,6 +16,7 @@ import (
 const (
 	PhaseADone = "A-done" // first boot's phase A finished; the container is gone
 	PhaseB     = "B"
+	PhaseR     = "R" // a recovery start: never adopted, replaced by the next normal start
 )
 
 // State is a project's applied state, kept root-only in
@@ -72,7 +73,7 @@ func (a *Agent) readState(ref string) (st State, ok bool, err error) {
 	if _, err := dec.Token(); err != io.EOF {
 		return State{}, false, fmt.Errorf("agent: %s: trailing data", path)
 	}
-	if p == nil || (p.Phase != PhaseADone && p.Phase != PhaseB) {
+	if p == nil || !knownPhase(p.Phase) {
 		return State{}, false, fmt.Errorf("agent: %s: not a state", path)
 	}
 	return *p, true, nil
@@ -84,7 +85,7 @@ func (a *Agent) writeState(ref string, st State) error {
 	if err := checkRef(ref); err != nil {
 		return err
 	}
-	if st.Phase != PhaseADone && st.Phase != PhaseB {
+	if !knownPhase(st.Phase) {
 		return fmt.Errorf("agent: unknown phase %q", st.Phase)
 	}
 	b, err := json.Marshal(st)
@@ -109,3 +110,5 @@ func checkState(st State, have bool, s Spec) error {
 	}
 	return nil
 }
+
+func knownPhase(p string) bool { return p == PhaseADone || p == PhaseB || p == PhaseR }

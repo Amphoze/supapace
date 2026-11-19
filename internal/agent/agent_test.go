@@ -75,6 +75,12 @@ type fakeHost struct {
 	before func(args []string)
 }
 
+// fakeVerbs: a verb (as the model names it: "logs", "network ls") or a
+// --format the fake does not model is looked up here before it is a test
+// error. Other test files of the package fill it in their init. A hook runs
+// with f.mu held: it reads and changes f's model directly.
+var fakeVerbs = map[string]func(f *fakeHost, args []string, stdin []byte) (string, error){}
+
 type fakeCtr struct {
 	Name, ID, Image string
 	Running         bool
@@ -488,6 +494,9 @@ func (f *fakeHost) run(args []string, stdin []byte) (string, error) {
 			case strings.Contains(format, "enable_icc"): // name and the inter-container option
 				fmt.Fprintf(&b, "%s %s\n", name, n.Options["com.docker.network.bridge.enable_icc"])
 			default:
+				if hook := fakeVerbs[format]; hook != nil {
+					return hook(f, args, stdin)
+				}
 				f.t.Errorf("fake docker: network inspect with an unmodelled format %q (script it with onRun)", format)
 				return "", errors.New("fake: unmodelled format")
 			}
@@ -496,6 +505,9 @@ func (f *fakeHost) run(args []string, stdin []byte) (string, error) {
 	case "container inspect":
 		format := flagValue(args, "--format")
 		if format != confFormat && format != modeFormat {
+			if hook := fakeVerbs[format]; hook != nil {
+				return hook(f, args, stdin)
+			}
 			f.t.Errorf("fake docker: container inspect with an unmodelled format %q (script it with onRun)", format)
 			return "", errors.New("fake: unmodelled format")
 		}
@@ -536,6 +548,9 @@ func (f *fakeHost) run(args []string, stdin []byte) (string, error) {
 	case "cp":
 		f.t.Errorf("fake docker: unscripted cp %v", args)
 		return "", errors.New("fake: cp not scripted")
+	}
+	if hook := fakeVerbs[verb]; hook != nil {
+		return hook(f, args, stdin)
 	}
 	f.t.Errorf("fake docker: unmodelled call %q (script it with onRun)", args)
 	return "", errors.New("fake: unmodelled call")
