@@ -738,8 +738,8 @@ func TestHeader_LengthBelowFourCloses(t *testing.T) {
 		if err := p.closed(t, login); !strings.Contains(err.Error(), "length below 4") {
 			t.Fatalf("after authentication-ok: %v", err)
 		}
-		bad[0] = 'E'
-		q := relayTo(t, noneClass(), func(s net.Conn) { write(s, rSASL, bad, readyMsg) })
+		early := binary.BigEndian.AppendUint32([]byte{'E'}, length) // a slice of its own: the first server may still write bad
+		q := relayTo(t, noneClass(), func(s net.Conn) { write(s, rSASL, early, readyMsg) })
 		if err := q.closed(t, rSASL); !strings.Contains(err.Error(), "length below 4") {
 			t.Fatalf("before authentication-ok: %v", err)
 		}
