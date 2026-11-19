@@ -731,3 +731,63 @@ func TestFakePG_UntriableSocketIsAnError(t *testing.T) {
 		t.Fatalf("the socket was removed: %v", err)
 	}
 }
+
+// With --listen the fake serves on TCP. scram-bad-signature completes the
+// exchange with a well-formed final message whose signature is not the
+// password's, then AuthenticationOk and ReadyForQuery; from there it is
+// escapes. The log holds the client's bytes as with a socket.
+func TestFakePG_ListenTCP_ScramBadSignature(t *testing.T) {
+	pw := filepath.Join(t.TempDir(), "pw")
+	if err := os.WriteFile(pw, []byte(testPassword+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logf := filepath.Join(t.TempDir(), "log")
+	addr := start(t, "fakepg", "--listen", "127.0.0.1:0", "--log", logf, "--mode", "scram-bad-signature",
+		"--password-file", pw, "--salt", testSaltHex)
+	nc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(2 * time.Second))
+	c := &recConn{Conn: nc}
+	c.Write(startupPacket())
+	// scram fails the test on a wrong signature; read the final message by hand.
+	expectAuth(t, c, 10)
+	const cnonce = "abcdefghijklmnop"
+	first := "n=,r=" + cnonce
+	writeMsg(t, c, 'p', []byte("SCRAM-SHA-256\x00"), binary.BigEndian.AppendUint32(nil, uint32(3+len(first))), []byte("n,,"+first))
+	sf := string(expectAuth(t, c, 11))
+	salt, _ := hex.DecodeString(testSaltHex)
+	sp, _ := pbkdf2.Key(sha256.New, testPassword, salt, 4096, 32)
+	ck := hmacSHA256(sp, "Client Key")
+	sk := sha256.Sum256(ck)
+	nonce := strings.Split(sf, ",")[0][2:]
+	final := "c=biws,r=" + nonce
+	am := first + "," + sf + "," + final
+	proof := hmacSHA256(sk[:], am)
+	for i := range proof {
+		proof[i] ^= ck[i]
+	}
+	writeMsg(t, c, 'p', []byte(final+",p="+base64.StdEncoding.EncodeToString(proof)))
+	got := string(expectAuth(t, c, 12))
+	right := "v=" + base64.StdEncoding.EncodeToString(hmacSHA256(hmacSHA256(sp, "Server Key"), am))
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(got, "v="))
+	if !strings.HasPrefix(got, "v=") || err != nil || len(sig) != 32 || got == right {
+		t.Fatalf("server-final %q: want a well-formed, wrong signature (the right one is %q)", got, right)
+	}
+	expectAuth(t, c, 0)
+	readGreeting(t, c)
+	query(t, c, false)
+	var got2 []byte
+	for typ := byte(0); typ != 'Z'; {
+		typ, _ = readMsg(t, c)
+		got2 = append(got2, typ)
+	}
+	if string(got2) != "NNEZ" {
+		t.Fatalf("answer %q, want the answer of escapes: NNEZ", got2)
+	}
+	writeMsg(t, c, 'X')
+	c.Close()
+	waitLog(t, logf, c.sent.Bytes())
+}

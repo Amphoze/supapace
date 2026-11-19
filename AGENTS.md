@@ -2661,3 +2661,157 @@ The scripts (exit 0 when no line fails, 1 on a FAIL, 3 on a lab error):
   probe loses nothing).
 - e43.sh: recorded only: an empty allow_list as a disable; txn_mode_leak_action.
 - e48.sh: recorded only: a second tenant <ref>-ro of one cluster for the read-only login.
+
+### 2026-11-19 — pgcap: the relay of one connection and the table's types; pgwire
+
+`internal/pgwire` — the checks of the Postgres wire protocol that the platform's guards share.
+Each reads only the bytes it is given and allocates nothing from a length a peer states.
+- `Header(h [5]byte) (typ, bodyLen, err)` — the stated length less 4; `ErrLength` (match with
+  `errors.Is`) when the stated length is below 4.
+- `AuthSubtype(body)` — the first four bytes of an authentication request; an error if it is
+  shorter. Constants `AuthOK`, `AuthCleartext`, `AuthMD5`, `AuthSASL`, `AuthSASLContinue`,
+  `AuthSASLFinal` (0, 3, 5, 10, 11, 12).
+- `ScramIterations(serverFirst)` — exactly `r=…,s=…,i=N` in that order with nothing after it;
+  N is 1 to 2^31-1 in ASCII digits, no sign, no leading zero. Extensions are refused.
+- `RowFields(body)` — the first two bytes of a row description.
+- `EncryptionRequest(first8) (tls, gss)`, `CancelRequest(first8)` — length and code together
+  (8 with 80877103 or 80877104; 16 with 80877102).
+- `StartupLength(first8) (n, ok)` — the stated length when it is 8 to 10,000.
+- `TooManyConnections()` — a fresh ErrorResponse: severity FATAL, SQLSTATE 53300, message
+  "too many connections".
+
+`internal/pgcap` — the per-connection half of the wire proxy that stands between shared
+services and every project's database server, and the types of its table. Nothing in it names
+a class and no cap is a constant: a class is a row of the table.
+
+The table (`class.go`)
+- `Table`, `Class`, `Stream` — one JSON document: `listen`, `project_block`, `slice_prefix`,
+  `max_conns`, `preamble_ms`, `classes`, and `slices` (slice index → class name → allowance).
+  0 means "none" for `message_bytes`, `conns_per_peer`, `cancels_per_peer`, `wall_ms` and
+  `notices_max`; `stream` is null for a class without a stream window. Window kinds:
+  `WindowConnection`, `WindowResponse`, `WindowNone`.
+- `ParseTable(b)` — strict; its errors are texts that start `pgcap: table:` (nothing to
+  match). It accepts only `Marshal`'s own bytes: white space, a repeated member, a member in
+  another case, a null, an unknown member or anything after the document is refused. Also
+  refused: two classes with one name or overlapping port ranges (a class has one port for
+  every slice of the block); a port past 65535; a peer or `listen` that is not IPv4; a block
+  that is not a masked IPv4 network; a slice prefix not longer than the block's or past /29;
+  a window kind other than the three; `window_bytes` of 0 with a window; an iteration floor
+  of 0 or above the cap; a stream rate of 0, an interval outside 10 to 1,000 ms or no stream
+  connections; a buffer outside 4 KiB to 1 MiB; a deadline, rate, burst or refusal pool that
+  is not positive; a negative cap; a count above 2^30; a slice index that is not a plain
+  number inside the block; an allowance for a class that does not exist; `max_conns` below
+  the sum of `Terms()`.
+- `(Table).Marshal()` — the canonical form: members in declaration order, no white space,
+  classes by name, slices in ascending numeric order. Always write the file with it.
+- `(Table).Terms() (conns, cancels, refusals)` — what the node-wide ceiling must cover: per
+  class the lesser of its allowances summed over the slices and its per-peer cap times its
+  peers (the allowances alone without a per-peer cap); the cancel allowances the same way;
+  the refusal pools, summed.
+- `(Class).ConnBytes()` — the worst memory of one relayed connection: two copy buffers and
+  four socket buffers at twice their size.
+
+The relay (`relay.go`, `state.go`, `stream.go`)
+- `Relay(ctx, Conn) error` runs one admitted connection to its end. `Conn`: `Class` (a copy: a
+  reload does not change a running connection), `Client` (the accepted socket; Relay closes
+  it), `First` (every byte already read from the client, its first eight at least; sent to
+  the server first), `From` and `To` (dial source and target), `Accepted` (the accept time),
+  `Streams` (the slice's `*StreamSlots` for this class; the zero value is ready).
+- It returns nil when a peer closed the connection, otherwise the reason as an error whose
+  text is meant for the log: a breach, the authentication deadline, the wall clock,
+  `dial: …`, `fault: …`, or the cause of `ctx` (`errors.Is(err, context.Canceled)` when the
+  caller cancelled without a cause). The reasons are not exported values.
+- Cancelling `ctx` closes both sides of that connection at once and nothing else, also while
+  a paced stream is waiting. When Relay returns, its two goroutines have ended, its stream
+  place is released and both sockets are closed.
+- Client to server: relayed unread through one buffer of `copy_buf_bytes` (never spliced: a
+  connection has two descriptors and no kernel pipe).
+- Server to client: one buffer of `copy_buf_bytes`, scanned in place. A read fills it; every
+  header that lies complete in it is judged, in order, before any byte of its message is
+  forwarded; what was admitted is written to the client in one write before the next read. So
+  the relay reads ahead at most one buffer, holds no message (a body longer than the buffer
+  streams through it; a dropped one is skipped the same way), and adds no delay: nothing
+  admitted waits for more bytes from the server. An authentication request and the first two
+  body bytes of a row description are held until they are whole, then checked, then
+  forwarded. A breach closes both sides: the client has received every message admitted
+  before the refused one and no byte of it. A fault leaves the client the same.
+  - A stated length below 4, above `message_bytes` (when set) or above what is left of the
+    byte window is a breach. A message counts 1 + its stated length. The window is the
+    connection, the response (it starts again after each ReadyForQuery; the startup counts in
+    the first) or none.
+  - Before authentication-ok only authentication requests, errors (relayed) and notices pass.
+    Any other type is a breach, a protocol-version negotiation included: a class's client
+    must ask for protocol 3.0 without protocol options. An authentication request is at most
+    1,024 bytes; the requests must be SASL, SASL-continue, SASL-final and ok, each once, in
+    that order, and the continue's iteration count must lie within `scram_iter_min` and
+    `scram_iter_max`. Any later authentication request is a breach. Only the order is
+    checked: the relay holds no secret and does not prove that the server knows the password.
+  - After authentication-ok a type the relay does not know is relayed under the byte caps.
+  - Count caps: parameter-status messages (`param_status_max`) and notices with
+    notifications (`notices_max`, 0 for none) are counted in the startup (until the first
+    ReadyForQuery), then per window — the connection, each response, each interval of the
+    stream state — and with no window in the startup only. Wherever those counts apply, one
+    row description of more than `row_fields_max` fields is a breach (per description, never
+    a sum). With `drop_notices`, notices and notifications are counted and not forwarded.
+  - A copy-both starts the stream state, which ends at the next ReadyForQuery. A class
+    without `stream` is closed at that header, and so is a connection beyond
+    `conns_per_project` of its slice. In the state the byte window does not count: a read
+    takes at most what is left of `bytes_per_interval` in the current `interval_ms`, and with
+    nothing left the relay waits for the next interval — paced, not closed. What was already
+    read beyond the copy-both counts in the first interval and is paid off, one budget an
+    interval, before more is read: the one burst is that read, at most one buffer. An idle
+    interval leaves no credit. Each stay in the state has its own interval.
+- Deadlines, all from `Accepted`: the dial within `dial_ms`; authentication-ok within
+  `auth_ms`; with `wall_ms` set, the end of the connection. Nothing else times a connection:
+  a class without a wall clock can be held open by either peer.
+- A panic while handling a connection is recovered and ends that connection alone (`fault:`).
+  The build tag `faulthook` adds `FaultMarker` ('!'): a server message of that type, of any
+  length, before authentication-ok too, panics its connection's handler, to test that rule;
+  the product build has no such code and treats the type like any other.
+
+Rules for the owner of the listening sockets (admission, the reload)
+1. Derive one context per slice, start every relay of the slice with it, and cancel it when
+   the slice leaves the table. Release your own counters after Relay returns; never close
+   `Client` yourself. The package keeps no registry of connections.
+2. `Accepted` is the accept time: every clock runs from it (a zero or old value ends the
+   connection at once; a later one would lengthen every clock).
+3. Set the class's `sock_buf_bytes` on the listening socket (`socketBuffers` as the listen
+   configuration's control function), so that accepted sockets have it from their first
+   packet; Relay sets the dialled socket's, which nothing outside Relay can reach.
+4. Leave Nagle's algorithm off on accepted sockets (Go's default).
+5. Keep one `StreamSlots` per slice and class for as long as the slice is in the table, not
+   one per reload; nil with a streaming class refuses every copy-both.
+6. `First` holds everything read from the client and is never an encryption or a cancel
+   request: Relay does not read the client's bytes.
+7. A first eight bytes with a request code (high sixteen bits 1234) that is not exactly one
+   of the three forms above is no startup packet: close the socket unanswered.
+8. Compute `From` and `To` from one slice index in one function: Relay cannot tell slices
+   apart. A connection without an IPv4 `From` is refused before any dial; a `From` that is
+   not the proxy's fails the dial.
+9. Log Relay's error text as the reason; nil is a peer's close.
+10. Write and accept the table only in `Marshal`'s bytes; a file that is anything else is a
+    file that does not parse.
+11. A class that streams: size its rate so that the bytes buffered ahead of the client — the
+    socket buffers and one copy buffer — over the rate stay under half the sender's timeout.
+    The rate paces a server that stays in the stream state; outside the state nothing is
+    paced, so a service's sizing against a hostile server rests on the message cap and the
+    byte window, not on the rate.
+12. A class's client must ask for protocol 3.0; the proof with the real client records that,
+    what the client reports when the dial fails, and how many statements a connection serves.
+
+Known limits
+- A dial that fails closes the client socket with its startup packet unread, which the client
+  sees as a reset.
+- Before authentication-ok the size of an error or a notice is bounded only by the class's
+  message cap and byte window and by the authentication deadline.
+- A result of many small rows is relayed at several million rows a second per connection
+  (`BenchmarkRelay_SmallRows`, loopback); a row larger than the buffer costs one read and one
+  write per buffer.
+
+Tests: `go test ./internal/pgwire ./internal/pgcap` (add `-tags faulthook` for the marker
+build). Test helpers live at package level in the package's test files: new tests there must
+not reuse their names. The proof against the dashboard's database client image runs on a bare
+test node with that image loaded: build it with `go test -c -tags reach ./internal/pgcap` and
+run `TestNode_ClientAfterWrongServerSignature` there as root; it records what that client does
+after a wrong server signature. `sp-probe fakepg` gained `--listen ADDR:PORT` (TCP, in place
+of `--socket`) and the mode `scram-bad-signature`.

@@ -32,10 +32,12 @@ const (
 var (
 	fakeModes = map[string]bool{"sasl": true, "cleartext": true, "md5": true, "authok": true, "sasl-iter": true,
 		"huge": true, "flood": true, "stall": true, "trickle": true,
-		"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true}
-	postAuth = map[string]bool{"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true}
+		"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true, "scram-bad-signature": true}
+	postAuth = map[string]bool{"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true,
+		"scram-bad-signature": true}
 	// saltModes take the salt the server-first message carries.
-	saltModes = map[string]bool{"sasl-iter": true, "row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true}
+	saltModes = map[string]bool{"sasl-iter": true, "row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true,
+		"scram-bad-signature": true}
 )
 
 const (
@@ -54,8 +56,9 @@ type fakeConfig struct {
 	salt     []byte // saltModes
 }
 
-// fakePG listens on a Unix socket like a Postgres backend and answers each
-// client as cfg.mode says, and appends every byte any client sends to logFile.
+// fakePG listens like a Postgres backend — on the Unix socket at socket, or with
+// socket empty on the TCP address tcpAddr — and answers each client as cfg.mode
+// says, and appends every byte any client sends to logFile.
 // No mode lets a client do anything: the post-authentication modes accept a
 // SCRAM login and then misbehave.
 //
@@ -70,7 +73,15 @@ type fakeConfig struct {
 // The fake may run as a container's init: it reaps nothing and on SIGTERM or
 // SIGINT (the stop signal Postgres images declare) exits 0, removing its socket
 // if the path still holds it.
-func fakePG(socket string, cfg fakeConfig, logFile string, stdout io.Writer) error {
+func fakePG(socket, tcpAddr string, cfg fakeConfig, logFile string, stdout io.Writer) error {
+	if socket == "" {
+		l, err := net.Listen("tcp", tcpAddr)
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		return serveFakes(l, func() {}, cfg, logFile, stdout)
+	}
 	if err := removeStaleSocket(socket); err != nil {
 		return err
 	}
@@ -96,6 +107,12 @@ func fakePG(socket string, cfg fakeConfig, logFile string, stdout io.Writer) err
 	if err := os.Chmod(socket, 0o777); err != nil {
 		return err
 	}
+	return serveFakes(l, removeOwn, cfg, logFile, stdout)
+}
+
+// serveFakes creates the log, prints "listening ADDR" and serves every client
+// of l; on SIGTERM or SIGINT it calls cleanup and exits 0.
+func serveFakes(l net.Listener, cleanup func(), cfg fakeConfig, logFile string, stdout io.Writer) error {
 	logf, err := os.OpenFile(logFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
@@ -103,8 +120,8 @@ func fakePG(socket string, cfg fakeConfig, logFile string, stdout io.Writer) err
 	defer logf.Close()
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
-	go func() { <-term; removeOwn(); os.Exit(0) }()
-	fmt.Fprintln(stdout, "listening", socket)
+	go func() { <-term; cleanup(); os.Exit(0) }()
+	fmt.Fprintln(stdout, "listening", l.Addr())
 	var mu sync.Mutex
 	for n := 1; ; n++ {
 		c, err := l.Accept()
@@ -363,6 +380,9 @@ func scramLogin(c net.Conn, r io.Reader, cfg fakeConfig) bool {
 		return false
 	}
 	sig := hmacSum(hmacSum(salted, "Server Key"), authMessage)
+	if cfg.mode == "scram-bad-signature" {
+		sig[0] ^= 0xff // still 32 bytes of valid base64: well-formed, and wrong
+	}
 	_, err = c.Write(bytes.Join([][]byte{authMsg(12, []byte("v="+base64.StdEncoding.EncodeToString(sig))), authMsg(0), greeting}, nil))
 	return err == nil
 }
@@ -388,7 +408,7 @@ func afterLogin(c net.Conn, r io.Reader, mode string) {
 			prefix = append(msg('1'), msg('t', []byte{0, 0})...) // ParseComplete, no parameters
 		}
 		switch mode {
-		case "escapes":
+		case "escapes", "scram-bad-signature":
 			if _, err := c.Write(escapes); err != nil {
 				return
 			}

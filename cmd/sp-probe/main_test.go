@@ -147,11 +147,42 @@ func TestTCP_IPv6LoopbackAndExactBind(t *testing.T) {
 		t.Skip("no IPv6 loopback:", err)
 	}
 	l.Close()
-	open := start(t, "listen", "tcp", "[::1]:0")
+	port := heldPort(t)
+	for try := 0; ; try++ { // until a port this test holds on 127.0.0.1 is free on [::1] too
+		if l, err := net.Listen("tcp", net.JoinHostPort("::1", port)); err == nil {
+			l.Close()
+			break
+		} else if try == 20 {
+			t.Fatal(err)
+		}
+		port = heldPort(t)
+	}
+	// The canary binds exactly its address: it starts although the same port
+	// of 127.0.0.1 is held by another socket, and that port stays closed.
+	open := start(t, "listen", "tcp", net.JoinHostPort("::1", port))
 	expect(t, "[::1] listener", 0, "connected", "tcp", open, "--timeout", "300ms")
-	_, port, _ := net.SplitHostPort(open)
-	// The canary binds exactly its address: the same port on 127.0.0.1 is closed.
 	expect(t, "other address, same port", 1, "refused ECONNREFUSED", "tcp", net.JoinHostPort("127.0.0.1", port), "--timeout", "300ms")
+}
+
+// heldPort returns a TCP port of 127.0.0.1 that a socket of this test holds
+// until the test ends — bound, not listening, without address reuse — so that
+// no other process can listen there meanwhile and a connect is refused. A port
+// the kernel picks for another address may be anyone's on 127.0.0.1.
+func heldPort(t *testing.T) string {
+	t.Helper()
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { syscall.Close(fd) })
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	sa, err := syscall.Getsockname(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strconv.Itoa(sa.(*syscall.SockaddrInet4).Port)
 }
 
 // Failing to resolve HOST is neither "refused" (1) nor "timeout" (2).
@@ -228,6 +259,10 @@ func TestUsage_ExitCodes(t *testing.T) {
 		{"fakepg", "--socket", "s", "--log", "l", "--mode", "row-huge", "--password-file", "/dev/null"},
 		{"fakepg", "--socket", "s", "--log", "l", "--mode", "row-huge", "--password-file", "/dev/null", "--salt", "zz"},
 		{"fakepg", "--socket", "s", "--log", "l", "--mode", "row-huge", "--password-file", "missing-file", "--salt", "00"},
+		{"fakepg", "--log", "l"},
+		{"fakepg", "--socket", "s", "--listen", "127.0.0.1:0", "--log", "l"},
+		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "scram-bad-signature"},
+		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "sasl", "--salt", "00"},
 		{"tcp", "127.0.0.1:1", "--bogus"},
 		{"tcp", "127.0.0.1"},
 	} {

@@ -16,9 +16,10 @@
 //	                                            (the kernel's choice if ADDR is unspecified).
 //	                                            A UDP echo to a unicast destination leaves
 //	                                            from that destination address
-//	sp-probe fakepg --socket PATH [--mode MODE] --log FILE [--password-file F --salt HEX]
+//	sp-probe fakepg --socket PATH|--listen ADDR:PORT [--mode MODE] --log FILE [--password-file F --salt HEX]
 //	                                            fake, untrusted Postgres backend on a Unix
-//	                                            socket; mode defaults to sasl; FILE gets every
+//	                                            socket, or on a TCP address (exactly one of
+//	                                            the two); mode defaults to sasl; FILE gets every
 //	                                            byte sent, as "conn N LEN" + LEN bytes per
 //	                                            chunk; --password-file and --salt are given
 //	                                            for the post-authentication modes, --salt
@@ -67,12 +68,13 @@
 // "error" (EINVAL from connect), exit 3. listen --join needs a multicast-capable
 // route on the interface it joins on.
 //
-// listen and fakepg print "listening ADDR" once ready. listen runs until killed;
+// listen and fakepg print "listening ADDR" once ready (for fakepg --listen, the
+// address bound: port 0 picks one). listen runs until killed;
 // fakepg runs until killed, or until SIGTERM or SIGINT, on which it exits 0 (so
 // it can be a container's init: it reaps nothing) and removes its socket — only
 // if PATH still holds the socket it bound (same inode).
 //
-// fakepg first removes a stale socket at PATH (a connect to it is refused, as for
+// With --socket, fakepg first removes a stale socket at PATH (a connect to it is refused, as for
 // one a killed fake left behind). A live socket (a connect succeeds; that live
 // server sees one connection that sends nothing), any other file, or a socket
 // that cannot be tried makes it fail with exit 3; it never takes over a live
@@ -114,6 +116,9 @@
 //	              so a second message field follows; every message, detail and
 //	              hint field starts with the marker "fake-marker"; then
 //	              ReadyForQuery
+//	scram-bad-signature
+//	              escapes, with one change: the server signature of the SCRAM
+//	              final message is wrong (its bytes altered; still well-formed)
 //
 // sys prints four lines from /proc/self/status — "seccomp 0|1|2", "nonewprivs
 // 0|1", "capeff HEX16", "capbnd HEX16" — then one line per call, in this order:
@@ -251,6 +256,7 @@ func command(args []string, stdout io.Writer) verdict {
 	qtype := fs.String("type", "A", "")
 	join := fs.String("join", "", "")
 	socket := fs.String("socket", "", "")
+	listenAddr := fs.String("listen", "", "")
 	mode := fs.String("mode", "sasl", "")
 	logFile := fs.String("log", "", "")
 	passwordFile := fs.String("password-file", "", "")
@@ -279,7 +285,7 @@ func command(args []string, stdout io.Writer) verdict {
 		return probeDNS(pos[0], *server, *qtype, *timeout)
 	case args[0] == "listen" && len(pos) == 2 && (pos[0] == "tcp" || pos[0] == "udp") && (*join == "" || pos[0] == "udp"):
 		err = listen(pos[0], pos[1], *join, stdout)
-	case args[0] == "fakepg" && len(pos) == 0 && *socket != "" && *logFile != "" && fakeModes[*mode] &&
+	case args[0] == "fakepg" && len(pos) == 0 && (*socket == "") != (*listenAddr == "") && *logFile != "" && fakeModes[*mode] &&
 		postAuth[*mode] == (*passwordFile != "") && saltModes[*mode] == (*saltHex != ""):
 		cfg := fakeConfig{mode: *mode}
 		if saltModes[*mode] {
@@ -294,7 +300,7 @@ func command(args []string, stdout io.Writer) verdict {
 			}
 			cfg.password = strings.TrimSuffix(string(pw), "\n")
 		}
-		err = fakePG(*socket, cfg, *logFile, stdout)
+		err = fakePG(*socket, *listenAddr, cfg, *logFile, stdout)
 	default:
 		return errorVerdict("usage: bad arguments %q", args)
 	}
