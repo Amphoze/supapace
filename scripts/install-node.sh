@@ -3,6 +3,10 @@
 # server), as root:
 #
 #   scripts/install-node.sh --domain D (--dev | --tls-cert F --tls-key F) [--ack-escrow]
+#       [--studio-domain S [--studio-tls-cert F --studio-tls-key F]]
+#
+# The studio pair is required with --studio-domain unless --dev is given or a
+# pair is already stored.
 #
 # The arguments are passed to `supapaced init` (--no-systemd is refused: this
 # script exists to wire systemd). Binaries come from BIN_DIR (default bin/, as

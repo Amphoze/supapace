@@ -9,6 +9,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Amphoze/supapace/internal/dashtok"
 )
 
 func TestDefault_Golden(t *testing.T) {
@@ -459,5 +462,154 @@ func TestLockedPostgresVersion(t *testing.T) {
 	if jerr := json.Unmarshal(imagesLock, &lock); err != nil || jerr != nil ||
 		lock["postgres"].Tag != "supabase/postgres:"+v {
 		t.Fatalf("version %q, %v; tag %q", v, err, lock["postgres"].Tag)
+	}
+}
+
+// studioCfg is a valid configuration for base with the studio domain studio.
+func studioCfg(base, studio string) Config {
+	c := Default(base)
+	c.MemAllocMB, c.PidsAlloc = 1, 1
+	c.StudioDomain = studio
+	return c
+}
+
+// The studio domain and the base domain are disjoint on label boundaries:
+// neither equals the other or lies under it. Load refuses a node file that
+// breaks this, so a hand edit does not reach the gateway or the agent.
+func TestConfig_StudioDomainDisjointFromBaseDomain(t *testing.T) {
+	refused := []struct{ name, base, studio string }{
+		{"equal", "example.test", "example.test"},
+		{"under the base", "example.test", "studio.example.test"},
+		{"deep under the base", "example.test", "a.b.example.test"},
+		{"above the base", "api.example.test", "example.test"},
+		{"far above the base", "a.b.example.test", "example.test"},
+		{"not a name: one label", "example.test", "studio"},
+		{"not a name: capitals", "example.test", "Studio.other.test"},
+		{"not a name: trailing dot", "example.test", "studio.other.test."},
+		{"not a name: an IPv4 address", "example.test", "192.0.2.1"},
+		{"not a name: ends in a number", "example.test", "studio.42"},
+		{"not a name: ends in a hex number", "example.test", "studio.0x2a"},
+		{"not a name: space", "example.test", "studio other.test"},
+		{"not a name: too long", "example.test", strings.Repeat("a.", 127) + "test"},
+	}
+	for _, r := range refused {
+		if err := studioCfg(r.base, r.studio).Validate(); err == nil || !strings.Contains(err.Error(), "studio_domain") {
+			t.Errorf("%s (%q, %q): Validate = %v, want a studio_domain refusal", r.name, r.base, r.studio, err)
+		}
+	}
+	accepted := []struct{ base, studio string }{
+		{"myexample.test", "example.test"}, // compared on label boundaries, in either order
+		{"example.test", "myexample.test"},
+		{"example.test", "studio.other.test"},
+		{"api.example.test", "studio.example.test"}, // siblings
+		{"example.test", "studio.0x2ag"},
+		{"example.test", ""}, // no studio domain
+	}
+	for _, a := range accepted {
+		if err := studioCfg(a.base, a.studio).Validate(); err != nil {
+			t.Errorf("(%q, %q): Validate = %v, want accepted", a.base, a.studio, err)
+		}
+	}
+	// A node file edited by hand to break the rule does not load; the same
+	// file with a disjoint studio domain does.
+	p := filepath.Join(t.TempDir(), "node.json")
+	for studio, ok := range map[string]bool{"studio.example.test": false, "example.test": false, "studio.other.test": true} {
+		b, _ := json.Marshal(studioCfg("example.test", studio))
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); (err == nil) != ok {
+			t.Errorf("Load with studio_domain %q: %v, want loaded %v", studio, err, ok)
+		}
+	}
+}
+
+// A node file written before the studio domain existed loads with none, and a
+// configuration without one writes no studio_domain member.
+func TestConfig_OlderNodeFileLoads(t *testing.T) {
+	c := studioCfg("sp.test", "")
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "studio") {
+		t.Fatalf("a configuration without a studio domain writes one: %s", b)
+	}
+	p := filepath.Join(t.TempDir(), "node.json")
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(p)
+	if err != nil {
+		t.Fatalf("an older node.json does not load: %v", err)
+	}
+	if !reflect.DeepEqual(got, c) || got.StudioDomain != "" {
+		t.Errorf("loaded %+v\nwant %+v", got, c)
+	}
+	// Control on the same path: a present member is read.
+	c.StudioDomain = "studio.test"
+	b, _ = json.Marshal(c)
+	if !strings.Contains(string(b), `"studio_domain":"studio.test"`) {
+		t.Fatalf("member not written: %s", b)
+	}
+	os.WriteFile(p, b, 0o600)
+	if got, err := Load(p); err != nil || got.StudioDomain != "studio.test" {
+		t.Errorf("studio_domain: %q, %v", got.StudioDomain, err)
+	}
+}
+
+// Validate holds node_id to the rule the dashboard's tokens hold their node
+// to: 1 to 255 bytes of UTF-8, no control character, neither U+2028 nor
+// U+2029. Every id it accepts can be signed; every id it refuses cannot.
+func TestConfig_NodeIDTheTokensCanSign(t *testing.T) {
+	priv, pub, err := dashtok.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sk, _ := dashtok.ParsePrivate(priv)
+	pk, _ := dashtok.ParsePublic(pub)
+	now := time.Now()
+	sign := func(node string) error {
+		a := dashtok.Assertion{Node: node, Iss: "https://issuer.test", Sub: "s", Ref: strings.Repeat("a", 20), Role: "owner", Iat: now.Unix(), Exp: now.Unix() + 30}
+		tok, err := dashtok.SignAssertion(sk, a)
+		if err != nil {
+			return err
+		}
+		_, err = dashtok.VerifyAssertion(pk, tok, node, now)
+		return err
+	}
+	for name, id := range map[string]string{
+		"default":               "local",
+		"255 bytes":             strings.Repeat("n", 255),
+		"255 bytes, multi-byte": strings.Repeat("é", 127) + "n",
+		"non-ASCII":             "nœud-1",
+	} {
+		c := studioCfg("sp.test", "")
+		c.NodeID = id
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: Validate = %v", name, err)
+		}
+		if err := sign(id); err != nil {
+			t.Errorf("%s: the tokens do not sign it: %v", name, err)
+		}
+	}
+	for name, id := range map[string]string{
+		"256 bytes":     strings.Repeat("n", 256),
+		"invalid UTF-8": "node\xff",
+		"C0 control":    "node\x07",
+		"newline":       "node\n",
+		"DEL":           "node\x7f",
+		"C1 control":    "node\u0085",
+		"U+2028":        "node ",
+		"U+2029":        "node ",
+	} {
+		c := studioCfg("sp.test", "")
+		c.NodeID = id
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "node_id") {
+			t.Errorf("%s: Validate = %v, want a node_id refusal", name, err)
+		}
+		if sign(id) == nil {
+			t.Errorf("%s: the tokens sign an id Validate refuses", name)
+		}
 	}
 }

@@ -267,10 +267,37 @@ func TestPush_NoStudioDomain_WritesNothing(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a file was written: %v", err)
 	}
-	// As built, node.json carries no studio domain yet: New writes nothing.
-	q := New(src, nodecfg.Default("example.test"), nodecfg.Paths{Root: t.TempDir()})
-	if g, err := q.Push(context.Background()); g != 0 || err != nil {
-		t.Fatalf("Push = %d, %v", g, err)
+}
+
+// New takes the studio domain from the node file: a pusher built from a node
+// file with one writes the file under that domain, one built from a node file
+// without one writes nothing.
+func TestNew_StudioDomainFromTheNodeFile(t *testing.T) {
+	src := &fakeSource{tbl: pushTable()}
+	for _, domain := range []string{"", "studio.test"} {
+		paths := nodecfg.Paths{Root: t.TempDir()}
+		path := dashcfg.PathsFor(paths).DashboardFile()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		c := nodecfg.Default("example.test")
+		c.StudioDomain = domain
+		g, err := New(src, c, paths).Push(context.Background())
+		if err != nil {
+			t.Fatalf("%q: %v", domain, err)
+		}
+		if domain == "" {
+			if g != 0 {
+				t.Errorf("no studio domain: generation %d", g)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("no studio domain: a file was written (%v)", err)
+			}
+			continue
+		}
+		if f := pushRead(t, path); g < 1 || f.Generation != g || f.StudioDomain != domain {
+			t.Errorf("generation %d, file %d for %q", g, f.Generation, f.StudioDomain)
+		}
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/nft"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/nodefs"
@@ -53,13 +54,15 @@ const escrowWord = "escrowed"
 var daemonKeysDropped = []string{"userland-proxy", "icc", "live-restore"}
 
 type initOpts struct {
-	domain, tlsCert, tlsKey string
-	dev, noSystemd, ack     bool
+	domain, tlsCert, tlsKey       string
+	studio, studioCert, studioKey string
+	dev, noSystemd, ack           bool
 }
 
 // initCmd writes a node's configuration before Docker runs: node.json, the
 // ruleset file, Docker's daemon.json, the systemd units, the TLS files (a
-// development CA with --dev), and the key-encryption key with its one-time
+// development CA with --dev; with a studio domain, also its pair in
+// tls-studio), and the key-encryption key with its one-time
 // escrow display. It touches neither Docker nor the database, and a second
 // run changes nothing.
 func initCmd(args []string) int {
@@ -72,6 +75,9 @@ func initCmd(args []string) int {
 	fl.BoolVar(&o.ack, "ack-escrow", false, "show the key escrow without waiting for the typed acknowledgement")
 	fl.StringVar(&o.tlsCert, "tls-cert", "", "server certificate (PEM) valid for *.<domain>")
 	fl.StringVar(&o.tlsKey, "tls-key", "", "the certificate's private key (PEM)")
+	fl.StringVar(&o.studio, "studio-domain", "", "the dashboard's domain; its hosts are <label>.<studio domain> (set once)")
+	fl.StringVar(&o.studioCert, "studio-tls-cert", "", "certificate chain (PEM) naming the studio domain and *.<studio domain>")
+	fl.StringVar(&o.studioKey, "studio-tls-key", "", "the studio certificate's private key (PEM)")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
@@ -83,10 +89,16 @@ func initCmd(args []string) int {
 		usage = "--domain is required"
 	case (o.tlsCert == "") != (o.tlsKey == ""):
 		usage = "--tls-cert and --tls-key go together"
-	case o.dev && o.tlsCert != "":
-		usage = "--dev issues its own certificate and takes no --tls-cert or --tls-key"
+	case (o.studioCert == "") != (o.studioKey == ""):
+		usage = "--studio-tls-cert and --studio-tls-key go together"
+	case o.studioCert != "" && o.studio == "":
+		usage = "--studio-tls-cert and --studio-tls-key need --studio-domain"
+	case o.dev && (o.tlsCert != "" || o.studioCert != ""):
+		usage = "--dev issues its own certificates and takes no --tls-cert, --tls-key, --studio-tls-cert or --studio-tls-key"
 	case !o.dev && o.tlsCert == "" && !exists(filepath.Join(paths.TLSDir(), "cert.pem")):
 		usage = "--tls-cert and --tls-key are required without --dev"
+	case !o.dev && o.studio != "" && o.studioCert == "" && !exists(filepath.Join(dashcfg.PathsFor(paths).StudioTLS(), "cert.pem")):
+		usage = "--studio-tls-cert and --studio-tls-key are required with --studio-domain without --dev"
 	}
 	if usage != "" {
 		fmt.Fprintf(stderr, "supapaced init: %s\n", usage)
@@ -132,6 +144,29 @@ func initNode(o initOpts) error {
 	if err != nil {
 		return err
 	}
+	if err := studioDomain(&c, o.studio); err != nil {
+		return err
+	}
+	var studioCertPEM, studioKeyPEM []byte
+	if o.studioCert != "" {
+		if studioCertPEM, studioKeyPEM, err = readStudioPair(o.studioCert, o.studioKey, c.StudioDomain); err != nil {
+			return err
+		}
+	}
+	if !o.dev && c.StudioDomain != "" && studioCertPEM == nil && !exists(filepath.Join(dashcfg.PathsFor(paths).StudioTLS(), "cert.pem")) {
+		return fmt.Errorf("%s holds studio domain %q and no studio certificate is stored; pass --studio-tls-cert and --studio-tls-key", paths.NodeJSON(), c.StudioDomain)
+	}
+	caPath := filepath.Join(paths.CADir(), "ca.pem")
+	if o.dev && c.StudioDomain != "" && exists(caPath) {
+		ca, _, err := loadCA(caPath, filepath.Join(paths.CADir(), "ca.key"))
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(ca.PermittedDNSDomains, c.StudioDomain) {
+			return fmt.Errorf("the development CA cannot vouch for the studio domain; re-initialise this development node to add a studio domain: remove %s and %s and run init --dev --studio-domain %s again (projects are kept; clients must trust the new %s)",
+				paths.CADir(), paths.TLSDir(), c.StudioDomain, caPath)
+		}
+	}
 	if err := checkRange(c); err != nil {
 		return err
 	}
@@ -165,7 +200,8 @@ func initNode(o initOpts) error {
 	for i, p := range leftovers {
 		leftovers[i] = filepath.Join(filepath.Dir(p), "."+filepath.Base(p)+".tmp-*")
 	}
-	for _, d := range []string{etc, paths.TLSDir(), paths.CADir()} {
+	studioDir := dashcfg.PathsFor(paths).StudioTLS()
+	for _, d := range []string{etc, paths.TLSDir(), paths.CADir(), studioDir} {
 		leftovers = append(leftovers, filepath.Join(d, ".*.tmp-*"))
 	}
 	w.removeLeftovers(leftovers...)
@@ -190,12 +226,23 @@ func initNode(o initOpts) error {
 		}
 	}
 	w.dir(paths.TLSDir())
-	switch {
-	case certPEM != nil:
+	if certPEM != nil {
 		w.etcFile(filepath.Join(paths.TLSDir(), "key.pem"), keyPEM, 0o600)
 		w.etcFile(filepath.Join(paths.TLSDir(), "cert.pem"), certPEM, 0o600)
-	case o.dev && w.err == nil && devCertDue():
-		w.devTLS(c)
+	}
+	// Without a studio domain nothing of the dashboard is written.
+	if c.StudioDomain != "" {
+		w.dir(studioDir)
+		if studioCertPEM != nil {
+			w.etcFile(filepath.Join(studioDir, "key.pem"), studioKeyPEM, 0o600)
+			w.etcFile(filepath.Join(studioDir, "cert.pem"), studioCertPEM, 0o600)
+		}
+	}
+	if o.dev && w.err == nil {
+		base, studio := devCertDue(paths.TLSDir()), c.StudioDomain != "" && devCertDue(studioDir)
+		if base || studio {
+			w.devTLS(c, base, studio)
+		}
 	}
 	if w.err != nil {
 		return w.err
@@ -232,6 +279,32 @@ func nodeConfig(domain string) (nodecfg.Config, error) {
 		return nodecfg.Config{}, fmt.Errorf("%s holds domain %q; init does not change it", paths.NodeJSON(), c.Domain)
 	}
 	return c, nil
+}
+
+// studioDomain sets the studio domain of c from the flag, or keeps the one in
+// place: it is set once and never changed. A node with a studio domain must
+// be one dashcfg.For accepts, or the dashboard could not run on it; that is
+// refused here, before anything is written.
+func studioDomain(c *nodecfg.Config, studio string) error {
+	if studio != "" {
+		if slices.Contains(strings.Split(studio, "."), dashcfg.SignInLabel) {
+			return fmt.Errorf("--studio-domain %q holds the reserved label %q", studio, dashcfg.SignInLabel)
+		}
+		if c.StudioDomain != "" && c.StudioDomain != studio {
+			return fmt.Errorf("%s holds studio domain %q; init does not change it, and there is no supported way to change or remove it", paths.NodeJSON(), c.StudioDomain)
+		}
+		c.StudioDomain = studio
+		if err := c.Validate(); err != nil {
+			return fmt.Errorf("--studio-domain: %w", err)
+		}
+	}
+	if c.StudioDomain == "" {
+		return nil
+	}
+	if _, err := dashcfg.For(*c); err != nil {
+		return fmt.Errorf("this node cannot have a studio domain: %w", err)
+	}
+	return nil
 }
 
 // checkRange refuses a node whose passwd, group, subuid or subgid already use
@@ -315,28 +388,79 @@ func unitPath(name string) string {
 // readServerPair reads the operator's certificate and key and requires them
 // to match and to cover a project host of domain.
 func readServerPair(certFile, keyFile, domain string) (certPEM, keyPEM []byte, err error) {
-	if certPEM, err = os.ReadFile(certFile); err != nil {
+	if certPEM, err = readRegular(certFile); err != nil {
 		return nil, nil, err
 	}
-	if keyPEM, err = os.ReadFile(keyFile); err != nil {
+	if keyPEM, err = readRegular(keyFile); err != nil {
 		return nil, nil, err
 	}
+	return certPEM, keyPEM, checkPair(certPEM, keyPEM, "--tls", strings.Repeat("a", 20)+"."+domain)
+}
+
+// readStudioPair reads the studio certificate and key and requires them to
+// match, to cover the studio domain, the sign-in host and a dashboard host,
+// and to name the studio domain and its wildcard literally, as the gateway's
+// loader requires.
+func readStudioPair(certFile, keyFile, studio string) (certPEM, keyPEM []byte, err error) {
+	if certPEM, err = readRegular(certFile); err != nil {
+		return nil, nil, err
+	}
+	if keyPEM, err = readRegular(keyFile); err != nil {
+		return nil, nil, err
+	}
+	if err := checkPair(certPEM, keyPEM, "--studio-tls", studio, dashcfg.SignInLabel+"."+studio, strings.Repeat("a", 20)+"."+studio); err != nil {
+		return nil, nil, err
+	}
+	if pair, _ := tls.X509KeyPair(certPEM, keyPEM); !slices.Contains(pair.Leaf.DNSNames, studio) || !slices.Contains(pair.Leaf.DNSNames, "*."+studio) {
+		return nil, nil, fmt.Errorf("--studio-tls-cert must name both %s and *.%s among its DNS names", studio, studio)
+	}
+	return certPEM, keyPEM, nil
+}
+
+// maxPairFile bounds what init reads of a certificate or key file.
+const maxPairFile = 1 << 20
+
+// readRegular reads a regular file of at most maxPairFile bytes. A link is
+// followed (the path is the operator's own); what it opens must be a regular
+// file, so a FIFO or a device is refused without being blocked on.
+func readRegular(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxPairFile+1))
+	if err == nil && len(b) > maxPairFile {
+		err = fmt.Errorf("%s is larger than %d bytes", path, maxPairFile)
+	}
+	return b, err
+}
+
+// checkPair requires the certificate to match the key, to cover every host,
+// to be valid now and to allow server authentication. flag names the pair's
+// flags in errors.
+func checkPair(certPEM, keyPEM []byte, flag string, hosts ...string) error {
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return nil, nil, fmt.Errorf("--tls-cert/--tls-key: %w", err)
+		return fmt.Errorf("%s-cert/%s-key: %w", flag, flag, err)
 	}
-	if err := pair.Leaf.VerifyHostname(strings.Repeat("a", 20) + "." + domain); err != nil {
-		return nil, nil, fmt.Errorf("--tls-cert does not cover project hosts of %s: %w", domain, err)
+	for _, h := range hosts {
+		if err := pair.Leaf.VerifyHostname(h); err != nil {
+			return fmt.Errorf("%s-cert does not cover %s: %w", flag, h, err)
+		}
 	}
 	switch t, leaf := now(), pair.Leaf; {
 	case t.After(leaf.NotAfter):
-		return nil, nil, fmt.Errorf("--tls-cert expired on %s", leaf.NotAfter.UTC().Format(time.RFC3339))
+		return fmt.Errorf("%s-cert expired on %s", flag, leaf.NotAfter.UTC().Format(time.RFC3339))
 	case t.Before(leaf.NotBefore):
-		return nil, nil, fmt.Errorf("--tls-cert is not valid before %s", leaf.NotBefore.UTC().Format(time.RFC3339))
+		return fmt.Errorf("%s-cert is not valid before %s", flag, leaf.NotBefore.UTC().Format(time.RFC3339))
 	case len(leaf.ExtKeyUsage) > 0 && !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) && !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageAny):
-		return nil, nil, errors.New("--tls-cert has an extended key usage without serverAuth")
+		return fmt.Errorf("%s-cert has an extended key usage without serverAuth", flag)
 	}
-	return certPEM, keyPEM, nil
+	return nil
 }
 
 // writer applies init's writes in order and stops at the first error. Every
@@ -416,15 +540,21 @@ func (w *writer) file(path string, data []byte, mode os.FileMode) {
 	}
 }
 
-// devTLS issues the development CA (unless one is in place) and a server
-// certificate for *.<domain> signed by it. Each key is written before its
+// devTLS issues the development CA (unless one is in place), constrained to
+// the node's domain and its studio domain, and with it the server pair for
+// *.<domain> when base is set and the studio pair for the studio domain and
+// its wildcard when studio is set. Each key is written before its
 // certificate, so a certificate on disk always has its key.
-func (w *writer) devTLS(c nodecfg.Config) {
+func (w *writer) devTLS(c nodecfg.Config, base, studio bool) {
 	w.dir(paths.CADir())
 	if w.err != nil {
 		return
 	}
 	caPEMPath, caKeyPath := filepath.Join(paths.CADir(), "ca.pem"), filepath.Join(paths.CADir(), "ca.key")
+	names := []string{c.Domain}
+	if c.StudioDomain != "" {
+		names = append(names, c.StudioDomain)
+	}
 	var ca *x509.Certificate
 	var caKey crypto.Signer
 	if exists(caPEMPath) {
@@ -439,7 +569,7 @@ func (w *writer) devTLS(c nodecfg.Config) {
 			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 			// It can vouch for the node's own names only.
 			PermittedDNSDomainsCritical: true,
-			PermittedDNSDomains:         []string{c.Domain},
+			PermittedDNSDomains:         names,
 			PermittedIPRanges:           []*net.IPNet{{IP: net.ParseIP(c.GatewayIngressIP).To4(), Mask: net.CIDRMask(32, 32)}},
 		}, caDays, nil, nil); w.err == nil {
 			w.etcFile(caKeyPath, keyPEM, 0o400)
@@ -449,17 +579,36 @@ func (w *writer) devTLS(c nodecfg.Config) {
 	if w.err != nil {
 		return
 	}
-	// The agent reaches the gateway at its ingress address, hence the IP name.
-	certPEM, keyPEM, _, _, err := issue(&x509.Certificate{
-		Subject:     pkix.Name{CommonName: "*." + c.Domain},
-		DNSNames:    []string{"*." + c.Domain},
-		IPAddresses: []net.IP{net.ParseIP(c.GatewayIngressIP)},
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}, serverDays, ca, caKey)
+	if base {
+		// The agent reaches the gateway at its ingress address, hence the IP name.
+		w.devPair(paths.TLSDir(), ca, caKey, &x509.Certificate{
+			Subject:     pkix.Name{CommonName: "*." + c.Domain},
+			DNSNames:    []string{"*." + c.Domain},
+			IPAddresses: []net.IP{net.ParseIP(c.GatewayIngressIP)},
+			KeyUsage:    x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		})
+	}
+	if studio {
+		w.devPair(dashcfg.PathsFor(paths).StudioTLS(), ca, caKey, &x509.Certificate{
+			Subject:     pkix.Name{CommonName: "*." + c.StudioDomain},
+			DNSNames:    []string{c.StudioDomain, "*." + c.StudioDomain},
+			KeyUsage:    x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		})
+	}
+}
+
+// devPair issues a server pair from tmpl, signed by the development CA, into
+// dir: the key first, then the certificate.
+func (w *writer) devPair(dir string, ca *x509.Certificate, caKey crypto.Signer, tmpl *x509.Certificate) {
+	if w.err != nil {
+		return
+	}
+	certPEM, keyPEM, _, _, err := issue(tmpl, serverDays, ca, caKey)
 	if w.err = err; err == nil {
-		w.etcFile(filepath.Join(paths.TLSDir(), "key.pem"), keyPEM, 0o600)
-		w.etcFile(filepath.Join(paths.TLSDir(), "cert.pem"), certPEM, 0o600)
+		w.etcFile(filepath.Join(dir, "key.pem"), keyPEM, 0o600)
+		w.etcFile(filepath.Join(dir, "cert.pem"), certPEM, 0o600)
 	}
 }
 
@@ -472,11 +621,11 @@ const (
 	kekEscrowName = "kek.escrowed"
 )
 
-// devCertDue reports whether the development server pair cannot be loaded
+// devCertDue reports whether the development pair in dir cannot be loaded
 // (a file missing or unreadable, a key that does not match) or the
 // certificate expires within renewWithin.
-func devCertDue() bool {
-	pair, err := tls.LoadX509KeyPair(filepath.Join(paths.TLSDir(), "cert.pem"), filepath.Join(paths.TLSDir(), "key.pem"))
+func devCertDue(dir string) bool {
+	pair, err := tls.LoadX509KeyPair(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
 	return err != nil || now().Add(renewWithin).After(pair.Leaf.NotAfter)
 }
 

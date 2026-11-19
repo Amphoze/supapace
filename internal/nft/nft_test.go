@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -384,18 +383,11 @@ func TestRender_ClosedList_Recorded(t *testing.T) {
 		}
 	}
 	// The same text on a node with and without a studio domain: the closed list
-	// is static. The member is set wherever the configuration carries one.
+	// is static.
 	d := defaultConfig(t)
-	v := reflect.ValueOf(&d).Elem()
-	set := false
-	for i := 0; i < v.NumField(); i++ {
-		if strings.HasPrefix(v.Type().Field(i).Tag.Get("json"), "studio_domain") {
-			v.Field(i).SetString("studio.sp.test")
-			set = true
-		}
-	}
-	if !set {
-		t.Log("the node configuration carries no studio domain")
+	d.StudioDomain = "studio.test"
+	if err := d.Validate(); err != nil {
+		t.Fatalf("a node with a studio domain: %v", err)
 	}
 	if render(t, d) != got {
 		t.Error("the ruleset depends on the studio domain")
@@ -973,22 +965,6 @@ func TestRender_MetaPortsAlwaysAValidRange(t *testing.T) {
 			if lo != a.MetaPortLo || hi != a.MetaPortHi || hi > 65535 {
 				t.Errorf("block /%d slices /%d: rendered %d-%d, Static %d-%d", bits, prefix, lo, hi, a.MetaPortLo, a.MetaPortHi)
 			}
-		}
-	}
-}
-
-// The studio-domain clause of TestRender_ClosedList_Recorded finds the field
-// by its JSON name. A field of another name would leave that clause testing
-// nothing: fail loudly instead, so the clause is updated with the field.
-func TestRender_StudioDomainFieldIsTheOneTheRecordedTestSets(t *testing.T) {
-	ty := reflect.TypeOf(nodecfg.Config{})
-	for i := 0; i < ty.NumField(); i++ {
-		tag := ty.Field(i).Tag.Get("json")
-		if strings.Contains(strings.ToLower(tag+ty.Field(i).Name), "studio") && !strings.HasPrefix(tag, "studio_domain") {
-			t.Errorf("node configuration field %s (json %q) names a studio setting the recorded test does not set", ty.Field(i).Name, tag)
-		}
-		if strings.HasPrefix(tag, "studio_domain") && ty.Field(i).Type.Kind() != reflect.String {
-			t.Errorf("field %s is not a string: the recorded test sets it with SetString", ty.Field(i).Name)
 		}
 	}
 }

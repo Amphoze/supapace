@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 type Config struct {
@@ -41,6 +43,7 @@ type Config struct {
 	BackupSubnet     string   `json:"backup_subnet"`              // an older node.json without it loads with the default
 	CPDiskQuotaMB    int      `json:"cp_disk_quota_mb,omitempty"` // 0: not set, resolved at use by CPQuotas
 	CPRepoQuotaMB    int      `json:"cp_repo_quota_mb,omitempty"` // likewise
+	StudioDomain     string   `json:"studio_domain,omitempty"`    // the dashboard's domain; empty: no dashboard
 }
 
 type Images struct {
@@ -242,7 +245,9 @@ func Load(path string) (Config, error) {
 // Validate checks that the configuration is internally consistent: every subnet
 // parses, the four networks are disjoint, the reserved addresses lie where the
 // layout needs them, the uid range fits and covers every slice, the domain is
-// lowercase DNS labels, and the images are pinned.
+// lowercase DNS labels, the studio domain (when set) is a name disjoint from
+// it on label boundaries, node_id is what the dashboard's tokens can sign, and
+// the images are pinned.
 func (c Config) Validate() error {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
@@ -260,11 +265,25 @@ func (c Config) Validate() error {
 			bad("%s: %q is not an address inside %s", name, s, in)
 		}
 	}
-	if c.NodeID == "" {
-		bad("node_id: empty")
+	if !nodeIDSignable(c.NodeID) {
+		bad("node_id: %q is not 1 to 255 bytes of UTF-8 without a control character, U+2028 or U+2029", c.NodeID)
 	}
 	if !ValidDomain(c.Domain) {
 		bad("domain: %q is not a domain name", c.Domain)
+	}
+	if s := c.StudioDomain; s != "" {
+		switch {
+		case len(s) > 253-21: // a 20-letter label under it must still be a name
+			bad("studio_domain: %q is longer than 232 bytes; its hosts would not be names", s)
+		case !ValidDomain(s) || endsInNumber(s):
+			bad("studio_domain: %q is not a domain name", s)
+		case s == c.Domain:
+			bad("studio_domain: %q is the base domain", s)
+		case strings.HasSuffix(s, "."+c.Domain):
+			bad("studio_domain: %q lies under the base domain %q", s, c.Domain)
+		case strings.HasSuffix(c.Domain, "."+s):
+			bad("studio_domain: the base domain %q lies under %q", c.Domain, s)
+		}
 	}
 	block := prefix("project_block", c.ProjectBlock)
 	if block.IsValid() && (c.SlicePrefix < block.Bits() || c.SlicePrefix > 30) {
@@ -420,3 +439,24 @@ var domainRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-
 // ValidDomain reports whether s is a base domain: lowercase DNS labels, at
 // most 253 bytes. Shared with the route file.
 func ValidDomain(s string) bool { return len(s) <= 253 && domainRE.MatchString(s) }
+
+// nodeIDSignable: what the dashboard's tokens accept as their node — 1 to 255
+// bytes of UTF-8 with no control character (Unicode Cc) and neither U+2028
+// nor U+2029.
+func nodeIDSignable(s string) bool {
+	if len(s) == 0 || len(s) > 255 || !utf8.ValidString(s) {
+		return false
+	}
+	return !strings.ContainsFunc(s, func(r rune) bool { return unicode.IsControl(r) || r == 0x2028 || r == 0x2029 })
+}
+
+// endsInNumber reports whether a browser's URL parser would read the name as
+// an IPv4 address: its last label is decimal digits or 0x and hex digits.
+func endsInNumber(s string) bool {
+	last := s[strings.LastIndexByte(s, '.')+1:]
+	digits := "0123456789"
+	if h, ok := strings.CutPrefix(last, "0x"); ok {
+		last, digits = h, "0123456789abcdef"
+	}
+	return strings.Trim(last, digits) == ""
+}

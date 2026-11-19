@@ -4013,3 +4013,53 @@ Known limits
   nil, such a job ends `internal`.
 - Known limit: the backup-lane bound is ceil(k/2) x the deadline plus, per pick, the 0-2 s delay
   and the removal of a container killed at its deadline.
+
+### 2026-11-19 — init: the studio domain and its certificate
+
+- `supapaced init` takes `--studio-domain S`, `--studio-tls-cert F` (a PEM chain, leaf first)
+  and `--studio-tls-key F`. Without them init writes exactly what it wrote before: node.json
+  has no `studio_domain`, there is no tls-studio directory, and the development CA is
+  constrained to the base domain alone.
+- nodecfg.Config.StudioDomain (`json:"studio_domain,omitempty"`, last field); empty means the
+  node has no dashboard. Validate, at init and at every Load, refuses a studio domain that is
+  not lowercase LDH labels, is longer than 232 bytes (a 20-letter label under it must still
+  be a name), ends in a numeric label (decimal, or 0x and hex: a browser reads it as an IPv4
+  address), equals the base domain, lies under it, or has the base domain under it. The
+  comparison is on label boundaries: myexample.test and example.test are disjoint. Validate
+  is the one owner of this rule; the gateway and the agent do not check it again.
+- Validate refuses a node_id that is empty, over 255 bytes, invalid UTF-8, or holds a Unicode
+  control character, U+2028 or U+2029: what the dashboard's tokens can sign.
+- init also refuses, before writing anything: a studio domain with the label `sign-in`
+  (dashcfg.SignInLabel); any node with a studio domain that dashcfg.For refuses (checked on
+  every run, also when the domain comes from node.json); and another value for a studio
+  domain already set. The studio domain is set once: init keeps it when the flag is absent,
+  and there is no supported way to change or remove it.
+- Without --dev the pair is required the first time S is set, and on any run where node.json
+  names S and no pair is stored. The certificate must match the key, list both S and *.S
+  literally among its DNS names (the gateway's loader requires exactly this; the wildcard
+  covers sign-in.S and every <ref>.S), be valid now, and allow serverAuth when it lists
+  extended key usages. It is not verified against any trust store. A rerun without the pair
+  flags keeps the stored pair; to renew, rerun init with the new pair.
+- Both pairs (base and studio) are read through one reader: links are followed (an ACME
+  client's current files work), what is opened must be a regular file of at most 1 MiB, and
+  a FIFO or a device is refused at once instead of blocking. The studio pair is stored as
+  /etc/supapace/tls-studio/{key,cert}.pem, root 0600 in a root 0700 directory, key first,
+  by temporary name and rename, never through a link; leftover temporary files there are
+  removed by the next run.
+- With --dev the pair flags are refused. A new node's CA is name-constrained to both domains
+  and init issues the studio pair (S and *.S, serverAuth, 825 days), reissued by any init run
+  when it cannot be loaded or expires within 30 days. An existing development CA without S
+  is refused with what to do: remove /etc/supapace/ca and /etc/supapace/tls and rerun
+  init --dev --studio-domain S; the projects are kept and clients must trust the new ca.pem.
+- dashpush.New takes the studio domain from the node file: with one, Push writes the
+  dashboard file; without one it writes nothing and returns generation 0.
+- For the packages that start Studio and wire the daemon: only init writes or renews
+  tls-studio (the daemon never does), so the gateway's copy must be refreshed from it by
+  digest at every repair round, and the gateway re-created when it changes. Nothing writes
+  the gateway's dash/domain file or its tls-studio copy yet, so until those packages land a
+  node with a studio domain serves the base certificate for every name and has no dashboard
+  host class. A node.json edited by hand can still name S with no stored pair; the gateway's
+  "dashboard unavailable" path must stay.
+- Known limits: a pair replaced in place is written key first, so a crash between the two
+  files leaves a mismatched pair until init is rerun with the pair; an xn-- label is
+  accepted as LDH without checking its punycode.

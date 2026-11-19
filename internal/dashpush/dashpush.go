@@ -40,9 +40,7 @@ type Pusher struct {
 
 // New returns the pusher of the node's dashboard file.
 func New(src Source, c nodecfg.Config, p nodecfg.Paths) *Pusher {
-	// node.json carries no studio domain yet: until it does, every node is one
-	// without a dashboard, and Push writes nothing.
-	return &Pusher{src: src, cfg: c, path: dashcfg.PathsFor(p).DashboardFile()}
+	return &Pusher{src: src, cfg: c, path: dashcfg.PathsFor(p).DashboardFile(), domain: c.StudioDomain}
 }
 
 // Push renders the file from one snapshot and, when it differs from the file

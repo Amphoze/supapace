@@ -1478,3 +1478,482 @@ func TestInit_AddsThePassphraseToAnInitialisedNode(t *testing.T) {
 	}
 	n.wantMode("etc/supapace/cp-stanza.sealed", 0o600)
 }
+
+// pairFiles writes a self-signed certificate for names and its key as
+// in/<prefix>cert.pem and in/<prefix>key.pem.
+func pairFiles(t *testing.T, n *node, prefix string, notBefore, notAfter time.Time, eku []x509.ExtKeyUsage, names ...string) {
+	t.Helper()
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: names, NotBefore: notBefore, NotAfter: notAfter, ExtKeyUsage: eku}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p8, _ := x509.MarshalPKCS8PrivateKey(k)
+	n.write("in/"+prefix+"cert.pem", string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), 0o644)
+	n.write("in/"+prefix+"key.pem", string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: p8})), 0o600)
+}
+
+// validPair writes a currently valid pair for names.
+func validPair(t *testing.T, n *node, prefix string, names ...string) {
+	t.Helper()
+	pairFiles(t, n, prefix, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), nil, names...)
+}
+
+// baseArgs is init on a node without --dev for base, with the pair in in/.
+func baseArgs(n *node, base string) []string {
+	return []string{"init", "--domain", base, "--no-systemd", "--ack-escrow", "--tls-cert", n.path("in/cert.pem"), "--tls-key", n.path("in/key.pem")}
+}
+
+// studioArgs names the studio domain and the pair in in/studio-*.
+func studioArgs(n *node, studio string) []string {
+	return []string{"--studio-domain", studio, "--studio-tls-cert", n.path("in/studio-cert.pem"), "--studio-tls-key", n.path("in/studio-key.pem")}
+}
+
+// operatorNode is an initialised node without --dev for base.
+func operatorNode(t *testing.T, base string) *node {
+	t.Helper()
+	n := newNode(t)
+	validPair(t, n, "", "*."+base)
+	if code, _, errs := n.run("", baseArgs(n, base)...); code != 0 {
+		t.Fatalf("init: exit %d, %s", code, errs)
+	}
+	return n
+}
+
+// unchanged fails the test when anything below the node's root changed.
+func unchanged(t *testing.T, n *node, before map[string]string) {
+	t.Helper()
+	after := snapshot(t, n.root)
+	if !reflect.DeepEqual(before, after) {
+		for k, v := range after {
+			if before[k] != v {
+				t.Errorf("changed: %s", k)
+			}
+		}
+		for k := range before {
+			if _, ok := after[k]; !ok {
+				t.Errorf("removed: %s", k)
+			}
+		}
+		t.Fatal("a refused run changed files")
+	}
+}
+
+// editNode rewrites node.json with edit applied, as a hand edit would.
+func editNode(t *testing.T, n *node, edit func(*nodecfg.Config)) {
+	t.Helper()
+	c, err := nodecfg.Load(n.p.NodeJSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit(&c)
+	b, _ := json.MarshalIndent(c, "", "  ")
+	if err := os.WriteFile(n.p.NodeJSON(), append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodecfg.Load(n.p.NodeJSON()); err != nil {
+		t.Fatalf("the edited node.json does not load: %v", err)
+	}
+}
+
+func TestInit_StudioDomain_Refusals(t *testing.T) {
+	cases := []struct{ name, base, studio string }{
+		{"equal to the base domain", "sp.test", "sp.test"},
+		{"under the base domain", "sp.test", "studio.sp.test"},
+		{"above the base domain", "app.sp.test", "sp.test"},
+		{"not a name: one label", "sp.test", "studio"},
+		{"not a name: capitals", "sp.test", "Studio.test"},
+		{"not a name: trailing dot", "sp.test", "studio.test."},
+		{"not a name: an IPv4 address", "sp.test", "192.0.2.1"},
+		{"a reserved label", "sp.test", "sign-in.studio.test"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// A fresh node: nothing is written.
+			n := newNode(t)
+			validPair(t, n, "", "*."+c.base)
+			validPair(t, n, "studio-", c.studio, "*."+c.studio)
+			code, _, errs := n.run("", append(baseArgs(n, c.base), studioArgs(n, c.studio)...)...)
+			if code != 1 || !strings.Contains(errs, "studio") {
+				t.Fatalf("exit %d, stderr %q; want 1 naming the studio domain", code, errs)
+			}
+			absent(t, n.p.NodeJSON())
+			absent(t, n.p.KEK())
+			absent(t, n.path("etc/supapace/tls"))
+			absent(t, n.path("etc/supapace/tls-studio"))
+			// An initialised node: nothing changes.
+			m := operatorNode(t, c.base)
+			validPair(t, m, "studio-", c.studio, "*."+c.studio)
+			before := snapshot(t, m.root)
+			if code, _, errs := m.run("", append(baseArgs(m, c.base), studioArgs(m, c.studio)...)...); code != 1 {
+				t.Fatalf("initialised node: exit %d, stderr %q", code, errs)
+			}
+			unchanged(t, m, before)
+		})
+	}
+	// Control on the same path: a disjoint studio domain is taken.
+	n := newNode(t)
+	validPair(t, n, "", "*.sp.test")
+	validPair(t, n, "studio-", "studio.test", "*.studio.test")
+	if code, _, errs := n.run("", append(baseArgs(n, "sp.test"), studioArgs(n, "studio.test")...)...); code != 0 {
+		t.Fatalf("control: exit %d, %s", code, errs)
+	}
+}
+
+// refusedByFor: on a node file dashcfg.For refuses, init with a studio domain
+// is refused naming word, before anything is written. Without one the node is
+// accepted, or, when without is set, refused by an older check naming it.
+func refusedByFor(t *testing.T, word, without string, edit func(*nodecfg.Config)) {
+	t.Helper()
+	n := operatorNode(t, "sp.test")
+	// No host id near the platform uids: the range itself is what is refused.
+	n.write("etc/passwd", "root:x:0:0:root:/root:/bin/sh\n", 0o644)
+	n.write("etc/group", "root:x:0:\n", 0o644)
+	editNode(t, n, edit)
+	// Without a studio domain: accepted, or (without = the reason) refused by
+	// a check of the first phase.
+	if code, _, errs := n.run("", baseArgs(n, "sp.test")...); (code == 0) != (without == "") || !strings.Contains(errs, without) {
+		t.Fatalf("control, without a studio domain: exit %d, %s", code, errs)
+	}
+	validPair(t, n, "studio-", "studio.test", "*.studio.test")
+	before := snapshot(t, n.root)
+	code, _, errs := n.run("", append(baseArgs(n, "sp.test"), studioArgs(n, "studio.test")...)...)
+	if code != 1 || !strings.Contains(errs, word) {
+		t.Fatalf("exit %d, stderr %q; want 1 naming %q", code, errs, word)
+	}
+	unchanged(t, n, before)
+}
+
+func TestInit_RefusesUidRangeOverPlatformUids(t *testing.T) {
+	t.Run("the control plane's uid", func(t *testing.T) {
+		refusedByFor(t, "platform uid 70", "is not within", func(c *nodecfg.Config) { c.UIDBase, c.UIDCount = 10, 1024 })
+	})
+	t.Run("the dashboard's uids", func(t *testing.T) {
+		refusedByFor(t, "platform uid 65527", "is not within", func(c *nodecfg.Config) { c.UIDBase, c.UIDCount = 64512, 1024 })
+	})
+}
+
+func TestInit_RefusesWhatDashcfgForRefuses(t *testing.T) {
+	t.Run("an address collision", func(t *testing.T) {
+		refusedByFor(t, "is a dashboard address", "", func(c *nodecfg.Config) { c.GatewayIP = "10.212.0.3" })
+	})
+	t.Run("more than 4096 slices", func(t *testing.T) {
+		refusedByFor(t, "8192 slices", "", func(c *nodecfg.Config) {
+			c.SlicePrefix = 29
+			c.PlatformSubnet, c.PlatformIPRange, c.GatewayIP = "10.212.64.0/18", "10.212.120.0/23", "10.212.64.2"
+		})
+	})
+}
+
+func TestInit_StudioPair_RequiredAndChecked(t *testing.T) {
+	day := 24 * time.Hour
+	nowT := time.Now()
+	studio := []string{"studio.test", "*.studio.test"}
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, n *node)
+		args  func(n *node) []string
+		code  int
+		word  string
+	}{
+		{"domain without the pair", nil, func(n *node) []string { return []string{"--studio-domain", "studio.test"} }, 2, "--studio-tls-cert"},
+		{"pair without the domain", nil, func(n *node) []string { return studioArgs(n, "studio.test")[2:] }, 2, "--studio-domain"},
+		{"certificate without key", nil, func(n *node) []string { return studioArgs(n, "studio.test")[:4] }, 2, "go together"},
+		{"the domain only", func(t *testing.T, n *node) { validPair(t, n, "studio-", "studio.test") }, nil, 1, "does not cover"},
+		{"the wildcard only", func(t *testing.T, n *node) { validPair(t, n, "studio-", "*.studio.test") }, nil, 1, "does not cover"},
+		{"another domain", func(t *testing.T, n *node) { validPair(t, n, "studio-", "other.test", "*.other.test") }, nil, 1, "does not cover"},
+		{"a key that does not match", func(t *testing.T, n *node) {
+			validPair(t, n, "studio-", studio...)
+			n.write("in/studio-key.pem", string(n.read("in/key.pem")), 0o600)
+		}, nil, 1, "--studio-tls-cert/--studio-tls-key"},
+		{"expired", func(t *testing.T, n *node) {
+			pairFiles(t, n, "studio-", nowT.Add(-90*day), nowT.Add(-day), nil, studio...)
+		}, nil, 1, "expired"},
+		{"client auth only", func(t *testing.T, n *node) {
+			pairFiles(t, n, "studio-", nowT.Add(-day), nowT.Add(90*day), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, studio...)
+		}, nil, 1, "serverAuth"},
+		{"the key is a FIFO", func(t *testing.T, n *node) {
+			validPair(t, n, "studio-", studio...)
+			os.Remove(n.path("in/studio-key.pem"))
+			if err := syscall.Mkfifo(n.path("in/studio-key.pem"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, nil, 1, "regular file"},
+		{"the certificate is too large", func(t *testing.T, n *node) {
+			validPair(t, n, "studio-", studio...)
+			n.write("in/studio-cert.pem", string(n.read("in/studio-cert.pem"))+strings.Repeat("\n", maxPairFile), 0o644)
+		}, nil, 1, "larger than"},
+		{"the key is missing", func(t *testing.T, n *node) {
+			validPair(t, n, "studio-", studio...)
+			os.Remove(n.path("in/studio-key.pem"))
+		}, nil, 1, "studio-key.pem"},
+		{"dev with the pair", func(t *testing.T, n *node) { validPair(t, n, "studio-", studio...) },
+			func(n *node) []string { return append([]string{"--dev"}, studioArgs(n, "studio.test")...) }, 2, "--dev"},
+		{"valid", func(t *testing.T, n *node) { validPair(t, n, "studio-", studio...) }, nil, 0, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n := newNode(t)
+			validPair(t, n, "", "*.sp.test")
+			if c.setup != nil {
+				c.setup(t, n)
+			}
+			args := []string{"init", "--domain", "sp.test", "--no-systemd", "--ack-escrow"}
+			if c.args == nil {
+				args = append(baseArgs(n, "sp.test"), studioArgs(n, "studio.test")...)
+			} else if extra := c.args(n); extra[0] == "--dev" {
+				args = append(args, extra...)
+			} else {
+				args = append(baseArgs(n, "sp.test"), extra...)
+			}
+			code, _, errs := n.run("", args...)
+			if code != c.code || !strings.Contains(errs, c.word) {
+				t.Fatalf("exit %d, stderr %q; want %d naming %q", code, errs, c.code, c.word)
+			}
+			if code != 0 {
+				absent(t, n.p.NodeJSON())
+				absent(t, n.path("etc/supapace/tls"))
+				absent(t, n.path("etc/supapace/tls-studio"))
+				return
+			}
+			n.wantMode("etc/supapace/tls-studio", fs.ModeDir|0o700)
+			n.wantMode("etc/supapace/tls-studio/cert.pem", 0o600)
+			n.wantMode("etc/supapace/tls-studio/key.pem", 0o600)
+			if !bytes.Equal(n.read("etc/supapace/tls-studio/cert.pem"), n.read("in/studio-cert.pem")) ||
+				!bytes.Equal(n.read("etc/supapace/tls-studio/key.pem"), n.read("in/studio-key.pem")) {
+				t.Error("the studio pair was not installed as given")
+			}
+			if c, err := nodecfg.Load(n.p.NodeJSON()); err != nil || c.StudioDomain != "studio.test" {
+				t.Errorf("node.json studio_domain %q, %v", c.StudioDomain, err)
+			}
+		})
+	}
+}
+
+// devCA parses the development CA of n.
+func devCA(t *testing.T, n *node) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode(n.read("etc/supapace/ca/ca.pem"))
+	if block == nil {
+		t.Fatal("ca.pem holds no PEM block")
+	}
+	ca, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ca
+}
+
+func TestInit_Dev_IssuesBothPairs_CAConstrainedToBoth(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(append(devArgs, "--studio-domain", "studio.test")...)
+	ca := devCA(t, n)
+	if !ca.PermittedDNSDomainsCritical || !reflect.DeepEqual(ca.PermittedDNSDomains, []string{"sp.test", "studio.test"}) {
+		t.Errorf("CA constraint %v (critical %v), want [sp.test studio.test]", ca.PermittedDNSDomains, ca.PermittedDNSDomainsCritical)
+	}
+	n.wantMode("etc/supapace/tls-studio", fs.ModeDir|0o700)
+	n.wantMode("etc/supapace/tls-studio/cert.pem", 0o600)
+	n.wantMode("etc/supapace/tls-studio/key.pem", 0o600)
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	leafOf := func(dir string) *x509.Certificate {
+		pair, err := tls.X509KeyPair(n.read(dir+"/cert.pem"), n.read(dir+"/key.pem"))
+		if err != nil {
+			t.Fatalf("%s: %v", dir, err)
+		}
+		return pair.Leaf
+	}
+	base, studio := leafOf("etc/supapace/tls"), leafOf("etc/supapace/tls-studio")
+	if !reflect.DeepEqual(base.DNSNames, []string{"*.sp.test"}) {
+		t.Errorf("base certificate names %v", base.DNSNames)
+	}
+	if !reflect.DeepEqual(studio.DNSNames, []string{"studio.test", "*.studio.test"}) || studio.IsCA {
+		t.Errorf("studio certificate names %v, CA %v", studio.DNSNames, studio.IsCA)
+	}
+	for _, host := range []string{"studio.test", "sign-in.studio.test", "abcdefghij0123456789.studio.test"} {
+		if _, err := studio.Verify(x509.VerifyOptions{Roots: roots, DNSName: host}); err != nil {
+			t.Errorf("studio certificate for %s: %v", host, err)
+		}
+	}
+	for _, host := range []string{"a.b.studio.test", "sp.test", "abcdefghij0123456789.sp.test"} {
+		if _, err := studio.Verify(x509.VerifyOptions{Roots: roots, DNSName: host}); err == nil {
+			t.Errorf("studio certificate verifies for %s", host)
+		}
+	}
+	if c, err := nodecfg.Load(n.p.NodeJSON()); err != nil || c.StudioDomain != "studio.test" {
+		t.Errorf("node.json studio_domain %q, %v", c.StudioDomain, err)
+	}
+	// A second run changes nothing, with or without the flag.
+	before := snapshot(t, n.root)
+	for _, args := range [][]string{append(devArgs, "--studio-domain", "studio.test"), devArgs} {
+		if out := n.mustInit(args...); !strings.Contains(out, "nothing to change") {
+			t.Errorf("init %v: %q", args, out)
+		}
+	}
+	unchanged(t, n, before)
+	// A studio pair that is gone is issued again by the same CA; the base pair
+	// and the CA stay.
+	caPEM, basePEM := n.read("etc/supapace/ca/ca.pem"), n.read("etc/supapace/tls/cert.pem")
+	os.Remove(n.path("etc/supapace/tls-studio/cert.pem"))
+	n.mustInit(devArgs...)
+	if !bytes.Equal(caPEM, n.read("etc/supapace/ca/ca.pem")) || !bytes.Equal(basePEM, n.read("etc/supapace/tls/cert.pem")) {
+		t.Error("the CA or the base pair changed")
+	}
+	if _, err := leafOf("etc/supapace/tls-studio").Verify(x509.VerifyOptions{Roots: roots, DNSName: "sign-in.studio.test"}); err != nil {
+		t.Errorf("reissued studio pair: %v", err)
+	}
+}
+
+func TestInit_Dev_ExistingCAWithoutTheStudioDomain_Refused(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(devArgs...)
+	before := snapshot(t, n.root)
+	code, _, errs := n.run("", append([]string{"init"}, append(devArgs, "--studio-domain", "studio.test")...)...)
+	if code != 1 || !strings.Contains(errs, "re-initialise this development node to add a studio domain") {
+		t.Fatalf("exit %d, stderr %q", code, errs)
+	}
+	unchanged(t, n, before)
+}
+
+func TestInit_ExistingNode_GainsAStudioDomain_BaseUnchanged(t *testing.T) {
+	n := operatorNode(t, "sp.test")
+	old, err := nodecfg.Load(n.p.NodeJSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	validPair(t, n, "studio-", "studio.test", "*.studio.test")
+	before := snapshot(t, n.root)
+	args := append([]string{"init", "--domain", "sp.test", "--no-systemd", "--ack-escrow"}, studioArgs(n, "studio.test")...)
+	if code, _, errs := n.run("", args...); code != 0 {
+		t.Fatalf("exit %d, %s", code, errs)
+	}
+	after := snapshot(t, n.root)
+	for k, v := range before {
+		// node.json and its directory, which gains tls-studio, change; nothing else.
+		if k != n.p.NodeJSON() && k != filepath.Dir(n.p.NodeJSON()) && after[k] != v {
+			t.Errorf("changed: %s", k)
+		}
+	}
+	got, err := nodecfg.Load(n.p.NodeJSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.StudioDomain = "studio.test"
+	if !reflect.DeepEqual(got, old) {
+		t.Errorf("node.json %+v\nwant the old one with the studio domain %+v", got, old)
+	}
+	if !bytes.Equal(n.read("etc/supapace/tls-studio/cert.pem"), n.read("in/studio-cert.pem")) {
+		t.Error("studio pair not installed")
+	}
+}
+
+func TestInit_StudioDomainCannotChange(t *testing.T) {
+	n := operatorNode(t, "sp.test")
+	validPair(t, n, "studio-", "studio.test", "*.studio.test")
+	if code, _, errs := n.run("", append(baseArgs(n, "sp.test"), studioArgs(n, "studio.test")...)...); code != 0 {
+		t.Fatalf("exit %d, %s", code, errs)
+	}
+	validPair(t, n, "studio-", "other.test", "*.other.test")
+	before := snapshot(t, n.root)
+	code, _, errs := n.run("", append(baseArgs(n, "sp.test"), studioArgs(n, "other.test")...)...)
+	if code != 1 || !strings.Contains(errs, "studio.test") {
+		t.Fatalf("exit %d, stderr %q", code, errs)
+	}
+	unchanged(t, n, before)
+	// Without the flag, and with the same domain and no pair, the domain stays.
+	for _, extra := range [][]string{nil, {"--studio-domain", "studio.test"}} {
+		args := append([]string{"init", "--domain", "sp.test", "--no-systemd", "--ack-escrow"}, extra...)
+		code, out, errs := n.run("", args...)
+		if code != 0 || !strings.Contains(out, "nothing to change") {
+			t.Fatalf("init %v: exit %d, %q %q", extra, code, out, errs)
+		}
+	}
+	unchanged(t, n, before)
+}
+
+func TestInit_WithoutStudioDomain_AsBefore(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(devArgs...)
+	if b := n.read("etc/supapace/node.json"); bytes.Contains(b, []byte("studio")) {
+		t.Errorf("node.json names a studio domain: %s", b)
+	}
+	got, err := nodecfg.Load(n.p.NodeJSON())
+	if err != nil || !reflect.DeepEqual(got, nodecfg.Default("sp.test")) {
+		t.Errorf("node.json %+v (%v), want nodecfg.Default", got, err)
+	}
+	if ca := devCA(t, n); !reflect.DeepEqual(ca.PermittedDNSDomains, []string{"sp.test"}) {
+		t.Errorf("CA constraint %v, want [sp.test]", ca.PermittedDNSDomains)
+	}
+	absent(t, n.path("etc/supapace/tls-studio"))
+	m := operatorNode(t, "sp.test")
+	absent(t, m.path("etc/supapace/tls-studio"))
+	if b := m.read("etc/supapace/node.json"); bytes.Contains(b, []byte("studio")) {
+		t.Errorf("node.json names a studio domain: %s", b)
+	}
+}
+
+// A temporary file an interrupted write left in tls-studio is removed by the
+// next run, as in init's other directories.
+func TestInit_RemovesStudioLeftovers(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(append(devArgs, "--studio-domain", "studio.test")...)
+	n.write("etc/supapace/tls-studio/.key.pem.tmp-0123456789abcdef", "partial", 0o600)
+	n.mustInit(devArgs...)
+	absent(t, n.path("etc/supapace/tls-studio/.key.pem.tmp-0123456789abcdef"))
+}
+
+// A FIFO named as the base certificate or key is refused at once; init does
+// not block on it.
+func TestInit_BasePair_FIFORefused(t *testing.T) {
+	for _, file := range []string{"cert.pem", "key.pem"} {
+		n := newNode(t)
+		validPair(t, n, "", "*.sp.test")
+		os.Remove(n.path("in/" + file))
+		if err := syscall.Mkfifo(n.path("in/"+file), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		var code int
+		var errs string
+		go func() { defer close(done); code, _, errs = n.run("", baseArgs(n, "sp.test")...) }()
+		select {
+		case <-done:
+		case <-time.After(time.Minute):
+			// Unblock the open so the goroutine ends, then fail.
+			if f, err := os.OpenFile(n.path("in/"+file), os.O_WRONLY, 0); err == nil {
+				f.Close()
+			}
+			<-done
+			t.Fatalf("%s: init blocked on a FIFO", file)
+		}
+		if code != 1 || !strings.Contains(errs, "not a regular file") {
+			t.Fatalf("%s: exit %d, stderr %q", file, code, errs)
+		}
+		absent(t, n.p.NodeJSON())
+	}
+}
+
+// The two refusals that leave the operator with a decision say what to do.
+func TestInit_StudioRefusals_SayWhatToDo(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(devArgs...)
+	_, _, errs := n.run("", append([]string{"init"}, append(devArgs, "--studio-domain", "studio.test")...)...)
+	for _, want := range []string{"re-initialise this development node to add a studio domain",
+		"remove " + n.p.CADir() + " and " + n.p.TLSDir(), "init --dev --studio-domain studio.test",
+		"projects are kept", "trust the new " + filepath.Join(n.p.CADir(), "ca.pem")} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("dev refusal %q lacks %q", errs, want)
+		}
+	}
+	m := operatorNode(t, "sp.test")
+	validPair(t, m, "studio-", "studio.test", "*.studio.test")
+	m.run("", append(baseArgs(m, "sp.test"), studioArgs(m, "studio.test")...)...)
+	validPair(t, m, "studio-", "other.test", "*.other.test")
+	_, _, errs = m.run("", append(baseArgs(m, "sp.test"), studioArgs(m, "other.test")...)...)
+	for _, want := range []string{`holds studio domain "studio.test"; init does not change it`, "no supported way to change or remove it"} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("change refusal %q lacks %q", errs, want)
+		}
+	}
+}
