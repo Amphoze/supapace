@@ -247,3 +247,28 @@ func open(key, aad, nonce, ct []byte) ([]byte, error) {
 	}
 	return plain, nil
 }
+
+// SealNode encrypts a node-level secret file under the KEK: the 12-byte nonce
+// followed by the AES-256-GCM ciphertext, with AAD "node" || 0x00 || name, so
+// a sealed file cannot be read back under another name.
+func SealNode(k KEK, name string, plain []byte) ([]byte, error) {
+	if name == "" {
+		return nil, errors.New("secrets: empty name")
+	}
+	nonce, ct, err := seal(k[:], []byte("node\x00"+name), plain)
+	if err != nil {
+		return nil, err
+	}
+	return append(nonce, ct...), nil
+}
+
+// OpenNode reverses SealNode; any mismatch of KEK, name or bytes fails.
+func OpenNode(k KEK, name string, sealed []byte) ([]byte, error) {
+	if name == "" {
+		return nil, errors.New("secrets: empty name")
+	}
+	if len(sealed) < 12 {
+		return nil, errCrypto
+	}
+	return open(k[:], []byte("node\x00"+name), sealed[:12], sealed[12:])
+}

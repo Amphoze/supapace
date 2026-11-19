@@ -20,4 +20,6 @@ dyndns.org        # the browser tests' second studio domain: a public-suffix ent
 mcr.microsoft.com # registry of the browser harness's pinned base image (test/harness/browsers/Dockerfile)
 169.254.0.0       # link-local block a pooler allow-list entry must not overlap (internal/poolcfg)
 api.supabase.com  # the upstream CLI's default Management API host, named where docs/management-api.md says how to point it elsewhere
+233.252.0.1       # MCAST-TEST-NET documentation multicast address: an endpoint answer the off-site resolver must refuse (internal/offsite)
 registry.npmjs.org # the registry the browser harness lockfile resolves its pinned packages from (test/harness/browsers/package-lock.json)
+240.0.0.1         # reserved block (240.0.0.0/4) address: an endpoint answer the off-site resolver must refuse (internal/offsite)

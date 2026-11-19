@@ -30,6 +30,7 @@ import (
 	"github.com/Amphoze/supapace/internal/nft"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/nodefs"
+	"github.com/Amphoze/supapace/internal/offsite"
 	"github.com/Amphoze/supapace/internal/secrets"
 )
 
@@ -203,8 +204,11 @@ func initNode(o initOpts) error {
 	if w.err != nil {
 		return w.err
 	}
-	shown, err := ensureKEK(etc, o.ack)
+	shown, k, err := ensureKEK(etc, o.ack)
 	if err != nil {
+		return err
+	}
+	if err := w.cpPass(k); err != nil {
 		return err
 	}
 	if len(w.wrote) == 0 && !shown {
@@ -521,20 +525,20 @@ func loadCA(certPath, keyPath string) (*x509.Certificate, crypto.Signer, error) 
 // shows its escrow text until the operator has acknowledged it once. Whether
 // to show is decided by the acknowledgement marker, never by the key file: a
 // power loss can leave a complete key that was never shown. It reports
-// whether the key was shown.
-func ensureKEK(etc string, ack bool) (bool, error) {
+// whether the key was shown and, when it read or generated it, the key.
+func ensureKEK(etc string, ack bool) (bool, *secrets.KEK, error) {
 	marker := filepath.Join(etc, kekEscrowName)
 	if exists(marker) {
 		if problem := kekProblem(paths.KEK()); problem != "" {
-			return false, fmt.Errorf("the key escrow was acknowledged but %s %s: restore the escrowed key; init will not make a new one", paths.KEK(), problem)
+			return false, nil, fmt.Errorf("the key escrow was acknowledged but %s %s: restore the escrowed key; init will not make a new one", paths.KEK(), problem)
 		}
-		return false, nil
+		return false, nil, nil
 	}
 	// The flag asserts the operator saw the key; a display that provably went
 	// nowhere cannot be acknowledged. A closed standard output is reopened on
 	// the null device by the Go runtime, so this covers that case too.
 	if ack && toNullDevice(stdout) {
-		return false, fmt.Errorf("--ack-escrow needs the key escrow shown somewhere: standard output is %s; run init with standard output on a terminal or a file", os.DevNull)
+		return false, nil, fmt.Errorf("--ack-escrow needs the key escrow shown somewhere: standard output is %s; run init with standard output on a terminal or a file", os.DevNull)
 	}
 	var k secrets.KEK
 	var err error
@@ -544,13 +548,13 @@ func ensureKEK(etc string, ack bool) (bool, error) {
 		k, err = secrets.LoadKEK(paths.KEK())
 	}
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	_, werr := fmt.Fprintf(stdout, "\nKey-encryption key of this node. Store it offline now; it is shown until acknowledged, then never again:\n\n%s\n\n", secrets.EscrowText(k))
-	clear(k[:])
 	if werr != nil {
+		clear(k[:])
 		// Never acknowledged unless shown: the next run shows it again.
-		return false, fmt.Errorf("the key escrow could not be shown: %w", werr)
+		return false, nil, fmt.Errorf("the key escrow could not be shown: %w", werr)
 	}
 	if ack {
 		fmt.Fprintln(stdout, "supapaced init: escrow acknowledged by --ack-escrow")
@@ -558,14 +562,41 @@ func ensureKEK(etc string, ack bool) (bool, error) {
 		fmt.Fprintf(stdout, "Type %q once it is stored: ", escrowWord)
 		line, _ := bufio.NewReader(stdin).ReadString('\n')
 		if strings.TrimSpace(line) != escrowWord {
-			return true, errors.New("key escrow not acknowledged; run init again to see the key")
+			clear(k[:])
+			return true, nil, errors.New("key escrow not acknowledged; run init again to see the key")
 		}
 	}
 	if err := nodefs.WriteFile(paths, etc, filepath.Base(marker), nil, 0o600, os.Geteuid(), os.Getegid()); err != nil {
-		return true, err
+		clear(k[:])
+		return true, nil, err
 	}
 	fmt.Fprintf(stdout, "supapaced init: wrote %s\n", marker)
-	return true, nil
+	return true, &k, nil
+}
+
+// cpPass creates the control plane's sealed cipher passphrase when it is
+// absent; a file in place is never touched. k is the key ensureKEK read or
+// generated (cleared here), or nil: then the key file is loaded.
+func (w *writer) cpPass(k *secrets.KEK) error {
+	if k != nil {
+		defer clear(k[:])
+	}
+	if exists(paths.CPStanzaSealed()) {
+		return nil
+	}
+	if k == nil {
+		key, err := secrets.LoadKEK(paths.KEK())
+		if err != nil {
+			return err
+		}
+		defer clear(key[:])
+		k = &key
+	}
+	if _, err := offsite.EnsureControlPlanePass(paths, *k); err != nil {
+		return err
+	}
+	w.done(paths.CPStanzaSealed())
+	return nil
 }
 
 // same reports whether path is a regular file owned by uid with exactly mode

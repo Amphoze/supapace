@@ -2918,3 +2918,56 @@ Engine facts (the harness's gate runs)
 - WebKit sends no SameSite=Strict cookie on a navigation the harness types after another site:
   start a log-out from a page of the origin, as a person does.
 - Firefox and WebKit apply a proxy bypass entry to its subdomains; Chromium matches it exactly.
+
+### 2026-11-19 — internal/offsite: object-store declaration, passphrase, escrow document
+
+- secrets.SealNode/OpenNode(k, name, b): 12-byte random nonce || AES-256-GCM with additional
+  data "node\x00"+name. A file opens only under its own name; an empty name is refused.
+  Nothing detects an older file of the same name put back by root (root holds the key).
+- offsite.Declaration{Endpoint, Region, PathStyle, CAPEM, Projects, ControlPlane Bucket};
+  Bucket{Name, Prefix, Write, Read Credential}. Credential redacts under every fmt verb,
+  slog (text and JSON) and encoding/json; never encode it with gob.
+- Load(p, k) → (d, State, err): no file is StateUndeclared with a nil error; both bucket
+  names and all four credentials → StateDeclared; any other valid file → StatePartial (the
+  file recover writes). A file that does not open or does not check is an error.
+- Save(p, k, d): checks d, seals it as "offsite", writes Paths.OffsiteSealed() 0600 by rename
+  through nodefs.WriteFile (directory owned by the caller, no group or other write).
+- Checks: Endpoint exactly https://host[:port] — no path, query, fragment, user, port 0; the
+  refusal never quotes the endpoint. Each prefix is empty, or at most 256 bytes with no
+  leading or trailing "/", no empty, "." or ".." segment, no segment over 255 bytes, no
+  control byte. One bucket for both uses only with disjoint prefixes (empty overlaps all).
+- EnsureControlPlanePass(p, k): returns the passphrase in Paths.CPStanzaSealed() (sealed as
+  "cp-stanza"); when absent creates 32 random bytes, base64url (43 characters), by temp file
+  and link in a directory that is a real directory of the caller's with no group or other
+  write, so racing creators, processes included, all get the winner's. A file that does not
+  open is an error and is kept: nothing regenerates it (that would orphan every backup).
+- Resolve(ctx, d, c): IPv4 lookup of the endpoint's host, deduplicated and sorted, with the
+  endpoint's port (443 by default); the whole answer goes through CheckAddrs, then the 16
+  lowest are kept. An empty answer is an error.
+- CheckAddrs(c, addrs) refuses the whole set for: not IPv4 with a port; loopback; link-local
+  (169.254.169.254 included); multicast; unspecified; 0.0.0.0/8; 240.0.0.0/4 (broadcast
+  included); the node's project block, platform, ingress and backup subnets and Docker pool
+  (from c); the subnet of any bridge (an interface with /sys/class/net/<if>/bridge), read
+  from the kernel at each call. Subnets of other interfaces are accepted. An interface list
+  that cannot be read refuses. An empty set passes.
+- BuildEscrow(k, d, cp, worker, version, now) → all, kek, rest: JSON, 2-space indent,
+  created_at RFC 3339 UTC; of d only the endpoint, region, path style, CA (null when empty)
+  and the control-plane bucket, prefix and read credential; read_only is false when that
+  read credential equals the write credential. kek part: version, part, kek. rest part:
+  everything but kek, kek_id included. What it returns always parses.
+- ParseEscrow(all) or (kek, rest) in either order: exact member set by path (unknown,
+  duplicate, case-folded, missing and null members refused; only ca_pem may be null), depth
+  at most 4, at most 1 MiB a part, version 1 (a newer one is named as such), kek 32 bytes of
+  strict base64 matching kek_id, stanza "cp-"+incarnation (a canonical decimal string up to
+  2^64-1). Errors carry a byte offset or a member path, never a value. Escrow and
+  EscrowControlPlane print and marshal redacted; Escrow.Offsite.Read is a Credential.
+- KEKID(k): first 16 hex digits of SHA-256("supapace-kek-id\x00" || key).
+  EscrowRestHash(rest): hex SHA-256 of a valid rest part re-marshalled without created_at,
+  so every print of one state hashes alike.
+- supapaced offsite set|show, root only. set reads four keys files (access key, newline,
+  secret key; at most 4 KiB; no blank or control bytes), runs the object-store client's
+  offline checks for each bucket and credential, then Save; it makes no request. show prints
+  state, location and presence flags, never a key; exit 0 when undeclared, which needs no
+  key. Further sub-commands register in offsiteCommands from their own init().
+- init writes cp-stanza.sealed once, after the key escrow is acknowledged; a rerun with the
+  file present does not load the key and reports nothing to change.

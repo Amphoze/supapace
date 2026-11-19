@@ -28,6 +28,8 @@ import (
 
 	"github.com/Amphoze/supapace/internal/nft"
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/offsite"
+	"github.com/Amphoze/supapace/internal/secrets"
 )
 
 // node is a fake node root for one test: init writes below it.
@@ -1338,4 +1340,71 @@ func TestInstallNode_StateDirOwner(t *testing.T) {
 	if fi, _ := os.Lstat(dir); owner(fi) != 0 || fi.Sys().(*syscall.Stat_t).Gid != 0 || fi.Mode().Perm() != 0o700 {
 		t.Errorf("/var/lib/supapace owner %d mode %v, want root:root 0700", owner(fi), fi.Mode().Perm())
 	}
+}
+
+// init writes the control plane's cipher passphrase, sealed under the key,
+// once: a later run leaves it as it is.
+func TestInit_WritesControlPlanePassphraseOnce(t *testing.T) {
+	n := newNode(t)
+	out := n.mustInit(devArgs...)
+	if !strings.Contains(out, "wrote "+n.p.CPStanzaSealed()) {
+		t.Errorf("init did not report the passphrase file: %q", out)
+	}
+	n.wantMode("etc/supapace/cp-stanza.sealed", 0o600)
+	var k secrets.KEK
+	copy(k[:], n.read("etc/supapace/kek"))
+	sealed := n.read("etc/supapace/cp-stanza.sealed")
+	pass, err := offsite.EnsureControlPlanePass(n.p, k)
+	if err != nil || len(pass) != 43 {
+		t.Fatalf("the file does not open under the node's key: %v", err)
+	}
+	if bytes.Contains(sealed, []byte(pass)) || strings.Contains(out, pass) {
+		t.Fatal("the passphrase is stored or shown in plain text")
+	}
+	if !bytes.Equal(n.read("etc/supapace/cp-stanza.sealed"), sealed) {
+		t.Fatal("opening the file changed it")
+	}
+	before := snapshot(t, n.root)
+	if out := n.mustInit(devArgs...); !strings.Contains(out, "nothing to change") {
+		t.Errorf("second run: %q", out)
+	}
+	if !reflect.DeepEqual(before, snapshot(t, n.root)) {
+		t.Fatal("a second run changed files")
+	}
+
+	// A file in place is never replaced, whatever it holds.
+	if err := os.WriteFile(n.p.CPStanzaSealed(), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n.mustInit(devArgs...)
+	if string(n.read("etc/supapace/cp-stanza.sealed")) != "x" {
+		t.Fatal("init replaced the passphrase file")
+	}
+}
+
+// Without the escrow acknowledged nothing is sealed under the key.
+func TestInit_NoPassphraseBeforeTheKeyIsAcknowledged(t *testing.T) {
+	n := newNode(t)
+	if code, _, _ := n.run("", "init", "--domain", "sp.test", "--dev", "--no-systemd"); code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	absent(t, n.p.CPStanzaSealed())
+}
+
+// A node initialised before the passphrase existed gains it on the next run;
+// that run loads the key file, which must be root's.
+func TestInit_AddsThePassphraseToAnInitialisedNode(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("loading an existing key requires a root-owned key file: runs as root on the node")
+	}
+	n := newNode(t)
+	n.mustInit(devArgs...)
+	if err := os.Remove(n.p.CPStanzaSealed()); err != nil {
+		t.Fatal(err)
+	}
+	out := n.mustInit(devArgs...)
+	if !strings.Contains(out, "wrote "+n.p.CPStanzaSealed()) || strings.Contains(out, "nothing to change") {
+		t.Fatalf("output %q", out)
+	}
+	n.wantMode("etc/supapace/cp-stanza.sealed", 0o600)
 }
