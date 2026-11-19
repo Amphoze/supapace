@@ -38,6 +38,7 @@ import (
 
 	"github.com/Amphoze/supapace/internal/bootstrap"
 	"github.com/Amphoze/supapace/internal/pgsock"
+	"github.com/Amphoze/supapace/internal/store"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -1013,12 +1014,14 @@ func TestReach11_Refs(t *testing.T) {
 // and inodes at its user limits while B keeps writing; a log flood of at
 // least 100 MiB from it leaves B and the control-plane database writable and
 // its container's log files within the configured bound and under 31 MiB;
-// after the runbook (a restart with twice the quota) it is active and writes
-// again. The fills run at its uid in a filler container (see filler), are
-// bounded by the quota and are removed in cleanup. Fails if a write past either limit
+// at its block limit `project show` carries its usage and a restart below
+// that usage plus the start headroom is refused (quotaRefusal); after the
+// runbook (a restart with twice the quota) it is active and writes again. The
+// fills run at its uid in a filler container (see filler), are bounded by
+// the quota and are removed in cleanup. Fails if a write past either limit
 // succeeds, if B or the control plane stops taking writes, if the log grows
-// past the bound, or if the controls (writes below the limit, the flood
-// reaching the log) fail.
+// past the bound, if the refusal or the usage is wrong, or if the controls
+// (writes below the limit, the flood reaching the log) fail.
 func TestReach13_Quota(t *testing.T) {
 	_, B := fixtureAB(t)
 	bl, err := bootstrap.LoadBaseline()
@@ -1034,6 +1037,7 @@ func TestReach13_Quota(t *testing.T) {
 	t.Run("log_flood", func(t *testing.T) { logFlood(t, S, B) })
 	t.Run("block_limit_and_runbook", func(t *testing.T) {
 		blockLimit(t, S, quotaMB)
+		quotaRefusal(t, S, quotaMB)
 		restartWait(t, S.Ref, fmt.Sprintf("disk_quota_mb=%d", 2*quotaMB))
 		if st := projectState(t, S.Ref); st != "active" {
 			t.Fatalf("after the runbook the project is %s, want active", st)
@@ -1255,6 +1259,54 @@ dd if=/dev/zero of="$1" bs=1M count=64 seek=$i conv=notrunc,fsync oflag=direct |
 	}
 	if _, err := sqlAs(t, S, "postgres", "insert into public.reach_q select repeat(md5(i::text), 64) from generate_series(1, 200000) i"); err == nil {
 		t.Fatal("a database write of 200,000 rows succeeded with the quota exhausted")
+	}
+}
+
+// quotaRefusal: with S at its block limit, `project show` carries the usage
+// the quota charges (non-null for an active project, within 64 MiB of the
+// quota report), and a restart to a quota below that usage plus the start
+// headroom is refused at once with 409 quota_below_usage naming the smallest
+// accepted value (the usage in MiB plus the headroom, again within 64 MiB);
+// nothing changes. Control: the runbook's quota that follows is at least that
+// value. Fails if the member is null or off, if the restart is not refused
+// with that code and value, or if the project's state or generation moved.
+func quotaRefusal(t *testing.T, S Project, quotaMB int) {
+	var sh struct {
+		State         string `json:"state"`
+		Generation    int64  `json:"generation"`
+		DiskUsedBytes *int64 `json:"disk_used_bytes"`
+	}
+	show := func() {
+		out, code := cli(t, "project", "show", S.Ref)
+		decode(t, "project show", out, &sh)
+		if code != 0 {
+			t.Fatalf("project show: exit %d", code)
+		}
+	}
+	show()
+	report := quotaOf(t, S.UID).BlocksUsed << 10
+	if sh.State != "active" || sh.DiskUsedBytes == nil {
+		t.Fatalf("project show: state %s, disk_used_bytes %v", sh.State, sh.DiskUsedBytes)
+	}
+	if d := *sh.DiskUsedBytes - report; d > 64<<20 || d < -64<<20 {
+		t.Fatalf("disk_used_bytes %d, the quota report says %d bytes", *sh.DiskUsedBytes, report)
+	}
+	used, gen := *sh.DiskUsedBytes, sh.Generation
+	out, code := cli(t, "project", "restart", S.Ref, "--set", fmt.Sprintf("disk_quota_mb=%d", quotaMB+1))
+	var e errorJSON
+	decode(t, "project restart below the usage", out, &e)
+	const tag = "the smallest accepted value is "
+	i := strings.LastIndex(e.Message, tag)
+	least, err := strconv.ParseInt(e.Message[max(i, 0)+len(tag):], 10, 64)
+	if code != 1 || e.Code != "quota_below_usage" || i < 0 || err != nil {
+		t.Fatalf("restart to %d MiB at %d bytes used: exit %d %s %q, want quota_below_usage", quotaMB+1, used, code, e.Code, e.Message)
+	}
+	want := (used+1<<20-1)>>20 + store.QuotaHeadroomMB
+	if least < want-64 || least > want+64 || least > int64(2*quotaMB) {
+		t.Fatalf("smallest accepted value %d, want about %d and at most the runbook's %d", least, want, 2*quotaMB)
+	}
+	if show(); sh.State != "active" || sh.Generation != gen {
+		t.Fatalf("after the refusal the project is %s at generation %d, want active at %d", sh.State, sh.Generation, gen)
 	}
 }
 

@@ -2,6 +2,7 @@ package nodefs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1401,5 +1402,88 @@ func TestSetQuota_ReadsWrappedDeviceName(t *testing.T) {
 	}
 	if err := SetQuota(p, 900042, 16); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestDiskUsage_ReadsUsedBlocks: the usage is the used-blocks column of the
+// uid's one user-quota record (KiB), read with the C locale; no record is no
+// usage; anything else is an error, never a guess.
+func TestDiskUsage_ReadsUsedBlocks(t *testing.T) {
+	p := nodecfg.Paths{Root: t.TempDir()}
+	bin := t.TempDir()
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	const rec = `/dev/x 2411724 0 1048576 00 [--------] 1220 0 262144 00 [--------] /m`
+	for name, tc := range map[string]struct {
+		out  string
+		want int64
+		ok   bool
+	}{
+		"one record":  {rec, 2411724 << 10, true},
+		"wrapped":     {"/dev/mapper/vg0-projects\\n  2411724 0 1048576 00 [--------] 1220 0 262144 00 [--------] /m", 2411724 << 10, true},
+		"no record":   {"", 0, true},
+		"two records": {rec + `\n` + rec, 0, false},
+		"garbage":     {"/dev/x lots 0 1048576 00 [--------] 1220 0 262144 00 [--------] /m", 0, false},
+		"negative":    {"/dev/x -1 0 1048576 00 [--------] 1220 0 262144 00 [--------] /m", 0, false},
+		"unbounded":   {"/dev/x 9223372036854775807 0 1048576 00 [--------] 1220 0 262144 00 [--------] /m", 0, false},
+		"bound":       {"/dev/x 1099511627776 0 1048576 00 [--------] 1220 0 262144 00 [--------] /m", 1 << 50, true},
+	} {
+		script := "#!/bin/sh\n[ \"$LC_ALL\" = C ] || exit 1\ncase \"$*\" in *\"quota -v -N -b -i -u 900042\"*) printf '" + tc.out + "\\n';; *) echo bad >&2;; esac\n"
+		if err := os.WriteFile(filepath.Join(bin, "xfs_quota"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		got, err := DiskUsage(context.Background(), p, 900042)
+		if tc.ok && (err != nil || got != tc.want) || !tc.ok && err == nil {
+			t.Errorf("%s: %d, %v", name, got, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(bin, "xfs_quota"), []byte("#!/bin/sh\necho 'xfs_quota: no such mount' >&2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DiskUsage(context.Background(), p, 900042); err == nil {
+		t.Error("error output trusted")
+	}
+	if _, err := DiskUsage(context.Background(), p, 0); err == nil {
+		t.Error("uid 0 accepted")
+	}
+}
+
+// TestDiskUsage_HungToolEndsWithContext: a quota tool that never returns (a
+// stalled filesystem) is killed when the caller's context ends, together with
+// what it started; DiskUsage answers an error instead of hanging.
+func TestDiskUsage_HungToolEndsWithContext(t *testing.T) {
+	p := nodecfg.Paths{Root: t.TempDir()}
+	bin, pids := t.TempDir(), filepath.Join(t.TempDir(), "pids")
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	script := "#!/bin/sh\nsleep 600 &\necho $$ $! > " + pids + "\nwait\n"
+	if err := os.WriteFile(filepath.Join(bin, "xfs_quota"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := DiskUsage(ctx, p, 900042); err == nil {
+		t.Fatal("a killed tool gave a usage")
+	}
+	if d := time.Since(start); d > 4*time.Second {
+		t.Fatalf("DiskUsage returned after %v", d)
+	}
+	b, err := os.ReadFile(pids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range strings.Fields(string(b)) {
+		pid, err := strconv.Atoi(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The orphaned child is reaped by init shortly after its kill.
+		deadline := time.Now().Add(5 * time.Second)
+		for syscall.Kill(pid, 0) == nil {
+			if time.Now().After(deadline) {
+				syscall.Kill(pid, syscall.SIGKILL)
+				t.Fatalf("process %d left running", pid)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 }

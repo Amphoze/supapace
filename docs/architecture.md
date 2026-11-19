@@ -128,8 +128,9 @@ under the project's lock, through fixed steps; `step` is the last step completed
 - create: `1` (the API), `2` secrets, `3` placement (uid, slice, admission), `4a` and `4`
   first boot and first networked start, `6` keys, `7` tokens, `9` PostgREST, `11` route
   published and probed, `12` active;
-- restart: `R0` merge-base check, `R1` the new configuration validated in a throw-away
-  container, `R2` generation bumped and route drained (the gateway confirms), `R3` stop,
+- restart: `R0` merge-base check, `R1` a changed disk quota checked against the project's
+  usage (the filesystem's accounting) plus 256 MiB, and the new configuration validated in a
+  throw-away container, `R2` generation bumped and route drained (the gateway confirms), `R3` stop,
   quota, start, `R4` health, `R5` route active again;
 - delete: `D1` route removed, `D2` PostgREST and `D3` cluster stopped and removed, `D4`
   network removed, `D5` `deleted` with the purge queued at now + retention (168 h);
@@ -145,11 +146,11 @@ at its step with nothing undone (`op retry` continues it). Some failures end at 
 compensation; a containment refusal is requeued without counting while the node is
 `containment_failed`. Each step has 300 s, each attempt 900 s.
 
-A restart whose health check fails rolls forward once to generation g+2 with the previous
-configuration and ends `aborted` with `last_error` `rolled_back: …`. If that rollback fails
-too, the operation ends `failed` and the project stays `restarting` with its route draining.
-A restart whose new cluster does not start fails at R3 after five attempts with no rollback:
-the project stays `restarting` with its route draining until `op retry` succeeds.
+A restart whose new cluster does not start (R3) or fails its health check (R4) rolls forward
+once to generation g+2 with the previous configuration and ends `aborted` with `last_error`
+`rolled_back: …`. If that rollback fails too, the operation ends `failed` and the project
+stays `restarting` with its route draining; it then accepts `op retry` of that restart, a new
+restart merged onto the generation it is at, or a delete — one at a time, as always.
 
 ## Routes, keys and tokens
 

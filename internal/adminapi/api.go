@@ -14,7 +14,8 @@
 // Mutations answer 202 with {"ref","operation_id"} and are refused with
 // containment_failed while the node's containment is not verified; reads are
 // always served. A create the placement would refuse for room is refused at once
-// with node_full. Projects and keys carry the project's URL and the path of
+// with node_full; a restart to a disk quota below the project's usage plus
+// store.QuotaHeadroomMB with quota_below_usage. Projects and keys carry the project's URL and the path of
 // the CA certificate that signed the gateway's (read from node.json and the
 // node's TLS files at each request).
 package adminapi
@@ -66,6 +67,9 @@ type Ops interface {
 	VerifyProject(ctx context.Context, ref string) (code, message string, drift []nodecfg.CheckResult)
 	NodeCheck(ctx context.Context) []nodecfg.CheckResult
 	ContainmentOK() bool
+	// DiskUsage returns the bytes the user quota of uid charges on the
+	// projects mount (the filesystem's accounting, never a cluster's figure).
+	DiskUsage(ctx context.Context, uid int) (int64, error)
 }
 
 // restartParams is what a restart hands to Ops.Submit: the merged target
@@ -397,6 +401,17 @@ type projectJSON struct {
 	endpointJSON
 }
 
+// showUsageWait bounds the usage read of `project show`.
+const showUsageWait = 5 * time.Second
+
+// showJSON is a project as `project show` answers it: the record plus the
+// bytes its user quota charges, a host-side figure (null when it cannot be
+// read or the project holds no directory: not placed yet, purged, aborted).
+type showJSON struct {
+	projectJSON
+	DiskUsedBytes *int64 `json:"disk_used_bytes"`
+}
+
 type keysJSON struct {
 	Ref              string `json:"ref"`
 	AnonKey          string `json:"anon_key"`
@@ -634,7 +649,17 @@ func (a *api) showProject(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return toProject(p, a.domain, a.caCert()), nil
+	out := showJSON{projectJSON: toProject(p, a.domain, a.caCert())}
+	if p.UID != nil && p.State != "purged" && p.State != "aborted" {
+		// A stalled quota tool must not hang the read: null after showUsageWait.
+		ctx, cancel := context.WithTimeout(r.Context(), showUsageWait)
+		used, err := a.ops.DiskUsage(ctx, *p.UID)
+		cancel()
+		if err == nil {
+			out.DiskUsedBytes = &used
+		}
+	}
+	return out, nil
 }
 
 // keys returns the project's own credentials, unsealed with its DEK.
@@ -738,6 +763,19 @@ func (a *api) restart(r *http.Request) (any, error) {
 	if _, err := pgconf.Overrides(next.GUC, next.MemMB); err != nil {
 		return nil, badRequest("%s", settingError(err, next.GUC))
 	}
+	// A changed quota must leave room above the usage for the cluster to
+	// start; the restart's own R1 checks again under the ref lock. A project
+	// in a state that takes no restart is left to Submit's state conflict.
+	if next.DiskQuotaMB != p.Config.DiskQuotaMB && p.UID != nil && (p.State == "active" || p.State == "restarting") {
+		used, err := a.ops.DiskUsage(r.Context(), *p.UID)
+		if err != nil {
+			return nil, err
+		}
+		if err := store.CheckQuota(next.DiskQuotaMB, used); err != nil {
+			return nil, &apiError{http.StatusConflict, "quota_below_usage",
+				strings.TrimPrefix(err.Error(), store.ErrQuotaBelowUsage.Error()+": ")}
+		}
+	}
 	// The worker refuses the restart when the project's generation is no
 	// longer the one this merge was based on.
 	params, err := json.Marshal(restartParams{BaseGeneration: p.Generation, Config: next})
@@ -822,7 +860,8 @@ func (a *api) abort(r *http.Request) (any, error) {
 	if errors.Is(err, store.ErrConflict) {
 		if p, gerr := a.st.GetProject(r.Context(), ref); gerr == nil && p.State != "provisioning" {
 			next := map[string]string{"active": "; an active project is removed with delete",
-				"deleted": "; a deleted project is removed for good with purge"}[p.State]
+				"restarting": "; a project left restarting by a failed restart takes a new restart or a delete",
+				"deleted":    "; a deleted project is removed for good with purge"}[p.State]
 			return nil, conflict("project is %s; abort applies only to a create in progress%s", p.State, next)
 		}
 	}

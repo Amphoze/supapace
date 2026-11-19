@@ -2132,3 +2132,93 @@ func TestCheckAdmission_NoNode(t *testing.T) {
 		t.Fatalf("error %v", err)
 	}
 }
+
+// A project left restarting by a failed restart accepts one new restart, from
+// the generation it is at, or a delete; while that one is open nothing else
+// is accepted, the failed restart cannot be retried beside it, and a project
+// that is restarting for any other reason is refused as before.
+func TestSubmitOperation_AfterFailedRestart(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	cfg := ProjectConfig{DiskQuotaMB: 1024, MemMB: 512, GUC: map[string]string{}}
+	// failedRestart leaves r restarting at generation 2 with its restart failed.
+	failedRestart := func(r string) int64 {
+		t.Helper()
+		activate(t, s, r, mustCreate(t, s, r))
+		id, err := s.SubmitOperation(ctx, r, "restart", nil, 1, time.Now())
+		must(t, err)
+		must(t, s.StartOperation(ctx, id))
+		// Running and restarting: an open operation still blocks.
+		must(t, s.BeginRestart(ctx, r, 2, cfg))
+		for _, k := range []string{"restart", "delete"} {
+			if _, err := s.SubmitOperation(ctx, r, k, nil, 2, time.Now()); !errors.Is(err, ErrConflict) ||
+				!strings.Contains(err.Error(), fmt.Sprintf("operation %d (restart) of the project is running", id)) {
+				t.Fatalf("%s beside a running restart: %v", k, err)
+			}
+		}
+		must(t, s.FinishOperation(ctx, id, "failed", "internal: boom"))
+		return id
+	}
+	failed := failedRestart(ref(1))
+	_, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 1, time.Now())
+	wantErr(t, err, ErrConflict) // merged onto the generation before the failed bump
+	next, err := s.SubmitOperation(ctx, ref(1), "restart", nil, 2, time.Now())
+	must(t, err)
+	if op, err := s.GetOperation(ctx, next); err != nil || op.Generation != 3 || op.State != "pending" {
+		t.Fatalf("takeover %+v, %v", op, err)
+	}
+	for _, k := range []string{"restart", "delete"} {
+		if _, err := s.SubmitOperation(ctx, ref(1), k, nil, 2, time.Now()); !errors.Is(err, ErrConflict) {
+			t.Fatalf("second %s beside the open takeover: %v", k, err)
+		}
+	}
+	wantErr(t, s.RetryOperation(ctx, failed), ErrConflict)
+
+	failedRestart(ref(2))
+	_, err = s.SubmitOperation(ctx, ref(2), "delete", nil, 2, time.Now())
+	must(t, err)
+
+	// Restarting without a failed restart (no restart at all, or its last
+	// restart done): refused, naming the way out.
+	activate(t, s, ref(3), mustCreate(t, s, ref(3)))
+	must(t, s.SetProjectState(ctx, ref(3), "restarting"))
+	for _, k := range []string{"restart", "delete"} {
+		_, err := s.SubmitOperation(ctx, ref(3), k, nil, 1, time.Now())
+		if !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "it is restarting") {
+			t.Fatalf("%s of a restarting project without a failed restart: %v", k, err)
+		}
+	}
+	id, err := s.SubmitOperation(ctx, ref(4), "restart", nil, 1, time.Now())
+	wantErr(t, err, ErrNotFound)
+	activate(t, s, ref(4), mustCreate(t, s, ref(4)))
+	id, err = s.SubmitOperation(ctx, ref(4), "restart", nil, 1, time.Now())
+	must(t, err)
+	must(t, s.StartOperation(ctx, id))
+	must(t, s.FinishOperation(ctx, id, "done", ""))
+	must(t, s.SetProjectState(ctx, ref(4), "restarting"))
+	_, err = s.SubmitOperation(ctx, ref(4), "delete", nil, 2, time.Now())
+	wantErr(t, err, ErrConflict)
+}
+
+// CheckQuota: the smallest accepted quota is the usage, rounded up to MiB,
+// plus the start headroom.
+func TestCheckQuota_Bound(t *testing.T) {
+	used := int64(2300<<20 + 1) // 2301 MiB rounded up
+	min := 2301 + QuotaHeadroomMB
+	if err := CheckQuota(min, used); err != nil {
+		t.Fatalf("quota at the bound: %v", err)
+	}
+	err := CheckQuota(min-1, used)
+	if !errors.Is(err, ErrQuotaBelowUsage) {
+		t.Fatalf("quota below the bound: %v", err)
+	}
+	for _, s := range []string{fmt.Sprintf("disk_quota_mb %d", min-1), "usage of 2301 MiB", strconv.Itoa(QuotaHeadroomMB) + " MiB",
+		fmt.Sprintf("smallest accepted value is %d", min)} {
+		if !strings.Contains(err.Error(), s) {
+			t.Errorf("message %q lacks %q", err, s)
+		}
+	}
+	if err := CheckQuota(QuotaHeadroomMB, 0); err != nil {
+		t.Fatalf("empty project: %v", err)
+	}
+}

@@ -49,9 +49,12 @@ func openOperation(ctx context.Context, tx pgx.Tx, ref string, except int64) err
 // SubmitOperation queues a restart or delete of an active project with no
 // other open operation, provided the project is still at generation base —
 // the generation the caller read when it built params, so two restarts merged
-// from the same base cannot drop each other's settings. A restart targets
-// generation + 1, anything else the current generation; project.generation
-// itself is not touched.
+// from the same base cannot drop each other's settings. A project left
+// restarting by a failed restart (its latest restart is failed, so no restart
+// is open) is accepted likewise: a new restart takes over from the generation
+// it is at, and a delete removes it. A restart targets generation + 1,
+// anything else the current generation; project.generation itself is not
+// touched.
 func (s *Store) SubmitOperation(ctx context.Context, ref, kind string, params json.RawMessage, base int64, notBefore time.Time) (int64, error) {
 	if kind != "restart" && kind != "delete" {
 		return 0, fmt.Errorf("%w: operation kind %q cannot be submitted", ErrConflict, kind)
@@ -60,11 +63,17 @@ func (s *Store) SubmitOperation(ctx context.Context, ref, kind string, params js
 	err := s.tx(ctx, func(tx pgx.Tx) error {
 		var state string
 		var gen int64
-		if err := tx.QueryRow(ctx, "select state, generation from project where ref = $1 for update", ref).Scan(&state, &gen); err != nil {
+		var stuck bool
+		if err := tx.QueryRow(ctx, `select state, generation, state = 'restarting' and coalesce((select o.state = 'failed'
+				from operation o where o.ref = p.ref and o.kind = 'restart' order by o.id desc limit 1), false)
+			from project p where ref = $1 for update`, ref).Scan(&state, &gen, &stuck); err != nil {
 			return err
 		}
-		if state != "active" {
-			return fmt.Errorf("%w: %s needs an active project; it is %s", ErrConflict, kind, state)
+		if state != "active" && !stuck {
+			if err := openOperation(ctx, tx, ref, 0); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: %s needs an active project, or one left restarting by a failed restart; it is %s", ErrConflict, kind, state)
 		}
 		if gen != base {
 			return fmt.Errorf("%w: the project is at generation %d, not %d; read it again", ErrConflict, gen, base)

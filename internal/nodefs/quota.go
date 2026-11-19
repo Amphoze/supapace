@@ -3,6 +3,7 @@ package nodefs
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
 )
@@ -48,7 +50,7 @@ func SetQuota(p nodecfg.Paths, uid, quotaMB int) error {
 	}
 	inodes := 0
 	if quotaMB > 0 {
-		state, err := xfsQuota(mount, "state -u")
+		state, err := xfsQuota(context.Background(), mount, "state -u")
 		if err != nil {
 			return err
 		}
@@ -57,7 +59,7 @@ func SetQuota(p nodecfg.Paths, uid, quotaMB int) error {
 		}
 		inodes = max(minInodes, quotaMB*inodesPerMB)
 	}
-	if _, err := xfsQuota(mount, fmt.Sprintf("limit -u bhard=%dm ihard=%d %d", quotaMB, inodes, uid)); err != nil {
+	if _, err := xfsQuota(context.Background(), mount, fmt.Sprintf("limit -u bhard=%dm ihard=%d %d", quotaMB, inodes, uid)); err != nil {
 		return err
 	}
 	recs, err := readLimits(mount, uid)
@@ -96,18 +98,53 @@ var errQuotaNotEnforced = errors.New("nodefs: user quota is not enforced on the 
 
 var bracketRE = regexp.MustCompile(`\[[^\]]*\]`)
 
+// DiskUsage returns the bytes of blocks the user quota of uid charges on the
+// projects mount: the quota's own accounting of every file the uid owns
+// there, the figure its block limit is enforced against. A uid with neither
+// usage nor limits has no record and uses 0 bytes.
+func DiskUsage(ctx context.Context, p nodecfg.Paths, uid int) (int64, error) {
+	if !projectID(uid) {
+		return 0, fmt.Errorf("nodefs: invalid project uid %d", uid)
+	}
+	recs, err := readQuota(ctx, p.ProjectsDir(), uid)
+	switch {
+	case err != nil:
+		return 0, err
+	case len(recs) == 0:
+		return 0, nil
+	case len(recs) > 1:
+		return 0, fmt.Errorf("nodefs: %d quota records for %d on %s, want one", len(recs), uid, p.ProjectsDir())
+	}
+	return int64(recs[0][0]) << 10, nil
+}
+
 // readLimits returns the (block hard limit in KiB, inode hard limit) of each
 // user-quota record xfs_quota prints for uid on mount. A quota with neither
 // limits nor usage prints no record.
 func readLimits(mount string, uid int) ([][2]int, error) {
-	out, err := xfsQuota(mount, fmt.Sprintf("quota -v -N -b -i -u %d", uid))
+	recs, err := readQuota(context.Background(), mount, uid)
+	var out [][2]int
+	for _, r := range recs {
+		out = append(out, [2]int{r[1], r[2]})
+	}
+	return out, err
+}
+
+// maxUsedKiB bounds a parsed usage (1 PiB, far above any quota) so that its
+// bytes, and the MiB rounding of callers, stay within int64.
+const maxUsedKiB = 1 << 40
+
+// readQuota returns the (blocks used in KiB, block hard limit in KiB, inode
+// hard limit) of each user-quota record xfs_quota prints for uid on mount.
+func readQuota(ctx context.Context, mount string, uid int) ([][3]int, error) {
+	out, err := xfsQuota(ctx, mount, fmt.Sprintf("quota -v -N -b -i -u %d", uid))
 	if err != nil {
 		return nil, err
 	}
 	// A device name too long for its column goes on a line of its own,
 	// the numbers on the next, indented one.
 	out = bytes.ReplaceAll(out, []byte("\n "), []byte(" "))
-	var recs [][2]int
+	var recs [][3]int
 	for _, l := range strings.Split(string(out), "\n") {
 		// device, used, soft, hard, warn, [grace], used, soft, hard, warn, [grace], mount
 		f := strings.Fields(bracketRE.ReplaceAllString(l, " "))
@@ -117,23 +154,28 @@ func readLimits(mount string, uid int) ([][2]int, error) {
 		if len(f) != 10 {
 			return nil, fmt.Errorf("nodefs: unexpected quota record %q", l)
 		}
+		u, err0 := strconv.Atoi(f[1])
 		b, err1 := strconv.Atoi(f[3])
 		i, err2 := strconv.Atoi(f[7])
-		if err1 != nil || err2 != nil {
+		if err0 != nil || err1 != nil || err2 != nil || u < 0 || u > maxUsedKiB {
 			return nil, fmt.Errorf("nodefs: unexpected quota record %q", l)
 		}
-		recs = append(recs, [2]int{b, i})
+		recs = append(recs, [3]int{u, b, i})
 	}
 	return recs, nil
 }
 
-func xfsQuota(mount string, cmds ...string) ([]byte, error) {
+func xfsQuota(ctx context.Context, mount string, cmds ...string) ([]byte, error) {
 	args := []string{"-x"}
 	for _, c := range cmds {
 		args = append(args, "-c", c)
 	}
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command("xfs_quota", append(args, mount)...)
+	cmd := exec.CommandContext(ctx, "xfs_quota", append(args, mount)...)
+	// A context that ends kills the tool and anything it started.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 2 * time.Second
 	// Its messages are translated; the state check needs the C locale.
 	cmd.Env = []string{"LC_ALL=C", "PATH=" + os.Getenv("PATH")}
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

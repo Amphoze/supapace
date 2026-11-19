@@ -52,10 +52,12 @@ Projects:
                            with a kid
       --ref REF            20 characters of a-z and 0-9; generated when omitted;
                            a ref is never reused
-      --user-role ROLE     a role the issuer's tokens may claim (repeatable;
-                           default authenticated). The platform does not
-                           create it: create it in the project's database
-                           and grant it to authenticator, as PostgREST
+      --user-role ROLE     a role the issuer's tokens may claim (repeatable).
+                           The roles given replace the default,
+                           authenticated: add --user-role authenticated
+                           to keep it. The platform does not create a
+                           role: create it in the project's database and
+                           grant it to authenticator, as PostgREST
                            requires (create role editor nologin;
                            grant editor to authenticator;)
       --disk-quota SIZE    MiB, or a number with suffix m, g or t
@@ -63,14 +65,16 @@ Projects:
       User tokens: there is no shared secret. The issuer signs each token
       with RS256 and a private key of the set; the header carries
       "alg":"RS256" and that key's "kid"; the claims carry "role"
-      (authenticated or a --user-role), "exp" (integer seconds, in the
-      future) and optionally "sub" and "nbf"; at most 8 KiB. A client sends
+      (authenticated, or one of the --user-role roles when any were given),
+      "exp" (integer seconds, in the future) and optionally "sub" and
+      "nbf"; at most 8 KiB. A client sends
       it as "Authorization: Bearer TOKEN" with the anon key as apikey.
   project list [--state STATE]...
       --state STATE        only projects in STATE (repeatable): provisioning,
                            active, restarting, deleting, deleted, purged or
                            aborted
-  project show REF         the project's record and url; its state is the
+  project show REF         the project's record, url and disk_used_bytes
+                           (what its disk quota charges); its state is the
                            lifecycle state, not health (see project check)
   project keys REF         the project's url and credentials:
       url                  https://REF.DOMAIN, the gateway's address for it
@@ -79,14 +83,22 @@ Projects:
       anon_key             for client applications: the apikey header (or
                            query parameter) of every request; RLS applies
       service_role_key     for trusted servers only; it bypasses RLS
-      postgres_password    the database role postgres (not a superuser), for
-                           schema changes; no port is published; psql asks
+      postgres_password    the database role postgres, for schema changes;
+                           no port is published; psql asks
                            for it: docker exec -it pg-REF
                            psql -h 127.0.0.1 -U postgres
   project check REF        check the project's database server and report
   project restart REF [--set KEY=VALUE]... [--no-wait]
       --set KEY=VALUE      disk_quota_mb=MIB or one of these (repeatable):
 ` + wrap(strings.Join(pgconf.GUCAllowList, ", "), 27, 80) + `
+      A disk_quota_mb below the project's disk usage plus 256 MiB (what a
+      clean cluster start needs) is refused (quota_below_usage; project
+      show has disk_used_bytes). A cluster that stopped at its quota needs
+      its usage plus 1280 MiB (crash recovery replays up to 1 GiB of WAL).
+      A restart whose stop/start step or health check fails is
+      rolled back to the previous configuration (aborted, rolled_back).
+      A project left restarting by a failed restart accepts a new restart
+      with other settings, or a delete.
   project delete REF [--no-wait]
   project purge REF [--no-wait]    purge a deleted project now
   project abort REF [--no-wait]    abort a create that has not completed
@@ -595,9 +607,20 @@ func summary(w io.Writer, op operation) {
 	if op.State != "failed" {
 		return
 	}
+	if op.Kind == "restart" && strings.HasPrefix(op.LastError, "quota_below_usage: ") {
+		fmt.Fprintf(w, "supapace: nothing was changed; restart with at least the smallest accepted value: "+
+			"'supapace project restart %s --set disk_quota_mb=MIB'\n", op.Ref)
+		return
+	}
 	fmt.Fprintf(w, "supapace: retry it with 'supapace op retry %d'\n", op.ID)
-	if op.Kind == "create" {
+	// A restart that left its project restarting says so in last_error (the
+	// worker's note); one that failed before the bump left the project active.
+	switch {
+	case op.Kind == "create":
 		fmt.Fprintf(w, "supapace: or give the project up with 'supapace project abort %s'\n", op.Ref)
+	case op.Kind == "restart" && strings.Contains(op.LastError, "; the project stays restarting at generation "):
+		fmt.Fprintf(w, "supapace: or replace it with other settings: 'supapace project restart %s --set KEY=VALUE', "+
+			"or remove the project: 'supapace project delete %s'\n", op.Ref, op.Ref)
 	}
 }
 

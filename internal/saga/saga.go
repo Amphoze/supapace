@@ -43,6 +43,7 @@ import (
 type Agent interface {
 	EnsureDir(context.Context, agent.Spec) error                      // create 3
 	SetQuota(context.Context, agent.Spec) error                       // restart R3 (cluster stopped)
+	DiskUsage(context.Context, agent.Spec) (int64, error)             // restart R1
 	EnsureNetwork(context.Context, agent.Spec) error                  // create 3
 	RemoveNetwork(context.Context, string) error                      // delete D4, abort C6
 	EnsureCluster(context.Context, agent.Spec) error                  // create 4a, 4 (one phase per call; FirstBoot only there); restart R3, R4
@@ -215,7 +216,7 @@ func (x *job) finishFailed(ctx context.Context, err error) {
 	if x.record(ctx) != nil {
 		return
 	}
-	msg := x.r.lastError(err)
+	msg := x.stranded(ctx, x.r.lastError(err))
 	if err := x.r.st.FinishOperation(ctx, x.op.ID, "failed", msg); err != nil {
 		x.r.log.Error("recording a failed operation", "op", x.op.ID, "ref", x.op.Ref, "err", x.r.text(err))
 		return
@@ -245,9 +246,9 @@ func (x *job) steps(ctx, actx context.Context) error {
 		cancel()
 		var rf *rollForward
 		if errors.As(err, &rf) {
-			// Restart R4 failed: write the rollback target first, so a resumed
+			// Restart R3 or R4 failed: write the rollback target first, so a resumed
 			// operation continues the rollback, then re-enter R1.
-			if err := x.rollForward(ctx, rf.err); err != nil {
+			if err := x.rollForward(ctx, rf); err != nil {
 				return err
 			}
 			if actx.Err() != nil {
@@ -427,6 +428,7 @@ func (x *job) afterError(ctx context.Context, err error) {
 		}
 	case errors.Is(err, agent.ErrContainment) && !errors.Is(err, agent.ErrCheckIncomplete), errors.Is(err, bootstrap.ErrAssertion), errors.Is(err, agent.ErrEpochDivergence),
 		errors.As(err, &f) && f.final, cur.Attempts-requeued >= maxAttempts:
+		msg = x.stranded(ctx, msg)
 		if werr = r.st.FinishOperation(ctx, op.ID, "failed", msg); werr == nil {
 			r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,
 				"attempt", cur.Attempts, "final", true, "err", msg)

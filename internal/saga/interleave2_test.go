@@ -2,9 +2,12 @@ package saga
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/Amphoze/supapace/internal/agent"
 )
 
 // A restart failed after its own bump (R2 recorded) and retried once another
@@ -21,7 +24,9 @@ func TestRestart_RetryPastR2RefusedOnceSuperseded(t *testing.T) {
 		case c.Method == "Prevalidate" && prevalidates.Add(1) <= 5:
 			return errBoom // restart A fails pre-validation
 		case c.Method == "PromoteCandidate" && promoteBroken.Load():
-			return errBoom // restart B fails after its bump
+			// restart B fails after its bump, with an error that does not
+			// roll it back (a start failure would)
+			return fmt.Errorf("gate: %w", agent.ErrContainment)
 		}
 		return nil
 	})

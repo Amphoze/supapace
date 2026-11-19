@@ -60,15 +60,19 @@ func TestAPI_StateMatrix(t *testing.T) {
 	rop, err := e.st.SubmitOperation(ctx, r, "restart", nil, 1, time.Now())
 	must(t, err)
 	rows["active/open-restart"] = row{r, rop, map[string]string{"restart": conflict, "delete": conflict, "purge": conflict, "abort": conflict, "retry": conflict}}
-	// restarting, restart failed
-	r = ref()
-	op = e.create(t, r).OperationID
-	e.activate(t, r, op)
-	rop, err = e.st.SubmitOperation(ctx, r, "restart", nil, 1, time.Now())
-	must(t, err)
-	must(t, e.st.SetProjectState(ctx, r, "restarting"))
-	e.failed(t, rop, "timeout: x")
-	rows["restarting/failed"] = row{r, rop, map[string]string{"restart": conflict, "delete": conflict, "purge": conflict, "abort": conflict, "retry": ok}}
+	// restarting, restart failed: a new restart, a delete or a retry leaves it
+	// (each accepted cell gets a row of its own below)
+	stranded := func() (string, int64) {
+		r := ref()
+		e.activate(t, r, e.create(t, r).OperationID)
+		rop, err := e.st.SubmitOperation(ctx, r, "restart", nil, 1, time.Now())
+		must(t, err)
+		must(t, e.st.SetProjectState(ctx, r, "restarting"))
+		e.failed(t, rop, "timeout: x")
+		return r, rop
+	}
+	r, rop = stranded()
+	rows["restarting/failed"] = row{r, rop, map[string]string{"restart": ok, "delete": ok, "purge": conflict, "abort": conflict, "retry": ok}}
 	// deleting, delete failed
 	r = ref()
 	op = e.create(t, r).OperationID
@@ -143,7 +147,18 @@ func TestAPI_StateMatrix(t *testing.T) {
 			if want != ok {
 				continue
 			}
-			_ = name
+			if name == "restarting/failed" {
+				r, o := stranded()
+				switch cmd {
+				case "restart":
+					e.wantOK(t, "POST", "/v1/projects/"+r+"/restart", `{}`, 202)
+				case "delete":
+					e.wantOK(t, "DELETE", "/v1/projects/"+r, "", 202)
+				case "retry":
+					e.wantOK(t, "POST", "/v1/operations/"+strconv.FormatInt(o, 10)+"/retry", "", 202)
+				}
+				continue
+			}
 			switch cmd {
 			case "restart":
 				e.wantOK(t, "POST", "/v1/projects/"+rw.ref+"/restart", `{}`, 202)

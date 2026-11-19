@@ -141,7 +141,11 @@ type fakeOps struct {
 	code, msg    string
 	drift        []nodecfg.CheckResult
 	checks       []nodecfg.CheckResult
-	failed       bool // containment failed
+	failed       bool  // containment failed
+	used         int64 // bytes DiskUsage reports
+	usedErr      error
+	usedUIDs     []int // uids DiskUsage was asked for
+	usedHang     bool  // DiskUsage returns only when its context ends
 }
 
 func (f *fakeOps) record(s string) {
@@ -203,6 +207,18 @@ func (f *fakeOps) NodeCheck(context.Context) []nodecfg.CheckResult {
 }
 
 func (f *fakeOps) ContainmentOK() bool { return !f.failed }
+
+func (f *fakeOps) DiskUsage(ctx context.Context, uid int) (int64, error) {
+	f.mu.Lock()
+	f.usedUIDs = append(f.usedUIDs, uid)
+	used, err, hang := f.used, f.usedErr, f.usedHang
+	f.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	return used, err
+}
 
 type env struct {
 	st  *store.Store
@@ -695,20 +711,21 @@ type (
 		GUC         map[string]string `json:"guc"`
 	}
 	projectShape struct {
-		Ref         string      `json:"ref"`
-		Name        string      `json:"name"`
-		State       string      `json:"state"`
-		Generation  int64       `json:"generation"`
-		AppliedGen  int64       `json:"applied_gen"`
-		UID         *int        `json:"uid"`
-		SubnetIndex *int        `json:"subnet_index"`
-		Config      configShape `json:"config"`
-		UserRoles   []string    `json:"user_roles"`
-		CreatedAt   string      `json:"created_at"`
-		DeletedAt   *string     `json:"deleted_at"`
-		PurgeAfter  *string     `json:"purge_after"`
-		URL         string      `json:"url"`
-		CACert      *string     `json:"ca_cert"`
+		Ref           string      `json:"ref"`
+		Name          string      `json:"name"`
+		State         string      `json:"state"`
+		Generation    int64       `json:"generation"`
+		AppliedGen    int64       `json:"applied_gen"`
+		UID           *int        `json:"uid"`
+		SubnetIndex   *int        `json:"subnet_index"`
+		Config        configShape `json:"config"`
+		UserRoles     []string    `json:"user_roles"`
+		CreatedAt     string      `json:"created_at"`
+		DeletedAt     *string     `json:"deleted_at"`
+		PurgeAfter    *string     `json:"purge_after"`
+		URL           string      `json:"url"`
+		CACert        *string     `json:"ca_cert"`
+		DiskUsedBytes *int64      `json:"disk_used_bytes"` // show only
 	}
 	opShape struct {
 		ID         int64  `json:"id"`

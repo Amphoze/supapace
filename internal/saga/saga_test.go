@@ -186,6 +186,8 @@ type fakeAgent struct {
 
 	inflight, maxInflight atomic.Int32
 
+	used atomic.Int64 // bytes DiskUsage reports
+
 	gwLag   int   // polls that still report an older route generation
 	gwAhead int64 // added to the generation the gateway reports (it may be past the one written)
 }
@@ -242,6 +244,13 @@ func (f *fakeAgent) EnsureDir(ctx context.Context, s agent.Spec) error {
 
 func (f *fakeAgent) SetQuota(ctx context.Context, s agent.Spec) error {
 	return f.enter(ctx, sc("SetQuota", s), &s)
+}
+
+func (f *fakeAgent) DiskUsage(ctx context.Context, s agent.Spec) (int64, error) {
+	if err := f.enter(ctx, sc("DiskUsage", s), &s); err != nil {
+		return 0, err
+	}
+	return f.used.Load(), nil
 }
 
 func (f *fakeAgent) EnsureNetwork(ctx context.Context, s agent.Spec) error {
@@ -1647,7 +1656,7 @@ func TestRestart_HappyPathOrder(t *testing.T) {
 	e.start(r)
 	op := e.waitState(id, "done")
 	wantSeq(t, e.steps(id), []string{"R0", "R1", "R2", "R3", "R4", "R5"})
-	wantSeq(t, e.ag.methods(ref), []string{"Prevalidate", "SetRoute", "StopPostgREST", "StopCluster",
+	wantSeq(t, e.ag.methods(ref), []string{"Prevalidate", "SetRoute", "StopPostgREST", "StopCluster", "SetQuota",
 		"PromoteCandidate", "EnsureCluster", "EnsureCluster", "VerifyCluster", "EnsurePostgREST", "SetRoute", "ProbeREST"})
 	p := e.project(ref)
 	if p.State != "active" || p.Generation != 2 || p.AppliedGen != 2 || p.Config.GUC["max_connections"] != "200" || op.LastError != "" {
@@ -1686,13 +1695,14 @@ func TestRestart_QuotaOnly(t *testing.T) {
 	if p := e.project(ref); p.Config.DiskQuotaMB != 16384 || p.State != "active" {
 		t.Fatalf("project %+v", p)
 	}
-	// Without a quota change there is no SetQuota.
+	// Without a quota change the stored quota is set again (idempotent), so
+	// the limit cannot stay apart from the stored configuration.
 	e.ag.reset()
 	next.GUC = map[string]string{"max_connections": "200"}
 	id = e.restart(r, ref, next)
 	e.waitState(id, "done")
-	if len(e.ag.callsOf(ref, "SetQuota")) != 0 {
-		t.Fatal("SetQuota without a quota change")
+	if c := e.ag.callsOf(ref, "SetQuota"); len(c) != 1 || c[0].Quota != 16384 || c[0].Gen != 3 {
+		t.Fatalf("SetQuota without a quota change %+v", c)
 	}
 }
 
@@ -1868,21 +1878,23 @@ func TestRestart_FailedIsContinuedByRetryNotResubmit(t *testing.T) {
 	r := e.runner()
 	id := e.restart(r, ref, withGUC("max_connections", "200"))
 	e.start(r)
+	// R3 failed, rolled forward to generation 3, and the rollback's R3 failed
+	// five times.
 	op := e.waitState(id, "failed")
-	if op.Step != "R2" || e.project(ref).State != "restarting" {
+	if op.Step != "R2" || e.project(ref).State != "restarting" || e.project(ref).Generation != 3 {
 		t.Fatalf("op %+v", op)
 	}
 	params, _ := json.Marshal(map[string]any{"base_generation": 2, "config": defaultConfig})
 	if _, err := r.Submit(context.Background(), "restart", ref, params); !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("second restart: %v", err)
+		t.Fatalf("restart merged onto a superseded generation: %v", err)
 	}
 	broken.Store(false)
 	must(t, e.st.RetryOperation(context.Background(), id))
-	e.waitState(id, "done")
-	if n := len(e.ag.callsOf(ref, "Prevalidate")); n != 1 {
+	e.waitState(id, "aborted") // the rollback completed
+	if n := len(e.ag.callsOf(ref, "Prevalidate")); n != 2 {
 		t.Fatalf("resumed before its recorded step: %d Prevalidate calls", n)
 	}
-	if p := e.project(ref); p.State != "active" || p.Generation != 2 {
+	if p := e.project(ref); p.State != "active" || p.Generation != 3 || len(p.Config.GUC) != 0 {
 		t.Fatalf("project %+v", p)
 	}
 }
@@ -2931,7 +2943,8 @@ func TestRestart_R3QuotaFailureNotIgnored(t *testing.T) {
 	id := e.restart(r, ref, next)
 	e.start(r)
 	op := e.waitState(id, "failed")
-	if op.Step != "R2" || op.LastError != "internal: boom" || len(e.ag.callsOf(ref, "PromoteCandidate")) != 0 {
+	// Rolled forward, the previous quota failed alike: still nothing after it.
+	if op.Step != "R2" || !strings.HasPrefix(op.LastError, "internal: boom; ") || len(e.ag.callsOf(ref, "PromoteCandidate")) != 0 {
 		t.Fatalf("op %+v, calls %v", op, e.ag.methods(ref))
 	}
 }
@@ -3075,7 +3088,7 @@ func TestRestart_RetryRestartsAClusterThatNeverAnswered(t *testing.T) {
 	if p := e.project(ref); p.State != "active" || p.Generation != 3 || p.AppliedGen != 3 {
 		t.Fatalf("retry after the cause was removed: project %s at %d, op %s", p.State, p.Generation, brief(op))
 	}
-	if m := e.ag.methods(ref); len(m) < 3 || !slices.Equal(m[:3], []string{"StopCluster", "PromoteCandidate", "EnsureCluster"}) {
+	if m := e.ag.methods(ref); len(m) < 4 || !slices.Equal(m[:4], []string{"StopCluster", "SetQuota", "PromoteCandidate", "EnsureCluster"}) {
 		t.Fatalf("the retry did not start the cluster afresh: %v", m)
 	}
 }

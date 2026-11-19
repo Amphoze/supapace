@@ -93,11 +93,17 @@ $ supapace project show qg6zivyo8iazv6bzkb5r
 {"ref":"qg6zivyo8iazv6bzkb5r","name":"demo","state":"active","generation":1,"applied_gen":1,
  "uid":700000,"subnet_index":0,"config":{"disk_quota_mb":8192,"mem_mb":512,"guc":{}},
  "user_roles":["authenticated"],"created_at":"2026-11-18T19:37:26Z","deleted_at":null,
- "purge_after":null,"url":"https://qg6zivyo8iazv6bzkb5r.sp.test","ca_cert":"/etc/supapace/ca/ca.pem"}
+ "purge_after":null,"url":"https://qg6zivyo8iazv6bzkb5r.sp.test",
+ "ca_cert":"/etc/supapace/ca/ca.pem","disk_used_bytes":2624581632}
 ```
 
-`project list` prints `{"projects":[…]}` with the same objects, tombstones (`purged`,
-`aborted`) included unless `--state` filters (repeatable; an unknown state is refused).
+`disk_used_bytes` is what the project's disk quota charges now (the filesystem's own
+accounting for the project's uid, not a figure from the database); it is `null` when it cannot
+be read within 5 s, and for a project not placed yet, `purged` or `aborted`.
+
+`project list` prints `{"projects":[…]}` with the same objects without `disk_used_bytes`,
+tombstones (`purged`, `aborted`) included unless `--state` filters (repeatable; an unknown
+state is refused).
 `state` is the lifecycle state, not health: use `project check`. `ca_cert` is the path of the
 node CA's certificate when that CA signed the gateway's certificate (a development node),
 otherwise `null`.
@@ -168,13 +174,20 @@ $ supapace project restart qg6zivyo8iazv6bzkb5r --set shared_buffers=9GB
 {"code":"bad_request","message":"shared_buffers = \"9GB\": want kB/MB/GB, 16MB to 40% of 512MB"}
 $ supapace project restart qg6zivyo8iazv6bzkb5r --set fsync=off
 {"code":"bad_request","message":"setting \"fsync\" cannot be set; see 'supapace project restart --help' for those that can"}
+$ supapace project restart jophro8uhcsuff93nbhy --set disk_quota_mb=1024
+{"code":"quota_below_usage","message":"disk_quota_mb 1024 is below the project's usage of 2504 MiB plus the 256 MiB a clean cluster start needs; the smallest accepted value is 2760"}
 ```
 
 A value starting with `0` followed by a digit or letter is refused (the server would read it
 as octal or hex). The merged configuration is checked against the generation it was read
 from: two restarts merged from the same base cannot drop each other's settings (the second is
-a `conflict`). A restart whose health check (R4) fails is rolled back; one whose new cluster
-does not start at all (R3) is not, see [restart outcomes](#restart-outcomes).
+a `conflict`). A new `disk_quota_mb` must be at least the project's current usage (rounded up
+to MiB) plus 256 MiB, the room a clean cluster start needs; otherwise the restart is refused with
+`quota_below_usage` (exit 1), and again by the restart's step R1 if the usage grew in between
+(the operation then ends `failed` after step R0 with nothing changed). A cluster that stopped
+at its quota needs more, see [the quota runbook](#a-project-at-its-disk-quota). A restart
+whose stop/start step (R3) or health check (R4) fails is rolled back, see
+[restart outcomes](#restart-outcomes).
 
 ### `project delete REF [--no-wait]`, `project purge REF [--no-wait]`
 
@@ -241,7 +254,7 @@ Exit 1 when any row fails. See [node check rows](#node-check-rows).
 |---|---|
 | `provisioning` | `show`; `keys` once issued; `abort` |
 | `active` | `show`, `keys`, `check`, `restart`, `delete` |
-| `restarting` | `show`, `keys`, `check`; `op retry` of its failed restart |
+| `restarting` | `show`, `keys`, `check`; failed restart: `op retry`, `restart`, `delete` |
 | `deleting` | `show`, `keys`; `op retry` of its failed delete |
 | `deleted` | `show`, `keys`, `purge` (also runs by itself at `purge_after`) |
 | `purged`, `aborted` | `show` (tombstone; keys destroyed, ref never reused) |
@@ -258,10 +271,12 @@ repair round).
 
 A step that fails is retried after 2, 5, 15 and 30 s; the fifth failure ends the operation
 `failed`. The CLI then prints `supapace: operation N failed after step S: <last_error>` and
-the ways on: `op retry N`, and for a create also `project abort REF`. `last_error` is
+the ways on: `op retry N`, for a create also `project abort REF`, for a restart also
+`project restart REF --set KEY=VALUE` and `project delete REF`. `last_error` is
 `<code>: <message>`; codes: `internal`, `timeout`, `peer`, `conflict`, `bad_request`,
-`node_full`, `containment_failed`, `assertion`, `epoch_divergence`, `stale_generation`, and
-`rolled_back` on an aborted restart. `conflict`, `bad_request`, `assertion` and
+`node_full`, `containment_failed`, `assertion`, `epoch_divergence`, `stale_generation`,
+`quota_below_usage`, and `rolled_back` on an aborted restart. `conflict`, `bad_request`,
+`quota_below_usage`, `assertion` and
 `epoch_divergence` end an operation at once; `node_full` sends a create straight to its
 compensation; a containment refusal waits (requeued every 10 s, not counted) while the node
 is `containment_failed`. A daemon restart in the middle of an operation counts as an attempt;
@@ -270,23 +285,42 @@ the worker resumes it after the restart.
 ### Restart outcomes
 
 - `done` — the new configuration runs at the new generation.
-- `failed` after step R2 — the new cluster did not start (`… is not running after docker start`)
-  in five attempts. Nothing is rolled back: the project stays `restarting` with its route
-  draining (clients get `503 project_restarting`) and neither a new restart nor a delete is
-  accepted. Read `docker logs pg-REF` on the node, remove the cause, then `supapace op retry ID`
-  (R3 stops and starts the cluster again).
+- `failed` after step R0, `last_error` `quota_below_usage: …` — the usage grew past the new
+  quota's bound after the restart was accepted. Nothing was changed; restart again with at
+  least the value the message names.
 - `aborted`, `last_error` `rolled_back: the project runs its previous configuration at
-  generation N; the restart to generation M was rolled back because its health check failed:
-  …` — the health check (R4) failed, the restart rolled forward to generation N = M + 1 with
-  the previous configuration (disk quota included). The CLI exits 1. The project is `active`;
-  fix the cause and restart again. `generation` of the operation stays M.
-- **The two-failure state:** the rollback's health check fails too. The operation ends
-  `failed`, the project stays `restarting` with its route draining (clients get `503
-  project_restarting`), and neither a new restart nor a delete is accepted. Read
-  `last_error` (`… rollback to generation N: …`) and the cluster's log (`docker logs pg-REF` on
-  the node, raw tenant output), remove the cause, then `supapace op retry ID`: it continues the
-  rollback (R3 stops and starts the cluster again, R4 checks it). Each R4 attempt waits up to
-  120 s for the server to accept a login.
+  generation N; the restart to generation M was rolled back because its stop/start step
+  failed: …` (R3) or `… because its health check failed: …` (R4) — the restart rolled forward
+  to generation N = M + 1 with the previous configuration (disk quota included). The CLI exits
+  1. The project is `active`; fix the cause and restart again. `generation` of the operation
+  stays M.
+- **A project left `restarting`:** the rollback fails too (its cluster does not start or does
+  not pass its health check either, for example a damaged data directory), or the drain (R2)
+  fails five times. The operation ends `failed`, the project stays `restarting` with its route
+  draining (clients get `503 project_restarting`), and `last_error` says so and names the
+  three ways out:
+
+  ```
+  $ supapace project restart jophro8uhcsuff93nbhy --set max_connections=100
+  …
+  supapace: operation 4 failed after step R2: internal: pg-jophro8uhcsuff93nbhy is not running
+  after docker start; the project stays restarting at generation 5 with its route draining: once
+  the cause is removed, 'supapace op retry 4' continues this restart; 'supapace project restart
+  jophro8uhcsuff93nbhy --set KEY=VALUE' replaces it with other settings; 'supapace project
+  delete jophro8uhcsuff93nbhy' removes the project
+  ```
+
+  Read the cluster's log (`docker logs pg-REF` on the node, raw tenant output) and remove the
+  cause. Then either `supapace op retry ID` (after a failed rollback it continues the rollback
+  and ends `aborted`, `rolled_back`; after a drain that failed five times it continues the
+  restart forward and ends `done`), or a new `project restart REF --set …`, merged onto the
+  configuration the project is at (it runs every step from R0; for example a larger
+  `disk_quota_mb`), or `project delete REF`, which needs no running cluster. The configuration
+  the project is at is the failed restart's, so a new restart that fails at R3 or R4 rolls
+  back to that configuration, one that never ran, and if that does not start either leaves
+  the project `restarting` again with the same ways out. Only one of them can be open at a
+  time; a failed restart that a newer restart superseded ends in a `conflict` if retried. Each
+  R4 attempt waits up to 120 s for the server to accept a login.
 
 ## Node check rows
 
@@ -363,7 +397,8 @@ REST answers `503` with `PGRST000` ("the database system is not accepting connec
 `project check` answers `ok: false`. In a test it served again after about 8 s with the data
 consistent.
 
-Look at the usage (uid from `project show`; excerpt):
+Look at the usage: `disk_used_bytes` of `project show`, or on the node (uid from `project
+show`; excerpt):
 
 ```
 $ xfs_quota -x -c 'report -u -n -h' /var/lib/supapace/projects
@@ -378,14 +413,25 @@ Then either free space (the developer drops data; space is returned at once:
 supapace project restart REF --set disk_quota_mb=2048
 ```
 
-The new quota is applied with the cluster stopped (R3), so it also helps a cluster whose
-crash recovery itself needs more space and exits at every start (the repair round starts it
-again once per round until then).
+The new quota is applied with the cluster stopped (R3), so it also helps a cluster that cannot
+start at its current quota: in a test, a project at its quota whose cluster exited at every
+start (`FATAL: could not create lock file "postmaster.pid": Disk quota exceeded`) was `done`
+and served again 9 s after `project restart REF --set disk_quota_mb=4096`.
 
-**Never set a quota below the current usage.** It is not refused, but the cluster then cannot
-start (`could not create lock file "postmaster.pid": Disk quota exceeded` in `docker logs`), the
-restart ends `failed` after step R2 and the project stays `restarting` with its route draining;
-`op retry` applies the same quota again, and this release has no command that leaves that state.
+A quota below the current usage plus 256 MiB (the room a clean cluster start needs) is refused and
+nothing is changed; the message names the smallest accepted value:
+
+```
+$ supapace project restart jophro8uhcsuff93nbhy --set disk_quota_mb=2900
+{"code":"quota_below_usage","message":"disk_quota_mb 2900 is below the project's usage of 2859 MiB plus the 256 MiB a clean cluster start needs; the smallest accepted value is 3115"}
+```
+
+A cluster that stopped at its quota (killed, or after a failed write of WAL) replays up to 1 GiB
+of WAL (`max_wal_size`) at its next start, before its first checkpoint, and can need that much
+more space: give it at least its usage plus 1280 MiB. A restart to less (the bound accepts it)
+can fail at its stop/start step and roll back to the old quota, which is below the usage: the
+project is then left `restarting` with its newest restart `failed`, and the way out is a new
+restart with a sufficient quota (`project restart REF --set disk_quota_mb=…`).
 
 ### The daemon restarts or is upgraded
 
@@ -470,10 +516,11 @@ work, refresh it within 15 minutes only if needed, and remove it afterwards.
   draining by a failed operation of an active project is not restored by the round. A cluster
   that exits at every start is re-created once per round. While the store is unreachable a
   dead container's route stays active.
-- A restart to a disk quota below the project's current usage leaves the project `restarting`
-  and unserved, with no command to recover it. Check the usage (`xfs_quota`) first.
-- A restart whose new cluster does not start is not rolled back: the project stays
-  `restarting` and unserved until `op retry` succeeds.
+- The 256 MiB a new disk quota must leave above the usage is what a clean cluster start
+  needs, not a guarantee: a cluster that stopped at its quota needs its usage plus 1280 MiB,
+  and a rollback restores the previous quota without that check. A restart whose rollback
+  fails too leaves the project `restarting` and unserved until `op retry`, a new `project
+  restart` or a `project delete` of it succeeds.
 - `--user-role` replaces the default role `authenticated` instead of adding to it.
 - A blocking node-check row that starts failing while the daemon runs is reported, not acted
   on, until the next daemon start.

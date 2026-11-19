@@ -48,6 +48,7 @@ var (
 
 	createProjectDir = nodefs.CreateProjectDir
 	setQuota         = nodefs.SetQuota
+	diskUsage        = nodefs.DiskUsage
 	writeFile        = nodefs.WriteFile
 	chown            = os.Lchown
 )

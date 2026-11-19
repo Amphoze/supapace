@@ -264,6 +264,37 @@ func admit(ctx context.Context, q interface {
 	return nil
 }
 
+// QuotaHeadroomMB is the room a new disk quota must leave above the project's
+// current usage: what a clean cluster start needs. A start creates files
+// before it serves (the postmaster's lock file first: at a quota below the
+// usage the start fails there) and keeps up to min_wal_size (80 MB) of WAL
+// segments of 16 MiB each; 256 MiB covers that with room for the writes of a
+// cluster that runs on until its restart stops it. It is a floor, not a
+// guarantee for a cluster that stopped at its quota: crash recovery replays
+// up to max_wal_size (1 GiB) of WAL before its first checkpoint and can
+// re-create relation data freed since the last one, so such a cluster needs
+// about its usage plus 1280 MiB.
+const QuotaHeadroomMB = 256
+
+// ErrQuotaBelowUsage: a disk quota that would leave a project less than
+// QuotaHeadroomMB above its usage.
+var ErrQuotaBelowUsage = errors.New("disk quota below usage")
+
+// CheckQuota refuses a disk quota of quotaMB MiB for a project whose user
+// quota charges usedBytes (a host-side figure: the filesystem's accounting,
+// never the cluster's) unless it is at least the usage, rounded up to MiB,
+// plus QuotaHeadroomMB. The error names both figures and the smallest
+// accepted value.
+func CheckQuota(quotaMB int, usedBytes int64) error {
+	usedMB := (usedBytes + 1<<20 - 1) >> 20
+	least := usedMB + QuotaHeadroomMB
+	if int64(quotaMB) >= least {
+		return nil
+	}
+	return fmt.Errorf("%w: disk_quota_mb %d is below the project's usage of %d MiB plus the %d MiB a clean cluster start needs; "+
+		"the smallest accepted value is %d", ErrQuotaBelowUsage, quotaMB, usedMB, QuotaHeadroomMB, least)
+}
+
 // CheckAdmission answers whether a new project whose cluster has clusterMemMB
 // would be admitted now, by the rule Place applies, also counting projects not
 // placed yet. It is advisory: Place remains the authority.

@@ -27,6 +27,15 @@ func (a *Agent) SetQuota(ctx context.Context, s Spec) error {
 	return setQuota(a.p, s.UID, s.DiskQuotaMB)
 }
 
+// DiskUsage returns the bytes the project uid's user quota charges: a
+// host-side fact, never a figure the cluster reports.
+func (a *Agent) DiskUsage(ctx context.Context, s Spec) (int64, error) {
+	if err := checkRef(s.Ref); err != nil {
+		return 0, err
+	}
+	return diskUsage(ctx, a.p, s.UID)
+}
+
 // RemoveRender removes the project's root-owned render directory; nil when
 // absent. Nothing a tenant can write lies below it, and links are removed,
 // never followed.

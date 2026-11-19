@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/nodefs"
 	"github.com/Amphoze/supapace/internal/pgsock"
 	"github.com/Amphoze/supapace/internal/store"
 )
@@ -68,3 +69,8 @@ func (o ops) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 }
 
 func (o ops) ContainmentOK() bool { return !o.d.ag.ContainmentFailed() }
+
+// DiskUsage reads the uid's user-quota accounting on the projects mount.
+func (o ops) DiskUsage(ctx context.Context, uid int) (int64, error) {
+	return nodefs.DiskUsage(ctx, o.d.p, uid)
+}
