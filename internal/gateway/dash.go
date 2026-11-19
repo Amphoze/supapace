@@ -42,7 +42,7 @@ type Dashboard struct {
 
 	mu       sync.Mutex
 	byRef    map[string]int       // dashboard requests in flight per ref; no zero entries
-	refused  map[string]*[5]int64 // refusals of rules 0 to 4 per ref ("_": the apex) since the last log line
+	refused  map[string]*[5]int64 // refusals of rules 0 to 4 per ref ("_": the sign-in host) since the last log line
 	projects int                  // GatewayDashProject
 }
 
@@ -50,7 +50,7 @@ type Dashboard struct {
 // the rules have classified.
 type dashRequest struct {
 	Table   *dashfile.File  // the table this request was classified against
-	Ref     string          // the host's ref; "_" on the apex
+	Ref     string          // the host's ref; "_" on the sign-in host
 	Path    []string        // the segments rule 0 accepted, percent-decoded, case as sent
 	Lower   []string        // the same, ASCII lower-cased
 	Session dashtok.Session // zero on the paths that need none
@@ -58,9 +58,14 @@ type dashRequest struct {
 	Purpose string
 	Keys    []jwtx.Key // Table's issuer keys as dashboard keys
 	Dash    *Dashboard // the domain, the signing key, the slots
+	// Unpresented: rule 5's exception — a navigation without a session that
+	// comes from this host's session page; a session cookie was set and did
+	// not come back.
+	Unpresented bool
 }
 
-// The sign-in handler (rule 1 and the apex) and the forwarder (rule 11).
+// The sign-in handler (rule 1, the sign-in host, rule 5's exception) and the
+// forwarder (rule 11).
 // While one is nil a request that reaches it is answered 503 unavailable.
 var (
 	dashAuth    func(http.ResponseWriter, *http.Request, *dashRequest)
@@ -236,9 +241,10 @@ func (d *Dashboard) release(ref string) {
 	}
 }
 
-// studioHost classifies a Host value against the studio domain: the apex
-// (label ""), or a host one label under it. name is the host without its
-// port; ok is false for any other host.
+// studioHost classifies a Host value against the studio domain: the studio
+// domain itself (label "", redirect only), the sign-in host (label
+// dashcfg.SignInLabel) or a dashboard host (any other label one level under
+// it). name is the host without its port; ok is false for any other host.
 func (d *Dashboard) studioHost(host string) (name, label string, ok bool) {
 	if !d.usable() {
 		return "", "", false
@@ -262,13 +268,15 @@ func (d *Dashboard) studioHost(host string) (name, label string, ok bool) {
 
 // dashHeaders sets the headers every answer on a studio host carries,
 // replacing any value: no sniffing, no framing, the page's own origin for
-// bases, forms, openers, resources and referrers. Never the sandbox.
+// bases, forms, openers, resources and referrers; HTTPS only. Never the
+// sandbox.
 func dashHeaders(h http.Header) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Security-Policy", dashCSP)
 	h.Set("Cross-Origin-Opener-Policy", "same-origin")
 	h.Set("Cross-Origin-Resource-Policy", "same-origin")
 	h.Set("Referrer-Policy", "same-origin")
+	h.Set("Strict-Transport-Security", "max-age=31536000") // each host for itself: never includeSubDomains
 }
 
 // writeDash writes a refusal on a studio host: the gateway's error body with
@@ -288,13 +296,17 @@ func writeDash(w http.ResponseWriter, status int, code string) {
 	fmt.Fprintf(w, `{"code":%q}`, code)
 }
 
-// serveDash answers a request on a studio host: the host's class, rule 0,
-// then the sign-in handler (rule 1 and the apex) or the request rules and
-// the forwarder.
+// serveDash answers a request on a studio host: the studio domain's fixed
+// answer; else the host's class, rule 0, then the sign-in handler (the
+// sign-in host, rule 1) or the request rules and the forwarder.
 func (g *Gateway) serveDash(w http.ResponseWriter, r *http.Request, name, label string) {
 	d := g.dash
 	if !sniAgrees(r, name) {
 		writeDash(w, http.StatusMisdirectedRequest, "misdirected")
+		return
+	}
+	if label == "" {
+		d.serveStudioDomain(w, r)
 		return
 	}
 	dt := d.table.cur.Load()
@@ -303,7 +315,7 @@ func (g *Gateway) serveDash(w http.ResponseWriter, r *http.Request, name, label 
 		return
 	}
 	ref := label
-	if label == "" {
+	if label == dashcfg.SignInLabel {
 		ref = "_"
 	} else if _, ok := dt.file.Projects[label]; !ok {
 		writeDash(w, http.StatusNotFound, "not_found")
@@ -317,7 +329,7 @@ func (g *Gateway) serveDash(w http.ResponseWriter, r *http.Request, name, label 
 		return
 	}
 	dr := &dashRequest{Table: &dt.file, Ref: ref, Path: path, Lower: lower(path), Keys: dt.keys, Dash: d}
-	if label == "" || strings.HasPrefix(raw, "/-/auth/") {
+	if ref == "_" || strings.HasPrefix(raw, "/-/auth/") {
 		call(dashAuth, w, r, dr)
 		return
 	}
@@ -330,6 +342,23 @@ func (g *Gateway) serveDash(w http.ResponseWriter, r *http.Request, name, label 
 	}
 	defer release()
 	call(dashForward, w, r, dr)
+}
+
+// serveStudioDomain is the studio domain's one answer: a GET or HEAD of
+// exactly "/" (any query) is 302 to the sign-in host; anything else is 404.
+// It needs no table, applies no path rule, reads and sets no cookie, and
+// nothing of the request reaches the answer.
+func (d *Dashboard) serveStudioDomain(w http.ResponseWriter, r *http.Request) {
+	raw, _, _ := strings.Cut(r.RequestURI, "?")
+	if raw != "/" || r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeDash(w, http.StatusNotFound, "not_found")
+		return
+	}
+	h := w.Header()
+	h.Set("Location", "https://"+dashcfg.SignInLabel+"."+d.domain+"/")
+	h.Set("Cache-Control", "no-store")
+	dashHeaders(h)
+	w.WriteHeader(http.StatusFound)
 }
 
 func call(h func(http.ResponseWriter, *http.Request, *dashRequest), w http.ResponseWriter, r *http.Request, dr *dashRequest) {

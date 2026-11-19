@@ -241,3 +241,14 @@ func TestDSN_RoundTripAndPgxReadsIt(t *testing.T) {
 		t.Fatalf("pgconn read %+v", cfg)
 	}
 }
+
+// TestSignInLabel_NeverARef: the sign-in host's label is "sign-in"; its hyphen
+// is a byte no ref holds, so no project's dashboard host can be it.
+func TestSignInLabel_NeverARef(t *testing.T) {
+	if SignInLabel != "sign-in" {
+		t.Fatalf("SignInLabel %q", SignInLabel)
+	}
+	if strings.Trim(SignInLabel, "abcdefghijklmnopqrstuvwxyz0123456789") == "" && len(SignInLabel) == 20 {
+		t.Errorf("%q has the shape of a ref", SignInLabel)
+	}
+}

@@ -35,6 +35,7 @@ const (
 	issuer    = "https://issuer.test"
 	dhostA    = refA + "." + studioDom
 	dhostB    = refB + "." + studioDom
+	signInH   = "sign-in." + studioDom
 	// principals of the fixture table
 	subOwnerA, subDevA, subROA, subOwnerB = "user-1", "user-2", "user-3", "user-4"
 )
@@ -128,6 +129,7 @@ type dashEnv struct {
 	priv ed25519.PrivateKey
 
 	fwd, auth []*dashRequest // what reached each seam
+	authHeld  int            // slots held when the sign-in seam was last entered
 	hold      chan struct{}  // when set, the forward seam waits on it
 	entered   chan struct{}  // signalled when the forward seam is entered
 	readBody  bool           // the forward seam reads the body and records the error
@@ -180,6 +182,7 @@ func newDashEnv(t *testing.T, routesFile *routes.File, table bool) *dashEnv {
 	dashAuth = func(w http.ResponseWriter, r *http.Request, dr *dashRequest) {
 		e.mu.Lock()
 		e.auth = append(e.auth, dr)
+		e.authHeld = len(e.gw.inflight) + len(e.d.slots)
 		e.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}
@@ -240,6 +243,7 @@ var dashWant = map[string]string{
 	"Cross-Origin-Opener-Policy":   "same-origin",
 	"Cross-Origin-Resource-Policy": "same-origin",
 	"Referrer-Policy":              "same-origin",
+	"Strict-Transport-Security":    "max-age=31536000",
 }
 
 // dashHeadersOK reports what is wrong with a gateway answer on a dashboard
@@ -303,15 +307,17 @@ func TestDashHostClasses(t *testing.T) {
 	// No domain file: the studio hosts are unknown hosts, answered as built.
 	plain := newEnv(t, active())
 	plain.expect(t, "no domain file, dashboard host", req("GET", dhostA, "/", nil), 404, "not_found")
-	plain.expect(t, "no domain file, apex", req("GET", studioDom, "/", nil), 404, "not_found")
+	plain.expect(t, "no domain file, studio domain", req("GET", studioDom, "/", nil), 404, "not_found")
 	if w := plain.do(req("GET", hostA, "/-/health", nil)); w.Header()["X-Supapace-Dashboard"] != nil {
 		t.Errorf("health carries the dashboard header without a domain file: %v", w.Header())
 	}
 
-	// A domain, no table: both classes 503.
+	// A domain, no table: the dashboard and sign-in hosts 503; the studio
+	// domain still redirects.
 	e := newDashEnv(t, active(), false)
 	e.dexpect(t, "no table, dashboard host", e.as(t, rawReq("GET", dhostA, "/"), refA, subOwnerA), 503, "unavailable")
-	e.dexpect(t, "no table, apex", rawReq("GET", studioDom, "/"), 503, "unavailable")
+	e.dexpect(t, "no table, sign-in host", rawReq("GET", signInH, "/"), 503, "unavailable")
+	e.dexpect(t, "no table, studio domain", rawReq("GET", studioDom, "/"), 302, "")
 	// Two labels under the domain are no dashboard host: unknown, as built.
 	e.expect(t, "two labels", req("GET", "www."+dhostA, "/", nil), 404, "not_found")
 	if w := e.do(req("GET", hostA, "/-/health", nil)); w.Header().Get("X-Supapace-Dashboard") != "ok" {
@@ -326,18 +332,22 @@ func TestDashHostClasses(t *testing.T) {
 	e.dexpect(t, "label not a ref", rawReq("GET", "www."+studioDom, "/"), 404, "not_found")
 	e.passes(t, "member, port in host", e.as(t, rawReq("GET", dhostA+":8443", "/"), refA, subOwnerA))
 	e.resetSeams()
-	if w := e.do(rawReq("GET", studioDom, "/")); w.Code != 200 {
-		t.Errorf("apex: %d", w.Code)
+	if w := e.do(rawReq("GET", signInH, "/")); w.Code != 200 {
+		t.Errorf("sign-in host: %d", w.Code)
 	} else if _, a := e.seams(); a != 1 {
-		t.Errorf("apex did not reach the sign-in seam")
+		t.Errorf("sign-in host did not reach the sign-in seam")
 	}
+	e.dexpect(t, "studio domain", rawReq("GET", studioDom, "/"), 302, "")
 
 	r := e.as(t, rawReq("GET", dhostA, "/"), refA, subOwnerA)
 	r.TLS = &tls.ConnectionState{ServerName: dhostB}
 	e.dexpect(t, "wrong server name", r, 421, "misdirected")
 	r = rawReq("GET", studioDom, "/")
 	r.TLS = &tls.ConnectionState{ServerName: dhostA}
-	e.dexpect(t, "wrong server name, apex", r, 421, "misdirected")
+	e.dexpect(t, "wrong server name, studio domain", r, 421, "misdirected")
+	r = rawReq("GET", signInH, "/")
+	r.TLS = &tls.ConnectionState{ServerName: studioDom}
+	e.dexpect(t, "wrong server name, sign-in host", r, 421, "misdirected")
 	r = e.as(t, rawReq("GET", dhostA, "/"), refA, subOwnerA)
 	r.TLS = &tls.ConnectionState{ServerName: strings.ToUpper(dhostA)}
 	e.passes(t, "server name in capitals", r)
@@ -387,7 +397,8 @@ func TestDashTable_BadKeepsLastGood_MissingUnloads_DomainMustAgree(t *testing.T)
 		t.Fatalf("missing file: err %v, generation %d", err, gen())
 	}
 	e.dexpect(t, "unloaded", ok2(), 503, "unavailable")
-	e.dexpect(t, "unloaded, apex", rawReq("GET", studioDom, "/"), 503, "unavailable")
+	e.dexpect(t, "unloaded, sign-in host", rawReq("GET", signInH, "/"), 503, "unavailable")
+	e.dexpect(t, "unloaded, studio domain", rawReq("GET", studioDom, "/"), 302, "")
 
 	writeDashFile(t, e.path(), dfile(5))
 	if err := e.d.table.Reload(); err != nil || gen() != 5 {
@@ -476,7 +487,8 @@ func TestDashAnswers_CarryTheDashboardHeaders_NeverSandbox(t *testing.T) {
 	e.dexpect(t, "421", r, 421, "misdirected")
 	e.dexpect(t, "404 label", rawReq("GET", "cccccccccccccccccccc."+studioDom, "/"), 404, "not_found")
 	e.dexpect(t, "400 rule 0", rawReq("GET", dhostA, "/a//b"), 400, "bad_request")
-	e.dexpect(t, "400 rule 0, apex", rawReq("GET", studioDom, "/a//b"), 400, "bad_request")
+	e.dexpect(t, "400 rule 0, sign-in host", rawReq("GET", signInH, "/a//b"), 400, "bad_request")
+	e.dexpect(t, "404 studio domain", rawReq("GET", studioDom, "/a//b"), 404, "not_found")
 	e.dexpect(t, "404 rule 2", rawReq("GET", dhostA, "/x/"+refB), 404, "not_found")
 	e.dexpect(t, "401", rawReq("GET", dhostA, "/api/x"), 401, "login_required")
 	nav := rawReq("GET", dhostA, "/x")
@@ -494,7 +506,8 @@ func TestDashAnswers_CarryTheDashboardHeaders_NeverSandbox(t *testing.T) {
 	dashForward, dashAuth = nil, nil
 	e.dexpect(t, "503 no forwarder", e.as(t, rawReq("GET", dhostA, "/"), refA, subOwnerA), 503, "unavailable")
 	e.dexpect(t, "503 no sign-in", rawReq("GET", dhostA, "/-/auth/login"), 503, "unavailable")
-	e.dexpect(t, "503 no apex", rawReq("GET", studioDom, "/"), 503, "unavailable")
+	e.dexpect(t, "503 no sign-in, sign-in host", rawReq("GET", signInH, "/"), 503, "unavailable")
+	e.dexpect(t, "302 studio domain, no seam needed", rawReq("GET", studioDom, "/"), 302, "")
 }
 
 func TestDashRefusals_CountedNotLoggedPerRequest(t *testing.T) {
@@ -510,7 +523,7 @@ func TestDashRefusals_CountedNotLoggedPerRequest(t *testing.T) {
 		e.do(owner("/x/" + refB)) // rule 2
 		e.do(owner("/api/ai/x"))  // rule 3
 		e.do(sw)                  // rule 4
-		e.do(rawReq("GET", studioDom, "/a/../b"))
+		e.do(rawReq("GET", signInH, "/a/../b"))
 		e.do(rawReq("GET", dhostA, "/api/x")) // rule 5: not counted here
 	}
 	if buf.Len() != 0 {
@@ -783,5 +796,240 @@ func TestDashTable_OversizeRefusedUnread(t *testing.T) {
 	}
 	if alloc := after.TotalAlloc - before.TotalAlloc; alloc >= 1<<20 {
 		t.Errorf("refusing an oversize file allocated %d bytes", alloc)
+	}
+}
+
+// TestDashHostClasses_SignInHostAndStudioDomain: the studio domain answers a
+// fixed redirect or 404 with or without a table; the sign-in host is
+// classified before the table is consulted and hands every request that
+// passes rule 0 to the sign-in seam.
+func TestDashHostClasses_SignInHostAndStudioDomain(t *testing.T) {
+	e := newDashEnv(t, active(), false)
+	withCookies := func(r *http.Request) *http.Request {
+		r.AddCookie(&http.Cookie{Name: "__Host-sp-session", Value: e.session(t, "_", issuer, subOwnerA, time.Now().Unix()-10, 3600)})
+		r.AddCookie(&http.Cookie{Name: "__Host-sp-login-AAAAAAAAAAA", Value: "x"})
+		r.AddCookie(&http.Cookie{Name: "other", Value: "y"})
+		return r
+	}
+	const loc = "https://" + signInH + "/"
+	var body404 string
+	studio := func(table string) {
+		for _, m := range []string{"GET", "HEAD"} {
+			for _, target := range []string{"/", "/?x=1", "/?return=https://evil.example/&next=//evil.example", "/?#x"} {
+				for _, host := range []string{studioDom, studioDom + ":8443", studioDom + ":0"} {
+					r := withCookies(rawReq(m, host, target))
+					r.Header.Set("X-Forwarded-Host", "evil.example")
+					r.Header.Set("Referer", "https://evil.example/")
+					name := table + " " + m + " " + host + target
+					w := e.dexpect(t, name, r, 302, "")
+					if got := w.Header().Values("Location"); len(got) != 1 || got[0] != loc {
+						t.Errorf("%s: Location %q", name, got)
+					}
+					if c := w.Header().Values("Set-Cookie"); len(c) != 0 || w.Body.Len() != 0 {
+						t.Errorf("%s: Set-Cookie %q, body %q", name, c, w.Body)
+					}
+				}
+			}
+		}
+		for _, c := range []struct{ m, target string }{
+			{"GET", "/x"}, {"GET", "/-/auth/login"}, {"GET", "/-/auth/callback"}, {"POST", "/"}, {"PUT", "/"},
+			{"OPTIONS", "/"}, {"DELETE", "/"}, {"get", "/"}, {"GET", "//"}, {"GET", "/a/../b"}, {"GET", "/%zz"},
+			{"GET", "/#"}, {"GET", "/x#/../"}, {"GET", "/%2F"}, {"GET", "/" + refA}, {"GET", "/api/mcp"}, {"GET", "*"}, {"GET", ""},
+		} {
+			name := table + " " + c.m + " " + c.target
+			w := e.dexpect(t, name, withCookies(rawReq(c.m, studioDom, c.target)), 404, "not_found")
+			if len(w.Header().Values("Set-Cookie")) != 0 || w.Header().Get("Location") != "" {
+				t.Errorf("%s: %v", name, w.Header())
+			}
+			if body404 == "" {
+				body404 = w.Body.String()
+			} else if w.Body.String() != body404 {
+				t.Errorf("%s: body %q, want the constant %q", name, w.Body, body404)
+			}
+		}
+	}
+	studio("no table")
+
+	// The sign-in host: no table, 503.
+	e.dexpect(t, "sign-in host, no table", rawReq("GET", signInH, "/"), 503, "unavailable")
+	e.dexpect(t, "sign-in host, no table, rule-0 path", rawReq("GET", signInH, "/a//b"), 503, "unavailable")
+
+	writeDashFile(t, e.path(), dfile(1))
+	if err := e.d.table.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	studio("table")
+
+	// The sign-in host: rule 0, then the seam with ref "_", holding no slot.
+	// The table has no project "sign-in", so reaching the seam shows the label
+	// was not looked up.
+	e.dexpect(t, "sign-in host, rule 0", rawReq("GET", signInH, "/a/../b"), 400, "bad_request")
+	sw := rawReq("GET", signInH, "/sw.js")
+	sw.Header.Set("Service-Worker", "script")
+	for _, r := range []*http.Request{
+		rawReq("GET", signInH, "/"), rawReq("GET", signInH, "/project/x"), rawReq("GET", signInH, "/project/"+refB),
+		rawReq("GET", signInH, "/api/mcp"), rawReq("POST", signInH, "/-/auth/callback"), rawReq("DELETE", signInH, "/x"),
+		rawReq("GET", signInH+":443", "/"), sw, e.as(t, rawReq("GET", signInH, "/x"), refA, subOwnerA),
+	} {
+		name := r.Method + " " + r.Host + r.RequestURI
+		e.resetSeams()
+		w := e.do(r)
+		f, a := e.seams()
+		if w.Code != 200 || f != 0 || a != 1 {
+			t.Errorf("%s: %d, forward %d, auth %d", name, w.Code, f, a)
+			continue
+		}
+		e.mu.Lock()
+		dr, held := e.auth[0], e.authHeld
+		e.mu.Unlock()
+		if dr.Ref != "_" || dr.Table == nil || dr.Dash != e.d || dr.Unpresented || held != 0 {
+			t.Errorf("%s: ref %q, table %v, unpresented %v, slots held %d", name, dr.Ref, dr.Table != nil, dr.Unpresented, held)
+		}
+	}
+
+	// A wrong server name is 421 on both.
+	for _, h := range []string{studioDom, signInH} {
+		r := rawReq("GET", h, "/")
+		r.TLS = &tls.ConnectionState{ServerName: dhostA}
+		e.dexpect(t, "wrong server name, "+h, r, 421, "misdirected")
+	}
+	r := rawReq("GET", signInH, "/")
+	r.TLS = &tls.ConnectionState{ServerName: signInH}
+	e.resetSeams()
+	if w := e.do(r); w.Code != 200 {
+		t.Errorf("server name equal to the sign-in host: %d", w.Code)
+	}
+
+	// Host matching is exact: none of these is the sign-in host or the studio
+	// domain, and none is redirected or reaches a seam.
+	for _, h := range []string{
+		"Sign-In." + studioDom, "SIGN-IN." + studioDom, "xsign-in." + studioDom, "sign-inx." + studioDom, "sign-in-." + studioDom,
+		"sign-in." + refA + "." + studioDom, "sign-in." + dhostA, signInH + ".", signInH + ":x", signInH + ":",
+		"sign-in", "sign_in." + studioDom, "signin." + studioDom, "[" + signInH + "]",
+		studioDom + ".", strings.ToUpper(studioDom), "x" + studioDom, studioDom + ":x", "[::1]", "[::1]:443", "[::ffff:192.0.2.1]",
+	} {
+		e.resetSeams()
+		w := e.do(rawReq("GET", h, "/"))
+		if f, a := e.seams(); w.Code != 404 || f+a != 0 || w.Header().Get("Location") != "" {
+			t.Errorf("host %q: %d, forward %d, auth %d, Location %q", h, w.Code, f, a, w.Header().Get("Location"))
+		}
+	}
+}
+
+// TestDashHeaders_TransportSecurityOnEveryStudioHost: every answer of the
+// studio domain, the sign-in host and a dashboard host carries exactly
+// max-age=31536000; no project-API answer carries it.
+func TestDashHeaders_TransportSecurityOnEveryStudioHost(t *testing.T) {
+	const want = "max-age=31536000"
+	e := newDashEnv(t, active(), false)
+	check := func(name string, r *http.Request, status int) {
+		t.Helper()
+		w := e.do(r)
+		if w.Code != status {
+			t.Errorf("%s: status %d, want %d", name, w.Code, status)
+		}
+		if v := w.Header().Values("Strict-Transport-Security"); len(v) != 1 || v[0] != want {
+			t.Errorf("%s: Strict-Transport-Security %q", name, v)
+		}
+	}
+	sni := func(r *http.Request, name string) *http.Request {
+		r.TLS = &tls.ConnectionState{ServerName: name}
+		return r
+	}
+	owner := func(m, target string) *http.Request { return e.as(t, rawReq(m, dhostA, target), refA, subOwnerA) }
+
+	check("studio domain 302, no table", rawReq("GET", studioDom, "/"), 302)
+	check("sign-in host 503, no table", rawReq("GET", signInH, "/"), 503)
+	check("dashboard host 503, no table", owner("GET", "/"), 503)
+
+	writeDashFile(t, e.path(), dfile(1))
+	if err := e.d.table.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	check("studio domain 302", rawReq("HEAD", studioDom, "/"), 302)
+	check("studio domain 404", rawReq("GET", studioDom, "/x"), 404)
+	check("studio domain 421", sni(rawReq("GET", studioDom, "/"), signInH), 421)
+	check("sign-in host 400", rawReq("GET", signInH, "/a//b"), 400)
+	check("sign-in host 421", sni(rawReq("GET", signInH, "/"), studioDom), 421)
+	check("dashboard host 404 label", rawReq("GET", "cccccccccccccccccccc."+studioDom, "/"), 404)
+	check("dashboard host 400", owner("GET", "/a//b"), 400)
+	check("dashboard host 421", sni(owner("GET", "/"), dhostB), 421)
+	check("dashboard host 404 rule 2", owner("GET", "/x/"+refB), 404)
+	check("dashboard host 404 rule 3", owner("GET", "/api/mcp"), 404)
+	nav := rawReq("GET", dhostA, "/x")
+	nav.Header.Set("Sec-Fetch-Mode", "navigate")
+	check("dashboard host 302 rule 5", nav, 302)
+	check("dashboard host 401 rule 5", rawReq("GET", dhostA, "/api/x"), 401)
+	check("dashboard host 403 rule 6", e.as(t, rawReq("GET", dhostA, "/"), refA, subOwnerB), 403)
+	check("dashboard host 403 rule 8", e.as(t, rawReq("POST", dhostA, "/x"), refA, subROA), 403)
+	big := owner("POST", "/x")
+	big.ContentLength = 3 << 20
+	check("dashboard host 413 rule 10", big, 413)
+	e.d.mu.Lock()
+	e.d.byRef[refA] = e.d.projects
+	e.d.mu.Unlock()
+	check("dashboard host 429", owner("GET", "/"), 429)
+	e.d.mu.Lock()
+	delete(e.d.byRef, refA)
+	e.d.mu.Unlock()
+	for i := 0; i < cap(e.d.slots); i++ {
+		e.d.slots <- struct{}{}
+	}
+	check("dashboard host 503 slots", owner("GET", "/"), 503)
+	for len(e.d.slots) > 0 {
+		<-e.d.slots
+	}
+	dashForward, dashAuth = nil, nil
+	check("dashboard host 503 no forwarder", owner("GET", "/"), 503)
+	check("sign-in host 503 no sign-in", rawReq("GET", signInH, "/"), 503)
+
+	// Never on the project API, nor on an unknown host.
+	for name, r := range map[string]*http.Request{
+		"project 401":     req("GET", hostA, "/rest/v1/x", nil),
+		"project health":  req("GET", hostA, "/-/health", nil),
+		"unknown host":    req("GET", "evil.example", "/", nil),
+		"trailing dot":    req("GET", studioDom+".", "/", nil),
+		"project via sni": sni(req("GET", hostA, "/rest/v1/x", nil), dhostA),
+	} {
+		if v := e.do(r).Header().Values("Strict-Transport-Security"); len(v) != 0 {
+			t.Errorf("%s: Strict-Transport-Security %q", name, v)
+		}
+	}
+}
+
+// TestDashRefusals_SignInHostCountedUnderItsOwnKey: rule-0 refusals on the
+// sign-in host are counted under "_", a dashboard host's under its ref; the
+// studio domain counts nothing.
+func TestDashRefusals_SignInHostCountedUnderItsOwnKey(t *testing.T) {
+	e := newDashEnv(t, active(), true)
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+	for i := 0; i < 3; i++ {
+		e.do(rawReq("GET", signInH, "/a/../b"))
+	}
+	for i := 0; i < 5; i++ {
+		e.do(rawReq("GET", studioDom, "/a/../b"))
+		e.do(rawReq("GET", studioDom, "/x"))
+	}
+	e.do(e.as(t, rawReq("GET", dhostA, "/a//b"), refA, subOwnerA))
+	e.d.mu.Lock()
+	keys := make([]string, 0, len(e.d.refused))
+	for k := range e.d.refused {
+		keys = append(keys, k)
+	}
+	e.d.mu.Unlock()
+	if len(keys) != 2 {
+		t.Errorf("counted under %q, want only _ and %s", keys, refA)
+	}
+	e.d.logRefusals()
+	got := buf.String()
+	for _, want := range []string{"ref _: rule0 3 rule2 0 rule3 0 rule4 0", "ref " + refA + ": rule0 1 "} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in %q", want, got)
+		}
+	}
+	if strings.Contains(got, studioDom) || strings.Contains(got, "sign-in") {
+		t.Errorf("a host name used as a key: %q", got)
 	}
 }

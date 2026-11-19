@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,13 +30,15 @@ func TestDashPath_RuleZero(t *testing.T) {
 		"/x?a#b", "/x?reveal=true#", "/x?#",
 	} {
 		e.dexpect(t, "dashboard "+raw, e.as(t, rawReq("GET", dhostA, raw), refA, subOwnerA), 400, "bad_request")
-		e.dexpect(t, "apex "+raw, rawReq("GET", studioDom, raw), 400, "bad_request")
+		e.dexpect(t, "sign-in host "+raw, rawReq("GET", signInH, raw), 400, "bad_request")
+		// Rule 0 does not judge the studio domain: anything but "/" is 404.
+		e.dexpect(t, "studio domain "+raw, rawReq("GET", studioDom, raw), 404, "not_found")
 	}
 	for _, raw := range []string{"/", "/a/b", "/a/b?q=%E2%84%AA", "/a?q=\xe2\x84\xaa", "/a%20b", "/a~b", "/a%25b", "/x%23y", "/x?a=%23"} {
 		e.passes(t, "dashboard "+raw, e.as(t, rawReq("GET", dhostA, raw), refA, subOwnerA))
 		e.resetSeams()
-		if w := e.do(rawReq("GET", studioDom, raw)); w.Code != 200 {
-			t.Errorf("apex %q: %d", raw, w.Code)
+		if w := e.do(rawReq("GET", signInH, raw)); w.Code != 200 {
+			t.Errorf("sign-in host %q: %d", raw, w.Code)
 		}
 	}
 	dr := e.passes(t, "segments", e.as(t, rawReq("GET", dhostA, "/Project/%61b%20C?x=1"), refA, subOwnerA))
@@ -46,9 +50,9 @@ func TestDashPath_RuleZero(t *testing.T) {
 		t.Errorf("root: Path %q Lower %q", dr.Path, dr.Lower)
 	}
 	e.resetSeams()
-	e.do(rawReq("GET", studioDom, "/x"))
-	if e.auth[0].Ref != "_" {
-		t.Errorf("apex ref %q", e.auth[0].Ref)
+	e.do(rawReq("GET", signInH, "/x"))
+	if len(e.auth) != 1 || e.auth[0].Ref != "_" {
+		t.Fatalf("sign-in host: %d requests at the seam", len(e.auth))
 	}
 }
 
@@ -137,7 +141,7 @@ func TestDashSession_Refusals(t *testing.T) {
 	two.AddCookie(&http.Cookie{Name: "__Host-sp-session", Value: good})
 	e.dexpect(t, "two cookies", two, 401, "login_required")
 	e.dexpect(t, "other ref", api(e.session(t, refB, issuer, subOwnerA, now-10, 3600)), 401, "login_required")
-	e.dexpect(t, "apex session", api(e.session(t, "_", issuer, subOwnerA, now-10, 3600)), 401, "login_required")
+	e.dexpect(t, "session of the sign-in host", api(e.session(t, "_", issuer, subOwnerA, now-10, 3600)), 401, "login_required")
 	e.dexpect(t, "other issuer", api(e.session(t, refA, "https://other.test", subOwnerA, now-10, 3600)), 401, "login_required")
 	e.dexpect(t, "expired", api(e.session(t, refA, issuer, subOwnerA, now-3600, 3600)), 401, "login_required")
 	e.dexpect(t, "longer than the table allows", api(e.session(t, refA, issuer, subOwnerA, now-10, 3601)), 401, "login_required")
@@ -478,4 +482,130 @@ func TestDashRules_FirstFailingRuleAnswers(t *testing.T) {
 	}
 	e.passes(t, "an encoded auth path is not rule 1", e.as(t, rawReq("GET", dhostA, "/-/%61uth/login"), refA, subOwnerA))
 	e.passes(t, "/-/auth alone is not rule 1", e.as(t, rawReq("GET", dhostA, "/-/auth"), refA, subOwnerA))
+}
+
+// TestDashSession_NotPresented_RefererOfTheSessionPage: a navigation without
+// a session whose Referer is this host's own session address, at most 60 s
+// old by the gateway's clock, goes to the sign-in seam marked Unpresented;
+// every other Referer is redirected to sign-in as before.
+func TestDashSession_NotPresented_RefererOfTheSessionPage(t *testing.T) {
+	e := newDashEnv(t, active(), true)
+	now := time.Now().Unix()
+	at := func(n int64) string { return strconv.FormatInt(n, 10) }
+	session := func(host, n string) string { return "https://" + host + "/-/auth/session?at=" + n }
+	const target = "/project/" + refA + "/sql?x=1"
+	nav := func(m, referer string) *http.Request {
+		r := rawReq(m, dhostA, target)
+		r.Header.Set("Sec-Fetch-Mode", "navigate")
+		if referer != "" {
+			r.Header.Set("Referer", referer)
+		}
+		return r
+	}
+	html := func(referer string) *http.Request {
+		r := rawReq("GET", dhostA, target)
+		r.Header.Set("Accept", "text/html")
+		r.Header.Set("Referer", referer)
+		return r
+	}
+	unpresented := func(name string, r *http.Request) {
+		t.Helper()
+		e.resetSeams()
+		w := e.do(r)
+		f, a := e.seams()
+		if w.Code != 200 || f != 0 || a != 1 || w.Header().Get("Location") != "" {
+			t.Errorf("%s: %d, forward %d, auth %d, Location %q", name, w.Code, f, a, w.Header().Get("Location"))
+			return
+		}
+		e.mu.Lock()
+		dr, held := e.auth[0], e.authHeld
+		e.mu.Unlock()
+		if !dr.Unpresented || dr.Ref != refA || dr.Session != (dashtok.Session{}) || held != 0 {
+			t.Errorf("%s: unpresented %v, ref %q, session %+v, slots held %d", name, dr.Unpresented, dr.Ref, dr.Session, held)
+		}
+	}
+	redirected := func(name string, r *http.Request) {
+		t.Helper()
+		w := e.dexpect(t, name, r, 302, "")
+		if loc := w.Header().Get("Location"); loc != "/-/auth/login?return="+url.QueryEscape(target) {
+			t.Errorf("%s: Location %q", name, loc)
+		}
+	}
+
+	unpresented("10 s old", nav("GET", session(dhostA, at(now-10))))
+	unpresented("now", nav("GET", session(dhostA, at(now))))
+	unpresented("50 s old", nav("GET", session(dhostA, at(now-50))))
+	unpresented("GET accepting html", html(session(dhostA, at(now-10))))
+	unpresented("a navigation by POST", nav("POST", session(dhostA, at(now-10))))
+
+	for name, ref := range map[string]string{
+		"61 s old":               session(dhostA, at(now-61)),
+		"an hour old":            session(dhostA, at(now-3600)),
+		"in the future":          session(dhostA, at(now+3600)),
+		"missing":                "https://" + dhostA + "/-/auth/session",
+		"no parameter":           "https://" + dhostA + "/-/auth/session?",
+		"empty":                  session(dhostA, ""),
+		"exponent":               session(dhostA, "1e3"),
+		"negative":               session(dhostA, "-"+at(now-10)),
+		"plus sign":              session(dhostA, "+"+at(now-10)),
+		"space":                  session(dhostA, " "+at(now-10)),
+		"fraction":               session(dhostA, at(now-10)+".0"),
+		"hexadecimal":            session(dhostA, "0x"+strconv.FormatInt(now-10, 16)),
+		"overflow":               session(dhostA, "99999999999999999999999"),
+		"second parameter":       session(dhostA, at(now-10)) + "&x=1",
+		"parameter first":        "https://" + dhostA + "/-/auth/session?x=1&at=" + at(now-10),
+		"twice":                  session(dhostA, at(now-10)) + "&at=" + at(now-10),
+		"name case":              "https://" + dhostA + "/-/auth/session?AT=" + at(now-10),
+		"fragment":               session(dhostA, at(now-10)) + "#",
+		"another dashboard":      session(dhostB, at(now-10)),
+		"the sign-in host":       session(signInH, at(now-10)),
+		"the studio domain":      session(studioDom, at(now-10)),
+		"another scheme":         "http://" + dhostA + "/-/auth/session?at=" + at(now-10),
+		"a port":                 "https://" + dhostA + ":443/-/auth/session?at=" + at(now-10),
+		"host in capitals":       session(strings.ToUpper(dhostA), at(now-10)),
+		"a segment longer":       "https://" + dhostA + "/-/auth/session/x?at=" + at(now-10),
+		"a segment shorter":      "https://" + dhostA + "/-/auth?at=" + at(now-10),
+		"another path":           "https://" + dhostA + "/-/auth/login?at=" + at(now-10),
+		"path case":              "https://" + dhostA + "/-/auth/Session?at=" + at(now-10),
+		"encoded path":           "https://" + dhostA + "/-/auth/%73ession?at=" + at(now-10),
+		"userinfo":               "https://x@" + dhostA + "/-/auth/session?at=" + at(now-10),
+		"suffix of another host": "https://x" + dhostA + "/-/auth/session?at=" + at(now-10),
+		"relative":               "/-/auth/session?at=" + at(now-10),
+		"no Referer":             "",
+	} {
+		redirected(name, nav("GET", ref))
+	}
+	two := nav("GET", session(dhostA, at(now-10)))
+	two.Header.Add("Referer", session(dhostA, at(now-10)))
+	redirected("two Referer headers", two)
+
+	// Not a navigation: 401 as before.
+	api := rawReq("GET", dhostA, "/api/x")
+	api.Header.Set("Referer", session(dhostA, at(now-10)))
+	e.dexpect(t, "not a navigation", api, 401, "login_required")
+
+	// With a valid session the request is forwarded whatever its Referer.
+	for _, ref := range []string{session(dhostA, at(now-10)), "https://evil.example/", ""} {
+		r := e.as(t, nav("GET", ref), refA, subOwnerA)
+		if dr := e.passes(t, "session, Referer "+ref, r); dr.Unpresented {
+			t.Errorf("session, Referer %q: marked unpresented", ref)
+		}
+	}
+
+	// A session that is present but invalid is no session: the exception holds.
+	bad := nav("GET", session(dhostA, at(now-10)))
+	bad.AddCookie(&http.Cookie{Name: "__Host-sp-session", Value: e.session(t, refB, issuer, subOwnerA, now-10, 3600)})
+	unpresented("session of another ref", bad)
+
+	// Rules 2 to 4 come first.
+	e.dexpect(t, "rule 2 first", func() *http.Request {
+		r := rawReq("GET", dhostA, "/x/"+refB)
+		r.Header.Set("Sec-Fetch-Mode", "navigate")
+		r.Header.Set("Referer", session(dhostA, at(now-10)))
+		return r
+	}(), 404, "not_found")
+
+	// Without the sign-in seam the exception is answered 503, never a redirect.
+	dashAuth = nil
+	e.dexpect(t, "no sign-in seam", nav("GET", session(dhostA, at(now-10))), 503, "unavailable")
 }

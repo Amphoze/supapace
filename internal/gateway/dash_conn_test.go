@@ -19,7 +19,7 @@ func TestDashPath_FragmentRefused(t *testing.T) {
 	e := newDashEnv(t, active(), true)
 	for _, raw := range []string{"/api/mcp#x", "/api/ai#/x", "/api/platform/pg-meta/" + refB + "#", "/x#y"} {
 		e.dexpect(t, raw, e.as(t, rawReq("GET", dhostA, raw), refA, subOwnerA), 400, "bad_request")
-		e.dexpect(t, raw+" on the apex", rawReq("GET", studioDom, raw), 400, "bad_request")
+		e.dexpect(t, raw+" on the sign-in host", rawReq("GET", signInH, raw), 400, "bad_request")
 	}
 	// An encoded "#" is a character of its segment for both readers.
 	e.passes(t, "encoded", e.as(t, rawReq("GET", dhostA, "/x%23y"), refA, subOwnerA))

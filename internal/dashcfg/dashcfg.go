@@ -24,6 +24,7 @@ const (
 	RoleOwner, RoleDeveloper, RoleReadOnly          = "owner", "developer", "read_only"
 	LoginRW, LoginRO                                = "postgres", "supabase_read_only_user"
 	SecretROPassword                                = "pg.supabase_read_only_user.password"
+	SignInLabel                                     = "sign-in" // the sign-in host's label under the studio domain; no ref can be it
 )
 
 // maxSlices is the dashboard file's cap on projects (dashfile.MaxProjects; a

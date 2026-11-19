@@ -3125,3 +3125,23 @@ Known limits:
 - init's removal of leftover temporary files runs outside the lock; a concurrent install then
   fails cleanly.
 - A flow to an address removed from the set lives until it closes; new connections fail.
+
+### 2026-11-19 — gateway: sign-in host, studio-domain redirect, transport security
+
+Host classes under the studio domain S, after the TLS server-name check (421) on each:
+- S itself answers one thing, with no table and no path rule: GET or HEAD of exactly "/" (any
+  query) is 302 to https://sign-in.S/ with no-store; every other path or method is 404. Nothing
+  of the request reaches the answer; no cookie is read or set.
+- sign-in.S (dashcfg.SignInLabel, a label no ref can have) is the sign-in host: no table 503;
+  rule 0; then every request goes to the sign-in seam with Ref "_", holding no slot.
+- <ref>.S is a dashboard host, as before. Its /-/auth/ paths also go to the sign-in seam.
+
+Rule 5 exception: a navigation without a valid session whose single Referer is exactly
+https://<ref>.S/-/auth/session?at=<n> (S as configured, no port; n plain decimal seconds, no
+sign or leading zero, not in the future, at most 60 s old by the gateway clock) is not
+redirected: dashRequest.Unpresented is set and the request goes to the sign-in seam, after
+rules 2-4 and before any slot. Anything else gets the 302 to /-/auth/login as before.
+
+Every answer the gateway writes on S, sign-in.S and dashboard hosts carries
+Strict-Transport-Security: max-age=31536000, never includeSubDomains (dashHeaders); project
+API answers do not. A seam that writes its own answer must call dashHeaders to keep it.

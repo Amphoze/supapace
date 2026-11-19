@@ -3,6 +3,7 @@ package gateway
 import (
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,11 @@ func (d *Dashboard) rules(w http.ResponseWriter, r *http.Request, dt *dashTable,
 	if !ok {
 		if r.Header.Get("Sec-Fetch-Mode") == "navigate" ||
 			r.Method == http.MethodGet && strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html") {
+			if d.unpresented(r, dr.Ref, time.Now()) {
+				dr.Unpresented = true
+				call(dashAuth, w, r, dr)
+				return false
+			}
 			h := w.Header()
 			h.Set("Location", "/-/auth/login?return="+url.QueryEscape(r.RequestURI))
 			h.Set("Cache-Control", "no-store")
@@ -114,6 +120,28 @@ func (d *Dashboard) session(r *http.Request, dt *dashTable, ref string, now time
 		return dashtok.Session{}, false
 	}
 	return s, true
+}
+
+// sessionPageWindow is how long after the relay a navigation from the
+// session page is rule 5's exception, in seconds.
+const sessionPageWindow = 60
+
+// unpresented reports whether r carries exactly one Referer and it is this
+// host's own session address, https://<ref>.<studio domain>/-/auth/session?at=<n>,
+// with n a plain decimal number of seconds not after now and at most
+// sessionPageWindow before it. The gateway wrote n at the relay, by its own
+// clock.
+func (d *Dashboard) unpresented(r *http.Request, ref string, now time.Time) bool {
+	vs := r.Header.Values("Referer")
+	if len(vs) != 1 {
+		return false
+	}
+	n, ok := strings.CutPrefix(vs[0], "https://"+ref+"."+d.domain+"/-/auth/session?at=")
+	if !ok || n == "" || len(n) > 1 && n[0] == '0' || strings.Trim(n, "0123456789") != "" {
+		return false
+	}
+	at, err := strconv.ParseInt(n, 10, 64)
+	return err == nil && at <= now.Unix() && now.Unix()-at <= sessionPageWindow
 }
 
 // apiPath reports whether lp, the lower-cased segments, is an API path: /api
