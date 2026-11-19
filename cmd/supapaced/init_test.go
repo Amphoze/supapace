@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"math/big"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1339,6 +1340,39 @@ func TestInstallNode_StateDirOwner(t *testing.T) {
 	}
 	if fi, _ := os.Lstat(dir); owner(fi) != 0 || fi.Sys().(*syscall.Stat_t).Gid != 0 || fi.Mode().Perm() != 0o700 {
 		t.Errorf("/var/lib/supapace owner %d mode %v, want root:root 0700", owner(fi), fi.Mode().Perm())
+	}
+}
+
+// init renders the ruleset from the saved off-site set, never drops it, and
+// refuses a malformed addresses file without touching the ruleset file.
+func TestInit_RendersTheSavedSet(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(devArgs...)
+	c, err := nodecfg.Load(n.p.NodeJSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.write("etc/supapace/offsite.addrs", "192.0.2.10:443\n", 0o600)
+	out := n.mustInit(devArgs...)
+	want, err := nft.RenderWith(c, []netip.AddrPort{netip.MustParseAddrPort("192.0.2.10:443")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(n.read("etc/supapace/nftables.nft"), want) {
+		t.Error("nftables.nft is not the rendering of the saved set")
+	}
+	if !strings.Contains(out, "wrote "+n.p.NftFile()) {
+		t.Errorf("init output %q does not name the rewritten ruleset file", out)
+	}
+	if out := n.mustInit(devArgs...); !strings.Contains(out, "nothing to change") {
+		t.Errorf("a third init changed something: %q", out)
+	}
+	n.write("etc/supapace/offsite.addrs", "junk\n", 0o600)
+	if code, _, errs := n.run("", append([]string{"init"}, devArgs...)...); code == 0 || !strings.Contains(errs, "offsite.addrs") {
+		t.Errorf("init with a malformed addresses file: exit %d, stderr %q", code, errs)
+	}
+	if !bytes.Equal(n.read("etc/supapace/nftables.nft"), want) {
+		t.Error("init with a malformed addresses file changed the ruleset file")
 	}
 }
 

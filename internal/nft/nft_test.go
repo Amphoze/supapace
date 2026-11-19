@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,11 @@ delete table bridge supapace
 define GATEWAY_IP = 10.212.0.2
 
 table inet supapace {
+	# the declared off-site endpoint's addresses and port, as the agent last
+	# resolved them; possibly none
+	set offsite4 {
+		type ipv4_addr . inet_service
+	}
 	# traffic addressed to the host itself, IPv4 and IPv6
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
@@ -45,10 +51,17 @@ table inet supapace {
 		type filter hook forward priority filter - 10; policy accept;
 		# the gateway's replies to clients of its published ports
 		iifname "spi0" ct state established,related accept comment "F1"
+		# replication jobs: new TCP connections to the declared endpoint only
+		iifname "spb0" ct state new ip daddr . tcp dport @offsite4 accept comment "F5"
+		# replication jobs: the rest of a connection F5 accepted, also after its
+		# address has left the set
+		iifname "spb0" ct state established,related accept comment "F7"
 		# nothing is routed out of any bridge
 		meta iifkind "bridge" drop comment "F2"
 		# clients to the gateway's published ports
 		oifname "spi0" accept comment "F3"
+		# replies to replication jobs
+		oifname "spb0" ct state established,related accept comment "F6"
 		# nothing is routed into any other bridge
 		meta oifkind "bridge" drop comment "F4"
 	}
@@ -68,6 +81,8 @@ table bridge supapace {
 		meta ibrname "spl0" ether type arp accept comment "B4"
 		meta ibrname "spl0" ether type ip ip saddr != $GATEWAY_IP ct state != { established, related } drop comment "B8"
 		meta ibrname "spl0" ether type ip accept comment "B6"
+		# backup bridge: replication jobs never reach each other
+		meta ibrname "spb0" drop comment "B10"
 		# everything else, including while a reload installs this chain before its policy
 		drop comment "B9"
 	}
@@ -200,12 +215,17 @@ func rules(t *testing.T, s string) []rule {
 	t.Helper()
 	var out []rule
 	var table, chain string
+	var inSet bool
 	for i, l := range strings.Split(s, "\n") {
 		f := strings.Fields(l)
 		switch {
 		case len(f) == 0 || f[0] == "#":
 		case f[0] == "table" && len(f) == 4 && f[3] == "{":
 			table = f[1] + " " + f[2]
+		case f[0] == "set" && len(f) == 3 && f[2] == "{":
+			inSet = true
+		case inSet:
+			inSet = f[0] != "}"
 		case f[0] == "chain" && len(f) == 3 && f[2] == "{":
 			chain = f[1]
 		case f[0] == "}":
@@ -231,9 +251,9 @@ func TestRender_EveryRuleHasUniqueComment(t *testing.T) {
 	rs := rules(t, render(t, defaultConfig(t)))
 	want := map[string]string{ // label → table/chain
 		"I1": "inet supapace/input", "I2": "inet supapace/input",
-		"F1": "inet supapace/forward", "F2": "inet supapace/forward", "F3": "inet supapace/forward", "F4": "inet supapace/forward",
+		"F1": "inet supapace/forward", "F5": "inet supapace/forward", "F6": "inet supapace/forward", "F7": "inet supapace/forward", "F2": "inet supapace/forward", "F3": "inet supapace/forward", "F4": "inet supapace/forward",
 	}
-	for _, l := range []string{"B1", "B2", "B3", "B4", "B6", "B8", "B9"} {
+	for _, l := range []string{"B1", "B2", "B3", "B4", "B6", "B8", "B9", "B10"} {
 		want[l] = "bridge supapace/forward"
 	}
 	seen := map[string]bool{}
@@ -253,7 +273,7 @@ func TestRender_EveryRuleHasUniqueComment(t *testing.T) {
 		t.Errorf("%d rules, want %d", len(rs), len(want))
 	}
 	// B8 sits before B6, which accepts the rest of the platform bridge; B9 is last.
-	if got := strings.Join(order, " "); got != "I1 I2 F1 F2 F3 F4 B1 B2 B3 B4 B8 B6 B9" {
+	if got := strings.Join(order, " "); got != "I1 I2 F1 F5 F7 F2 F3 F6 F4 B1 B2 B3 B4 B8 B6 B10 B9" {
 		t.Errorf("rule order %q", got)
 	}
 }
@@ -642,4 +662,35 @@ func lookPath(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+func TestRender_EmptySet(t *testing.T) {
+	got := render(t, defaultConfig(t))
+	if !strings.Contains(got, "\tset offsite4 {\n\t\ttype ipv4_addr . inet_service\n\t}\n") {
+		t.Error("without elements the set is not declared empty")
+	}
+}
+
+func TestRender_Elements_SortedStable(t *testing.T) {
+	c := defaultConfig(t)
+	a, b := netip.MustParseAddrPort("192.0.2.20:443"), netip.MustParseAddrPort("192.0.2.3:9443")
+	x, err := RenderWith(c, []netip.AddrPort{a, b, a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, _ := RenderWith(c, []netip.AddrPort{b, a})
+	if !bytes.Equal(x, y) {
+		t.Error("the same set in another order renders other bytes")
+	}
+	if !strings.Contains(string(x), "\t\telements = { 192.0.2.3 . 9443, 192.0.2.20 . 443 }\n") {
+		t.Errorf("elements not sorted and deduplicated:\n%s", x)
+	}
+	if want := strings.Replace(render(t, c), "\t\ttype ipv4_addr . inet_service\n", "\t\ttype ipv4_addr . inet_service\n\t\telements = { 192.0.2.3 . 9443, 192.0.2.20 . 443 }\n", 1); string(x) != want {
+		t.Error("the elements are not the only difference to the empty rendering")
+	}
+	for _, bad := range []netip.AddrPort{{}, netip.MustParseAddrPort("[2001:db8::1]:443"), netip.MustParseAddrPort("192.0.2.1:0")} {
+		if _, err := RenderWith(c, []netip.AddrPort{bad}); err == nil {
+			t.Errorf("element %q accepted", bad)
+		}
+	}
 }

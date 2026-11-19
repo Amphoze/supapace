@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
@@ -36,7 +37,23 @@ var ourTables = []string{"inet supapace", "bridge supapace"}
 // tables and nothing else), records the SHA-256 of the file and of the
 // installed tables' listing in the sum file, and then switches bridge-nf off.
 // A switch that cannot be written is reported after the tables are in place.
+// It holds the exclusive lock; not obtained before ctx ends, it returns the
+// context's error.
 func Load(ctx context.Context, p nodecfg.Paths) error {
+	// A node without the file (never initialised) has no lock directory either:
+	// the error names the file.
+	if _, err := os.Stat(p.NftFile()); err != nil {
+		return fmt.Errorf("nft: load: %w", err)
+	}
+	unlock, err := lock(ctx, p, syscall.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return loadLocked(ctx, p)
+}
+
+func loadLocked(ctx context.Context, p nodecfg.Paths) error {
 	file, err := os.ReadFile(p.NftFile())
 	if err != nil {
 		return fmt.Errorf("nft: load: %w", err)
@@ -58,7 +75,18 @@ func Load(ctx context.Context, p nodecfg.Paths) error {
 // Check returns ErrAbsent when a table is missing, ErrDrift when the file or
 // the installed tables differ from what Load recorded, and ErrBridgeNF when a
 // bridge-nf switch is on.
+// It holds the shared lock, so it never sees a writer half done; not obtained
+// before ctx ends, it returns ErrUnverified.
 func Check(ctx context.Context, p nodecfg.Paths) error {
+	unlock, err := lock(ctx, p, syscall.LOCK_SH)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnverified, err)
+	}
+	defer unlock()
+	return checkLocked(ctx, p)
+}
+
+func checkLocked(ctx context.Context, p nodecfg.Paths) error {
 	listing, err := listTables(ctx)
 	if err != nil {
 		return err

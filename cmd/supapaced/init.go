@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -152,11 +153,6 @@ func initNode(o initOpts) error {
 	if err != nil {
 		return err
 	}
-	ruleset, err := nft.Render(c)
-	if err != nil {
-		return err
-	}
-
 	w := &writer{uid: os.Geteuid(), gid: os.Getegid()}
 	w.dir(etc)
 	// Leftovers of interrupted writes: every ".<name>.tmp-*" in init's own
@@ -179,7 +175,7 @@ func initNode(o initOpts) error {
 		w.etcFile(devMarker, nil, 0o600)
 	}
 	w.etcFile(paths.NodeJSON(), append(nodeJSON, '\n'), 0o600)
-	w.etcFile(paths.NftFile(), ruleset, 0o600)
+	w.ruleset(c)
 	if daemon != nil {
 		w.file(daemonPath, daemon, 0o644)
 	}
@@ -392,6 +388,20 @@ func (w *writer) etcFile(path string, data []byte, mode os.FileMode) {
 	}
 	if w.err = nodefs.WriteFile(paths, filepath.Dir(path), filepath.Base(path), data, mode, w.uid, w.gid); w.err == nil {
 		w.done(path)
+	}
+}
+
+// ruleset writes the ruleset file through nft.EnsureRules (rendered from the
+// saved off-site set, written only when it differs; nothing is loaded).
+func (w *writer) ruleset(c nodecfg.Config) {
+	if w.err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	changed, err := nft.EnsureRules(ctx, paths, c, false)
+	if w.err = err; err == nil && changed {
+		w.done(paths.NftFile())
 	}
 }
 

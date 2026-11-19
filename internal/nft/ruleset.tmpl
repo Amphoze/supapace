@@ -11,6 +11,14 @@ delete table bridge supapace
 define GATEWAY_IP = {{.GatewayIP}}
 
 table inet supapace {
+	# the declared off-site endpoint's addresses and port, as the agent last
+	# resolved them; possibly none
+	set offsite4 {
+		type ipv4_addr . inet_service
+{{- if .Offsite}}
+		elements = { {{range $i, $e := .Offsite}}{{if $i}}, {{end}}{{$e.Addr}} . {{$e.Port}}{{end}} }
+{{- end}}
+	}
 	# traffic addressed to the host itself, IPv4 and IPv6
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
@@ -24,10 +32,17 @@ table inet supapace {
 		type filter hook forward priority filter - 10; policy accept;
 		# the gateway's replies to clients of its published ports
 		iifname "spi0" ct state established,related accept comment "F1"
+		# replication jobs: new TCP connections to the declared endpoint only
+		iifname "spb0" ct state new ip daddr . tcp dport @offsite4 accept comment "F5"
+		# replication jobs: the rest of a connection F5 accepted, also after its
+		# address has left the set
+		iifname "spb0" ct state established,related accept comment "F7"
 		# nothing is routed out of any bridge
 		meta iifkind "bridge" drop comment "F2"
 		# clients to the gateway's published ports
 		oifname "spi0" accept comment "F3"
+		# replies to replication jobs
+		oifname "spb0" ct state established,related accept comment "F6"
 		# nothing is routed into any other bridge
 		meta oifkind "bridge" drop comment "F4"
 	}
@@ -47,6 +62,8 @@ table bridge supapace {
 		meta ibrname "spl0" ether type arp accept comment "B4"
 		meta ibrname "spl0" ether type ip ip saddr != $GATEWAY_IP ct state != { established, related } drop comment "B8"
 		meta ibrname "spl0" ether type ip accept comment "B6"
+		# backup bridge: replication jobs never reach each other
+		meta ibrname "spb0" drop comment "B10"
 		# everything else, including while a reload installs this chain before its policy
 		drop comment "B9"
 	}

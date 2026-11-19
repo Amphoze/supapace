@@ -153,7 +153,7 @@ func serveCmd(args []string) int {
 	}
 	ag := agent.New(cfg, paths)
 	d := newDaemon(paths, ag)
-	d.nftRender = func() ([]byte, error) { return nft.Render(cfg) }
+	d.nftRender = func() ([]byte, error) { return nft.RenderSaved(cfg, paths) }
 	d.connect = func(ctx context.Context) (*backend, error) {
 		st, err := openStore(ctx, paths, cfg)
 		if err != nil {

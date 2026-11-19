@@ -16,12 +16,21 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
+	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -347,7 +356,7 @@ func TestLoad_ThenCheckPasses(t *testing.T) {
 	load(t, p)
 	// Every rule is installed with its label, once.
 	for _, c := range []struct{ family, chain, labels string }{
-		{"inet", "input", "I1 I2"}, {"inet", "forward", "F1 F2 F3 F4"}, {"bridge", "forward", "B1 B2 B3 B4 B8 B6 B9"},
+		{"inet", "input", "I1 I2"}, {"inet", "forward", "F1 F5 F7 F2 F3 F6 F4"}, {"bridge", "forward", "B1 B2 B3 B4 B8 B6 B10 B9"},
 	} {
 		m := labels(t, c.family, c.chain)
 		var got []string
@@ -376,9 +385,9 @@ func TestCheck_FailsAfterRuleDeleted(t *testing.T) {
 	p := node(t)
 	for _, r := range []ruleRef{
 		{"inet", "input", "I1"}, {"inet", "input", "I2"},
-		{"inet", "forward", "F1"}, F2, {"inet", "forward", "F3"}, F4,
+		{"inet", "forward", "F1"}, {"inet", "forward", "F5"}, {"inet", "forward", "F7"}, F2, {"inet", "forward", "F3"}, {"inet", "forward", "F6"}, F4,
 		{"bridge", "forward", "B1"}, {"bridge", "forward", "B2"}, {"bridge", "forward", "B3"}, {"bridge", "forward", "B4"},
-		B8, {"bridge", "forward", "B6"}, {"bridge", "forward", "B9"},
+		B8, {"bridge", "forward", "B6"}, {"bridge", "forward", "B10"}, {"bridge", "forward", "B9"},
 	} {
 		withDeleted(t, p, []ruleRef{r}, func() {
 			if err := Check(ctx, p); !errors.Is(err, ErrDrift) {
@@ -778,6 +787,37 @@ func helperMain(a []string) int {
 		wg.Wait()
 		fmt.Println("connected", ok.Load(), "of", n)
 		return 0
+	case len(a) == 4 && a[0] == "flight" && a[1] == "tcp":
+		// Like hold, but says "open" as soon as the connection is up.
+		dur, _ := time.ParseDuration(a[3])
+		c, err := net.DialTimeout("tcp", a[2], 2*time.Second)
+		if err != nil {
+			fmt.Println("error", err)
+			return 3
+		}
+		defer c.Close()
+		fmt.Println("open")
+		r := bufio.NewReader(c)
+		n := 0
+		for end := time.Now().Add(dur); time.Now().Before(end); n++ {
+			c.SetDeadline(time.Now().Add(3 * time.Second))
+			msg := fmt.Sprintf("line %d\n", n)
+			if _, err := c.Write([]byte(msg)); err != nil {
+				fmt.Println("broken", n, err)
+				return 1
+			}
+			if got, err := r.ReadString('\n'); err != nil || got != msg {
+				fmt.Println("broken", n, err)
+				return 1
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		fmt.Println("held", n)
+		return 0
+	case len(a) == 2 && a[0] == "tlsserve":
+		return tlsServe(a[1])
+	case len(a) == 2 && a[0] == "tlsget":
+		return tlsGet(a[1])
 	case len(a) == 1 && a[0] == "ctflush":
 		if err := ctFlush(); err != nil {
 			fmt.Println("error", err)
@@ -1143,6 +1183,24 @@ func TestIngress_Paths(t *testing.T) {
 	})
 }
 
+// arpDropped probes a path whose drop is at ARP (the bridge chain drops it):
+// the neighbour entry fails after about 3 s, so under load the kernel's
+// "unreachable EHOSTUNREACH" can beat the probe's 1 s deadline. Both read as
+// "blocked"; any other verdict is returned as it is.
+func arpDropped(t *testing.T, pid int, addr string) string {
+	t.Helper()
+	o, e, code, err := exe(nil, asTenant(pid, probeBin, "tcp", addr, "--timeout", "1s")...)
+	if err != nil {
+		t.Fatalf("probe %s: %v", addr, err)
+	}
+	switch v := strings.TrimSpace(o); {
+	case v == "timeout" && code == 2, v == "unreachable EHOSTUNREACH" && code == 1:
+		return "blocked"
+	default:
+		return fmt.Sprintf("%q exit %d (stderr %q)", v, code, strings.TrimSpace(e))
+	}
+}
+
 // Members of the ingress bridge cannot reach each other; the host's and the
 // published port's paths to the gateway do not cross the bridge chain.
 func TestIngress_MembersIsolated(t *testing.T) {
@@ -1152,8 +1210,8 @@ func TestIngress_MembersIsolated(t *testing.T) {
 	listen(t, other, "10.212.8.3:4000")
 	texpect(t, "host -> gateway", probe(t, hostNS, gwPort), "connected")
 	texpect(t, "neighbour -> published port", probe(t, nb, published), "connected")
-	texpect(t, "second ingress member -> gateway", probe(t, other, gwPort), "timeout")
-	texpect(t, "gateway -> second ingress member", probe(t, gw, "10.212.8.3:4000"), "timeout")
+	texpect(t, "second ingress member -> gateway", arpDropped(t, other, gwPort), "blocked")
+	texpect(t, "gateway -> second ingress member", arpDropped(t, gw, "10.212.8.3:4000"), "blocked")
 	withPolicyAccept(t, p, func() {
 		texpect(t, "second ingress member -> gateway with the chain open", probe(t, other, gwPort), "connected")
 		texpect(t, "gateway -> second ingress member with the chain open", probe(t, gw, "10.212.8.3:4000"), "connected")
@@ -1396,4 +1454,395 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	os.Exit(m.Run())
+}
+
+// ───────── the backup bridge: replication jobs reach the declared endpoint only ─────────
+
+const (
+	backupSubnet = "10.212.9.0/24"
+	backupHost   = "10.212.9.1" // the bridge's own address: the host
+	job1IP       = "10.212.9.10"
+	job2IP       = "10.212.9.11"
+	endpointA    = "10.215.250.2:9443" // on the neighbour, behind the uplink
+	endpointB    = "10.215.252.2:9443" // a second address of the neighbour, never declared unless a test adds it
+	otherPortA   = "10.215.250.2:8333"
+	transferSize = 8 << 20
+)
+
+// backup builds the backup network as the agent creates it, one job on it and
+// the neighbour holding both endpoint addresses; it returns the job's and the
+// neighbour's namespaces.
+func backup(t *testing.T) (job, nb int) {
+	t.Helper()
+	network(t, "spnft-backup", "--driver", "bridge", "--subnet", backupSubnet, "-o", "com.docker.network.bridge.name="+nodecfg.BackupBridge)
+	job = member(t, "spnft-job1", "spnft-backup", job1IP)
+	nb = neighbour(t)
+	must(t, inNS(nb, "ip", "addr", "add", "10.215.252.2/32", "dev", "spnftp")...)
+	t.Cleanup(func() { try(t, "ip", "route", "del", "10.215.252.2/32") })
+	must(t, "ip", "route", "add", "10.215.252.2/32", "via", "10.215.250.2")
+	return job, nb
+}
+
+// installSet makes the given elements the loaded off-site set.
+func installSet(t *testing.T, p nodecfg.Paths, elems ...string) {
+	t.Helper()
+	var s []netip.AddrPort
+	for _, e := range elems {
+		s = append(s, netip.MustParseAddrPort(e))
+	}
+	if err := InstallSet(t.Context(), p, nodecfg.Default("sp.test"), s); err != nil {
+		t.Fatalf("InstallSet %v: %v", elems, err)
+	}
+	if err := Check(t.Context(), p); err != nil {
+		t.Fatalf("Check after InstallSet %v: %v", elems, err)
+	}
+}
+
+func TestBackup_OnlyDeclaredEndpoint(t *testing.T) {
+	p := node(t)
+	job, nb := backup(t)
+	listen(t, nb, endpointA)
+	listen(t, nb, endpointB)
+	expect(t, "node -> A (allowed peer)", hostNS, endpointA, "connected")
+	expect(t, "node -> B (allowed peer)", hostNS, endpointB, "connected")
+	expect(t, "job -> A, empty set", job, endpointA, "timeout")
+	installSet(t, p, endpointA)
+	expect(t, "job -> A, declared", job, endpointA, "connected")
+	expect(t, "job -> B, not declared", job, endpointB, "timeout")
+	installSet(t, p, endpointA, endpointB)
+	expect(t, "control: job -> B with B added to the set", job, endpointB, "connected")
+	installSet(t, p, endpointA)
+	expect(t, "job -> B, removed again", job, endpointB, "timeout")
+}
+
+func TestBackup_OtherPortOfADeclaredAddress(t *testing.T) {
+	p := node(t)
+	job, nb := backup(t)
+	listen(t, nb, endpointA)
+	listen(t, nb, otherPortA)
+	expect(t, "node -> A:8333 (allowed peer)", hostNS, otherPortA, "connected")
+	installSet(t, p, endpointA)
+	expect(t, "job -> A:9443", job, endpointA, "connected")
+	expect(t, "job -> A:8333", job, otherPortA, "timeout")
+	installSet(t, p, endpointA, otherPortA)
+	expect(t, "control: job -> A:8333 with that port added", job, otherPortA, "connected")
+}
+
+// serveHelper starts a helper mode of this binary in pid's namespace (as
+// root) and waits until it reports listening.
+func serveHelper(t *testing.T, pid int, args ...string) {
+	t.Helper()
+	argv := append([]string{"env", helperEnv + "=1"}, inNS(pid, append([]string{self(t)}, args...)...)...)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	line := make(chan string, 1)
+	go func() {
+		s, _ := bufio.NewReader(out).ReadString('\n')
+		line <- s
+		io.Copy(io.Discard, out)
+	}()
+	select {
+	case s := <-line:
+		if !strings.HasPrefix(s, "listening") {
+			t.Fatalf("helper %q: %q", args, s)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("helper %q did not start", args)
+	}
+}
+
+// tlsGetFrom fetches the TLS server's body from pid at the tenant uid and
+// returns the helper's line and exit code.
+func tlsGetFrom(t *testing.T, pid int, addr string) (string, int) {
+	t.Helper()
+	o, e, code, err := exe(nil, append([]string{"env", helperEnv + "=1"}, asTenant(pid, self(t), "tlsget", addr)...)...)
+	if err != nil {
+		t.Fatalf("tlsget: %v", err)
+	}
+	return strings.TrimSpace(o + " " + e), code
+}
+
+// A connect alone passes on F5; the rest of the exchange needs F7.
+func TestBackup_WholeTransferPasses(t *testing.T) {
+	p := node(t)
+	job, nb := backup(t)
+	serveHelper(t, nb, "tlsserve", endpointA)
+	want := fmt.Sprintf("got %d %x", transferSize, sha256.Sum256(body()))
+	if got, code := tlsGetFrom(t, hostNS, endpointA); code != 0 || got != want {
+		t.Fatalf("node -> TLS server (allowed peer): %q exit %d, want %q", got, code, want)
+	}
+	installSet(t, p, endpointA)
+	if got, code := tlsGetFrom(t, job, endpointA); code != 0 || got != want {
+		t.Errorf("job -> declared TLS server: %q exit %d, want %q", got, code, want)
+	}
+	withDeleted(t, p, ruleRefs("F7"), func() {
+		texpect(t, "job -> A with F7 deleted: the handshake's first packet passes", probe(t, job, endpointA), "connected")
+		if got, code := tlsGetFrom(t, job, endpointA); code == 0 {
+			t.Errorf("control: with F7 deleted the transfer still passed: %q", got)
+		}
+	})
+}
+
+func TestBackup_MemberToMember(t *testing.T) {
+	p := node(t)
+	job, _ := backup(t)
+	job2 := member(t, "spnft-job2", "spnft-backup", job2IP)
+	listen(t, job2, job2IP+":7002")
+	installSet(t, p, endpointA)
+	// No peer may open the second job's port (I2 drops its replies to the
+	// host), so its listener is proven from its own namespace.
+	expect(t, "second job -> its own :7002", job2, job2IP+":7002", "connected")
+	expect(t, "job -> second job", job, job2IP+":7002", "timeout")
+	// Deleting B10 and B9 still leaves the chain's policy drop: the control is an accept.
+	func() {
+		defer load(t, p)
+		must(t, "nft", "insert", "rule", "bridge", "supapace", "forward", "meta", "ibrname", `"spb0"`, "accept", "comment", `"spnft-control"`)
+		expect(t, "control: job -> second job with an accept for spb0 inserted", job, job2IP+":7002", "connected")
+	}()
+}
+
+func TestBackup_HostInput(t *testing.T) {
+	p := node(t)
+	nodeAddr(t, "10.215.251.1/32")
+	job, _ := backup(t)
+	listen(t, hostNS, "0.0.0.0:7001")
+	installSet(t, p, endpointA)
+	expect(t, "node -> its own address (allowed peer)", hostNS, "10.215.251.1:7001", "connected")
+	expect(t, "job -> the bridge's host address", job, backupHost+":7001", "timeout")
+	expect(t, "job -> another host address", job, "10.215.251.1:7001", "timeout")
+	withDeleted(t, p, ruleRefs("I2"), func() {
+		expect(t, "control: job -> the bridge's host address with I2 deleted", job, backupHost+":7001", "connected")
+		expect(t, "control: job -> another host address with I2 deleted", job, "10.215.251.1:7001", "connected")
+	})
+}
+
+// A connection open across a reload that removes its address lives on (F7);
+// a new one to the removed address fails.
+func TestBackup_ReloadKeepsFlight(t *testing.T) {
+	p := node(t)
+	job, nb := backup(t)
+	listen(t, nb, endpointA)
+	listen(t, nb, endpointB)
+	installSet(t, p, endpointA)
+	expect(t, "job -> A before the reload", job, endpointA, "connected")
+
+	argv := append([]string{"env", helperEnv + "=1"}, asTenant(job, self(t), "flight", "tcp", endpointA, "15s")...)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	lines := make(chan string, 4)
+	go func() {
+		s := bufio.NewScanner(out)
+		for s.Scan() {
+			lines <- s.Text()
+		}
+		close(lines)
+	}()
+	next := func() string {
+		select {
+		case l, ok := <-lines:
+			if ok {
+				return l
+			}
+			return "<ended>"
+		case <-time.After(60 * time.Second):
+			t.Fatal("the flight said nothing within 60 s")
+		}
+		return ""
+	}
+	if l := next(); l != "open" {
+		t.Fatalf("flight: %q", l)
+	}
+	installSet(t, p, endpointB)
+	select {
+	case l := <-lines:
+		t.Fatalf("the flight ended before the reload was in: %q", l)
+	default:
+	}
+	expect(t, "job -> A, removed from the set", job, endpointA, "timeout")
+	expect(t, "job -> B, the new set", job, endpointB, "connected")
+	if l := next(); !strings.HasPrefix(l, "held") {
+		t.Errorf("the open connection did not survive the reload: %q", l)
+	}
+}
+
+func TestCheck_StableAcrossReloadWithSameSet(t *testing.T) {
+	ctx := t.Context()
+	p := node(t)
+	var elems []string
+	for i := 1; i <= 16; i++ {
+		elems = append(elems, fmt.Sprintf("10.215.241.%d:9443", 100+i))
+	}
+	installSet(t, p, elems...)
+	first, err := listTables(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		load(t, p)
+		again, err := listTables(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(again, first) {
+			t.Fatalf("reload %d of the same file listed other tables", i)
+		}
+	}
+}
+
+// A writer in another process rotates two sets once a second; checks back to
+// back meanwhile never see the file and the tables apart.
+func TestCheck_NeverDriftsWhileTheSetRotates(t *testing.T) {
+	p := node(t)
+	installSet(t, p, endpointA)
+	ch := child(t, "rotate", p.Root, procSys, "15s", endpointA, endpointB)
+	var ok, drift, other, unlockedDrift int
+	var rotated string
+	for rotated == "" {
+		select {
+		case l, open := <-ch.lines:
+			if !open {
+				t.Fatal("the rotating writer ended without its count")
+			}
+			if strings.HasPrefix(l, "rotated") || strings.HasPrefix(l, "error") {
+				rotated = l
+			}
+		default:
+			switch err := Check(t.Context(), p); {
+			case err == nil:
+				ok++
+			case errors.Is(err, ErrDrift):
+				drift++
+			default:
+				other++
+				t.Logf("check: %v", err)
+			}
+			// Without the lock the same check races the writer.
+			if errors.Is(checkLocked(t.Context(), p), ErrDrift) {
+				unlockedDrift++
+			}
+		}
+	}
+	t.Logf("writer: %s; checks ok %d, drift %d, other %d; unlocked checks that saw drift: %d", rotated, ok, drift, other, unlockedDrift)
+	if n, err := strconv.Atoi(strings.TrimPrefix(rotated, "rotated ")); err != nil || n < 10 {
+		t.Fatalf("writer: %q, want at least 10 installs", rotated)
+	}
+	if drift != 0 || other != 0 || ok == 0 {
+		t.Errorf("checks: ok %d, drift %d, other %d; want no drift and no other error", ok, drift, other)
+	}
+}
+
+// body is the TLS server's response: transferSize deterministic bytes.
+func body() []byte {
+	b := make([]byte, transferSize)
+	for i := range b {
+		b[i] = byte(i * 7)
+	}
+	return b
+}
+
+// tlsServe serves body() over HTTPS at addr with a fresh self-signed certificate.
+func tlsServe(addr string) int {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		fmt.Println("error", err)
+		return 3
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		fmt.Println("error", err)
+		return 3
+	}
+	l, err := tls.Listen("tcp", addr, &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}})
+	if err != nil {
+		fmt.Println("error", err)
+		return 3
+	}
+	fmt.Println("listening", addr)
+	b := body()
+	http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write(b) }))
+	return 3
+}
+
+// tlsGet fetches https://addr/ (the certificate is the server's own, not
+// verified: the exchange is what is measured) and prints its length and hash.
+func tlsGet(addr string) int {
+	c := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	resp, err := c.Get("https://" + addr + "/")
+	if err != nil {
+		fmt.Println("error", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, resp.Body)
+	if err != nil {
+		fmt.Println("error after", n, err)
+		return 1
+	}
+	fmt.Printf("got %d %x\n", n, h.Sum(nil))
+	return 0
+}
+
+// From the backup network nothing but TCP to an element leaves: not UDP to
+// the declared address and port, not DNS (TCP or UDP), not the metadata
+// address. Each beside a control on the same path: the destination added to
+// the set (TCP) or F2 deleted (UDP).
+func TestBackup_NoOtherWayOut(t *testing.T) {
+	p := node(t)
+	job, nb := backup(t)
+	const md, dns = "169.254.169.254:80", "10.215.250.2:53"
+	must(t, inNS(nb, "ip", "addr", "add", "169.254.169.254/32", "dev", "spnftp")...)
+	t.Cleanup(func() { try(t, "ip", "route", "del", "169.254.169.254/32") })
+	must(t, "ip", "route", "add", "169.254.169.254/32", "via", "10.215.250.2")
+	listen(t, nb, endpointA)
+	listen(t, nb, md)
+	listen(t, nb, dns)
+	udpA, udpDNS := receiver(t, nb, endpointA), receiver(t, nb, dns)
+
+	expect(t, "node -> metadata (allowed peer)", hostNS, md, "connected")
+	expect(t, "node -> DNS over TCP (allowed peer)", hostNS, dns, "connected")
+	tsend(t, hostNS, endpointA, "-", 5)
+	tsend(t, hostNS, dns, "-", 5)
+	if !udpA(2*time.Second) || !udpDNS(2*time.Second) {
+		t.Fatal("node -> UDP receivers (allowed peer): nothing arrived")
+	}
+	installSet(t, p, endpointA)
+	expect(t, "job -> A (the path works)", job, endpointA, "connected")
+	expect(t, "job -> metadata", job, md, "timeout")
+	expect(t, "job -> DNS over TCP", job, dns, "timeout")
+	tsend(t, job, endpointA, "-", 5)
+	tsend(t, job, dns, "-", 5)
+	if udpA(2 * time.Second) {
+		t.Error("job -> UDP to the declared address and port: delivered")
+	}
+	if udpDNS(2 * time.Second) {
+		t.Error("job -> DNS over UDP: delivered")
+	}
+	withDeleted(t, p, ruleRefs("F2"), func() {
+		tsend(t, job, endpointA, "-", 5)
+		tsend(t, job, dns, "-", 5)
+		if !udpA(2*time.Second) || !udpDNS(2*time.Second) {
+			t.Error("control: job -> UDP with F2 deleted: nothing arrived")
+		}
+	})
+	installSet(t, p, endpointA, md, dns)
+	expect(t, "control: job -> metadata in the set", job, md, "connected")
+	expect(t, "control: job -> DNS over TCP in the set", job, dns, "connected")
 }

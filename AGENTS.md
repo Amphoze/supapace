@@ -3061,3 +3061,67 @@ Engine facts (the harness's gate runs)
   last complete push / replication is older than the threshold. A subject that has never
   completed one is not counted. RepoQuotaTotals: sum and maximum of disk_quota_mb over
   projects that are neither purged nor aborted.
+
+### 2026-11-19 — nft: egress for replication jobs, the saved address set, one ruleset lock
+
+The ruleset (`internal/nft/ruleset.tmpl`) gains set `offsite4` (`ipv4_addr . inet_service`; the
+elements line is omitted when empty) and four rules. Label order is
+`I1 I2 F1 F5 F7 F2 F3 F6 F4 B1 B2 B3 B4 B8 B6 B10 B9`:
+- F5: a new TCP connection from the backup bridge (spb0) to an element of `offsite4` is accepted.
+- F7: established/related packets from spb0 are accepted. This carries the rest of a connection F5
+  accepted, also after its address left the set. Without F7 only the handshake passes.
+- F6: replies routed into spb0 (established/related) are accepted.
+- B10: frames between spb0 members are dropped (B9 and the policy would drop them anyway; B10 is
+  the rule a test can address).
+Everything else from spb0 (UDP, DNS, other ports and addresses, the host, IPv6) falls to F2/I2.
+
+Rendering:
+- `RenderWith(c, set)`: IPv4 only, port 1..65535, at most 256 elements; sorted, no duplicates,
+  so one set always renders the same bytes. `Render(c)` is `RenderWith(c, nil)`.
+- No rule limits where an element points. Callers pass only `offsite.Resolve`/`CheckAddrs` output.
+
+The saved set, `Paths.OffsiteAddrs()` (`/etc/supapace/offsite.addrs`):
+- One canonical `ip:port` per line (`netip.AddrPort.String()`), a final newline, empty or absent
+  meaning none.
+- A regular file, 0600, owned by the daemon's uid, at most 64 KiB, opened without following
+  links. Anything else is refused.
+- `InstallSet` is its only writer. It holds the set the loaded tables hold.
+
+One lock for every writer and check, in every process (`Paths.NftLock()`, a regular 0600 file
+created on first use, never through a link):
+- `Load`, `InstallSet` and `EnsureRules` take an exclusive flock; `Check`, `SavedSet` and
+  `RenderSaved` a shared one.
+- It is tried without blocking every 10 ms until the caller's context ends. Not obtained: `Check`
+  answers `ErrUnverified`; `Load`, `InstallSet` and `EnsureRules` return an error matching the
+  context's (`errors.Is(err, context.DeadlineExceeded)`).
+- `SavedSet` and `RenderSaved` take no context and wait at most 30 s, then return an error
+  matching `context.DeadlineExceeded`.
+- Never call an exported locking function while holding the lock in the same process: flock
+  conflicts between descriptors of one process, so it waits until the deadline.
+
+API:
+- `SavedSet(p)`: the saved set; no file means none.
+- `RenderSaved(c, p)`: `RenderWith(c, SavedSet(p))` under one hold of the lock.
+- `InstallSet(ctx, p, c, set)`, under the lock, in this order: render; write the ruleset file if
+  it differs; load; only then write the addresses file if it differs (or its mode/owner is
+  wrong); then the checksum.
+  - A failed load puts the previous ruleset file back, with no reload.
+  - A failure after the load puts both files back and loads the previous ruleset again, on its
+    own 1-minute context detached from the caller's.
+  - A failed restore of the addresses file ends the put-back: files and tables stay at the new
+    set under the old checksum, so `Check` reports drift and `EnsureRules` converges.
+  - Load failures match `ErrUnverified` (nft could not apply the file); this is not a lock error.
+- `EnsureRules(ctx, p, c, load)`: renders from the saved set and writes the ruleset file when its
+  content, mode (0600) or owner differs; reports whether it wrote. With `load` it loads when the
+  file changed or `Check` fails, then checks again; a check that still fails is its error. It is
+  the only way the ruleset file is written outside a set change. `init` calls it without `load`.
+- `Load` and `Check` are unchanged apart from the lock. `Check` now creates the lock file.
+
+Known limits:
+- The daemon's start still renders with `RenderSaved`, then writes and loads outside the lock. A
+  start racing another process's `InstallSet` can load the older set (Check passes) until the next
+  install.
+- The drift reload loads the file as it is.
+- init's removal of leftover temporary files runs outside the lock; a concurrent install then
+  fails cleanly.
+- A flow to an address removed from the set lives until it closes; new connections fail.
