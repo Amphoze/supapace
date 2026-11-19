@@ -68,3 +68,24 @@ func LockedImages() (Images, error) {
 
 // NodeImage returns the pinned base image of the test harness node.
 func NodeImage() (string, error) { return lockedRef("node") }
+
+var versionRE = regexp.MustCompile(`^[0-9]+(\.[0-9]+)+$`)
+
+// LockedPostgresVersion returns the version part of the lock's "postgres" tag
+// (the text after its colon: dot-separated numbers). It goes through
+// lockedRef, so the entry is checked as the image reference is.
+func LockedPostgresVersion() (string, error) {
+	if _, err := lockedRef("postgres"); err != nil {
+		return "", err
+	}
+	var lock map[string]lockEntry
+	if err := json.Unmarshal(imagesLock, &lock); err != nil {
+		return "", fmt.Errorf("images.lock: %w", err)
+	}
+	tag := lock["postgres"].Tag
+	v := tag[strings.LastIndex(tag, ":")+1:]
+	if strings.LastIndex(tag, ":") < strings.LastIndex(tag, "/") || !versionRE.MatchString(v) {
+		return "", fmt.Errorf("images.lock: %q: the tag has no version", "postgres")
+	}
+	return v, nil
+}

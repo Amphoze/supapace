@@ -14,6 +14,14 @@ type PostgRESTConfig struct {
 
 const maxPasswordLen = 256
 
+// PostgRESTSchemas and PostgRESTExtraSearchPath are what postgrest.conf sets as
+// db-schemas and db-extra-search-path: the schemas the REST service exposes and
+// the search path it adds.
+const (
+	PostgRESTSchemas         = "public, graphql_public"
+	PostgRESTExtraSearchPath = "public, extensions"
+)
+
 // PostgREST renders postgrest.conf. The password appears only here, inside
 // db-uri, with every byte outside [A-Za-z0-9._~-] percent-encoded (PostgREST's
 // configuration syntax gives '$' a meaning of its own). ClusterAddr must be
@@ -38,13 +46,13 @@ func PostgREST(c PostgRESTConfig) ([]byte, error) {
 		}
 	}
 	return fmt.Appendf(nil, `db-uri = "postgres://authenticator:%s@%s:5432/postgres?require_auth=scram-sha-256"
-db-schemas = "public, graphql_public"
+db-schemas = "%s"
 db-anon-role = "anon"
 db-pool = 10
-db-extra-search-path = "public, extensions"
+db-extra-search-path = "%s"
 jwt-secret = "@/etc/postgrest/jwks.json"
 db-config = false
 server-host = "*4"
 server-port = 3000
-`, enc.String(), c.ClusterAddr), nil
+`, enc.String(), c.ClusterAddr, PostgRESTSchemas, PostgRESTExtraSearchPath), nil
 }

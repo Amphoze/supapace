@@ -451,3 +451,13 @@ func TestValidate_ControlPlaneQuotasNotNegative(t *testing.T) {
 		}
 	}
 }
+
+// The version is the whole text after the tag's colon, not a part of it.
+func TestLockedPostgresVersion(t *testing.T) {
+	v, err := LockedPostgresVersion()
+	var lock map[string]lockEntry
+	if jerr := json.Unmarshal(imagesLock, &lock); err != nil || jerr != nil ||
+		lock["postgres"].Tag != "supabase/postgres:"+v {
+		t.Fatalf("version %q, %v; tag %q", v, err, lock["postgres"].Tag)
+	}
+}

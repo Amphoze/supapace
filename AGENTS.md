@@ -2280,3 +2280,42 @@ deadline inside the namespace, thread count stable after 1,000 dials.
   with a message. It runs the third-party binary directly: only on a disposable machine or
   inside a container.
 - Known limits: only `projects list` is checked; the control plane serves no part of this API.
+
+### 2026-11-20 — `internal/dashsock`: the dashboard socket's server
+
+- `NewServer(pub, node, baseDomain, addrs, m, p) *Server`: pub and node are the assertion key
+  and node id; addrs must be `dashcfg.For`'s (a connection string rendered from a zero address
+  is refused, 503). `Server.Log` (set before `Serve`; nil uses `slog.Default`) receives the log
+  lines.
+- `Listen(dashcfg.Paths)`: creates `SocketDir` (owner root, group `StudioUID`, 0750; a symlink
+  there is refused); at `SocketDir/dash.sock` removes a stale socket and refuses anything else
+  (a symlink, a file, a directory), leaving it untouched; listens there and sets owner root,
+  group `StudioUID`, mode 0660. Must run as root.
+- `(*Server).Serve(l)`: pass `Listen`'s listener itself. The peer's uid is read from
+  `SO_PEERCRED` of the accepted Unix connection; a listener that wraps its connections makes
+  every request `403 peer`.
+- Interfaces the caller provides: `Members.MemberRole(ctx, ref, iss, sub)`; `Projects.Facts`
+  (returns `ErrNotHere` for a project unknown, placed elsewhere or not live), `Passwords` (ro ""
+  while there is no read-only secret), `Keys`.
+- Requests: `POST /v1/resolve`, `POST /v1/keys`, no body, one `X-Supapace-Assertion` header.
+  Checks in order, first failure answers `{"code":"..."}`: peer is Studio's uid (403 `peer`);
+  request target exactly one of the two paths (404 `not_found`); POST (405
+  `method_not_allowed`); no body, chunked included (400 `bad_request`); one valid assertion for
+  this node (401 `bad_assertion`); per-ref rate, 20 a second, burst 40, counted before any store
+  read (429 `rate_limited`); `Facts` and a state of active, restarting or restoring (404
+  `not_here`); stored role for (ref, iss, sub) equal to the asserted role (403 `not_a_member`).
+- Any error from `MemberRole` is `not_a_member`, except when the request's deadline has passed.
+  Any other store error, and a key without its public part, is 503 `unavailable`, logged with
+  ref and step only.
+- Answers: `dsn_rw` for owner and developer; `dsn_ro` for every role when the secret exists;
+  each string must pass `dashcfg.ParseDSN`. `service_role_key` only for an owner under purpose
+  `reveal`; otherwise the member is absent.
+- Logged: each resolve (ref, iss, sub, role) and each service-key release (ref, iss, sub). Never
+  a string, a key, an assertion or an error's text.
+- Bounds: 64 connections; request line and header 8 KiB (8192 bytes pass, 8193 get 431); header
+  within 2 s; read and write of a request within 2 s; idle connections closed after 2 s; all
+  store reads of one request share an 800 ms deadline.
+- 431 and malformed requests are answered by net/http as plain text, not `{"code"}`.
+- `nodecfg.LockedPostgresVersion()`: the text after the colon of the lock's postgres tag.
+  `pgconf.PostgRESTSchemas` and `pgconf.PostgRESTExtraSearchPath`: the values postgrest.conf
+  sets; the `data_api` answer splits them on ", ".
