@@ -3786,3 +3786,57 @@ Caller rules and limits:
 - Bridged frames never reach the inet forward chain while bridge-nf is off; Load keeps it off and
   Check reports ErrBridgeNF.
 - The saved off-site set, the lock, InstallSet and EnsureRules are unchanged.
+
+### 2026-11-19 — the backup experiments' kit (test/harness/experiments: lib-backup.sh, bk/)
+Test tooling that stands one or more layout-2 projects up inside a bare test node (no daemon),
+with the platform's own code where it exists, and runs one experiment script there.
+Nothing of it is built by `make build` or `make images`; bk is built into a scratch directory.
+
+Run: make build && make images && make node-bare NODE=<node>   (SP_OFFSITE=0: no stand-in), then
+  test/harness/experiments/bk/lab.sh <node> <script>
+  test/harness/experiments/bk/lab.sh <node> test/harness/experiments/lib-backup-selftest.sh
+The selftest prints "SELFTEST ok" (about 3 minutes): stanza, full backup, three pushes (one entry
+of a timeline that is not admitted is quarantined), a copy to the stand-in and back, a time-target
+restore, the re-key, the networked start with the new password, the old one refused, labels.
+Exit status: 0 all lines pass, 1 a line failed, 3 a lab error, 4 a criterion not run (UNRUN: the
+copy step without the stand-in); lab.sh: 2 usage or node not usable, 1 a refusal.
+
+lab.sh (host, bash): checks CLUSTER_FLAGS and the container-side mounts of lib-backup.sh against
+clusterRunArgs in internal/agent/cluster.go (flag names, literal values, mount targets and their
+order; --user, --memory, --pids-limit, --network and --sysctl are not compared); builds bk; refuses
+a node with a daemon, a missing node, or an existing /var/lib/sp-exp/bk; copies the kit in and
+runs the script as root; on every exit path (also TERM, INT, HUP) stops the run by its recorded
+pid and removes what is left: containers and networks named sp-test-bk-... with the label
+supapace.test=1, the lab projects' trees and quotas, the kit directory. Nothing prunes.
+
+lib-backup.sh (POSIX sh, in the node), REF = 20 characters, UID = the project's uid and gid:
+- lab_up; project REF UID IDX; cluster REF A|B|R (first boot, networked, recovery start);
+  mk REF UID IDX (all of it); stopc; sql / tsql REF SQL (SCRAM / trust session through bk);
+  rekey REF GEN; wipe; restore_files REF [OPTS]; recover REF PINS-ARGS (leaves the promoted
+  cluster running); serve_start / serve_stop.
+- worker REF push|db|restore|serve CMD..., job REF ARGS..., pushall REF: job containers of the
+  worker image at the project's ids, no network, every pgBackRest option by environment (an
+  env file, root 0600, removed at teardown). Knobs: ADMIT, LLC, WARGS, WDETACH, REPOSRC,
+  PROMOTE_WAIT, DISK_MB, REPO_MB.
+- s3 ROLE ..., copy_out REF PREFIX [ROLE], copy_back REF PREFIX [ROLE]: sp-probe s3 with one
+  role's keys; a copy at the replicator's uid with the project's group. Use a fresh PREFIX per
+  run: the stand-in keeps what earlier runs wrote. copy_back fetches current objects only (no
+  as-of mode; compose `s3 ROLE versions` and `get --version`).
+- res WORD CRITERION FIGURE, check, control, finish NAME.
+
+STAND-INS: the push, job, serve and copy programs are shell scripts mounted at /x, not the
+platform's job programs. A result they print is not a result of the product. Re-run with the real
+programs: push (spool filter, links, lock path), stanza-create/backup/check, restore and serve,
+replicate and fetch (walk, allow-list, backup network, limits: the copy job here has the
+node's network, 512m/256/128m). The environment names, mount targets and job flags are written by
+hand and must be compared with the product's once it exists.
+
+bk (Go, package main, imported by nothing): render (directories and quotas by nodefs, files by
+pgconf, command line and PGOPTIONS), bootstrap, sql (SCRAM via pgsock, generation GEN), scram (the
+re-key session in the agent's order), trust (pgx with an explicit parameter list: the platform's,
+plus -set/-unset), pins (recovery start: extension pins, then the recovery pins, target last;
+always with the three extension pins: not for the control plane). Passwords are lab values
+(lab<gen>-<hex>) derived inside bk and never on a command line; SQL text is on one.
+Limits: no control-plane set-up; no ruleset on a bare node; the restore prints unknown user and
+group warnings (project ids are not in the worker's passwd); set -e does not apply inside a
+function run by check.
