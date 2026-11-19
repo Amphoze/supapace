@@ -47,12 +47,13 @@ type Gateway struct {
 	mu         sync.Mutex
 	projectCap int
 	byProject  map[string]int // proxied requests in flight per ref; no zero entries
+	rates      rates          // request buckets per ref
 
 	dash *Dashboard // nil without a studio domain
 }
 
 func New(t *Table) *Gateway {
-	return &Gateway{table: t, transport: newTransport(), inflight: make(chan struct{}, maxInFlight),
+	return &Gateway{table: t, transport: newTransport(upstreamIdle), inflight: make(chan struct{}, maxInFlight),
 		projectCap: maxProjectInFlight, byProject: map[string]int{}}
 }
 
@@ -123,6 +124,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p.draining:
 		fail(w, http.StatusServiceUnavailable, "project_restarting")
 		return
+	case p.stopped:
+		refuse(w, http.StatusServiceUnavailable, "project_stopped", "the project is stopped")
+		return
 	case len(headerValues(r.Header, "Upgrade")) > 0:
 		fail(w, http.StatusBadRequest, "upgrade_not_supported")
 		return
@@ -135,6 +139,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bearer, code, msg := authenticate(r.Header, queryKeys, p, time.Now())
 	if code != "" {
 		refuse(w, http.StatusUnauthorized, code, msg)
+		return
+	}
+	if !g.rates.allow(ref, p.rate, time.Now()) {
+		fail(w, http.StatusTooManyRequests, "too_many_requests")
 		return
 	}
 	path, graphql, ok := route(r)
@@ -172,7 +180,9 @@ func refuse(w http.ResponseWriter, status int, code, msg string) {
 	sandbox(h)
 	switch status {
 	case http.StatusServiceUnavailable:
-		h.Set("Retry-After", "5")
+		if code != "project_stopped" { // a stop is not undone by waiting
+			h.Set("Retry-After", "5")
+		}
 	case http.StatusTooManyRequests:
 		h.Set("Retry-After", "1")
 	}

@@ -1150,7 +1150,7 @@ func TestLimitListener_PerSource(t *testing.T) {
 }
 
 func TestTransport_ResponseHeaderTimeout(t *testing.T) {
-	tr := newTransport()
+	tr := newTransport(upstreamIdle)
 	if tr.ResponseHeaderTimeout != 30*time.Second || tr.MaxConnsPerHost != maxProjectInFlight ||
 		maxUpstreamHeader != 32<<10 || tr.MaxResponseHeaderBytes != maxUpstreamHeader || tr.MaxIdleConnsPerHost != 16 ||
 		tr.Proxy != nil || dialer.Timeout != 5*time.Second {

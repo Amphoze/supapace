@@ -48,7 +48,7 @@ func authenticate(h http.Header, queryKeys []string, p *project, now time.Time) 
 		if !ok {
 			return "", "invalid_token", "Authorization is not \"Bearer <token>\""
 		}
-		if _, err := p.verify(tok, now); err != nil {
+		if err := p.verifyBearer(tok, now); err != nil {
 			return "", "invalid_token", tokenMessage(err)
 		}
 		return tok, "", ""

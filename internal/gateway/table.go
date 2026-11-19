@@ -20,6 +20,9 @@ type project struct {
 	upstream  *url.URL // http://<platform address>:3000
 	userRoles []string
 	keys      []jwtx.Key
+	stopped   bool
+	aud       []string     // an issuer token must carry one of these
+	rate      *routes.Rate // nil: no bucket
 }
 
 // table is an immutable snapshot of the route file.
@@ -117,7 +120,8 @@ func build(f routes.File) (*table, error) {
 		if err != nil {
 			return nil, fmt.Errorf("routes: %s: rest: %w", ref, err)
 		}
-		np := &project{draining: p.State == "draining", upstream: u, userRoles: p.UserRoles}
+		np := &project{draining: p.State == "draining" || p.State == "asleep", upstream: u, userRoles: p.UserRoles,
+			stopped: p.State == "stopped", aud: p.Aud, rate: p.Rate}
 		for _, k := range p.Keys {
 			key, err := jwtx.KeyFromJWK(k.KID, jwtx.Class(k.Class), k.N, k.E)
 			if err != nil {

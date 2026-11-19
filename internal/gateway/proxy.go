@@ -24,6 +24,10 @@ const maxUpstreamHeader = 32 << 10
 // maxInformational is the number of 1xx responses relayed per request.
 const maxInformational = 8
 
+// upstreamIdle closes an idle upstream connection, which holds one of the
+// project PostgREST's connection slots.
+const upstreamIdle = 60 * time.Second
+
 // dialer opens upstream connections.
 var dialer = &net.Dialer{Timeout: 5 * time.Second}
 
@@ -32,7 +36,7 @@ var dialer = &net.Dialer{Timeout: 5 * time.Second}
 // connections get the same fixed kernel buffers as client ones. Connections per
 // upstream equal the per-project cap, so no admitted request waits inside the
 // gateway for a connection.
-func newTransport() *http.Transport {
+func newTransport(idle time.Duration) *http.Transport {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, err := dialer.DialContext(ctx, network, addr)
@@ -44,6 +48,7 @@ func newTransport() *http.Transport {
 		ResponseHeaderTimeout:  30 * time.Second,
 		MaxConnsPerHost:        maxProjectInFlight,
 		MaxIdleConnsPerHost:    16,
+		IdleConnTimeout:        idle,
 		MaxResponseHeaderBytes: maxUpstreamHeader,
 	}
 }

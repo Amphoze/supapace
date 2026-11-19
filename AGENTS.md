@@ -3673,3 +3673,47 @@ The image:
 
 The listener reads PORT, HOST, NITRO_PORT, NITRO_HOST, NITRO_SSL_CERT and NITRO_SSL_KEY;
 `dashcfg.StudioEnv` refuses the TLS pair from the label.
+
+### 2026-11-19 — Gateway: per-project rate limit, audience check, the stopped state
+
+Route file (`internal/routes`), new members, all optional and omitted when empty, so a file
+without them encodes byte for byte as before:
+- `Project.Aud []string` (`aud`): at most 8, each 1-255 bytes of 0x20-0x7e. Empty or absent: no
+  audience check.
+- `Project.Rate *Rate` (`rate`), `type Rate struct{RPS, Burst int}` (`rps`, `burst`): RPS 1-100000,
+  Burst from RPS to 10 x RPS. Absent: no bucket.
+- `File.IdleStopS int` (`idle_stop_s`): >= 0; 0 means no idle project is reported. Nothing reads
+  it yet.
+- States `asleep` and `stopped` join `active` and `draining`; every state needs `rest`. Parse and
+  Marshal refuse anything outside these bounds. The agent's writer (`checkRoute`) still accepts
+  only `active` and `draining`.
+
+Gateway request order: health, route table, host, TLS name, draining (503 project_restarting),
+stopped (503 project_stopped), upgrade refusal, apikey, bearer with the audience check, rate
+bucket (429 too_many_requests), route (404), declared body length (413), in-flight caps, proxy.
+- Stopped: a fixed body {"code":"project_stopped","message":"the project is stopped"} and no
+  Retry-After; it answers before any key is looked at. Every other 503 keeps Retry-After: 5.
+- Audience: only for bearer tokens signed by an issuer-class key, and only when the entry has
+  `aud`. The token's `aud` (a string, or a list whose non-string members are ignored) must hold
+  one listed value, matched exactly; otherwise 401 invalid_token, "token is invalid". Tokens of
+  the anon and service_role keys are never checked. Verification is unchanged and runs first.
+- Rate bucket (`rate.go`, `rates` on `Gateway`, zero value ready): one per project ref, refilled
+  at RPS a second, holding at most Burst; one token per request that passed the key check, so
+  requests refused before it take none and an authenticated 404 or 413 takes one. The 429
+  carries Retry-After: 1 (with RPS >= 1 a token is back within a second). Buckets live outside
+  the route table: a reload neither refills nor resets them; new figures apply from the next
+  request. A clock that steps back adds nothing. Full buckets are dropped when new ones are
+  made, so memory follows the projects busy in the last Burst/RPS seconds.
+  That sweep runs when the map has doubled since the last one, so no request pattern makes
+  every request walk the map; the map holds at most twice the recently busy projects, plus one.
+- Known limit: the bucket is per project, not per source. A holder of the project's public anon
+  key can drain it for the project's other clients. Floods without a valid key are bounded only
+  by the connection limits (per source, gateway-wide).
+- Until the wake lands, an `asleep` entry must not be proxied (its REST service is stopped).
+
+Upstream transport: `newTransport(idle time.Duration)`; `New` passes `upstreamIdle` (60 s), so
+an idle upstream connection, which holds one of the project PostgREST's slots, is closed.
+
+Caller rules: files added to the gateway for these features (`gatewayAdditions` in
+rate_test.go) give the upstream transport no hook, wrap no request body, and start no goroutine
+(`go`, `time.AfterFunc`); `TestGatewayAdditions_UseNoTransportHook` checks each listed file.
