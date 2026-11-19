@@ -80,14 +80,14 @@ build:
 	@if [ -d test/reach ]; then CGO_ENABLED=0 $(GO) test -c -tags reach -o $(BIN)/reach.test ./test/reach; fi
 
 # PULL_ONLY=1 pulls the pinned images without saving archives (a host install, where this
-# machine's Docker is the node's): the worker image is then left in this Docker only,
+# machine's Docker is the node's): the gateway and worker images are then left in this Docker only,
 # and the stand-in is not pulled (a host install has none).
 images: build
 	@mkdir -p "$(IMAGE_CACHE)/src"
 	scripts/cache-images.sh $(if $(PULL_ONLY),--pull-only) "$(IMAGE_CACHE)"
 	@if [ -f deploy/gateway/Dockerfile ]; then \
-		docker build -t $(GATEWAY_IMAGE) -f deploy/gateway/Dockerfile . && \
-		scripts/cache-images.sh --save $(GATEWAY_IMAGE) supapace-gateway:local "$(IMAGE_CACHE)/supapace-gateway.tar"; \
+		docker build -t $(GATEWAY_IMAGE) -f deploy/gateway/Dockerfile . \
+		$(if $(PULL_ONLY),,&& scripts/cache-images.sh --save $(GATEWAY_IMAGE) supapace-gateway:local "$(IMAGE_CACHE)/supapace-gateway.tar"); \
 	else echo "images: deploy/gateway/Dockerfile absent, gateway image skipped"; fi
 	@# The source archive is kept only once its checksum matches images.lock; the
 	@# build checks it again before unpacking it.
