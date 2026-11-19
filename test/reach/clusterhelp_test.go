@@ -322,10 +322,17 @@ var hostileModes = []hostileMode{
 	{"flood", false, codeEither, 15 * time.Second},
 	{"stall", false, codeTimeout, 15 * time.Second},
 	{"trickle", false, codeTimeout, 15 * time.Second},
+	// A cleartext request is refused by the platform's guard and by the client
+	// library's own SCRAM requirement; either alone keeps the password unsent.
 	{"cleartext", false, codeInternal, 5 * time.Second},
 	{"md5", false, codeInternal, 5 * time.Second},
 	{"authok", false, codeInternal, 5 * time.Second},
+	// The server-first message carries the platform's salt, so the iteration
+	// count is the one parameter that differs.
 	{"sasl-iter", false, codeEither, 2 * time.Second},
+	// row-huge is bounded by the message cap and by the byte budget,
+	// rows-endless by the byte budget and by the statement bound; one of each
+	// pair suffices.
 	{"row-huge", true, codeTimeout, 15 * time.Second},
 	{"rows-endless", true, codeTimeout, 15 * time.Second},
 	{"stall-auth", true, codeTimeout, 15 * time.Second},
@@ -601,6 +608,18 @@ func rssKiB(pid int) (int64, error) {
 	return 0, errors.New("no VmRSS")
 }
 
+// ppidOf is a process's parent pid, or 0 if it cannot be read.
+func ppidOf(pid int) int {
+	b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	for line := range strings.Lines(string(b)) {
+		if v, ok := strings.CutPrefix(line, "PPid:"); ok {
+			n, _ := strconv.Atoi(strings.TrimSpace(v))
+			return n
+		}
+	}
+	return 0
+}
+
 func TestClusterhelp_ProcsOf(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {
@@ -614,6 +633,9 @@ func TestClusterhelp_ProcsOf(t *testing.T) {
 	}
 	if n, err := rssKiB(os.Getpid()); err != nil || n <= 0 {
 		t.Fatalf("rss %d %v", n, err)
+	}
+	if p := ppidOf(os.Getpid()); p != os.Getppid() {
+		t.Fatalf("ppidOf: %d, want %d", p, os.Getppid())
 	}
 }
 

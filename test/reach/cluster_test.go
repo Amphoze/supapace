@@ -162,9 +162,12 @@ func restartWait(t testing.TB, ref string, sets ...string) time.Duration {
 }
 
 // daemonPids lists the running `supapaced serve` processes (node or host
-// install path).
+// install path). A process the daemon is starting shows the daemon's
+// executable and command line between its fork and its exec; one whose parent
+// is listed is such a child, not a second daemon, and is left out.
 func daemonPids() []int {
-	return slices.Concat(procsOf(daemonBin, "serve"), procsOf("/usr/local/bin/supapaced", "serve"))
+	ps := slices.Concat(procsOf(daemonBin, "serve"), procsOf("/usr/local/bin/supapaced", "serve"))
+	return slices.DeleteFunc(slices.Clone(ps), func(p int) bool { return slices.Contains(ps, ppidOf(p)) })
 }
 
 func daemonPid(t testing.TB) int {
@@ -353,7 +356,9 @@ drop role if exists reach_t7_su; drop table if exists storage.reach_t7_tbl; drop
 // under its frozen name, with ok:true, and is gone once reverted; restart
 // completes with drift present; a superuser-owned login trigger fires for a
 // plain login of that role and not for the platform's session; tenant
-// database-level session settings leave the check ok.
+// database-level session settings leave the check ok, and a check statement
+// that waits on a lock is bounded by the platform's statement bound, not by
+// the database's statement_timeout.
 func bootstrapDrift(t *testing.T, S Project, check func() checkJSON, restart func()) {
 	wantCheck(t, "control: a fresh project", check())
 
@@ -497,6 +502,19 @@ create event trigger reach_login on login execute function public.reach_login_fn
 			t.Fatalf("control: the tenant's database-level settings were not stored (%v)", set)
 		}
 		wantCheck(t, "with database-level settings "+strings.Join(set, ", "), check())
+		// The check's statements end within 1 ms on an idle catalog, so the
+		// stored statement_timeout is shown by a statement that waits: a session
+		// holds an exclusive lock on pg_event_trigger, which the check reads
+		// after its login. Under the platform's own statement_timeout the
+		// statement waits until the platform's statement bound (timeout); under
+		// the database's 1 ms it would be cancelled at once (internal).
+		release := holdLock(t, S, "begin; lock table pg_catalog.pg_event_trigger in access exclusive mode;", "LOCK TABLE")
+		c := check()
+		release()
+		if c.OK || c.Code != "timeout" {
+			t.Fatalf("with database-level statement_timeout=1ms and a check statement waiting on a lock: ok %v code %q, want timeout", c.OK, c.Code)
+		}
+		wantCheck(t, "after the lock is released", check())
 	})
 }
 
@@ -634,7 +652,7 @@ func fakeConns(t testing.TB, container, path string) map[int][]byte {
 // and that listener received no bytes. Control: connecting through the link
 // the way a client that follows it would reaches the listener, which logs
 // what it got. Fails if the platform's dial follows the link (the fake logs
-// the startup packet) or if the check passes.
+// the startup packet, or the check reports peer) or if the check passes.
 func plantedLink(t *testing.T, S Project, check func() (checkJSON, time.Duration)) {
 	user := fmt.Sprintf("%d:%d", S.UID, S.UID)
 	other := "/var/run/postgresql/.reach-other.s"
@@ -645,8 +663,11 @@ func plantedLink(t *testing.T, S Project, check func() (checkJSON, time.Duration
 	fakeInContainer(t, pgName(S), user, "--socket", other, "--log", log)
 	mustUID(t, S, `cd /var/run/postgresql && mv .s.PGSQL.5432 .reach-real && ln -s .reach-other.s .s.PGSQL.5432`)
 	res, _ := check()
-	if res.OK {
-		t.Errorf("project check with the socket replaced by a link: ok")
+	// The link itself is refused when the socket is opened (internal). A dial
+	// that followed it would meet the listener, whose process is not the
+	// recorded postmaster (peer), so peer means the link was followed.
+	if res.OK || res.Code != "internal" {
+		t.Errorf("project check with the socket replaced by a link: ok %v code %q, want internal", res.OK, res.Code)
 	}
 	if conns := fakeConns(t, pgName(S), log); len(conns) != 0 {
 		t.Errorf("the link's target received %d connection(s) with data from the platform's dial", len(conns))
@@ -697,7 +718,8 @@ func fakeInCluster(t *testing.T, S Project, check func() (checkJSON, time.Durati
 // fake backend; the suite records the fake's pid and start time as the
 // postmaster's, so the peer check passes and the fake is the server the
 // platform talks to. For post-authentication modes the fake holds S's
-// administrative password and the platform's salt for that role. Each mode's
+// administrative password and the platform's salt for that role; sasl-iter
+// gets that salt too. Each mode's
 // verdict and bound are in hostileModes; meanwhile the daemon's resident set
 // grows by less than 64 MiB and a restart of B completes in its normal time.
 // Fails on a missed bound, a passing check, a password sent in any form but
@@ -801,8 +823,11 @@ func (h *replacedInit) start(t testing.TB, m hostileMode, saltHex string) int {
 	}
 	args = append(append(args, h.flags.args()...), "--entrypoint", toolsInPG, h.image,
 		"fakepg", "--mode", m.mode, "--socket", sockInPG, "--log", fakeLogIn)
-	if m.postAuth {
+	switch {
+	case m.postAuth:
 		args = append(args, "--password-file", "/opt/supapace/tools/pw", "--salt", saltHex)
+	case m.mode == "sasl-iter": // the platform's salt: only the iteration count differs
+		args = append(args, "--salt", saltHex)
 	}
 	docker(t, args...)
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(200 * time.Millisecond) {
@@ -2037,14 +2062,15 @@ func fairness(t *testing.T, A, B Project) {
 }
 
 // holdLock opens a session in p's cluster as the administrative role over the
-// socket, sends sql and waits for the line ready; the session stays open
-// until the returned function (also a cleanup) closes its input.
+// socket with the neutral startup options, sends sql and waits for the line
+// ready; the session stays open until the returned function (also a cleanup)
+// closes its input.
 func holdLock(t testing.TB, p Project, sql, ready string) func() {
 	t.Helper()
 	pw := string(platformSecret(t, p, "pg.supabase_admin.password"))
-	cmd := exec.Command("docker", "exec", "-i", "-e", "PGPASSWORD", pgName(p), "psql", "-X", "-w", "-h", "/var/run/postgresql",
+	cmd := exec.Command("docker", "exec", "-i", "-e", "PGPASSWORD", "-e", "PGOPTIONS", pgName(p), "psql", "-X", "-w", "-h", "/var/run/postgresql",
 		"-U", "supabase_admin", "-d", "postgres")
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+pw)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+pw, neutral)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 5 * time.Second
 	in, err := cmd.StdinPipe()

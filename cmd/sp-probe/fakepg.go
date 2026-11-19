@@ -34,6 +34,8 @@ var (
 		"huge": true, "flood": true, "stall": true, "trickle": true,
 		"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true}
 	postAuth = map[string]bool{"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true}
+	// saltModes take the salt the server-first message carries.
+	saltModes = map[string]bool{"sasl-iter": true, "row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true}
 )
 
 const (
@@ -49,7 +51,7 @@ const (
 type fakeConfig struct {
 	mode     string
 	password string // post-authentication modes
-	salt     []byte // post-authentication modes
+	salt     []byte // saltModes
 }
 
 // fakePG listens on a Unix socket like a Postgres backend and answers each
@@ -235,9 +237,7 @@ func serveFake(c net.Conn, r io.Reader, cfg fakeConfig) {
 	case "sasl-iter":
 		c.Write(saslRequest)
 		if cnonce, _, ok := clientFirst(r); ok {
-			salt := make([]byte, 16)
-			rand.Read(salt)
-			c.Write(authMsg(11, []byte("r="+cnonce+rand.Text()+",s="+base64.StdEncoding.EncodeToString(salt)+",i=10000000")))
+			c.Write(authMsg(11, []byte("r="+cnonce+rand.Text()+",s="+base64.StdEncoding.EncodeToString(cfg.salt)+",i=10000000")))
 		}
 	default: // post-authentication modes
 		if scramLogin(c, r, cfg) {

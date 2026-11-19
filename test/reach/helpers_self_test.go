@@ -551,8 +551,8 @@ func TestHelpers_GatewayOnlyBearers(t *testing.T) {
 	if again[0].bad.sign(t, priv) != again2[0].bad.sign(t, priv) {
 		t.Error("the same arguments gave different bytes")
 	}
-	if len(cases) != 6 {
-		t.Fatalf("%d cases, want 6", len(cases))
+	if len(cases) != 7 {
+		t.Fatalf("%d cases, want 7", len(cases))
 	}
 	for _, c := range cases {
 		if err := check(c.bad.sign(t, priv)); err != c.want {

@@ -198,6 +198,9 @@ func startModeFake(t *testing.T, mode string) (string, string) {
 	if err := os.WriteFile(pw, []byte(testPassword+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if mode == "sasl-iter" {
+		return startFake(t, "--mode", mode, "--salt", testSaltHex)
+	}
 	if !postAuth[mode] {
 		return startFake(t, "--mode", mode)
 	}
@@ -269,8 +272,9 @@ func TestFakePG_Modes(t *testing.T) {
 			first := "n=,r=abc"
 			writeMsg(t, c, 'p', []byte("SCRAM-SHA-256\x00"), binary.BigEndian.AppendUint32(nil, uint32(3+len(first))), []byte("n,,"+first))
 			sf := string(expectAuth(t, c, 11))
-			if !strings.HasPrefix(sf, "r=abc") || !strings.HasSuffix(sf, ",i=10000000") || !strings.Contains(sf, ",s=") {
-				t.Fatalf("server-first %q", sf)
+			if want, _ := hex.DecodeString(testSaltHex); !strings.HasPrefix(sf, "r=abc") || !strings.HasSuffix(sf, ",i=10000000") ||
+				!strings.Contains(sf, ",s="+base64.StdEncoding.EncodeToString(want)+",") {
+				t.Fatalf("server-first %q, want the given salt and ten million iterations", sf)
 			}
 		}},
 		{"stall-auth", func(t *testing.T, c *recConn) {

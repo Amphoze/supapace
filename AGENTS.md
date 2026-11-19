@@ -545,12 +545,14 @@ patch surface, backup model) were verified against upstream source first.
     mode streams stops after 1 GiB per connection; the connection is then held.
   - Modes before authentication (a client never authenticates): `sasl` (default, the
     request then nothing), `cleartext`, `md5`, `authok` (AuthenticationOk without any
-    exchange; queries get no answer), `sasl-iter` (a server-first message with a random
-    salt and ten million iterations), `huge` (a header announcing 1 GiB, then its body),
+    exchange; queries get no answer), `sasl-iter` (a server-first message with the `--salt`
+    salt, which it requires, and ten million iterations), `huge` (a header announcing 1 GiB,
+    then its body),
     `flood` (ParameterStatus and NoticeResponse without end), `stall` (nothing), `trickle`
     (the SASL request, one byte per second).
-  - Post-authentication modes need `--password-file` and `--salt` (refused for every other
-    mode): they complete a real SCRAM-SHA-256 exchange with that password, that salt and
+  - Post-authentication modes need `--password-file` and `--salt`; `sasl-iter` needs `--salt`
+    alone; both flags are refused for every other mode. The post-authentication modes
+    complete a real SCRAM-SHA-256 exchange with that password, that salt and
     4096 iterations, then answer a simple Query, or the Sync of an extended batch:
     `row-huge` (a DataRow announcing 64 MiB), `rows-endless` (1 KiB DataRows without end),
     `stall-auth` (no reply), `escapes` (notices and an error whose message, detail and hint
@@ -2324,3 +2326,32 @@ deadline inside the namespace, thread count stable after 1,000 dials.
 - `nodecfg.LockedPostgresVersion()`: the text after the colon of the lock's postgres tag.
   `pgconf.PostgRESTSchemas` and `pgconf.PostgRESTExtraSearchPath`: the values postgrest.conf
   sets; the `data_api` answer splits them on ", ".
+
+### 2026-11-20 — reach: assertions that single out their mechanism
+
+- Test 02 bearer cases add `duplicate_role_permitted_last` (a forbidden role first,
+  `authenticated` last). With `duplicate_role` both orders of a duplicated `role` member are
+  covered: a decoder that kept either member fails the test.
+- Test 02 row `R1b_issuer_claims_role_outside_user_roles`: an issuer token for a role that is
+  neither a user role of the project nor forbidden. Only the user-role check refuses it, and
+  the gateway's own 401 `invalid_token` is required. The forbidden-list check cannot be
+  reached end to end (project create refuses a forbidden user role); the internal/jwtx unit
+  tests cover it.
+- Test 04 gate has two rows. `only_bridge_name`: the network has the scratch project's slice,
+  IPv4 only and the isolated gateway mode, so only the bridge name is wrong; the test also
+  checks that the project got that slice. `foreign_subnet`: the earlier case. Both want
+  `containment_failed` and no cluster container.
+- Test 07: with database-level `statement_timeout=1ms` stored, a check whose statement waits
+  on a lock held on `pg_event_trigger` must end with code `timeout` (the platform's own
+  bound), then `ok` once the lock is released. holdLock opens its session with the neutral
+  startup options.
+- Test 09 planted link: the check must report code `internal` (the no-follow open); `peer`
+  means the link was followed and fails the test.
+- Test 09 hostile init `sasl-iter`: the fake backend gets the platform's salt, so the
+  iteration count is the one parameter that differs.
+- sp-probe fakepg: `sasl-iter` requires `--salt` (hex) and sends that salt;
+  `--password-file` is refused for it. Other modes' flag rules are unchanged.
+- Test 09 comments: cleartext and the message-cap/byte-budget pairs are each refused by two
+  mechanisms; one of each pair suffices.
+- Suite helper daemonPids leaves out a process whose parent is a listed daemon: a child
+  between fork and exec shows the daemon's executable and command line.

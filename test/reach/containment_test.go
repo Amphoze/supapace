@@ -252,25 +252,49 @@ func clusterEgress(t *testing.T, A, B Project) {
 
 // TestReach04_UnknownBridge: a project network created without the
 // bridge-name option is refused by the start gate (the create fails with
-// containment_failed and no cluster container exists); with the gate bypassed,
+// containment_failed and no cluster container exists), also when its subnet
+// and gateway mode are the project's; with the gate bypassed,
 // two members of a non-internal unnamed bridge and two of docker0 reach
 // neither the host, nor each other, nor a routed address until both of our
 // tables are deleted.
 func TestReach04_UnknownBridge(t *testing.T) {
 	fixtureAB(t)
 	t.Run("gate", func(t *testing.T) {
-		driftHold(t) // before the unnamed network exists, released after it is gone
-		ref := randomRef(t)
-		scratchNet(t, "proj-"+ref, "--internal")
-		fixtureScratch(t, "--ref", ref, "--no-wait")
-		op := waitOp(t, newestOp(t, ref).ID)
-		if op.State != "failed" || !strings.HasPrefix(op.LastError, "containment_failed") {
-			t.Fatalf("create on an unnamed project bridge: operation %s at step %q (%q), want failed with containment_failed", op.State, op.Step, op.LastError)
-		}
-		for _, c := range []string{"pg-", "postgrest-"} {
-			if ids := strings.Fields(docker(t, "ps", "-aq", "--filter", "name=^"+c+ref+"$")); len(ids) != 0 {
-				t.Errorf("%s%s exists although the gate refused", c, ref)
-			}
+		// Each row's network differs from the project network in what it names:
+		// only_bridge_name has the slice the scratch project is given and the
+		// isolated gateway mode, so the bridge name alone is wrong; foreign_subnet
+		// also lacks both.
+		for _, row := range []struct {
+			name      string
+			ownSubnet bool
+		}{{"only_bridge_name", true}, {"foreign_subnet", false}} {
+			t.Run(row.name, func(t *testing.T) {
+				driftHold(t) // before the unnamed network exists, released after it is gone
+				ref, slice := randomRef(t), lowestFreeSlice(t)
+				opts := []string{"--internal"}
+				if row.ownSubnet {
+					opts = append(opts, "--ipv6=false", "--subnet", nodeConf(t).Slice(slice).String(),
+						"-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated")
+				}
+				scratchNet(t, "proj-"+ref, opts...)
+				fixtureScratch(t, "--ref", ref, "--no-wait")
+				op := waitOp(t, newestOp(t, ref).ID)
+				if p := showPlacement(t, ref); row.ownSubnet && (p.SubnetIndex == nil || *p.SubnetIndex != slice) {
+					got := "none"
+					if p.SubnetIndex != nil {
+						got = strconv.Itoa(*p.SubnetIndex)
+					}
+					t.Fatalf("the scratch project's slice is %s, the network was made for slice %d", got, slice)
+				}
+				if op.State != "failed" || !strings.HasPrefix(op.LastError, "containment_failed") {
+					t.Fatalf("create on an unnamed project bridge: operation %s at step %q (%q), want failed with containment_failed", op.State, op.Step, op.LastError)
+				}
+				for _, c := range []string{"pg-", "postgrest-"} {
+					if ids := strings.Fields(docker(t, "ps", "-aq", "--filter", "name=^"+c+ref+"$")); len(ids) != 0 {
+						t.Errorf("%s%s exists although the gate refused", c, ref)
+					}
+				}
+			})
 		}
 	})
 	t.Run("bypass", func(t *testing.T) { bypassUnknownBridges(t) })

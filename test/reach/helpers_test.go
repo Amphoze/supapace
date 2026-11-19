@@ -1322,8 +1322,12 @@ func gatewayOnlyBearers(kid, sub string, exp int64) (twin tokenSpec, cases []bea
 			func(s tokenSpec) tokenSpec { return tokenSpec{s.header, with(s.claims, role)} }, jwtx.ErrNoRole},
 		{"unknown_crit", tokenSpec{with(with(h, `"crit":["x-reach"]`), `"x-reach":1`), c},
 			func(s tokenSpec) tokenSpec { return tokenSpec{without(without(s.header, "crit"), "x-reach"), s.claims} }, jwtx.ErrMalformed},
+		// The two orders of a duplicated role: one with the permitted role first,
+		// one with it last, so a decoder that kept either member would serve one.
 		{"duplicate_role", tokenSpec{h, with(c, `"role":"service_role"`)},
 			func(s tokenSpec) tokenSpec { return tokenSpec{s.header, withoutLast(s.claims, "role")} }, jwtx.ErrDuplicateMember},
+		{"duplicate_role_permitted_last", tokenSpec{h, with(with(without(c, "role"), `"role":"service_role"`), role)},
+			func(s tokenSpec) tokenSpec { return tokenSpec{s.header, with(without(s.claims, "role"), role)} }, jwtx.ErrDuplicateMember},
 		{"no_kid", tokenSpec{without(h, "kid"), c},
 			func(s tokenSpec) tokenSpec { return tokenSpec{with(s.header, kidM), s.claims} }, jwtx.ErrNoKID},
 		{"role_authenticator", tokenSpec{h, with(without(c, "role"), `"role":"authenticator"`)},

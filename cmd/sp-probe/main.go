@@ -21,8 +21,8 @@
 //	                                            socket; mode defaults to sasl; FILE gets every
 //	                                            byte sent, as "conn N LEN" + LEN bytes per
 //	                                            chunk; --password-file and --salt are given
-//	                                            for the post-authentication modes and refused
-//	                                            for the others
+//	                                            for the post-authentication modes, --salt
+//	                                            alone for sasl-iter; refused for the others
 //	sp-probe s3 SUB … --endpoint URL --keys FILE --bucket B
 //	                                            object-store calls for the harness
 //	                                            (s3.go)
@@ -89,7 +89,7 @@
 //	authok        AuthenticationOk without any exchange, then ParameterStatus,
 //	              BackendKeyData and ReadyForQuery; queries get no answer
 //	sasl-iter     AuthenticationSASL; to the client-first message a server-first
-//	              message with a random salt and i=10000000; nothing more
+//	              message with the --salt salt and i=10000000; nothing more
 //	huge          a message header 'R' announcing 1 GiB, then its body of zeros
 //	flood         ParameterStatus and NoticeResponse messages without end, never an
 //	              authentication request
@@ -280,12 +280,14 @@ func command(args []string, stdout io.Writer) verdict {
 	case args[0] == "listen" && len(pos) == 2 && (pos[0] == "tcp" || pos[0] == "udp") && (*join == "" || pos[0] == "udp"):
 		err = listen(pos[0], pos[1], *join, stdout)
 	case args[0] == "fakepg" && len(pos) == 0 && *socket != "" && *logFile != "" && fakeModes[*mode] &&
-		postAuth[*mode] == (*passwordFile != "") && postAuth[*mode] == (*saltHex != ""):
+		postAuth[*mode] == (*passwordFile != "") && saltModes[*mode] == (*saltHex != ""):
 		cfg := fakeConfig{mode: *mode}
-		if postAuth[*mode] {
+		if saltModes[*mode] {
 			if cfg.salt, err = hex.DecodeString(*saltHex); err != nil || len(cfg.salt) == 0 {
 				return errorVerdict("usage: --salt must be hex")
 			}
+		}
+		if postAuth[*mode] {
 			pw, err := os.ReadFile(*passwordFile)
 			if err != nil {
 				return errorVerdict("%v", err)

@@ -117,8 +117,8 @@ func TestReach01_Signature(t *testing.T) {
 	})
 }
 
-// TestReach02_KeyRole walks the key→role table: eight refusals, each after its
-// accepted twin, and four acceptances.
+// TestReach02_KeyRole walks the key→role table: nine refusals and the bearer
+// cases, each after its accepted twin, and four acceptances.
 func TestReach02_KeyRole(t *testing.T) {
 	A, B := fixtureAB(t)
 	kAnon, kidAnon := platformKey(t, A, "jwt.anon.private")
@@ -158,10 +158,19 @@ func TestReach02_KeyRole(t *testing.T) {
 		extra = append(extra, row{c.name, bearerReq(twinSpec.sign(t, A.Issuer)), "authenticated",
 			bearerReq(c.bad.sign(t, A.Issuer)), "invalid_token"})
 	}
+	// An issuer token's role must be one of the project's user roles and not on
+	// the forbidden list. R1 and role_authenticator claim roles outside A's user
+	// roles that are also forbidden: either check alone refuses them. R1b claims
+	// a role that is neither: only the user-role check refuses it. A forbidden
+	// role among a project's user roles cannot be set up (create refuses it), so
+	// the forbidden-list check is a second line behind create's validation.
 	for _, r := range append([]row{
 		{"R1_issuer_claims_service_role",
 			req{whoamiPath, hdr("apikey", A.AnonKey, "Authorization", bearer(A.UserToken("authenticated", nil)))}, "authenticated",
 			req{whoamiPath, hdr("apikey", A.AnonKey, "Authorization", bearer(A.UserToken("service_role", nil)))}, "invalid_token"},
+		{"R1b_issuer_claims_role_outside_user_roles",
+			req{whoamiPath, hdr("apikey", A.AnonKey, "Authorization", bearer(A.UserToken("authenticated", nil)))}, "authenticated",
+			req{whoamiPath, hdr("apikey", A.AnonKey, "Authorization", bearer(A.UserToken("reach_other", nil)))}, "invalid_token"},
 		{"R2_anon_key_claims_service_role",
 			req{whoamiPath, hdr("apikey", ownAnon, "Authorization", bearer(ownAnon))}, "anon",
 			req{whoamiPath, hdr("apikey", forgedAnon, "Authorization", bearer(forgedAnon))}, "invalid_apikey"},
