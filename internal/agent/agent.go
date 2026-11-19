@@ -79,6 +79,11 @@ type Spec struct {
 	// state file is refused instead of being given a first boot, which
 	// empties its data directory.
 	FirstBoot bool
+	// Backups. Layout 0 or 1 renders the cluster as before them.
+	Layout      int
+	RepoQuotaMB int    // equals DiskQuotaMB
+	Stanza      string // "<ref>-<incarnation>"
+	StanzaPass  string `json:"-"` // the stanza's cipher passphrase; never printed
 }
 
 // String and GoString keep the secrets out of every fmt verb and log line.

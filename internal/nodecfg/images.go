@@ -49,7 +49,7 @@ func lockedRef(key string) (string, error) {
 }
 
 // LockedImages returns the images a node runs, each pinned by digest; the gateway
-// is the locally built GatewayImage.
+// and the worker are the locally built GatewayImage and WorkerImage.
 func LockedImages() (Images, error) {
 	var im Images
 	for _, f := range []struct {
@@ -62,7 +62,7 @@ func LockedImages() (Images, error) {
 		}
 		*f.dst = ref
 	}
-	im.Gateway = GatewayImage
+	im.Gateway, im.Worker = GatewayImage, WorkerImage
 	return im, nil
 }
 

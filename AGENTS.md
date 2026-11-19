@@ -1951,3 +1951,61 @@ at first boot.
   functions of the restored database (the reset's function, those the reads use); nothing
   secret is sent after the password statements.
 - Tests: about 95 s with -race; the cluster tests need the pinned image and skip without it.
+
+### 2026-11-19 — Backup paths, limits and job formats (nodecfg, bklimit, jobio, agent types)
+Provides
+- nodecfg constants: ReplicatorUID 65530 and ControlPlaneUID 70 (each also the gid),
+  BackupBridge "spb0", BackupNetwork "backup", WorkerImage "supapace-worker:local",
+  ControlPlaneSubject "cp".
+- Config.BackupSubnet (default 10.212.9.0/24; Validate refuses an overlap with the other
+  four networks), CPDiskQuotaMB/CPRepoQuotaMB (omitempty; 0 = unset; negative refused),
+  Images.Worker (must equal WorkerImage). Load fills BackupSubnet and Images.Worker when
+  absent, so a node.json written before them loads; init rewrites it with both.
+- CPQuotas(c, p): a set quota as it is, else 32,768 MiB, or 2,048 when the dev-mode marker
+  (a regular file beside node.json) exists. Read the quotas only through it.
+- Defaults(): Default without a domain and without Validate.
+- Paths: RepoRoot, RepoDir(subject), CPProjectDir, CPRestoring, ToolsDir, JobsDir,
+  IndexFile(subject), OffsiteSealed, OffsiteAddrs, NftLock, CPStanzaSealed, EscrowAcked,
+  OffsiteCheck. Subject is a project ref or "cp"; nothing checks it.
+- bklimit: every figure that sizes a backup job, loop, budget or lag. Deadline(kind, diskMB,
+  repoMB) errors on an unknown kind or a negative quota; serve has the recover deadline;
+  every division rounds up. PushLoopMax, ReplLoopMax, ReplMemMB, Budgets (objects follow
+  the effective byte budget, floor 7,500), FetchMargin (negative extra = 0; above 3 it
+  returns WholeArchive). ResultMax 1 MiB.
+- jobio, standard library only: Input/ReplInput (/job/input.json); one result type per
+  kind (CheckJobResult for check and stanza-create; ReplResult for replicate and probe,
+  its wire "rows" is Rows or ProbeRows by mode); RecoverResult (the runner's own, never
+  parsed); Failure; IndexRow and PlanRow lines with their readers and writers.
+- agent: Spec gains Layout, RepoQuotaMB, Stanza, StanzaPass (json "-"). types_backup.go
+  holds JobSpec, JobResult, QuotaUse, HostState. JobSpec's String, GoString and Format
+  print only ID, Subject and Kind; SecretEnv and Cred are json "-". Do not redeclare them.
+Contracts and refusals
+- Every JSON document is decoded strictly: member names exactly as declared and unique
+  (encoding/json alone would fold case and keep the last duplicate), nesting <= 16, no
+  unknown member, nothing after it. Null or missing timelines only for subject "cp" or
+  kind probe; an empty list admits none.
+- MarshalResult: one line plus "\n", at most ResultMax bytes before it. ParseResult(kind,
+  line) takes the line with or without its newline and returns the kind's value or a
+  *Failure; err means unusable: record the job crashed. Store the value re-encoded with
+  MarshalResult, never the raw line. A stored document (a fetch with histories, a
+  replication with counts) is not ParseResult input. There is no kind recover.
+- A failure is exactly {ok,code,message}: code [a-z0-9_-]{1,64}, message <= 256 bytes,
+  unsanitised (sanitise before storing). Replicate takes modes copy and rebuild, probe
+  takes probe; a copy has no rows; a fetch result with histories is refused.
+- Count bounds: quarantined <= 56 and newest <= 64 (also a push nested in check,
+  stanza-create and backup), serve none <= 64, rebuild rows <= 4,000.
+- Rows (uploaded, adopted, rows): key 1-1,024 bytes, no control byte in key or version
+  id, numbers not negative, hash empty or lower-case hex. AppendIndexRow returns an error
+  and dst unchanged for a row that would not read back; ParseResult rows always fit.
+- Index line: key, size, ino, ctime_ns, sha256 or "-". Plan line: key, version id or "-",
+  sha256 or "-", size. Tab-separated, fields non-empty, no control byte, numbers 1-19
+  digits. ParseIndexRow refuses a key over 1,024 bytes; ReadPlan a line over 4 KiB and an
+  unterminated last line; WritePlan a row that would not read back.
+Known limits
+- Not bounded by count beyond the 1 MiB line: probe rows, uploaded, adopted, notices,
+  info versions. newest's keys and values, labels and segment names are not shape-checked.
+- Parsing a 1 MiB replication result costs about 125 ms and 25 MB.
+- A JobSpec or Spec held in an unexported field of a printed struct prints raw. Spec's
+  Secrets still print under %d and in JSON; no code does either today.
+- A node.json hand-edited so another network covers 10.212.9.0/24 no longer loads; set
+  backup_subnet explicitly.

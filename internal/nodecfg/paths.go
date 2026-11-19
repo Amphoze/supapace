@@ -54,3 +54,24 @@ func (p Paths) RenderDir(ref string) string { return p.at(varDir, "platform", "p
 // ProjectsDir is the XFS mount holding the project-owned trees.
 func (p Paths) ProjectsDir() string          { return p.at(varDir, "projects") }
 func (p Paths) ProjectDir(ref string) string { return p.at(varDir, "projects", ref) }
+
+// Backups. The repository filesystem holds one root-owned directory per
+// subject; the control plane's data and spools sit on the projects filesystem.
+func (p Paths) RepoRoot() string              { return p.at(varDir, "repo") }
+func (p Paths) RepoDir(subject string) string { return p.at(varDir, "repo", subject) }
+func (p Paths) CPProjectDir() string          { return p.at(varDir, "projects", ControlPlaneSubject) }
+func (p Paths) CPRestoring() string           { return p.at(varDir, "cp", "restoring") }
+func (p Paths) ToolsDir() string              { return p.at(varDir, "platform", "tools") }
+func (p Paths) JobsDir() string               { return p.at(varDir, "platform", "jobs") }
+
+// IndexFile is the replicator's index of subject's uploaded keys.
+func (p Paths) IndexFile(subject string) string {
+	return p.at(varDir, "platform", "replica", subject+".idx")
+}
+
+func (p Paths) OffsiteSealed() string  { return p.at(etcDir, "offsite.sealed") }
+func (p Paths) OffsiteAddrs() string   { return p.at(etcDir, "offsite.addrs") }
+func (p Paths) NftLock() string        { return p.at(etcDir, "nft.lock") }
+func (p Paths) CPStanzaSealed() string { return p.at(etcDir, "cp-stanza.sealed") }
+func (p Paths) EscrowAcked() string    { return p.at(etcDir, "escrow.acked") }
+func (p Paths) OffsiteCheck() string   { return p.at(etcDir, "offsite.check") }

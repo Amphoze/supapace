@@ -38,6 +38,9 @@ type Config struct {
 	Retention        string   `json:"retention"`
 	Uplinks          []string `json:"uplinks"`
 	Images           Images   `json:"images"`
+	BackupSubnet     string   `json:"backup_subnet"`              // an older node.json without it loads with the default
+	CPDiskQuotaMB    int      `json:"cp_disk_quota_mb,omitempty"` // 0: not set, resolved at use by CPQuotas
+	CPRepoQuotaMB    int      `json:"cp_repo_quota_mb,omitempty"` // likewise
 }
 
 type Images struct {
@@ -45,12 +48,25 @@ type Images struct {
 	PostgREST    string `json:"postgrest"`
 	ControlPlane string `json:"control_plane"`
 	Gateway      string `json:"gateway"` // always GatewayImage
+	Worker       string `json:"worker"`  // always WorkerImage
 }
 
 // GatewayImage is the locally built gateway image (make images).
 const GatewayImage = "supapace-gateway:local"
 
 const PlatformBridge, IngressBridge = "spl0", "spi0"
+
+const (
+	ReplicatorUID       = 65530 // also its gid
+	ControlPlaneUID     = 70    // also its gid
+	BackupBridge        = "spb0"
+	BackupNetwork       = "backup"
+	WorkerImage         = "supapace-worker:local" // the locally built backup worker image
+	ControlPlaneSubject = "cp"                    // the control plane's name among backup subjects
+)
+
+// defaultBackupSubnet is the backup network, also of a node.json that predates it.
+const defaultBackupSubnet = "10.212.9.0/24"
 
 // CheckResult is one row of a node check; shared by the agent and the admin API.
 type CheckResult struct {
@@ -88,7 +104,30 @@ func defaultAt(domain, root string) Config {
 		Retention:        "168h",
 		Uplinks:          uplinks(root),
 		Images:           im,
+		BackupSubnet:     defaultBackupSubnet,
 	}
+}
+
+// Defaults is Default without a domain and without validation: what a node
+// that has no node.json yet (the recovery of the control plane) runs with.
+func Defaults() Config { return Default("") }
+
+// CPQuotas resolves the control plane's disk and repository quotas in MiB: a
+// value set in node.json as it is; else 32,768, or 2,048 on a development node
+// (the dev-mode marker, a regular file beside node.json, exists).
+func CPQuotas(c Config, p Paths) (diskMB, repoMB int) {
+	def := 32768
+	if fi, err := os.Lstat(filepath.Join(filepath.Dir(p.NodeJSON()), "dev-mode")); err == nil && fi.Mode().IsRegular() {
+		def = 2048
+	}
+	diskMB, repoMB = c.CPDiskQuotaMB, c.CPRepoQuotaMB
+	if diskMB <= 0 {
+		diskMB = def
+	}
+	if repoMB <= 0 {
+		repoMB = def
+	}
+	return diskMB, repoMB
 }
 
 // memAllocMB is 75 % of min(MemTotal, the smallest numeric memory.max of the
@@ -184,7 +223,8 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	var c Config
+	// Fields added after the first release take their defaults when absent.
+	c := Config{BackupSubnet: defaultBackupSubnet, Images: Images{Worker: WorkerImage}}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
@@ -263,11 +303,12 @@ func (c Config) Validate() error {
 	if pool.IsValid() && (c.DockerPoolSize < pool.Bits() || c.DockerPoolSize > 30) {
 		bad("docker_pool_size: %d does not fit docker_pool %s", c.DockerPoolSize, pool)
 	}
-	// The four networks are separate bridges and address pools; none may share an address.
+	backup := prefix("backup_subnet", c.BackupSubnet)
+	// The five networks are separate bridges and address pools; none may share an address.
 	nets := []struct {
 		name string
 		p    netip.Prefix
-	}{{"project_block", block}, {"platform_subnet", platform}, {"ingress_subnet", ingress}, {"docker_pool", pool}}
+	}{{"project_block", block}, {"platform_subnet", platform}, {"ingress_subnet", ingress}, {"docker_pool", pool}, {"backup_subnet", backup}}
 	for i, a := range nets {
 		for _, b := range nets[i+1:] {
 			if a.p.IsValid() && b.p.IsValid() && a.p.Overlaps(b.p) {
@@ -299,6 +340,12 @@ func (c Config) Validate() error {
 	}
 	if c.Images.Gateway != GatewayImage {
 		bad("images.gateway: %q, want %q", c.Images.Gateway, GatewayImage)
+	}
+	if c.CPDiskQuotaMB < 0 || c.CPRepoQuotaMB < 0 {
+		bad("cp_disk_quota_mb/cp_repo_quota_mb: %d/%d must not be negative", c.CPDiskQuotaMB, c.CPRepoQuotaMB)
+	}
+	if c.Images.Worker != WorkerImage {
+		bad("images.worker: %q, want %q", c.Images.Worker, WorkerImage)
 	}
 	return errors.Join(errs...)
 }

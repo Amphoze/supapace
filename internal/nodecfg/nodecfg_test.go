@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -247,5 +248,206 @@ func TestLockedImages_Parses(t *testing.T) {
 	}
 	if !ref.MatchString(node) || !strings.HasPrefix(node, "docker@") {
 		t.Errorf("node image = %q", node)
+	}
+}
+
+// A node.json written before the backup fields existed (today's init) loads:
+// the backup subnet and the worker image take their defaults, the control
+// plane's quotas stay unset and resolve at use.
+func TestLoad_OldNodeJSONGetsDefaults(t *testing.T) {
+	c := Default("sp.test")
+	c.MemAllocMB, c.PidsAlloc = 1, 1
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "backup_subnet")
+	delete(m["images"].(map[string]any), "worker")
+	old, _ := json.Marshal(m)
+	if strings.Contains(string(old), "backup") || strings.Contains(string(old), "worker") || strings.Contains(string(old), "cp_") {
+		t.Fatalf("fixture still names a new field: %s", old)
+	}
+	p := filepath.Join(t.TempDir(), "node.json")
+	if err := os.WriteFile(p, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(p)
+	if err != nil {
+		t.Fatalf("an old node.json does not load: %v", err)
+	}
+	if got.BackupSubnet != "10.212.9.0/24" || got.Images.Worker != WorkerImage || got.CPDiskQuotaMB != 0 || got.CPRepoQuotaMB != 0 {
+		t.Errorf("defaults not applied: backup_subnet %q, worker %q, cp quotas %d/%d", got.BackupSubnet, got.Images.Worker, got.CPDiskQuotaMB, got.CPRepoQuotaMB)
+	}
+	if !reflect.DeepEqual(got, c) {
+		t.Errorf("loaded %+v\nwant Default %+v", got, c)
+	}
+	// A value that is present is kept, not replaced by the default.
+	m["backup_subnet"] = "10.212.10.0/24"
+	set, _ := json.Marshal(m)
+	os.WriteFile(p, set, 0o600)
+	if got, err := Load(p); err != nil || got.BackupSubnet != "10.212.10.0/24" {
+		t.Errorf("explicit backup_subnet: %q, %v", got.BackupSubnet, err)
+	}
+	// A worker image other than the local one is refused, as for the gateway.
+	m["images"].(map[string]any)["worker"] = "alpine@sha256:" + strings.Repeat("a", 64)
+	set, _ = json.Marshal(m)
+	os.WriteFile(p, set, 0o600)
+	if _, err := Load(p); err == nil {
+		t.Error("a foreign worker image was accepted")
+	}
+}
+
+func TestValidate_BackupSubnetOverlap(t *testing.T) {
+	c := Default("sp.test")
+	c.MemAllocMB, c.PidsAlloc = 1, 1
+	if err := c.Validate(); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	for name, s := range map[string]string{
+		"platform":       "10.212.0.0/24",
+		"inside ingress": "10.212.8.128/25",
+		"over ingress":   "10.212.8.0/23",
+		"project block":  "10.213.4.0/24",
+		"docker pool":    "10.214.0.0/24",
+		"covers all":     "10.212.0.0/14",
+		"not a network":  "10.212.9.1/24",
+		"ipv6":           "2001:db8::/64",
+		"garbage":        "spb0",
+		"empty":          "",
+	} {
+		d := c
+		d.BackupSubnet = s
+		if err := d.Validate(); err == nil || !strings.Contains(err.Error(), "backup_subnet") {
+			t.Errorf("%s (%q): Validate = %v, want a backup_subnet error", name, s, err)
+		}
+	}
+	d := c
+	d.BackupSubnet = "10.212.10.0/24"
+	if err := d.Validate(); err != nil {
+		t.Errorf("a free subnet refused: %v", err)
+	}
+}
+
+func TestPaths_New(t *testing.T) {
+	root := t.TempDir()
+	p, prod := Paths{Root: root}, Paths{}
+	ref := "abcdefghij0123456789"
+	for _, pr := range []struct{ got, prod, want string }{
+		{p.RepoRoot(), prod.RepoRoot(), "/var/lib/supapace/repo"},
+		{p.RepoDir(ref), prod.RepoDir(ref), "/var/lib/supapace/repo/" + ref},
+		{p.RepoDir(ControlPlaneSubject), prod.RepoDir(ControlPlaneSubject), "/var/lib/supapace/repo/cp"},
+		{p.CPProjectDir(), prod.CPProjectDir(), "/var/lib/supapace/projects/cp"},
+		{p.CPRestoring(), prod.CPRestoring(), "/var/lib/supapace/cp/restoring"},
+		{p.ToolsDir(), prod.ToolsDir(), "/var/lib/supapace/platform/tools"},
+		{p.JobsDir(), prod.JobsDir(), "/var/lib/supapace/platform/jobs"},
+		{p.IndexFile(ref), prod.IndexFile(ref), "/var/lib/supapace/platform/replica/" + ref + ".idx"},
+		{p.OffsiteSealed(), prod.OffsiteSealed(), "/etc/supapace/offsite.sealed"},
+		{p.OffsiteAddrs(), prod.OffsiteAddrs(), "/etc/supapace/offsite.addrs"},
+		{p.NftLock(), prod.NftLock(), "/etc/supapace/nft.lock"},
+		{p.CPStanzaSealed(), prod.CPStanzaSealed(), "/etc/supapace/cp-stanza.sealed"},
+		{p.EscrowAcked(), prod.EscrowAcked(), "/etc/supapace/escrow.acked"},
+		{p.OffsiteCheck(), prod.OffsiteCheck(), "/etc/supapace/offsite.check"},
+	} {
+		if pr.prod != pr.want || pr.got != root+pr.want {
+			t.Errorf("path %q (rooted %q), want %q", pr.prod, pr.got, pr.want)
+		}
+	}
+	// The constants other packages build names from.
+	if ReplicatorUID != 65530 || ControlPlaneUID != 70 || BackupBridge != "spb0" || BackupNetwork != "backup" ||
+		WorkerImage != "supapace-worker:local" || ControlPlaneSubject != "cp" {
+		t.Error("a backup constant changed")
+	}
+}
+
+func TestCPQuotas_SetValueElseDefaultElseDevFigure(t *testing.T) {
+	p := Paths{Root: t.TempDir()}
+	c := Default("sp.test")
+	if d, r := CPQuotas(c, p); d != 32768 || r != 32768 {
+		t.Errorf("unset, production node: %d/%d, want 32768/32768", d, r)
+	}
+	c.CPDiskQuotaMB = 4096
+	if d, r := CPQuotas(c, p); d != 4096 || r != 32768 {
+		t.Errorf("disk set: %d/%d, want 4096/32768", d, r)
+	}
+	marker := filepath.Join(filepath.Dir(p.NodeJSON()), "dev-mode")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Only a regular file is the marker.
+	if err := os.Symlink("/dev/null", marker); err != nil {
+		t.Fatal(err)
+	}
+	if d, r := CPQuotas(c, p); d != 4096 || r != 32768 {
+		t.Errorf("a link at the marker: %d/%d, want 4096/32768", d, r)
+	}
+	os.Remove(marker)
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if d, r := CPQuotas(c, p); d != 4096 || r != 2048 {
+		t.Errorf("development node, disk set: %d/%d, want 4096/2048", d, r)
+	}
+	c.CPRepoQuotaMB = 10000
+	if d, r := CPQuotas(c, p); d != 4096 || r != 10000 {
+		t.Errorf("both set: %d/%d, want 4096/10000", d, r)
+	}
+	c.CPDiskQuotaMB, c.CPRepoQuotaMB = 0, 0
+	if d, r := CPQuotas(c, p); d != 2048 || r != 2048 {
+		t.Errorf("development node, unset: %d/%d, want 2048/2048", d, r)
+	}
+}
+
+// init writes a node.json equal to Default, also with --dev: the quota fields
+// stay unset and are omitted from the file.
+func TestDefault_LeavesTheControlPlaneQuotasUnset(t *testing.T) {
+	c := Default("sp.test")
+	if c.CPDiskQuotaMB != 0 || c.CPRepoQuotaMB != 0 {
+		t.Errorf("cp quotas %d/%d, want unset", c.CPDiskQuotaMB, c.CPRepoQuotaMB)
+	}
+	b, _ := json.Marshal(c)
+	if strings.Contains(string(b), "cp_disk_quota_mb") || strings.Contains(string(b), "cp_repo_quota_mb") {
+		t.Errorf("unset quotas written: %s", b)
+	}
+	if c.BackupSubnet != "10.212.9.0/24" || c.Images.Worker != WorkerImage {
+		t.Errorf("backup subnet %q, worker %q", c.BackupSubnet, c.Images.Worker)
+	}
+	c.CPDiskQuotaMB = 1
+	if b, _ := json.Marshal(c); !strings.Contains(string(b), `"cp_disk_quota_mb":1`) {
+		t.Errorf("a set quota not written: %s", b)
+	}
+}
+
+func TestDefaults_NeedsNoDomain(t *testing.T) {
+	d := Defaults()
+	if d.Domain != "" {
+		t.Errorf("domain %q, want none", d.Domain)
+	}
+	want := Default("x.test")
+	want.Domain = ""
+	if !reflect.DeepEqual(d, want) {
+		t.Errorf("Defaults = %+v\nwant Default without its domain %+v", d, want)
+	}
+	if d.BackupSubnet == "" || d.ProjectBlock == "" || d.Images.Worker != WorkerImage || d.Images.ControlPlane == "" {
+		t.Errorf("a value recover needs is missing: %+v", d)
+	}
+}
+
+func TestValidate_ControlPlaneQuotasNotNegative(t *testing.T) {
+	c := Default("sp.test")
+	c.MemAllocMB, c.PidsAlloc = 1, 1
+	c.CPDiskQuotaMB, c.CPRepoQuotaMB = 0, 1
+	if err := c.Validate(); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	for _, q := range [][2]int{{-1, 0}, {0, -1}} {
+		d := c
+		d.CPDiskQuotaMB, d.CPRepoQuotaMB = q[0], q[1]
+		if err := d.Validate(); err == nil || !strings.Contains(err.Error(), "cp_") {
+			t.Errorf("quotas %v: Validate = %v", q, err)
+		}
 	}
 }
