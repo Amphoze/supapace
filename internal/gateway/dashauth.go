@@ -99,6 +99,7 @@ func serveSignIn(w http.ResponseWriter, r *http.Request, dr *dashRequest) {
 		s.refusal(http.StatusMethodNotAllowed, textMethod, "")
 		return
 	case !posts && crossOrigin(r, dr.Lower):
+		s.count(causeCrossOrigin)
 		s.refuse(http.StatusForbidden, "cross_origin")
 		return
 	}
@@ -126,6 +127,9 @@ func (s *signIn) hosted(ref string) bool {
 	_, ok := s.dt.file.Projects[ref]
 	return ok || ref == "_"
 }
+
+// count counts an answer of this request by its cause, under the host's ref.
+func (s *signIn) count(c signInCause) { s.d.countSignIn(s.ref, c) }
 
 // origin is the origin of a ref's host; the sign-in host's for "_". ref is
 // "_" or a ref of the table, so nothing of a request names a host.
@@ -275,8 +279,8 @@ func (s *signIn) login(query string) {
 
 // fields reads the form of a sign-in post: at most 16 KiB of
 // application/x-www-form-urlencoded with id_token and state each exactly
-// once. Every other field is ignored; hasError reports the field "error".
-// Nothing is read from the query.
+// once. Every other field is ignored; hasError reports the field "error" in
+// any body that parses. Nothing is read from the query.
 func (s *signIn) fields() (tok, state string, hasError, ok bool) {
 	limit := int64(dashcfg.Limits.SignInBodyBytes)
 	mt, _, err := mime.ParseMediaType(s.r.Header.Get("Content-Type"))
@@ -288,10 +292,13 @@ func (s *signIn) fields() (tok, state string, hasError, ok bool) {
 		return "", "", false, false
 	}
 	f, err := url.ParseQuery(string(b))
-	if err != nil || len(f["id_token"]) != 1 || len(f["state"]) != 1 {
+	if err != nil {
 		return "", "", false, false
 	}
 	_, hasError = f["error"]
+	if len(f["id_token"]) != 1 || len(f["state"]) != 1 {
+		return "", "", hasError, false
+	}
 	return f["id_token"][0], f["state"][0], hasError, true
 }
 
@@ -303,6 +310,16 @@ func (s *signIn) callback() {
 	tok, state, hasError, ok := s.fields()
 	at, valid := parseState(state)
 	if !ok || hasError || !valid || !s.hosted(at.target) || len(tok) > maxIDToken || !idTokenRE.MatchString(tok) {
+		// Counted by the first of: the issuer's error, a body or field the
+		// post refuses, the state, the token's size or alphabet.
+		c := causeTokenForm
+		switch {
+		case hasError:
+			c = causeIssuerError
+		case ok && (!valid || !s.hosted(at.target)):
+			c = causeState
+		}
+		s.count(c)
 		s.refusal(http.StatusBadRequest, textDidNotComplete, "")
 		return
 	}
@@ -319,6 +336,11 @@ func (s *signIn) session() {
 	tok, state, _, ok := s.fields()
 	at, valid := parseState(state)
 	if !ok || !valid || at.target != s.ref {
+		c := causeState
+		if !ok {
+			c = causeTokenForm
+		}
+		s.count(c)
 		s.refusal(http.StatusBadRequest, textDidNotComplete, "")
 		return
 	}
@@ -337,10 +359,12 @@ func (s *signIn) session() {
 			s.signedIn(c, at.ret)
 			return
 		case !errors.Is(err, jwtx.ErrNonce): // any failure before the nonce, whatever the nonce and whatever n
+			s.count(tokenCause(err))
 			s.refusal(http.StatusUnauthorized, textFailed, again)
 			return
 		}
 	}
+	s.count(causeBinding) // the retry page and the final page alike
 	switch {
 	case !at.retry: // the one retry
 		s.page(http.StatusOK, "next", again+"&retry=1", nextHash, "'none'")
@@ -349,6 +373,22 @@ func (s *signIn) session() {
 	default:
 		s.refusal(http.StatusUnauthorized, textFailed, again)
 	}
+}
+
+// tokenCause is the cause a token error of jwtx.VerifyID but ErrNonce counts
+// under.
+func tokenCause(err error) signInCause {
+	switch {
+	case errors.Is(err, jwtx.ErrNoKID), errors.Is(err, jwtx.ErrUnknownKID), errors.Is(err, jwtx.ErrAlg), errors.Is(err, jwtx.ErrKey):
+		return causeTokenKey
+	case errors.Is(err, jwtx.ErrSignature):
+		return causeTokenSignature
+	case errors.Is(err, jwtx.ErrClaim):
+		return causeTokenClaim
+	case errors.Is(err, jwtx.ErrExpired), errors.Is(err, jwtx.ErrNotYetValid):
+		return causeTokenTime
+	}
+	return causeTokenForm // ErrMalformed, ErrDuplicateMember
 }
 
 // signedIn sets this host's session cookie and answers the page that
@@ -363,6 +403,7 @@ func (s *signIn) signedIn(c jwtx.IDClaims, ret string) {
 		return
 	}
 	setCookie(s.w, sessionCookie, tok, int(s.is.SessionSeconds), http.SameSiteStrictMode)
+	s.count(causeOK)
 	s.page(http.StatusOK, "next", ret, nextHash, "'none'")
 }
 
@@ -389,6 +430,7 @@ func displayName(name string) string {
 // host's own session page: a session cookie was set and did not come back.
 // The page's link carries the request's path and query as a return path.
 func (s *signIn) unpresented() {
+	s.count(causeNotPresented)
 	s.refusal(http.StatusUnauthorized, textUnpresented, "/-/auth/login?return="+url.QueryEscape(returnPath(s.r.RequestURI)))
 }
 

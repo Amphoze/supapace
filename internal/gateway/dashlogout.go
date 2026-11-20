@@ -29,6 +29,7 @@ func (s *signIn) logout(query string) {
 	// A query that does not parse may have meant a ticket; a ticket is one
 	// parameter, and the sign-in host takes none.
 	if err != nil || hop && (len(ts) != 1 || s.ref == "_") {
+		s.count(causeTicket)
 		s.refusal(http.StatusBadRequest, textBadTicket, "")
 		return
 	}
@@ -39,6 +40,7 @@ func (s *signIn) logout(query string) {
 		// ref of the table: the redirect below names no other host.
 		t, err = dashtok.VerifyTicket(s.d.pub, ts[0], s.now)
 		if err != nil || t.Refs[0] != s.ref || !s.allHosted(t.Refs) {
+			s.count(causeTicket)
 			s.refusal(http.StatusBadRequest, textBadTicket, "")
 			return
 		}

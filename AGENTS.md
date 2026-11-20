@@ -4756,3 +4756,72 @@ on the dashboard node until a test/reach/dash_*_test.go exists, then `make reach
 configuration: `-test.run Browser`, i.e. TestDash14_SignIn_Browser and
 TestDash15_CrossSite_Browser; the step fails when a dashboard test file exists and no test
 matches). unit also vets tags `reach dash` and `browser`.
+
+### 2026-11-21 — The sign-in seam's answers counted by cause; the sign-in model as the gateway
+
+The gateway (internal/gateway):
+- signInCause: a fixed list of twelve causes - ok, state, binding, token_key,
+  token_signature, token_claim, token_time, token_form, issuer_error, ticket,
+  cross_origin, not_presented. Nothing of a request names one.
+- Dashboard.countSignIn(ref, cause): one count, under d.mu, beside the rule
+  counts. Every count is made after the handler's hosted check, so ref is "_"
+  (the sign-in host) or a ref of the table. The map holds at most the refs the
+  table had in the minute, plus one.
+- logRefusals, once a minute: after the rule lines, one line per ref that has
+  counts, in ref order:
+    gateway: dashboard sign-in in the last minute: ref <ref>: ok N state N
+    binding N token_key N token_signature N token_claim N token_time N
+    token_form N issuer_error N ticket N cross_origin N not_presented N
+  (one line; the logger's prefix comes first). Both maps are swapped under the
+  lock and written after it is released: a request never waits on the log.
+  Nothing is logged per request; no token, cookie, state, nonce, return path,
+  subject or error value reaches the line.
+
+What counts as what:
+- ok: a session cookie set.
+- state: a state that does not parse or names no table host (callback), or
+  that is not this host's (session endpoint).
+- binding: the attempt's cookie absent, doubled or not 43 characters, or
+  jwtx.ErrNonce - on the retry page and on the final 401 alike.
+- token_key: ErrNoKID, ErrUnknownKID (also a kid listed twice in the set),
+  ErrAlg, ErrKey.
+- token_signature: ErrSignature. token_claim: ErrClaim.
+- token_time: ErrExpired, ErrNotYetValid.
+- token_form: ErrMalformed, ErrDuplicateMember, a body or field either post
+  refuses (a state field absent or doubled among them), and a callback token
+  over 8 KiB or outside its alphabet.
+- issuer_error: the callback's body holds "error" (its value never read),
+  with or without a token.
+- At the callback the first of: issuer_error, a refused body or field, state,
+  the token's form.
+- ticket: every log-out 400.
+- cross_origin: the seam's 403.
+- not_presented: the 401 page of rule 5's exception and of the picker.
+- Not counted: the login's 302, 404, 405, 503, 401 login_required, the log-out
+  redirects (?ended=0 included), the signed-out page, the relay page, and the
+  picker's page and its redirect.
+- signIn.fields reports "error" for any body that parses. The answers are
+  unchanged: the callback refuses either way, the session endpoint ignores it.
+
+The model (cmd/sp-dashstub flow) answers as the gateway does:
+- Log-out without a session ends on signed-out?ended=0.
+- The unsigned ticket is "<iat>.<0|1>.<refs>": more is set past 16 other
+  refs, carried by every hop, and the last hop adds ?more=1.
+- The signed-out page has the gateway's three sentences: ended=0 and more=1,
+  each written exactly once, select them; both at once show both.
+- The policy: script-src is the page's own hash (the relay's, or the
+  navigating script's on the session and retry pages) or 'none'; style-src is
+  the one style's hash.
+- On the sign-in host any method but GET of its endpoints is 404, and so is
+  POST / with a session.
+- The posts read the body alone.
+- The not-presented page's link carries a validated return path.
+- cross_origin, not_found and login_required are JSON refusals; Accept is
+  read in any letter case.
+- The state's path must be strict base64url; the cookie must hold a
+  43-character secret.
+- A project page checks the session before the same-origin rule.
+Known limit: the model reads the first segment raw where the gateway reads
+it percent-decoded (/%61pi).
+test/browser: the log-out scenarios wait for signed-out?ended=0 (no session,
+or reached from another site) and signed-out?more=1 (from the sign-in host).

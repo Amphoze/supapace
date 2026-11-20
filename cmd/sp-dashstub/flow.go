@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -61,7 +62,8 @@ var (
 	flowRefRE   = regexp.MustCompile(`^[a-z0-9]{20}$`)
 	flowTokenRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`) // and at most 8 KiB
 	flowHostRE  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
-	attemptRE   = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
+	stateRE     = regexp.MustCompile(`^v1\.(_|[a-z0-9]{20})\.([A-Za-z0-9_-]{11})\.([01])\.([A-Za-z0-9_-]+)$`)
+	secretRE    = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 	loginNameRE = regexp.MustCompile(`^__Host-sp-login-[A-Za-z0-9_-]{11}$`)
 	secondsRE   = regexp.MustCompile(`^(0|[1-9][0-9]{0,18})$`)
 )
@@ -124,7 +126,7 @@ type flowModel struct {
 func newFlow(studio, issuer string, refs []string) *flowModel {
 	return &flowModel{studio: studio, signIn: signInLabel + "." + studio, issuer: issuer, now: time.Now,
 		refs: slices.Sorted(slices.Values(refs)), policy: map[string]string{
-			"Content-Security-Policy":      pagesPolicy("'none'"),
+			"Content-Security-Policy":      pagesPolicy("'none'", "'none'"),
 			"X-Content-Type-Options":       "nosniff",
 			"Cross-Origin-Opener-Policy":   "same-origin",
 			"Cross-Origin-Resource-Policy": "same-origin",
@@ -135,28 +137,45 @@ func newFlow(studio, issuer string, refs []string) *flowModel {
 
 func (m *flowModel) clock() int64 { return m.now().Unix() + m.ahead.Load() }
 
-// pagesPolicy is the gateway-pages policy with the given form-action.
-func pagesPolicy(formAction string) string {
-	return fmt.Sprintf("default-src 'none'; script-src '%s' '%s'; form-action %s; frame-ancestors 'none'; base-uri 'none'",
-		scriptHash(relayScript), scriptHash(sessionScript), formAction)
+// pagesPolicy is the gateway-pages policy: script is the hash of the
+// answer's one script or 'none', the style the one constant style's.
+func pagesPolicy(script, formAction string) string {
+	return "default-src 'none'; script-src " + script + "; style-src " + hashOf(flowStyle) +
+		"; frame-ancestors 'none'; base-uri 'none'; form-action " + formAction
 }
 
-func scriptHash(s string) string {
+func hashOf(s string) string {
 	sum := sha256.Sum256([]byte(s))
-	return "sha256-" + base64.StdEncoding.EncodeToString(sum[:])
+	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
 }
 
-// The page scripts, constant so that the policy admits them by hash.
+// The page scripts and style, constant so that the policy admits them by hash.
 const (
 	relayScript   = `document.forms[0].submit()`
 	sessionScript = `location.replace(document.getElementById("next").getAttribute("href"))`
 	issuerScript  = `if (!document.cookie.split("; ").includes("hold=1")) document.forms[0].submit()`
+	flowStyle     = `body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem}`
+)
+
+// The gateway's words.
+const (
+	textDidNotComplete = "Sign-in did not complete."
+	textFailed         = "Sign-in could not be completed."
+	textNoCookie       = "This browser did not keep the sign-in cookie. Allow cookies for this site, then start again."
+	textUnpresented    = "Sign-in completed, and this browser did not send back the session cookie it was given. Allow cookies for this site, then start again."
+	textMethod         = "This address takes the sign-in form and nothing else."
+	textBadTicket      = "Log out did not complete: this log-out address is not valid or is no longer valid."
+	textSignedOut      = "Log out from a dashboard ends the session of that dashboard, of up to sixteen other projects of yours, and of this sign-in page."
+	textEnded          = "No dashboard session was shown with this log-out, so none was ended. The session of this sign-in page is ended. A session still open on a dashboard is ended by Log out from a page of that dashboard."
+	textMore           = "Sessions on further projects stay valid until they expire or your access is revoked."
 )
 
 var flowPages = template.Must(template.New("").Parse(`
-{{define "form"}}<!doctype html><title>{{.Title}}</title><form method="post" action="{{.Action}}">{{range $k, $v := .Fields}}<input type="hidden" name="{{$k}}" value="{{$v}}">{{end}}<button>Continue</button></form><script>{{.Script}}</script>{{end}}
-{{define "next"}}<!doctype html><title>{{.Title}}</title><noscript><meta http-equiv="refresh" content="0;url={{.Next}}"></noscript><a id="next" href="{{.Next}}">Continue</a><script>` + sessionScript + `</script>{{end}}
-{{define "text"}}<!doctype html><title>{{.Title}}</title><p id="text">{{.Text}}</p>{{range .Links}}<a href="{{.}}">{{.}}</a>{{end}}{{end}}
+{{define "head"}}<!doctype html><title>{{.}}</title><style>` + flowStyle + `</style>{{end}}
+{{define "form"}}{{template "head" .Title}}<form method="post" action="{{.Action}}">{{range $k, $v := .Fields}}<input type="hidden" name="{{$k}}" value="{{$v}}">{{end}}<button>Continue</button></form><script>{{.Script}}</script>{{end}}
+{{define "next"}}{{template "head" .Title}}<noscript><meta http-equiv="refresh" content="0;url={{.Next}}"></noscript><a id="next" href="{{.Next}}">Continue</a><script>` + sessionScript + `</script>{{end}}
+{{define "text"}}{{template "head" .Title}}<p id="text">{{.Text}}</p>{{range .Links}}<a href="{{.}}">{{.}}</a>{{end}}{{end}}
+{{define "signedout"}}{{template "head" "Log out"}}<p id="text">{{if .Ended}}` + textEnded + `{{else}}` + textSignedOut + `{{end}}</p>{{if .More}}<p>` + textMore + `</p>{{end}}{{end}}
 {{define "link"}}<!doctype html><title>link</title><a id="go" href="{{.}}">open</a>{{end}}
 `))
 
@@ -168,6 +187,41 @@ func (m *flowModel) page(w http.ResponseWriter, status int, name string, data an
 
 func (m *flowModel) text(w http.ResponseWriter, status int, text string, links ...string) {
 	m.page(w, status, "text", map[string]any{"Title": text, "Text": text, "Links": links})
+}
+
+// next is the page that navigates to next: the session page and the retry
+// page, with the hash of their one script.
+func (m *flowModel) next(w http.ResponseWriter, title, next string) {
+	w.Header().Set("Content-Security-Policy", pagesPolicy(hashOf(sessionScript), "'none'"))
+	m.page(w, http.StatusOK, "next", map[string]any{"Title": title, "Next": template.URL(next)})
+}
+
+// refuse is a refusal that is not a page, as the gateway writes one.
+func refuse(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"code":%q}`, code)
+}
+
+// navigation is the gateway's reading of one: Sec-Fetch-Mode navigate, or a
+// GET that accepts text/html in any letter case.
+func navigation(r *http.Request) bool {
+	return r.Header.Get("Sec-Fetch-Mode") == "navigate" ||
+		r.Method == http.MethodGet && strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
+}
+
+// crossOrigin is the gateway's same-origin rule: a Sec-Fetch-Site that is
+// present and neither same-origin nor none, unless the request is a
+// top-level navigation by GET to something that is not an API path.
+func crossOrigin(r *http.Request, path string) bool {
+	first, _, _ := strings.Cut(strings.TrimPrefix(path, "/"), "/")
+	for _, v := range r.Header.Values("Sec-Fetch-Site") {
+		if v != "same-origin" && v != "none" && !(r.Method == http.MethodGet && strings.ToLower(first) != "api" &&
+			r.Header.Get("Sec-Fetch-Mode") == "navigate" && r.Header.Get("Sec-Fetch-Dest") == "document") {
+			return true
+		}
+	}
+	return false
 }
 
 // origin is the host of a target: a ref's host, or the sign-in host for "_".
@@ -194,7 +248,7 @@ func (m *flowModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "https://"+m.signIn+"/", http.StatusFound)
 			return
 		}
-		http.Error(w, "not_found", http.StatusNotFound)
+		refuse(w, http.StatusNotFound, "not_found")
 		return
 	}
 	ref := "_"
@@ -204,7 +258,7 @@ func (m *flowModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if ok {
 				w.Header().Set("Strict-Transport-Security", hsts) // a host the gateway serves
 			}
-			http.Error(w, "not_found", http.StatusNotFound)
+			refuse(w, http.StatusNotFound, "not_found")
 			return
 		}
 		ref = label
@@ -221,15 +275,17 @@ func (m *flowModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Origin-Agent-Cluster", "?1")
 	}
 	isGet, isPost := r.Method == http.MethodGet, r.Method == http.MethodPost
+	// The sign-in seam: the sign-in host and /-/auth/ on a project host.
+	// The two posts are cross-site by design; every other answer of the
+	// seam is under the same-origin rule first.
+	seam := ref == "_" || strings.HasPrefix(p, "/-/auth/")
 	posts := p == "/-/auth/session" || p == "/-/auth/callback" && ref == "_"
-	if posts && !isPost {
-		m.text(w, http.StatusMethodNotAllowed, "method_not_allowed")
+	switch {
+	case posts && !isPost:
+		m.text(w, http.StatusMethodNotAllowed, textMethod)
 		return
-	}
-	if s := r.Header.Get("Sec-Fetch-Site"); s != "" && s != "same-origin" && s != "none" && !posts &&
-		!(isGet && r.Header.Get("Sec-Fetch-Mode") == "navigate" &&
-			r.Header.Get("Sec-Fetch-Dest") == "document" && !strings.HasPrefix(strings.ToLower(p), "/api/")) {
-		m.text(w, http.StatusForbidden, "cross_origin")
+	case seam && !posts && crossOrigin(r, p):
+		refuse(w, http.StatusForbidden, "cross_origin")
 		return
 	}
 	switch {
@@ -242,24 +298,22 @@ func (m *flowModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "/-/auth/logout" && isGet:
 		m.logout(w, r, ref)
 	case p == "/-/auth/signed-out" && isGet && ref == "_":
-		m.clearShownLogins(w, r)
-		m.clear(w, sessionCookie)
-		m.text(w, http.StatusOK, "signed out")
-	case strings.HasPrefix(p, "/-/auth/"):
-		m.text(w, http.StatusNotFound, "not_found")
-	case ref == "_" && p != "/":
-		m.text(w, http.StatusNotFound, "not_found")
+		m.signedOut(w, r)
+	case strings.HasPrefix(p, "/-/auth/"), ref == "_" && (p != "/" || !isGet): // a path or a method the seam does not name
+		refuse(w, http.StatusNotFound, "not_found")
 	case !m.hasSession(r, ref):
-		nav := r.Header.Get("Sec-Fetch-Mode") == "navigate" || isGet && strings.Contains(r.Header.Get("Accept"), "text/html")
-		again := "/-/auth/login?return=" + url.QueryEscape(r.URL.RequestURI())
 		switch {
-		case nav && m.markedBySessionPage(r, host):
-			m.text(w, http.StatusUnauthorized, "Sign-in completed, and this browser did not send back the session cookie it was given. Allow cookies for this site, then start again.", again)
-		case nav:
-			http.Redirect(w, r, again, http.StatusFound)
+		case navigation(r) && m.markedBySessionPage(r, host):
+			m.text(w, http.StatusUnauthorized, textUnpresented, "/-/auth/login?return="+url.QueryEscape(returnPath(r.URL.RequestURI())))
+		case navigation(r) && ref == "_":
+			http.Redirect(w, r, "/-/auth/login", http.StatusFound)
+		case navigation(r):
+			http.Redirect(w, r, "/-/auth/login?return="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		default:
-			m.text(w, http.StatusUnauthorized, "login_required")
+			refuse(w, http.StatusUnauthorized, "login_required")
 		}
+	case !seam && crossOrigin(r, p): // a project page: the session first, as the gateway's rules
+		refuse(w, http.StatusForbidden, "cross_origin")
 	case ref == "_":
 		var links []string
 		for _, x := range m.refs {
@@ -393,14 +447,14 @@ type attempt struct {
 }
 
 // parseState reads v1.<target>.<a>.<n>.<p>; target must be "_" or a ref of
-// the table. The return path is validated as it is read.
+// the table, and p the return path in its one spelling (strict unpadded
+// base64url, not empty). The return path is validated as it is read.
 func (m *flowModel) parseState(s string) (attempt, bool) {
-	f := strings.Split(s, ".")
-	if len(s) > maxStateLen || len(f) != 5 || f[0] != "v1" || f[1] != "_" && !slices.Contains(m.refs, f[1]) ||
-		!attemptRE.MatchString(f[2]) || f[3] != "0" && f[3] != "1" {
+	f := stateRE.FindStringSubmatch(s)
+	if len(s) > maxStateLen || f == nil || f[1] != "_" && !slices.Contains(m.refs, f[1]) {
 		return attempt{}, false
 	}
-	p, err := base64.RawURLEncoding.DecodeString(f[4])
+	p, err := base64.RawURLEncoding.Strict().DecodeString(f[4])
 	if err != nil {
 		return attempt{}, false
 	}
@@ -427,32 +481,40 @@ func (m *flowModel) login(w http.ResponseWriter, r *http.Request, ref string) {
 	http.Redirect(w, r, "https://"+m.issuer+"/authorize?"+q.Encode(), http.StatusFound)
 }
 
-// twoFields reads id_token and state from a post body of at most 16 KiB,
-// each exactly once; ok is false otherwise, or when error is present and
-// withError is false.
-func twoFields(w http.ResponseWriter, r *http.Request, withError bool) (tok, state string, ok bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
-	if r.ParseForm() != nil {
-		return "", "", false
+// twoFields reads id_token and state, each exactly once, from a body of at
+// most 16 KiB of application/x-www-form-urlencoded, and nothing from the
+// address; ok is false otherwise. hasError reports the field error.
+func twoFields(w http.ResponseWriter, r *http.Request) (tok, state string, hasError, ok bool) {
+	const limit = 16 << 10
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mt != "application/x-www-form-urlencoded" || r.ContentLength > limit {
+		return "", "", false, false
 	}
-	f := r.PostForm
-	_, hasError := f["error"]
-	if len(f["id_token"]) != 1 || len(f["state"]) != 1 || hasError && !withError {
-		return "", "", false
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil {
+		return "", "", false, false
 	}
-	return f["id_token"][0], f["state"][0], true
+	f, err := url.ParseQuery(string(b))
+	if err != nil {
+		return "", "", false, false
+	}
+	_, hasError = f["error"]
+	if len(f["id_token"]) != 1 || len(f["state"]) != 1 {
+		return "", "", false, false
+	}
+	return f["id_token"][0], f["state"][0], hasError, true
 }
 
 // callback reads and sets no cookie: it relays the token and the state to the
 // state's target, at its session endpoint with the relay's clock.
 func (m *flowModel) callback(w http.ResponseWriter, r *http.Request) {
-	tok, state, ok := twoFields(w, r, false)
+	tok, state, hasError, ok := twoFields(w, r)
 	at, valid := m.parseState(state)
-	if !ok || !valid || len(tok) > 8<<10 || !flowTokenRE.MatchString(tok) {
-		m.text(w, http.StatusBadRequest, "Sign-in did not complete.")
+	if !ok || hasError || !valid || len(tok) > 8<<10 || !flowTokenRE.MatchString(tok) {
+		m.text(w, http.StatusBadRequest, textDidNotComplete)
 		return
 	}
-	w.Header().Set("Content-Security-Policy", pagesPolicy(m.origin(at.target)))
+	w.Header().Set("Content-Security-Policy", pagesPolicy(hashOf(relayScript), m.origin(at.target)))
 	m.page(w, http.StatusOK, "form", map[string]any{"Title": "signing in", "Script": template.JS(relayScript),
 		"Action": template.URL(fmt.Sprintf("%s/-/auth/session?at=%d", m.origin(at.target), m.clock())),
 		"Fields": map[string]string{"id_token": tok, "state": state}})
@@ -463,10 +525,10 @@ func (m *flowModel) callback(w http.ResponseWriter, r *http.Request) {
 // its nonce last. The model's token is "idt." and the nonce; any other form
 // stands for a token that fails before its nonce.
 func (m *flowModel) session(w http.ResponseWriter, r *http.Request, ref string) {
-	tok, state, ok := twoFields(w, r, true)
+	tok, state, _, ok := twoFields(w, r)
 	at, valid := m.parseState(state)
 	if !ok || !valid || at.target != ref {
-		m.text(w, http.StatusBadRequest, "bad_request")
+		m.text(w, http.StatusBadRequest, textDidNotComplete)
 		return
 	}
 	name := loginPrefix + at.a
@@ -474,10 +536,11 @@ func (m *flowModel) session(w http.ResponseWriter, r *http.Request, ref string) 
 	if len(held) > 0 {
 		m.clear(w, name) // read, so cleared on every answer
 	}
-	if len(held) == 1 {
+	again := "/-/auth/login?return=" + url.QueryEscape(at.ret)
+	if len(held) == 1 && secretRE.MatchString(held[0]) {
 		nonce, isToken := strings.CutPrefix(tok, "idt.")
 		if !isToken {
-			m.text(w, http.StatusUnauthorized, "Sign-in could not be completed.", "/-/auth/login?return="+url.QueryEscape(at.ret))
+			m.text(w, http.StatusUnauthorized, textFailed, again)
 			return
 		}
 		if nonce == nonceOf(held[0]) {
@@ -485,58 +548,104 @@ func (m *flowModel) session(w http.ResponseWriter, r *http.Request, ref string) 
 				m.dropSessions.Store(0)
 				m.setCookie(w, sessionCookie, "s."+ref, flowSessionSecs)
 			}
-			m.page(w, http.StatusOK, "next", map[string]any{"Title": "signed in", "Next": template.URL(at.ret)})
+			m.next(w, "signed in", at.ret)
 			return
 		}
 	}
-	again := "/-/auth/login?return=" + url.QueryEscape(at.ret)
 	switch {
 	case !at.retry:
-		m.page(w, http.StatusOK, "next", map[string]any{"Title": "signing in", "Next": template.URL(again + "&retry=1")})
+		m.next(w, "signing in", again+"&retry=1")
 	case len(loginCookies(r)) == 0:
-		m.text(w, http.StatusUnauthorized, "This browser did not keep the sign-in cookie. Allow cookies for this site, then start again.", again)
+		m.text(w, http.StatusUnauthorized, textNoCookie, again)
 	default:
-		m.text(w, http.StatusUnauthorized, "Sign-in could not be completed.", again)
+		m.text(w, http.StatusUnauthorized, textFailed, again)
 	}
 }
 
-// logout: with t, the model's ticket "<iat>.<refs still to visit>" (one query
-// parameter, expiring 60 s after iat, refused at exactly 60 s), this host must be its first ref and
-// the next hop's ticket keeps iat; without, a session of this host builds the
-// chain, and no session goes straight to the signed-out page. Every answer
-// clears the login cookies it was shown.
+// logout: with t, the model's ticket "<iat>.<more>.<refs still to visit>"
+// (one query parameter, on a project host only, expiring 60 s after iat,
+// refused at exactly 60 s; more 0 or 1), this host must be its first ref and
+// the next hop's ticket keeps iat and more; without, a session of this host
+// builds the chain over at most 16 other refs, more set when there were
+// further ones, and no session goes to the signed-out page with ended=0. The
+// last hop adds more=1 when more is set. Every answer clears the login
+// cookies it was shown; a query that does not parse is refused.
 func (m *flowModel) logout(w http.ResponseWriter, r *http.Request, ref string) {
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	t, hop := q["t"]
+	if err != nil || hop && (len(t) != 1 || ref == "_") {
+		m.text(w, http.StatusBadRequest, textBadTicket)
+		return
+	}
+	signedOut := "https://" + m.signIn + "/-/auth/signed-out"
 	var next []string
-	iat := m.clock()
-	if t, ok := r.URL.Query()["t"]; ok {
-		ts, list, _ := strings.Cut(t[0], ".")
-		hops := strings.Split(list, ",")
-		n, err := strconv.ParseInt(ts, 10, 64)
-		if len(t) != 1 || !secondsRE.MatchString(ts) || err != nil || n > iat || iat-n >= ticketSecs ||
-			hops[0] != ref || len(hops) > maxTicketRefs ||
-			slices.ContainsFunc(hops, func(x string) bool { return !slices.Contains(m.refs, x) }) {
-			m.text(w, http.StatusBadRequest, "bad_request")
+	more, iat := false, m.clock()
+	switch {
+	case hop:
+		f := strings.SplitN(t[0], ".", 3)
+		if len(f) != 3 {
+			m.text(w, http.StatusBadRequest, textBadTicket)
 			return
 		}
-		next, iat = hops[1:], n
+		hops := strings.Split(f[2], ",")
+		n, err := strconv.ParseInt(f[0], 10, 64)
+		if !secondsRE.MatchString(f[0]) || err != nil || n > iat || iat-n >= ticketSecs || f[1] != "0" && f[1] != "1" ||
+			hops[0] != ref || len(hops) > maxTicketRefs ||
+			slices.ContainsFunc(hops, func(x string) bool { return !slices.Contains(m.refs, x) }) {
+			m.text(w, http.StatusBadRequest, textBadTicket)
+			return
+		}
+		next, iat, more = hops[1:], n, f[1] == "1"
 		m.clear(w, sessionCookie)
-	} else if m.hasSession(r, ref) {
+	case m.hasSession(r, ref):
 		m.clear(w, sessionCookie)
 		for _, x := range m.refs {
-			if x != ref && len(next) < maxTicketRefs {
+			if x != ref {
 				next = append(next, x)
 			}
 		}
-	} else if len(cookieValues(r, sessionCookie)) > 0 {
-		m.clear(w, sessionCookie) // shown, so cleared
+		if len(next) > maxTicketRefs {
+			next, more = next[:maxTicketRefs], true
+		}
+	default:
+		if len(cookieValues(r, sessionCookie)) > 0 {
+			m.clear(w, sessionCookie) // shown, so cleared
+		}
+		m.clearShownLogins(w, r)
+		http.Redirect(w, r, signedOut+"?ended=0", http.StatusFound)
+		return
 	}
 	m.clearShownLogins(w, r)
 	if len(next) == 0 {
-		http.Redirect(w, r, "https://"+m.signIn+"/-/auth/signed-out", http.StatusFound)
+		if more {
+			signedOut += "?more=1"
+		}
+		http.Redirect(w, r, signedOut, http.StatusFound)
 		return
 	}
-	t := fmt.Sprintf("%d.%s", iat, strings.Join(next, ","))
-	http.Redirect(w, r, m.origin(next[0])+"/-/auth/logout?t="+url.QueryEscape(t), http.StatusFound)
+	mark := "0"
+	if more {
+		mark = "1"
+	}
+	tk := fmt.Sprintf("%d.%s.%s", iat, mark, strings.Join(next, ","))
+	http.Redirect(w, r, m.origin(next[0])+"/-/auth/logout?t="+url.QueryEscape(tk), http.StatusFound)
+}
+
+// signedOut is the sign-in host's last page: it clears that host's session
+// cookie and the login cookies shown, whatever the query. more=1 and ended=0,
+// each written exactly so and once, select a fixed sentence; nothing of the
+// query is rendered.
+func (m *flowModel) signedOut(w http.ResponseWriter, r *http.Request) {
+	m.clear(w, sessionCookie)
+	m.clearShownLogins(w, r)
+	count, written := map[string]int{}, map[string]bool{}
+	for _, kv := range strings.Split(r.URL.RawQuery, "&") {
+		k, _, _ := strings.Cut(kv, "=")
+		count[k]++
+		written[kv] = true
+	}
+	m.page(w, http.StatusOK, "signedout", map[string]bool{
+		"Ended": count["ended"] == 1 && written["ended=0"], "More": count["more"] == 1 && written["more=1"]})
 }
 
 func (m *flowModel) serveIssuer(w http.ResponseWriter, r *http.Request) {

@@ -299,7 +299,7 @@ func TestFlow_Login_CookieStateAndRedirect(t *testing.T) {
 	if strings.Contains(loc.String(), m[2]) {
 		t.Error("R in a URL")
 	}
-	if r.Header.Get("Cache-Control") != "no-store" || !strings.Contains(r.Header.Get("Content-Security-Policy"), "form-action 'none';") {
+	if r.Header.Get("Cache-Control") != "no-store" || !strings.HasSuffix(r.Header.Get("Content-Security-Policy"), "; form-action 'none'") {
 		t.Errorf("gateway-pages policy: %q", r.Header)
 	}
 	// retry=1 makes n 1; the sign-in host's target is "_".
@@ -537,7 +537,7 @@ func TestFlow_StudioDomain_OneRedirect(t *testing.T) {
 func TestFlow_SignInHost_PickerAndPages(t *testing.T) {
 	h := tFlow()
 	r := tReq(h, "GET", "https://"+tSignIn+"/", nil, nav("none")...)
-	if r.StatusCode != 302 || r.Header.Get("Location") != "/-/auth/login?return=%2F" {
+	if r.StatusCode != 302 || r.Header.Get("Location") != "/-/auth/login" {
 		t.Fatalf("picker without session: %d %q", r.StatusCode, r.Header.Get("Location"))
 	}
 	// Not a navigation: 401, as on a project host (no redirect).
@@ -637,13 +637,13 @@ func TestFlow_LogOut_Chains(t *testing.T) {
 	}
 	// Without a session: the cookies shown are cleared, and the signed-out page; no chain.
 	r := tReq(h, "GET", "https://"+a+"/-/auth/logout", nil, append(nav("cross-site"), "Cookie", "__Host-sp-login-AAAAAAAAAAA=x")...)
-	if r.StatusCode != 302 || r.Header.Get("Location") != "https://"+tSignIn+"/-/auth/signed-out" ||
+	if r.StatusCode != 302 || r.Header.Get("Location") != "https://"+tSignIn+"/-/auth/signed-out?ended=0" ||
 		strings.Join(r.Header.Values("Set-Cookie"), "|") != clearLogin {
 		t.Errorf("no session: %d %q %q", r.StatusCode, r.Header.Get("Location"), r.Header.Values("Set-Cookie"))
 	}
 	// A wrong session cookie is shown, so it is cleared; still no chain.
 	r = tReq(h, "GET", "https://"+a+"/-/auth/logout", nil, "Cookie", "__Host-sp-session=s."+tB)
-	if r.StatusCode != 302 || r.Header.Get("Location") != "https://"+tSignIn+"/-/auth/signed-out" || strings.Join(r.Header.Values("Set-Cookie"), "|") != clear {
+	if r.StatusCode != 302 || r.Header.Get("Location") != "https://"+tSignIn+"/-/auth/signed-out?ended=0" || strings.Join(r.Header.Values("Set-Cookie"), "|") != clear {
 		t.Errorf("foreign session: %d %q", r.StatusCode, r.Header.Values("Set-Cookie"))
 	}
 	// Tickets naming another host, a ref outside the table, too many refs, or on the sign-in host.
@@ -653,9 +653,9 @@ func TestFlow_LogOut_Chains(t *testing.T) {
 	}
 	now := time.Now().Unix()
 	h.now = func() time.Time { return time.Unix(now, 0) } // the controls below are exact to the second
-	tk := func(refs string) string { return fmt.Sprintf("%d.%s", now, refs) }
+	tk := func(refs string) string { return fmt.Sprintf("%d.0.%s", now, refs) }
 	for _, q := range []string{"t=" + tk(tB), "t=" + tk(tA+",dddddddddddddddddddd"), "t=" + tk(""), "t=" + tk(strings.Join(long, ",")),
-		"t=" + tA, fmt.Sprintf("t=%d.%s", now-61, tA), "t=" + tk(tA) + "&t=" + tk(tA), "t=x." + tA} {
+		"t=" + tA, fmt.Sprintf("t=%d.0.%s", now-61, tA), fmt.Sprintf("t=%d.%s", now, tA), "t=" + tk(tA) + "&t=" + tk(tA), "t=x." + tA, "%zz", "t=" + tk(tA) + "&%zz"} {
 		r := tReq(h, "GET", "https://"+a+"/-/auth/logout?"+q, nil, nav("cross-site")...)
 		if r.StatusCode != 400 || r.Header.Get("Location") != "" {
 			t.Errorf("ticket %q: %d", q, r.StatusCode)
@@ -664,27 +664,29 @@ func TestFlow_LogOut_Chains(t *testing.T) {
 	if r := tReq(h, "GET", "https://"+tSignIn+"/-/auth/logout?t="+tk(tA), nil); r.StatusCode != 400 {
 		t.Errorf("ticket on the sign-in host: %d", r.StatusCode)
 	}
-	if r := tReq(h, "GET", "https://"+a+"/-/auth/logout?t="+fmt.Sprintf("%d.%s", now+5, tA), nil); r.StatusCode != 400 {
+	if r := tReq(h, "GET", "https://"+a+"/-/auth/logout?t="+fmt.Sprintf("%d.0.%s", now+5, tA), nil); r.StatusCode != 400 {
 		t.Errorf("ticket from the future: %d", r.StatusCode)
 	}
-	early := func(refs string) string { return fmt.Sprintf("%d.%s", now-30, refs) }
+	early := func(refs string) string { return fmt.Sprintf("%d.0.%s", now-30, refs) }
 	r = tReq(h, "GET", "https://"+a+"/-/auth/logout?t="+early(tA+","+tB), nil)
 	if r.StatusCode != 302 || r.Header.Get("Location") != "https://"+b+"/-/auth/logout?t="+url.QueryEscape(early(tB)) {
 		t.Errorf("control: %d %q (the next ticket keeps the first one's time)", r.StatusCode, r.Header.Get("Location"))
 	}
 }
 
+// Seventeen projects: from one, the chain visits the sixteen others and
+// more stays false.
 func TestFlow_LogOut_ChainCappedAt16(t *testing.T) {
-	var refs []string
-	for i := range 18 {
-		refs = append(refs, fmt.Sprintf("r%019d", i))
-	}
+	refs := manyRefs(17)
 	h := newFlow(tStudio, tIssuer, refs)
 	r := tReq(h, "GET", "https://"+refs[0]+"."+tStudio+"/-/auth/logout", nil, "Cookie", "__Host-sp-session=s."+refs[0])
 	loc, _ := url.Parse(r.Header.Get("Location"))
-	_, list, _ := strings.Cut(loc.Query().Get("t"), ".")
-	if got := strings.Split(list, ","); len(got) != 16 || got[0] != refs[1] || got[15] != refs[16] {
-		t.Fatalf("ticket %v", got)
+	p := strings.SplitN(loc.Query().Get("t"), ".", 3)
+	if got := strings.Split(p[len(p)-1], ","); len(p) != 3 || p[1] != "0" || len(got) != 16 || got[0] != refs[1] || got[15] != refs[16] {
+		t.Fatalf("ticket %q", loc.Query().Get("t"))
+	}
+	if hosts, end := follow(t, h, refs[0]+"."+tStudio, "__Host-sp-session=s."+refs[0]); len(hosts) != 17 || end != "https://"+tSignIn+"/-/auth/signed-out" {
+		t.Fatalf("hops %v, end %q", hosts, end)
 	}
 }
 
@@ -692,7 +694,7 @@ func TestFlow_SignedOut(t *testing.T) {
 	h := tFlow()
 	r := tReq(h, "GET", "https://"+tSignIn+"/-/auth/signed-out", nil, nav("cross-site")...)
 	if r.StatusCode != 200 || r.Header.Get("Set-Cookie") != "__Host-sp-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict" ||
-		!strings.Contains(tBody(t, r), "signed out") {
+		!strings.Contains(tBody(t, r), wSignedOut) {
 		t.Fatalf("signed-out: %d %q", r.StatusCode, r.Header.Values("Set-Cookie"))
 	}
 	if r := tReq(h, "GET", "https://"+tA+"."+tStudio+"/-/auth/signed-out", nil); r.StatusCode != 404 {
@@ -710,7 +712,8 @@ func TestFlow_SameOriginRule(t *testing.T) {
 	}{
 		{"GET", a + "/-/auth/login", []string{"Sec-Fetch-Site", "cross-site", "Sec-Fetch-Mode", "cors"}, 403},
 		{"GET", a + "/-/auth/login", []string{"Sec-Fetch-Site", "same-site", "Sec-Fetch-Mode", "navigate", "Sec-Fetch-Dest", "iframe"}, 403},
-		{"GET", a + "/api/x", nav("cross-site"), 403},
+		{"GET", a + "/api/x", append(nav("cross-site"), "Cookie", "__Host-sp-session=s."+tA), 403},
+		{"GET", a + "/api/x", nav("cross-site"), 302}, // the session first, as rule 5 comes before rule 7
 		{"GET", a + "/-/auth/login", nav("cross-site"), 302},
 		{"GET", a + "/-/auth/login", nil, 302},
 		{"POST", a + "/-/auth/logout", []string{"Sec-Fetch-Site", "cross-site"}, 403},
@@ -788,7 +791,7 @@ func TestFlow_Relay_PostsWithTheClock(t *testing.T) {
 		t.Fatalf("relay action %q", action)
 	}
 	r := tReq(m, "POST", "https://"+tSignIn+"/-/auth/callback", url.Values{"id_token": {"idt.x"}, "state": {st}})
-	if csp := r.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "form-action https://"+tA+"."+tStudio+";") {
+	if csp := r.Header.Get("Content-Security-Policy"); !strings.HasSuffix(csp, "; form-action https://"+tA+"."+tStudio) {
 		t.Errorf("relay form-action: %q", csp)
 	}
 	for _, q := range []string{"", "?at=1", "?at=x", "?at=1&at=2"} {
@@ -1011,7 +1014,7 @@ func TestFlow_LogOut_TicketWindow(t *testing.T) {
 	m.now = func() time.Time { return time.Unix(now, 0) }
 	a := "https://" + tA + "." + tStudio
 	for age, want := range map[int64]int{0: 302, 59: 302, 60: 400, 61: 400} {
-		if r := tReq(m, "GET", a+"/-/auth/logout?t="+fmt.Sprintf("%d.%s", now-age, tA), nil); r.StatusCode != want {
+		if r := tReq(m, "GET", a+"/-/auth/logout?t="+fmt.Sprintf("%d.0.%s", now-age, tA), nil); r.StatusCode != want {
 			t.Errorf("ticket %d s old: %d, want %d", age, r.StatusCode, want)
 		}
 	}
@@ -1023,5 +1026,361 @@ func TestFlow_UnknownRefHost_HSTS(t *testing.T) {
 	r := tReq(tFlow(), "GET", "https://dddddddddddddddddddd."+tStudio+"/", nil)
 	if r.StatusCode != 404 || r.Header.Get("Strict-Transport-Security") != "max-age=31536000" {
 		t.Fatalf("%d %q", r.StatusCode, r.Header.Get("Strict-Transport-Security"))
+	}
+}
+
+// The gateway's words, which the model's pages show as the gateway's do.
+const (
+	wSignedOut = "Log out from a dashboard ends the session of that dashboard, of up to sixteen other projects of yours, and of this sign-in page."
+	wEnded     = "No dashboard session was shown with this log-out, so none was ended. The session of this sign-in page is ended. A session still open on a dashboard is ended by Log out from a page of that dashboard."
+	wMore      = "Sessions on further projects stay valid until they expire or your access is revoked."
+	wUnpresent = "Sign-in completed, and this browser did not send back the session cookie it was given. Allow cookies for this site, then start again."
+)
+
+// refusalCode is the code of a JSON refusal as the gateway writes one, ""
+// for any other answer.
+func refusalCode(t *testing.T, r *http.Response) string {
+	t.Helper()
+	body := tBody(t, r)
+	m := regexp.MustCompile(`^\{"code":"([a-z_]+)"\}$`).FindStringSubmatch(body)
+	if r.Header.Get("Content-Type") != "application/json" || m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+func TestFlow_LogOut_WithoutASession_EndedZero(t *testing.T) {
+	h := tFlow()
+	ended := "https://" + tSignIn + "/-/auth/signed-out?ended=0"
+	for _, c := range []struct{ host, cookie string }{
+		{tA + "." + tStudio, ""}, {tA + "." + tStudio, "__Host-sp-session=s." + tB}, {tA + "." + tStudio, "__Host-sp-session=s." + tA + "; __Host-sp-session=s." + tA},
+		{tSignIn, ""}, {tSignIn, "__Host-sp-session=s." + tA},
+	} {
+		r := tReq(h, "GET", "https://"+c.host+"/-/auth/logout", nil, append(nav("same-origin"), "Cookie", c.cookie)...)
+		if r.StatusCode != 302 || r.Header.Get("Location") != ended {
+			t.Errorf("%s %q: %d %q", c.host, c.cookie, r.StatusCode, r.Header.Get("Location"))
+		}
+	}
+	// Control: with this host's session the chain starts, no ended=0.
+	r := tReq(h, "GET", "https://"+tA+"."+tStudio+"/-/auth/logout", nil, "Cookie", "__Host-sp-session=s."+tA)
+	if loc := r.Header.Get("Location"); r.StatusCode != 302 || !strings.HasPrefix(loc, "https://"+tB+"."+tStudio+"/-/auth/logout?t=") {
+		t.Errorf("control: %d %q", r.StatusCode, loc)
+	}
+}
+
+// follow runs a log-out chain from start with cookie and returns the hosts
+// it visits and the address the last hop redirects to.
+func follow(t *testing.T, h http.Handler, start, cookie string) (hosts []string, end string) {
+	t.Helper()
+	u := "https://" + start + "/-/auth/logout"
+	hdr := append(nav("same-origin"), "Cookie", cookie)
+	for range 40 {
+		pu, _ := url.Parse(u)
+		if pu.Path != "/-/auth/logout" {
+			return hosts, u
+		}
+		hosts = append(hosts, pu.Host)
+		r := tReq(h, "GET", u, nil, hdr...)
+		if r.StatusCode != 302 {
+			t.Fatalf("%s: %d", u, r.StatusCode)
+		}
+		u, hdr = r.Header.Get("Location"), nav("cross-site")
+	}
+	t.Fatal("the chain does not end")
+	return nil, ""
+}
+
+func manyRefs(n int) []string {
+	var refs []string
+	for i := range n {
+		refs = append(refs, fmt.Sprintf("r%019d", i))
+	}
+	return refs
+}
+
+func TestFlow_LogOut_EighteenRefs_MoreAfterSixteen(t *testing.T) {
+	refs := manyRefs(18)
+	h := newFlow(tStudio, tIssuer, refs)
+	r := tReq(h, "GET", "https://"+refs[0]+"."+tStudio+"/-/auth/logout", nil, "Cookie", "__Host-sp-session=s."+refs[0])
+	loc, _ := url.Parse(r.Header.Get("Location"))
+	if p := strings.SplitN(loc.Query().Get("t"), ".", 3); len(p) != 3 || p[1] != "1" || len(strings.Split(p[2], ",")) != 16 {
+		t.Fatalf("the first ticket %q: more and sixteen refs wanted", loc.Query().Get("t"))
+	}
+	hosts, end := follow(t, h, refs[0]+"."+tStudio, "__Host-sp-session=s."+refs[0])
+	if len(hosts) != 17 || hosts[16] != refs[16]+"."+tStudio || end != "https://"+tSignIn+"/-/auth/signed-out?more=1" {
+		t.Fatalf("hops %v, end %q", hosts, end)
+	}
+	// The seventeenth other project is never visited: its session stays.
+	for _, host := range hosts {
+		if host == refs[17]+"."+tStudio {
+			t.Fatalf("the seventeenth visited: %v", hosts)
+		}
+	}
+	// The sign-in host has seventeen others too: the same.
+	if hosts, end := follow(t, newFlow(tStudio, tIssuer, refs[:17]), tSignIn, "__Host-sp-session=s._"); len(hosts) != 17 || end != "https://"+tSignIn+"/-/auth/signed-out?more=1" {
+		t.Errorf("from the sign-in host: hops %v, end %q", hosts, end)
+	}
+	// A hop passes more on; a ticket whose more is not 0 or 1 is refused.
+	now := time.Now().Unix()
+	h.now = func() time.Time { return time.Unix(now, 0) }
+	a := "https://" + refs[1] + "." + tStudio + "/-/auth/logout?t="
+	if r := tReq(h, "GET", a+fmt.Sprintf("%d.1.%s,%s", now, refs[1], refs[2]), nil); r.Header.Get("Location") != "https://"+refs[2]+"."+tStudio+"/-/auth/logout?t="+url.QueryEscape(fmt.Sprintf("%d.1.%s", now, refs[2])) {
+		t.Errorf("hop: %q", r.Header.Get("Location"))
+	}
+	if r := tReq(h, "GET", a+fmt.Sprintf("%d.1.%s", now, refs[1]), nil); r.Header.Get("Location") != "https://"+tSignIn+"/-/auth/signed-out?more=1" {
+		t.Errorf("last hop: %q", r.Header.Get("Location"))
+	}
+	for _, m := range []string{"2", "", "true", "01"} {
+		if r := tReq(h, "GET", a+fmt.Sprintf("%d.%s.%s", now, m, refs[1]), nil); r.StatusCode != 400 {
+			t.Errorf("more %q: %d", m, r.StatusCode)
+		}
+	}
+}
+
+func TestFlow_SignedOut_ThreeSentences(t *testing.T) {
+	h := tFlow()
+	type words struct{ plain, ended, more bool }
+	pages := map[words]string{}
+	for q, want := range map[string]words{
+		"": {true, false, false}, "ended=0": {false, true, false}, "more=1": {true, false, true},
+		"ended=0&more=1": {false, true, true}, "more=1&ended=0&x=1": {false, true, true}, "x=1&more=1": {true, false, true},
+		"&more=1&": {true, false, true}, "ended=0&x=<script>": {false, true, false}, "ended=0&more=2": {false, true, false},
+		"ended=1": {true, false, false}, "more=0": {true, false, false}, "more=1&more=1": {true, false, false},
+		"ended=0&ended=0": {true, false, false}, "MORE=1": {true, false, false}, "more=1;ended=0": {true, false, false},
+		"more%3D1": {true, false, false}, "mor%65=1": {true, false, false}, "more=%31": {true, false, false},
+		"more=01": {true, false, false}, "more": {true, false, false}, "ended": {true, false, false},
+		"ended=0&more=1&more=1": {false, true, false}, "more=1&ended=0&ended=00": {true, false, true},
+	} {
+		u := "https://" + tSignIn + "/-/auth/signed-out"
+		if q != "" {
+			u += "?" + q
+		}
+		r := tReq(h, "GET", u, nil, append(nav("cross-site"), "Cookie", "__Host-sp-session=s._; __Host-sp-login-AAAAAAAAAAA=x")...)
+		body := tBody(t, r)
+		has := func(s string) bool { return strings.Contains(body, ">"+s+"</p>") }
+		if got := (words{has(wSignedOut), has(wEnded), has(wMore)}); r.StatusCode != 200 || got != want {
+			t.Errorf("?%s: %d, sentences %+v, want %+v", q, r.StatusCode, got, want)
+		}
+		if p, ok := pages[want]; ok && p != body {
+			t.Errorf("?%s: not the fixed page of %+v", q, want)
+		}
+		pages[want] = body
+		if got := strings.Join(r.Header.Values("Set-Cookie"), "|"); got != "__Host-sp-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict|__Host-sp-login-AAAAAAAAAAA=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None" {
+			t.Errorf("?%s: Set-Cookie %q", q, got)
+		}
+	}
+	if len(pages) != 4 {
+		t.Fatalf("%d pages, want the four fixed ones", len(pages))
+	}
+}
+
+var (
+	scriptsRE = regexp.MustCompile(`(?s)<script>(.*?)</script>`)
+	stylesRE  = regexp.MustCompile(`(?s)<style>(.*?)</style>`)
+)
+
+func quotedHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+}
+
+func TestFlow_Policy_OneScriptHashPerPage(t *testing.T) {
+	h := tFlow()
+	a := "https://" + tA + "." + tStudio
+	si := "https://" + tSignIn
+	st := "v1." + tA + ".AAAAAAAAAAA.0.Lw"
+	login := tReq(h, "GET", a+"/-/auth/login", nil)
+	cookie := strings.SplitN(login.Header.Get("Set-Cookie"), ";", 2)[0]
+	_, f := tForm(t, tBody(t, tReq(h, "GET", login.Header.Get("Location"), nil)))
+	scripted := 0
+	for _, c := range []struct {
+		name, method, url, formAction string
+		form                          url.Values
+		hdr                           []string
+	}{
+		{"relay", "POST", si + "/-/auth/callback", a, url.Values{"id_token": {"idt.x"}, "state": {st}}, nil},
+		{"session", "POST", a + "/-/auth/session", "'none'", f, []string{"Cookie", cookie}},
+		{"retry", "POST", a + "/-/auth/session", "'none'", url.Values{"id_token": {"idt.x"}, "state": {st}}, nil},
+		{"400 page", "POST", si + "/-/auth/callback", "'none'", url.Values{}, nil},
+		{"405 page", "GET", a + "/-/auth/session", "'none'", nil, nil},
+		{"401 page", "GET", a + "/p", "'none'", nil, append(nav("same-origin"), "Referer", fmt.Sprintf("%s/-/auth/session?at=%d", a, time.Now().Unix()))},
+		{"login redirect", "GET", a + "/-/auth/login", "'none'", nil, nil},
+		{"logout redirect", "GET", a + "/-/auth/logout", "'none'", nil, nil},
+		{"signed out", "GET", si + "/-/auth/signed-out", "'none'", nil, nil},
+		{"picker", "GET", si + "/", "'none'", nil, []string{"Cookie", "__Host-sp-session=s._"}},
+		{"not found", "GET", si + "/x", "'none'", nil, nil},
+		{"login required", "GET", a + "/p", "'none'", nil, []string{"Sec-Fetch-Mode", "cors"}},
+		{"cross origin", "GET", a + "/-/auth/login", "'none'", nil, []string{"Sec-Fetch-Site", "cross-site"}},
+	} {
+		r := tReq(h, c.method, c.url, c.form, c.hdr...)
+		body := tBody(t, r)
+		script, style := "'none'", quotedHash(flowStyle)
+		if m := scriptsRE.FindAllStringSubmatch(body, -1); len(m) == 1 {
+			script = quotedHash(m[0][1])
+			scripted++
+		} else if len(m) > 1 || strings.Count(body, "<script") != len(m) {
+			t.Errorf("%s: more than one script: %s", c.name, body)
+		}
+		if m := stylesRE.FindAllStringSubmatch(body, -1); len(m) > 1 || len(m) == 1 && m[0][1] != flowStyle {
+			t.Errorf("%s: the style %q", c.name, m)
+		} else if len(m) == 0 && strings.HasPrefix(body, "<!doctype") {
+			t.Errorf("%s: a page without the style", c.name)
+		}
+		want := "default-src 'none'; script-src " + script + "; style-src " + style + "; frame-ancestors 'none'; base-uri 'none'; form-action " + c.formAction
+		if got := r.Header.Values("Content-Security-Policy"); len(got) != 1 || got[0] != want {
+			t.Errorf("%s (%d): policy %q, want %q", c.name, r.StatusCode, got, want)
+		}
+	}
+	if scripted != 3 {
+		t.Errorf("%d answers with a script, want the relay, the session and the retry page", scripted)
+	}
+}
+
+func TestFlow_SignInHost_OtherMethods404(t *testing.T) {
+	h := tFlow()
+	si := "https://" + tSignIn
+	session := "__Host-sp-session=s._"
+	if r := tReq(h, "POST", si+"/", url.Values{}, "Cookie", session, "Sec-Fetch-Site", "same-origin"); r.StatusCode != 404 || refusalCode(t, r) != "not_found" {
+		t.Errorf("POST / with a session: %d", r.StatusCode)
+	}
+	for _, p := range []string{"/-/auth/login", "/-/auth/logout", "/-/auth/signed-out", "/"} {
+		if r := tReq(h, "HEAD", si+p, nil, "Cookie", session); r.StatusCode != 404 || r.Header.Get("Location") != "" || len(r.Header.Values("Set-Cookie")) != 0 {
+			t.Errorf("HEAD %s: %d %q", p, r.StatusCode, r.Header.Values("Set-Cookie"))
+		}
+	}
+	a := "https://" + tA + "." + tStudio
+	for _, p := range []string{"/-/auth/login", "/-/auth/logout"} {
+		if r := tReq(h, "HEAD", a+p, nil, "Cookie", "__Host-sp-session=s."+tA); r.StatusCode != 404 {
+			t.Errorf("HEAD %s on a project host: %d", p, r.StatusCode)
+		}
+	}
+	// Control: GET of each.
+	for p, want := range map[string]int{"/-/auth/login": 302, "/-/auth/logout": 302, "/-/auth/signed-out": 200, "/": 200} {
+		if r := tReq(h, "GET", si+p, nil, "Cookie", session); r.StatusCode != want {
+			t.Errorf("GET %s: %d, want %d", p, r.StatusCode, want)
+		}
+	}
+}
+
+func TestFlow_Posts_ReadTheBodyAlone(t *testing.T) {
+	h := tFlow()
+	a := "https://" + tA + "." + tStudio
+	login := tReq(h, "GET", a+"/-/auth/login?return=%2Fp", nil)
+	cookie := strings.SplitN(login.Header.Get("Set-Cookie"), ";", 2)[0]
+	_, f := tForm(t, tBody(t, tReq(h, "GET", login.Header.Get("Location"), nil)))
+	r := tReq(h, "POST", a+"/-/auth/session?at=%zz", f, "Cookie", cookie)
+	if r.StatusCode != 200 || !strings.Contains(strings.Join(r.Header.Values("Set-Cookie"), "|"), "__Host-sp-session=s."+tA+";") {
+		t.Fatalf("session with ?at=%%zz: %d %q", r.StatusCode, r.Header.Values("Set-Cookie"))
+	}
+	st := "v1." + tA + ".AAAAAAAAAAA.0.Lw"
+	if r := tReq(h, "POST", "https://"+tSignIn+"/-/auth/callback?%zz", url.Values{"id_token": {"idt.x"}, "state": {st}}); r.StatusCode != 200 {
+		t.Errorf("callback with ?%%zz: %d", r.StatusCode)
+	}
+	// The fields in the address and not in the body are not read.
+	q := url.Values{"id_token": {"idt.x"}, "state": {st}}.Encode()
+	for _, u := range []string{"https://" + tSignIn + "/-/auth/callback?" + q, a + "/-/auth/session?" + q} {
+		if r := tReq(h, "POST", u, url.Values{}); r.StatusCode != 400 {
+			t.Errorf("%s: %d", u, r.StatusCode)
+		}
+	}
+	// A body that is not a form, or over 16 KiB, is refused.
+	big := url.Values{"id_token": {"idt.x"}, "state": {st}, "x": {strings.Repeat("a", 16<<10)}}
+	if r := tReq(h, "POST", "https://"+tSignIn+"/-/auth/callback", big); r.StatusCode != 400 {
+		t.Errorf("over 16 KiB: %d", r.StatusCode)
+	}
+	// A declared length over the bound is refused unread.
+	decl := httptest.NewRequest("POST", "https://"+tSignIn+"/-/auth/callback", strings.NewReader(q))
+	decl.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	decl.ContentLength = 16<<10 + 1
+	dw := httptest.NewRecorder()
+	h.ServeHTTP(dw, decl)
+	if dw.Code != 400 {
+		t.Errorf("a declared length over 16 KiB: %d", dw.Code)
+	}
+	rq := httptest.NewRequest("POST", "https://"+tSignIn+"/-/auth/callback", strings.NewReader(q))
+	rq.Header.Set("Content-Type", "text/plain")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, rq)
+	if w.Code != 400 {
+		t.Errorf("a text body: %d", w.Code)
+	}
+}
+
+func TestFlow_NotPresented_LinkIsAReturnPath(t *testing.T) {
+	h := tFlow()
+	a := tA + "." + tStudio
+	for target, want := range map[string]string{
+		"/p?x=1":           "/-/auth/login?return=%2Fp%3Fx%3D1",
+		"/api/v1/x?y=1":    "/-/auth/login?return=%2F",
+		"/API/x":           "/-/auth/login?return=%2F",
+		"/p?u=//evil.test": "/-/auth/login?return=%2F",
+	} {
+		r := tReq(h, "GET", "https://"+a+target, nil, append(nav("same-origin"), "Referer", fmt.Sprintf("https://%s/-/auth/session?at=%d", a, time.Now().Unix()))...)
+		body := tBody(t, r)
+		m := regexp.MustCompile(`<a href="([^"]*)">`).FindAllStringSubmatch(body, -1)
+		if r.StatusCode != 401 || !strings.Contains(body, wUnpresent) || len(m) != 1 || strings.ReplaceAll(m[0][1], "&amp;", "&") != want {
+			t.Errorf("%s: %d, links %q, want %q", target, r.StatusCode, m, want)
+		}
+	}
+}
+
+func TestFlow_Refusals_AsTheGateway(t *testing.T) {
+	h := tFlow()
+	a := "https://" + tA + "." + tStudio
+	si := "https://" + tSignIn
+	for _, c := range []struct {
+		name, url, code string
+		status          int
+		hdr             []string
+	}{
+		{"cross origin, sign-in seam", a + "/-/auth/login", "cross_origin", 403, []string{"Sec-Fetch-Site", "cross-site", "Sec-Fetch-Mode", "cors"}},
+		{"cross origin, a project's API", a + "/api/x", "cross_origin", 403, append(nav("cross-site"), "Cookie", "__Host-sp-session=s."+tA)},
+		{"cross origin, the API in capitals", a + "/API/x", "cross_origin", 403, append(nav("cross-site"), "Cookie", "__Host-sp-session=s."+tA)},
+		{"cross origin, the picker", si + "/", "cross_origin", 403, []string{"Sec-Fetch-Site", "same-site", "Cookie", "__Host-sp-session=s._"}},
+		{"not found, sign-in host", si + "/x", "not_found", 404, nil},
+		{"not found, under /-/auth/", a + "/-/auth/none", "not_found", 404, nil},
+		{"not found, the callback on a project host", a + "/-/auth/callback", "not_found", 404, nil},
+		{"not found, a ref outside the table", "https://dddddddddddddddddddd." + tStudio + "/", "not_found", 404, nil},
+		{"not found, the studio domain", "https://" + tStudio + "/x", "not_found", 404, nil},
+		{"login required, a project host", a + "/p", "login_required", 401, []string{"Sec-Fetch-Mode", "cors"}},
+		{"login required, the picker", si + "/", "login_required", 401, []string{"Accept", "application/json"}},
+	} {
+		r := tReq(h, "GET", c.url, nil, c.hdr...)
+		if got := refusalCode(t, r); r.StatusCode != c.status || got != c.code {
+			t.Errorf("%s: %d %q, want %d %q", c.name, r.StatusCode, got, c.status, c.code)
+		}
+	}
+	// Without a session a project page is first a sign-in, whatever the site.
+	if r := tReq(h, "GET", a+"/api/x", nil, nav("cross-site")...); r.StatusCode != 302 {
+		t.Errorf("cross-site navigation without a session: %d", r.StatusCode)
+	}
+	// Accept is read in any letter case.
+	for _, accept := range []string{"text/html", "TEXT/HTML", "Text/Html;q=0.9"} {
+		if r := tReq(h, "GET", a+"/p", nil, "Accept", accept); r.StatusCode != 302 {
+			t.Errorf("Accept %q: %d", accept, r.StatusCode)
+		}
+	}
+	// A state whose path is not written in its one spelling is refused, at the
+	// callback and at the session endpoint.
+	pre := "v1." + tA + ".AAAAAAAAAAA.0."
+	for _, st := range []string{pre + "Lx", pre + "L2F", pre + "Lw\n", pre + "Lw\r", pre, pre + "Lw=", pre + "L w"} {
+		f := url.Values{"id_token": {"idt.x"}, "state": {st}}
+		if r := tReq(h, "POST", si+"/-/auth/callback", f); r.StatusCode != 400 {
+			t.Errorf("callback, state %q: %d", st, r.StatusCode)
+		}
+		if r := tReq(h, "POST", a+"/-/auth/session", f); r.StatusCode != 400 {
+			t.Errorf("session, state %q: %d", st, r.StatusCode)
+		}
+	}
+	// The attempt's cookie counts only holding a secret of 43 characters:
+	// another value is a binding failure, whatever the token.
+	st := pre + "Lw"
+	if r := tReq(h, "POST", a+"/-/auth/session", url.Values{"id_token": {"idt." + nonceOf("short")}, "state": {st}}, "Cookie", loginPrefix+"AAAAAAAAAAA=short"); r.StatusCode != 200 || !strings.Contains(tBody(t, r), "retry=1") {
+		t.Errorf("a cookie that holds no secret: %d", r.StatusCode)
+	}
+
+	// Control: the spelling that is the path's.
+	if r := tReq(h, "POST", si+"/-/auth/callback", url.Values{"id_token": {"idt.x"}, "state": {pre + "L2E"}}); r.StatusCode != 200 {
+		t.Errorf("control: %d", r.StatusCode)
 	}
 }

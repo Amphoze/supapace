@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -41,9 +42,10 @@ type Dashboard struct {
 	slots chan struct{} // dashboard requests in flight, node-wide
 
 	mu       sync.Mutex
-	byRef    map[string]int       // dashboard requests in flight per ref; no zero entries
-	refused  map[string]*[5]int64 // refusals of rules 0 to 4 per ref ("_": the sign-in host) since the last log line
-	projects int                  // GatewayDashProject
+	byRef    map[string]int                   // dashboard requests in flight per ref; no zero entries
+	refused  map[string]*[5]int64             // refusals of rules 0 to 4 per ref ("_": the sign-in host) since the last log line
+	signIns  map[string]*[nSignInCauses]int64 // the sign-in seam's answers per ref and cause, the same way
+	projects int                              // GatewayDashProject
 }
 
 // dashRequest is what the sign-in and forwarding handlers get of a request
@@ -83,7 +85,7 @@ func LoadDashboard(dir string) *Dashboard {
 	}
 	l := dashcfg.Limits
 	d := &Dashboard{slots: make(chan struct{}, l.GatewayDashNode), byRef: map[string]int{},
-		refused: map[string]*[5]int64{}, projects: l.GatewayDashProject}
+		refused: map[string]*[5]int64{}, signIns: map[string]*[nSignInCauses]int64{}, projects: l.GatewayDashProject}
 	if d.broken = d.load(dir, b, err); d.broken != nil {
 		log.Printf("gateway: dashboard unavailable until restarted, project API served: %v", d.broken)
 		return d
@@ -203,22 +205,61 @@ func (d *Dashboard) count(ref string, n int) {
 	c[n]++
 }
 
+// signInCause is why the sign-in seam answered as it did, for the answers
+// that are counted. The causes are a fixed list: nothing of a request names
+// one.
+type signInCause int
+
+const (
+	causeOK             signInCause = iota // a session cookie set
+	causeState                             // a state that does not parse, or names another or no host
+	causeBinding                           // the attempt's cookie absent, doubled or no secret; the nonce
+	causeTokenKey                          // no or an unknown or doubled key id, another algorithm, a key of another class
+	causeTokenSignature                    // the signature
+	causeTokenClaim                        // iss, aud, azp or sub
+	causeTokenTime                         // expired, too old, not yet valid
+	causeTokenForm                         // a field or body the posts refuse; a token that does not parse
+	causeIssuerError                       // the callback's error field present, its value never read
+	causeTicket                            // a log-out query or ticket refused
+	causeCrossOrigin                       // the same-origin rule's 403
+	causeNotPresented                      // a session cookie set and not sent back
+	nSignInCauses
+)
+
+var signInCauseNames = [nSignInCauses]string{"ok", "state", "binding", "token_key", "token_signature", "token_claim",
+	"token_time", "token_form", "issuer_error", "ticket", "cross_origin", "not_presented"}
+
+// countSignIn records an answer of the sign-in seam for ref by its cause.
+func (d *Dashboard) countSignIn(ref string, c signInCause) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := d.signIns[ref]
+	if n == nil {
+		n = new([nSignInCauses]int64)
+		d.signIns[ref] = n
+	}
+	n[c]++
+}
+
 // logRefusals writes one line per ref with its counts of refusals of rules 0
-// to 4 since the last call, and resets them. Those refusals are not logged
-// per request, so a flood of refused paths cannot fill the log.
+// to 4 since the last call, and one per ref with its sign-in answers by
+// cause, and resets them. Neither is logged per request, so a flood of
+// refused requests cannot fill the log. A ref with no counts writes no line.
 func (d *Dashboard) logRefusals() {
 	d.mu.Lock()
-	counts := d.refused
-	d.refused = map[string]*[5]int64{}
+	counts, signIns := d.refused, d.signIns
+	d.refused, d.signIns = map[string]*[5]int64{}, map[string]*[nSignInCauses]int64{}
 	d.mu.Unlock()
-	refs := make([]string, 0, len(counts))
-	for ref := range counts {
-		refs = append(refs, ref)
-	}
-	slices.Sort(refs)
-	for _, ref := range refs {
+	for _, ref := range slices.Sorted(maps.Keys(counts)) {
 		c := counts[ref]
 		log.Printf("gateway: dashboard refusals in the last minute: ref %s: rule0 %d rule2 %d rule3 %d rule4 %d", ref, c[0], c[2], c[3], c[4])
+	}
+	for _, ref := range slices.Sorted(maps.Keys(signIns)) {
+		var b strings.Builder
+		for i, n := range signIns[ref] {
+			fmt.Fprintf(&b, " %s %d", signInCauseNames[i], n)
+		}
+		log.Printf("gateway: dashboard sign-in in the last minute: ref %s:%s", ref, b.String())
 	}
 }
 

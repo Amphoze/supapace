@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1890,4 +1891,360 @@ func TestSession_AnotherPrincipalsAttemptNeverSignsIn(t *testing.T) {
 	noSession("their pair on another host", w)
 	// Control: with their cookie, on their host, the pair is theirs.
 	e.signedIn(t, "control", e.sessionPost(t, dhostA, token, theirs.state, theirs.cookie), theirs, refA, subDevA)
+}
+
+// signInLines runs the minute's log and returns its sign-in lines by ref:
+// what follows "ref <ref>:". Any other line but the rule counts' fails.
+func (e *authEnv) signInLines(t *testing.T) map[string]string {
+	t.Helper()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(io.Discard)
+	e.d.logRefusals()
+	out := map[string]string{}
+	lineRE := regexp.MustCompile(`gateway: dashboard sign-in in the last minute: ref (_|[a-z0-9]{20}):((?: [a-z_]+ [0-9]+)+)$`)
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if l == "" || strings.Contains(l, "gateway: dashboard refusals in the last minute: ") {
+			continue
+		}
+		m := lineRE.FindStringSubmatch(l)
+		if m == nil {
+			t.Fatalf("not a sign-in line: %q", l)
+		}
+		if _, ok := out[m[1]]; ok {
+			t.Fatalf("two lines for ref %s: %q", m[1], buf.String())
+		}
+		out[m[1]] = m[2]
+	}
+	return out
+}
+
+// countsOf is the sign-in line's counts with the causes given n times each.
+func countsOf(n map[string]int) string {
+	var b strings.Builder
+	for _, c := range []string{"ok", "state", "binding", "token_key", "token_signature", "token_claim", "token_time",
+		"token_form", "issuer_error", "ticket", "cross_origin", "not_presented"} {
+		fmt.Fprintf(&b, " %s %d", c, n[c])
+	}
+	return b.String()
+}
+
+// rawToken is a token of three parts from a header and a payload as written,
+// signed by s.
+func rawToken(t *testing.T, s signer, header, payload string) string {
+	t.Helper()
+	b := base64.RawURLEncoding.EncodeToString
+	return resign(t, s, b([]byte(header)), b([]byte(payload)))
+}
+
+func TestSignInCounts_OneLineAMinutePerRef_ByCause(t *testing.T) {
+	e := newAuthEnv(t)
+	a, _, _ := keys()
+	other := newSigner()
+	if got := e.signInLines(t); len(got) != 0 {
+		t.Fatalf("a line before any answer: %v", got)
+	}
+	// session posts a token of at's attempt with at's cookie (or cookie) to host.
+	tokenFor := func(at attemptT, mod func(map[string]any)) string {
+		c := idClaims(subOwnerA, at.nonce)
+		if mod != nil {
+			mod(c)
+		}
+		return idToken(t, issuerSigner, c)
+	}
+	mark := func(host string) string {
+		return "https://" + host + "/-/auth/session?at=" + strconv.FormatInt(time.Now().Unix()-5, 10)
+	}
+	now := time.Now().Unix()
+	cases := []struct {
+		cause, ref string
+		do         func()
+	}{
+		{"ok", refA, func() {
+			at := e.login(t, dhostA, "")
+			e.signedIn(t, "ok", e.sessionPost(t, dhostA, goodToken(t, at), at.state, at.cookie), at, refA, subOwnerA)
+		}},
+		{"ok", "_", func() {
+			at := e.login(t, signInH, "")
+			e.signedIn(t, "ok, sign-in host", e.sessionPost(t, signInH, goodToken(t, at), at.state, at.cookie), at, "_", subOwnerA)
+		}},
+		{"state", refB, func() { // a state of another host, counted on the host it was posted to
+			at := e.login(t, dhostA, "")
+			refusal(t, "state", e.sessionPost(t, dhostB, goodToken(t, at), at.state, at.cookie), 400, textDidNotComplete)
+		}},
+		{"state", refA, func() { // a state that does not parse
+			at := e.login(t, dhostA, "")
+			refusal(t, "state", e.sessionPost(t, dhostA, goodToken(t, at), "v1.x", at.cookie), 400, textDidNotComplete)
+		}},
+		{"state", "_", func() { // at the callback: a target outside the table
+			refusal(t, "callback state", e.ask(t, post(signInH, "/-/auth/callback", form("x", "v1."+refD+".AAAAAAAAAAA.0.Lw"))), 400, textDidNotComplete)
+		}},
+		{"binding", refA, func() { // n 0: the retry page
+			at := e.login(t, dhostA, "")
+			retried(t, "binding", e.sessionPost(t, dhostA, goodToken(t, at), at.state, ""))
+		}},
+		{"binding", refA, func() { // n 1: the nonce, the final page
+			at := e.login(t, dhostA, "?retry=1")
+			tok := idToken(t, issuerSigner, idClaims(subOwnerA, "x"+at.nonce))
+			refusal(t, "nonce", e.sessionPost(t, dhostA, tok, at.state, at.cookie), 401, textFailed)
+		}},
+		{"binding", refA, func() { // n 1: no login cookie at all
+			at := e.login(t, dhostA, "?retry=1")
+			refusal(t, "no cookie", e.sessionPost(t, dhostA, goodToken(t, at), at.state, ""), 401, textNoCookie)
+		}},
+		{"binding", refA, func() { // a value that is no secret
+			at := e.login(t, dhostA, "")
+			retried(t, "no secret", e.sessionPost(t, dhostA, goodToken(t, at), at.state, at.name+"=short"))
+		}},
+		{"token_key", refA, func() {
+			at := e.login(t, dhostA, "")
+			refusal(t, "unknown key", e.sessionPost(t, dhostA, idToken(t, other, idClaims(subOwnerA, at.nonce)), at.state, at.cookie), 401, textFailed)
+		}},
+		{"token_signature", refA, func() {
+			at := e.login(t, dhostA, "")
+			refusal(t, "signature", e.sessionPost(t, dhostA, flipSig(goodToken(t, at)), at.state, at.cookie), 401, textFailed)
+		}},
+		{"token_claim", refA, func() {
+			at := e.login(t, dhostA, "")
+			refusal(t, "claim", e.sessionPost(t, dhostA, tokenFor(at, func(c map[string]any) { c["aud"] = "other" }), at.state, at.cookie), 401, textFailed)
+		}},
+		{"token_time", refA, func() {
+			at := e.login(t, dhostA, "")
+			refusal(t, "time", e.sessionPost(t, dhostA, tokenFor(at, func(c map[string]any) { c["exp"] = now - 61 }), at.state, at.cookie), 401, textFailed)
+		}},
+		{"token_form", refA, func() { // a token that does not parse
+			at := e.login(t, dhostA, "")
+			refusal(t, "form", e.sessionPost(t, dhostA, "x.y.z", at.state, at.cookie), 401, textFailed)
+		}},
+		{"token_form", refA, func() { // a body the post refuses
+			refusal(t, "body", e.ask(t, post(dhostA, "/-/auth/session", "id_token=a&id_token=b&state=v1.x")), 400, textDidNotComplete)
+		}},
+		{"token_form", "_", func() { // the callback: no token field
+			refusal(t, "callback form", e.ask(t, post(signInH, "/-/auth/callback", "state=v1."+refA+".AAAAAAAAAAA.0.Lw")), 400, textDidNotComplete)
+		}},
+		{"token_form", "_", func() { // the callback: a token outside its alphabet
+			refusal(t, "callback alphabet", e.ask(t, post(signInH, "/-/auth/callback", form("a+b", "v1."+refA+".AAAAAAAAAAA.0.Lw"))), 400, textDidNotComplete)
+		}},
+		{"issuer_error", "_", func() { // the issuer's error answer has no token
+			refusal(t, "issuer error", e.ask(t, post(signInH, "/-/auth/callback", "error=access_denied&state=v1."+refA+".AAAAAAAAAAA.0.Lw")), 400, textDidNotComplete)
+		}},
+		{"issuer_error", "_", func() { // and with one, it is the error that counts
+			refusal(t, "issuer error, token", e.ask(t, post(signInH, "/-/auth/callback", form("x", "v1.x")+"&error=x")), 400, textDidNotComplete)
+		}},
+		{"ticket", refA, func() {
+			refusal(t, "ticket", e.ask(t, get(dhostA, "/-/auth/logout?t=x")), 400, textBadTicket)
+		}},
+		{"ticket", "_", func() { // a query that does not parse
+			refusal(t, "logout query", e.ask(t, get(signInH, "/-/auth/logout?%zz")), 400, textBadTicket)
+		}},
+		{"cross_origin", refA, func() {
+			if w := e.ask(t, get(dhostA, "/-/auth/login", "Sec-Fetch-Site", "cross-site", "Sec-Fetch-Mode", "cors")); w.Code != 403 || code(w) != "cross_origin" {
+				t.Errorf("cross origin: %d %s", w.Code, w.Body)
+			}
+		}},
+		{"not_presented", refA, func() {
+			refusal(t, "not presented", e.ask(t, get(dhostA, "/p", append(navTo("same-origin"), "Referer", mark(dhostA))...)), 401, textUnpresented)
+		}},
+		{"not_presented", "_", func() {
+			refusal(t, "picker", e.ask(t, get(signInH, "/", append(navTo("same-origin"), "Referer", mark(signInH))...)), 401, textUnpresented)
+		}},
+	}
+	for _, c := range cases {
+		c.do()
+		if got := e.signInLines(t); len(got) != 1 || got[c.ref] != countsOf(map[string]int{c.cause: 1}) {
+			t.Errorf("%s on %s: lines %v", c.cause, c.ref, got)
+		}
+	}
+	// Every token error, under its cause, through the session endpoint.
+	b := base64.RawURLEncoding.EncodeToString
+	for name, c := range map[string]struct {
+		cause string
+		tok   func(at attemptT) string
+	}{
+		"no key id": {"token_key", func(at attemptT) string { return rawToken(t, issuerSigner, `{"alg":"RS256"}`, `{}`) }},
+		"another algorithm": {"token_key", func(at attemptT) string {
+			return b([]byte(`{"alg":"HS256","kid":"k"}`)) + "." + b([]byte(`{}`)) + ".AA"
+		}},
+		"a project's key, not the table's": {"token_key", func(at attemptT) string { return idToken(t, a.svc, idClaims(subOwnerA, at.nonce)) }},
+		"a wrong issuer":                   {"token_claim", func(at attemptT) string { return tokenFor(at, func(c map[string]any) { c["iss"] = "x" }) }},
+		"no subject":                       {"token_claim", func(at attemptT) string { return tokenFor(at, func(c map[string]any) { delete(c, "sub") }) }},
+		"issued too long ago":              {"token_time", func(at attemptT) string { return tokenFor(at, func(c map[string]any) { c["iat"] = now - 700 }) }},
+		"not yet valid":                    {"token_time", func(at attemptT) string { return tokenFor(at, func(c map[string]any) { c["nbf"] = now + 120 }) }},
+		"issued in the future": {"token_time", func(at attemptT) string {
+			return tokenFor(at, func(c map[string]any) { c["iat"] = now + 120 })
+		}},
+		"a doubled member": {"token_form", func(at attemptT) string {
+			return rawToken(t, issuerSigner, `{"alg":"RS256","kid":"`+issuerSigner.kid+`"}`, `{"sub":"a","sub":"b"}`)
+		}},
+		"a name not text": {"token_form", func(at attemptT) string { return tokenFor(at, func(c map[string]any) { c["name"] = 7 }) }},
+	} {
+		at := e.login(t, dhostA, "")
+		refusal(t, name, e.sessionPost(t, dhostA, c.tok(at), at.state, at.cookie), 401, textFailed)
+		if got := e.signInLines(t); got[refA] != countsOf(map[string]int{c.cause: 1}) || len(got) != 1 {
+			t.Errorf("%s: lines %v, want %s 1", name, got, c.cause)
+		}
+	}
+
+	// Every key the table gives is a dashboard key, so a key of another class
+	// is not reached through the handler: its cause is checked here.
+	if tokenCause(jwtx.ErrKey) != causeTokenKey || tokenCause(fmt.Errorf("wrapped: %w", jwtx.ErrClaim)) != causeTokenClaim {
+		t.Error("ErrKey, or a wrapped error, under another cause")
+	}
+
+	// Not counted: the login's redirect, 404, 405, 503, 401 login_required,
+	// the log-out chain's redirects, the signed-out page; the picker's page
+	// and its redirect.
+	e.login(t, dhostA, "")
+	e.ask(t, get(dhostA, "/-/auth/none"))
+	e.ask(t, get(signInH, "/x"))
+	e.ask(t, get(dhostA, "/-/auth/session"))
+	e.ask(t, get(signInH, "/", "Sec-Fetch-Mode", "cors"))
+	e.ask(t, get(signInH, "/", navTo("same-origin")...))
+	e.ask(t, get(signInH, "/", "Cookie", e.sessionOf(t, "_", subOwnerA)))
+	e.setTable(t, func(f *dashfile.File) { member(f, subOwnerA, refB) })
+	if _, end := e.chain(t, dhostA, e.sessionOf(t, refA, subOwnerA)); end.Code != 200 {
+		t.Fatalf("the chain ends with %d", end.Code)
+	}
+	e.chain(t, dhostA, "")
+	e.ask(t, get(signInH, "/-/auth/signed-out?more=1"))
+	e.setTable(t, func(f *dashfile.File) { f.Issuer.AuthorizeURL = "http://issuer.test/authorize" })
+	e.ask(t, get(dhostA, "/-/auth/login"))
+	e.setTable(t, func(f *dashfile.File) { f.Issuer = nil })
+	e.ask(t, post(signInH, "/-/auth/callback", ""))
+	if got := e.signInLines(t); len(got) != 0 {
+		t.Errorf("answers that are not counted were: %v", got)
+	}
+	// Two refs in one minute: a line each, and no line for a ref without one.
+	e.setTable(t, nil)
+	e.ask(t, get(dhostA, "/-/auth/logout?t=x"))
+	e.ask(t, get(dhostA, "/-/auth/logout?t=y"))
+	e.ask(t, post(signInH, "/-/auth/callback", ""))
+	if got := e.signInLines(t); len(got) != 2 || got[refA] != countsOf(map[string]int{"ticket": 2}) || got["_"] != countsOf(map[string]int{"token_form": 1}) {
+		t.Errorf("two refs: %v", got)
+	}
+}
+
+func TestSignInCounts_NoByteOfARequest(t *testing.T) {
+	e := newAuthEnv(t)
+	const mk = "Qz7mark"
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+	var sent []string // every value of a request that carried the marker
+	at := e.login(t, dhostA, "?return="+url.QueryEscape("/"+mk))
+	c := idClaims(mk+"sub", mk+"nonce")
+	tok := idToken(t, issuerSigner, c)
+	loginCookie := at.name + "=" + mk + strings.Repeat("A", 43-len(mk))
+	session := sessionCookie + "=" + mk + "session"
+	state := withPath(at.state, "/"+mk+"path")
+	sent = append(sent, tok, loginCookie, session, state, "/"+mk+"path", mk+"sub", mk+"nonce", mk+"error")
+	for _, r := range []*http.Request{
+		post(dhostA, "/-/auth/session", form(tok, state), "Cookie", loginCookie+"; "+session), // token: the nonce
+		post(dhostA, "/-/auth/session", form(tok, state), "Cookie", session),                  // binding
+		post(dhostA, "/-/auth/session", form(mk+"tok", state), "Cookie", loginCookie),         // token_form
+		post(dhostA, "/-/auth/session", form(tok, "v1."+mk), "Cookie", loginCookie),           // state
+		post(signInH, "/-/auth/callback", form(tok, state)+"&error="+mk+"error"),              // issuer_error
+		post(signInH, "/-/auth/callback", form(tok, "v1."+mk)),                                // state
+		get(dhostA, "/-/auth/logout?t="+mk, "Cookie", session),                                // ticket
+		get(dhostA, "/-/auth/login?"+mk, "Sec-Fetch-Site", "cross-site", "Cookie", session),   // cross_origin
+		get(dhostA, "/"+mk, append(navTo("same-origin"), "Cookie", session, "Referer",
+			"https://"+dhostA+"/-/auth/session?at="+strconv.FormatInt(time.Now().Unix(), 10))...), // not_presented
+	} {
+		e.ask(t, r)
+	}
+	// And one that signs in: the subject and the name carry the marker.
+	at = e.login(t, dhostA, "?return="+url.QueryEscape("/"+mk))
+	c = idClaims(mk+"sub", at.nonce)
+	c["name"] = mk + "name"
+	e.signedIn(t, "signed in", e.sessionPost(t, dhostA, idToken(t, issuerSigner, c), at.state, at.cookie), at, refA, mk+"sub")
+	if buf.Len() != 0 {
+		t.Fatalf("logged per request: %q", buf.String())
+	}
+	e.d.logRefusals()
+	line := buf.String()
+	want := countsOf(map[string]int{"ok": 1, "state": 1, "binding": 2, "token_form": 1, "ticket": 1, "cross_origin": 1, "not_presented": 1})
+	wantSignIn := countsOf(map[string]int{"state": 1, "issuer_error": 1})
+	if strings.Count(line, "\n") != 2 || !strings.Contains(line, "ref "+refA+":"+want+"\n") || !strings.Contains(line, "ref _:"+wantSignIn+"\n") {
+		t.Fatalf("the lines: %q, want ref %s:%s and ref _:%s", line, refA, want, wantSignIn)
+	}
+	for _, s := range append(sent, mk) {
+		if strings.Contains(line, s) {
+			t.Errorf("the line holds %q: %q", s, line)
+		}
+	}
+}
+
+func TestSignInCounts_NoLinePerRequest(t *testing.T) {
+	e := newAuthEnv(t)
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+	for i := 0; i < 10000; i++ {
+		if w := e.do(post(signInH, "/-/auth/callback", "")); w.Code != 400 {
+			t.Fatalf("post %d: %d", i, w.Code)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("logged per request: %.300q", buf.String())
+	}
+	e.d.logRefusals()
+	if got := strings.Split(strings.TrimSpace(buf.String()), "\n"); len(got) != 1 ||
+		!strings.HasSuffix(got[0], "gateway: dashboard sign-in in the last minute: ref _:"+countsOf(map[string]int{"token_form": 10000})) {
+		t.Fatalf("lines %q", got)
+	}
+}
+
+func TestSignInCounts_RelayAndHostsOutsideTheTableUncounted(t *testing.T) {
+	e := newAuthEnv(t)
+	// The relay page is the callback's answer that passes: not counted.
+	if w := e.do(post(signInH, "/-/auth/callback", form("x", "v1."+refA+".AAAAAAAAAAA.0.Lw"))); w.Code != 200 {
+		t.Fatalf("relay: %d", w.Code)
+	}
+	// A host whose ref is not in the table counts nothing, whatever it asks.
+	e.setTable(t, func(f *dashfile.File) { delete(f.Projects, refA) })
+	for _, host := range []string{dhostA, hostOf(refD)} {
+		e.do(get(host, "/-/auth/logout?t=x"))
+		e.do(post(host, "/-/auth/session", "id_token=a&id_token=b"))
+		e.do(get(host, "/-/auth/login", "Sec-Fetch-Site", "cross-site"))
+		e.do(get(host, "/p", append(navTo("same-origin"), "Referer", "https://"+host+"/-/auth/session?at="+strconv.FormatInt(time.Now().Unix(), 10))...))
+	}
+	if got := e.signInLines(t); len(got) != 0 {
+		t.Errorf("lines %v, want none", got)
+	}
+}
+
+// stallWriter blocks every write until release is closed and reports the
+// first on entered.
+type stallWriter struct{ entered, release chan struct{} }
+
+func (s stallWriter) Write(p []byte) (int, error) {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return len(p), nil
+}
+
+func TestSignInCounts_LogWriteHoldsNoLockARequestTakes(t *testing.T) {
+	e := newAuthEnv(t)
+	e.do(post(signInH, "/-/auth/callback", ""))
+	sw := stallWriter{make(chan struct{}, 1), make(chan struct{})}
+	log.SetOutput(sw)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+	done := make(chan struct{})
+	go func() { e.d.logRefusals(); close(done) }()
+	<-sw.entered // the minute's line is being written, and does not finish
+	answered := make(chan int, 1)
+	go func() { answered <- e.do(post(signInH, "/-/auth/callback", "")).Code }()
+	select {
+	case code := <-answered:
+		if code != 400 {
+			t.Errorf("refused post: %d", code)
+		}
+	case <-time.After(30 * time.Second):
+		t.Error("a refused post waited on the minute's log write")
+	}
+	close(sw.release)
+	<-done
 }

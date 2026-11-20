@@ -649,13 +649,17 @@ func TestBrowsers_FlowModel_LogOut(t *testing.T) {
 		// navigation. A navigation the harness types (page.goto) is not
 		// same-origin in every engine — WebKit sends no Strict cookie on it
 		// once the tab is on another site — and would start without a session.
-		for _, start := range []string{m.host(refs[1]), m.signIn} {
+		// From a project origin the chain visits the sixteen other projects and
+		// ends bare; from the sign-in host it has seventeen others, visits the
+		// first sixteen and ends with more=1.
+		for _, c := range []struct{ start, end string }{{m.host(refs[1]), signedOut}, {m.signIn, signedOut + "?more=1"}} {
+			start, end := c.start, c.end
 			t.Run("from_"+strings.SplitN(start, ".", 2)[0], func(t *testing.T) {
 				p := "https://" + start + "/"
 				steps := append(signInAll(), // the jar at 12
 					step{"op": "goto", "url": p}, step{"op": "wait", "url": p}, step{"op": "requests"},
 					step{"op": "eval", "expr": `location.assign("/-/auth/logout")`},
-					step{"op": "wait", "url": signedOut}, secureStep(0), textStep(0), step{"op": "cookies"}, step{"op": "requests"})
+					step{"op": "wait", "url": end}, secureStep(0), textStep(0), step{"op": "cookies"}, step{"op": "requests"})
 				jar := len(steps) - 2
 				for _, h := range all {
 					steps = append(steps, step{"op": "goto", "url": "https://" + h + "/"}, step{"op": "wait", "url": "https://" + h + "/"})
@@ -684,9 +688,9 @@ func TestBrowsers_FlowModel_LogOut(t *testing.T) {
 		t.Run("without_a_session", func(t *testing.T) {
 			r := runScenario(t, m.scenario(engine, true, tail(
 				step{"op": "goto", "url": "https://" + m.host(refs[0]) + "/-/auth/logout"},
-				step{"op": "wait", "url": signedOut}, secureStep(0), textStep(0))...))
+				step{"op": "wait", "url": signedOut + "?ended=0"}, secureStep(0), textStep(0))...))
 			ends(t, m, r)
-			if txt := r.Steps[3]["value"]; txt != "signed out" {
+			if txt, _ := r.Steps[3]["value"].(string); !strings.HasPrefix(txt, "No dashboard session was shown with this log-out, so none was ended.") {
 				t.Errorf("page %v", txt)
 			}
 		})
@@ -697,7 +701,7 @@ func TestBrowsers_FlowModel_LogOut(t *testing.T) {
 			r := runScenario(t, m.scenario(engine, true, tail(
 				step{"op": "goto", "url": p}, step{"op": "wait", "url": p},
 				step{"op": "goto", "url": "https://" + issuerHost + "/link?to=" + url.QueryEscape(p+"-/auth/logout")},
-				step{"op": "click", "selector": "#go"}, step{"op": "wait", "url": signedOut}, secureStep(0))...))
+				step{"op": "click", "selector": "#go"}, step{"op": "wait", "url": signedOut + "?ended=0"}, secureStep(0))...))
 			cs, _ := ends(t, m, r)
 			checkSession(t, cs, m.host(refs[0]))
 		})
