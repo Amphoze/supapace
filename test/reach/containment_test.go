@@ -36,11 +36,27 @@ const (
 	bootCount    = "/var/lib/sp/boot/count" // the harness node's boot counter, rewritten first at every boot
 )
 
-// phaseBMounts are the mount targets the platform gives a running cluster.
-var phaseBMounts = []string{
-	"/var/lib/postgresql/data", "/var/run/postgresql", "/etc/passwd", "/etc/group",
-	"/etc/postgresql-custom/pgsodium_root.key", includeDir, "/etc/postgresql-custom/supautils.conf",
-	"/etc/postgresql/pg_hba.conf", "/etc/postgresql/pg_ident.conf", "/opt/supapace/tools",
+// phaseBMounts are the mount targets the platform gives a running cluster of
+// layout; layout 2 adds the archive spool and the restore spool.
+func phaseBMounts(layout int) []string {
+	m := []string{
+		"/var/lib/postgresql/data", "/var/run/postgresql", "/etc/passwd", "/etc/group",
+		"/etc/postgresql-custom/pgsodium_root.key", includeDir, "/etc/postgresql-custom/supautils.conf",
+		"/etc/postgresql/pg_hba.conf", "/etc/postgresql/pg_ident.conf", "/opt/supapace/tools",
+	}
+	if layout == 2 {
+		m = append(m, "/opt/supapace/spool", "/opt/supapace/rspool")
+	}
+	return m
+}
+
+// writableClusterMounts are the cluster's read-write mounts at layout.
+func writableClusterMounts(layout int) []string {
+	m := []string{"/var/lib/postgresql/data", "/var/run/postgresql"}
+	if layout == 2 {
+		m = append(m, "/opt/supapace/spool", "/opt/supapace/rspool")
+	}
+	return m
 }
 
 func pgName(p Project) string   { return "pg-" + p.Ref }
@@ -720,7 +736,7 @@ func TestReach06_Container(t *testing.T) {
 	})
 
 	t.Run("read_write_mounts", func(t *testing.T) {
-		writableMounts(t, pgA, []string{"/var/lib/postgresql/data", "/var/run/postgresql"})
+		writableMounts(t, pgA, writableClusterMounts(nodeLayout(t)))
 		writableMounts(t, restA, nil)
 	})
 
@@ -759,7 +775,7 @@ func onlyProjectFiles(t *testing.T, A, B Project) {
 	spid, _ := containerPid(t, scratch)
 
 	want := slices.DeleteFunc(mountPoints(t, spid), func(m string) bool { return m == probeInImage })
-	for _, m := range phaseBMounts { // as the container's own links resolve them
+	for _, m := range phaseBMounts(layoutOf(t, A.Ref)) { // as the container's own links resolve them
 		r, err := resolveIn(fmt.Sprintf("/proc/%d/root", pid), m)
 		if err != nil {
 			t.Fatal(err)

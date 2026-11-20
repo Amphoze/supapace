@@ -1337,9 +1337,15 @@ func quotaRefusal(t *testing.T, S Project, quotaMB int) {
 
 // ───────── test 14 ─────────
 
-// createSteps are the worker's steps of a create; step 1 is the admin API's
-// own transaction and has no boundary to stop at.
-var createSteps = []string{"2", "3", "4a", "4", "6", "7", "9", "11", "12"}
+// createSteps are the worker's steps of a create of layout; step 1 is the
+// admin API's own transaction and has no boundary to stop at. Layout 2 adds
+// the first backup's steps after 4 and the control plane's catch-up before 12.
+func createSteps(layout int) []string {
+	if layout == 2 {
+		return []string{"2", "3", "4a", "4", "5a", "5b", "5c", "5d", "6", "7", "9", "11", "12a", "12b", "12"}
+	}
+	return []string{"2", "3", "4a", "4", "6", "7", "9", "11", "12"}
+}
 
 // TestReach14_SagaAndIdentity: a daemon killed at each step boundary of a
 // create comes back and the create ends done with exactly one of each object;
@@ -1360,7 +1366,8 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 	// Fails if the failpoint is never hit (no restart), if the create does not
 	// end done after the restart, if any object is missing or doubled, if a
 	// uid is reused or lower, or if A's or B's containers were restarted.
-	for _, step := range createSteps {
+	layout := nodeLayout(t)
+	for _, step := range createSteps(layout) {
 		t.Run("failpoint_create_"+step, func(t *testing.T) {
 			t.Cleanup(func() { os.Remove(paths.Failpoint()) })
 			old := daemonPid(t)
@@ -1396,26 +1403,35 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 
 	t.Run("queue_retention_and_release", func(t *testing.T) {
 		// S1 is the scratch project; S2 is created right after it and must wait
-		// for the single worker: pending at step 1 while S1's create runs.
+		// for the single worker: pending at step 1 while S1's create runs. No
+		// single listing shows both running. A create parked on a job
+		// (waiting_job) gives the worker back, so at layout 2 S2 may run then;
+		// at layout 1 nothing parks and S2 starts only once S1 is done.
 		S1 := fixtureScratch(t, "--no-wait")
 		op1 := newestOp(t, S1.Ref)
 		_, op2id := extraProject(t)
-		sawQueued := false
-		for {
-			o1, o2 := waitState(t, op1.ID), waitState(t, op2id)
-			if o2.State == "running" || o2.State == "done" || o2.Step != "1" {
-				if o1.State != "done" {
+		sawQueued, started := false, false
+		final := func(o Op) bool { return o.State == "done" || o.State == "failed" || o.State == "aborted" }
+		for deadline := time.Now().Add(2 * cliTimeout); ; time.Sleep(500 * time.Millisecond) {
+			ops := opListing(t)
+			o1, o2 := ops[op1.ID], ops[op2id]
+			if o1.State == "running" && o2.State == "running" {
+				t.Fatalf("one listing shows both creates running (steps %q and %q)", o1.Step, o2.Step)
+			}
+			if o2.State == "pending" && o2.Step == "1" {
+				sawQueued = sawQueued || o1.State == "running"
+			} else if !started {
+				started = true
+				if layout != 2 && o1.State != "done" {
 					t.Fatalf("the second create ran (%s, step %q) while the first was %s", o2.State, o2.Step, o1.State)
 				}
+			}
+			if final(o1) && final(o2) {
 				break
 			}
-			if o1.State == "running" {
-				sawQueued = true
+			if time.Now().After(deadline) {
+				t.Fatalf("the two creates still %s and %s after %v", o1.State, o2.State, 2*cliTimeout)
 			}
-			if o1.State == "done" {
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
 		}
 		if !sawQueued {
 			t.Fatal("control: the first create was never seen running while the second waited")

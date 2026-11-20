@@ -4063,3 +4063,36 @@ Known limits
 - Known limits: a pair replaced in place is written key first, so a crash between the two
   files leaves a mismatched pair until init is rerun with the pair; an xn-- label is
   accepted as LDH without checking its punycode.
+
+### 2026-11-20 — test/reach: backup helpers; archive, spool, worker and quarantine tests
+- Tests written ahead of the features: TestReach20_NoBackupSecret, TestReach21_ArchiveContract,
+  TestReach22_Spool, TestReach23_WorkerConfinement, TestReach26_BackupRole,
+  TestReach28_Quarantine (tag reach). Each starts with needBackups: at layout 1 it skips with
+  "the node creates projects at layout 1; the backup tests need layout 2", or fails when
+  SUPAPACE_BACKUP=1. Sub-tests that need the object-store stand-in call needStandin (skip, or
+  fail when SUPAPACE_STANDIN=1, which `make reach` exports when the stand-in exists).
+- Helpers (untagged, backuphelp_test.go; self-tests in backuphelp_self_test.go, no daemon):
+  nodeLayout/layoutOf - `project show`'s config.layout, absent = 1, anything but 2 fails;
+  backups(t, ref) - `project backups`, must answer for ref; restore(t, ref, args...) - the
+  operation document and exit status; waitPush(t, ref) - returns after two complete pushes
+  recorded after the call (a push running at the call may have listed the spool before it),
+  5 min per push; opListing - one `op list` by id; holdDaemon(t) - writes /run/sp-hold, kills
+  every `supapaced serve`, returns an idempotent release (also a cleanup) that waits for the
+  admin socket; s3(t, role, args...) - sp-probe s3 with the role's keys, the role's bucket
+  unless --bucket is given, only the stand-in's declared addresses; returns the whole output
+  and the exit status, which must agree with the last line's verdict ("error" fails; an empty
+  `versions` output is an empty listing); asProjectUID / workerRun - a worker-image container
+  at a uid with no network, cap-drop ALL, no-new-privileges, read-only root, private /tmp
+  (a subset of the job flags); environment values pass through the docker client's
+  environment, never its argv.
+- Tree readers: spool (as root, links not followed), quarantined (entries outside the archive
+  pattern that are not `.tmp-` temporaries), repoFiles, archived (a segment, label or history
+  of a stanza by its repository name). secretsReadableBy(uid, gid, roots, mounted, needles):
+  mode bits only; host roots are traversed from `/`, mount sources (mounted=true) from the
+  source down, as a container reaches them.
+- The first phase's suite: phaseBMounts(layout) and writableClusterMounts(layout) add the two
+  spools at layout 2; createSteps(layout) adds 5a-5d and 12a, 12b; the queue sub-test allows a
+  second create to run while the first waits on a job, never both running in one listing.
+- Known limits: the stalling fake server is the only hostile-server mode run; the restore-spool
+  temporary-name case waits for the serve job's naming; "a link swapped in during a backup" is a
+  race whose every outcome is checked; the documents' pointer members decode into values.
