@@ -4471,3 +4471,15 @@ URL assembled at run time is not seen (the recorded browser session finds contac
 Public files are held only by their names' shape. A deleted route's path reaches the page
 fallback (404 page, 406 for JSON, 307 for a trailing slash); the hard 404/405 for API paths
 is the Studio request guard's, a later patch.
+
+### 2026-11-21 — agent: the purge removes the spool trees
+- `PurgeDir`'s task runs `rmtree /p/data /p/sock /p/spool /p/rspool` at every layout, with no
+  layout test: an absent path is done for rmtree, and a layout-1 directory left with spool trees by
+  a rolled-back switch needs it as well. Root's non-recursive removal of the project directory
+  failed "directory not empty" on every layout-2 abort or purge before this.
+- Every writer of `spool/` and `rspool/` is the project uid, so the task at that uid removes all of
+  it; links in these tenant-writable trees are unlinked, never followed.
+- `TestPurgeDir_RunsAtProjectUID` pins the four paths in order; the reach test
+  `TestAgent_PurgeDirLayout2RemovesSpools` purges a filled layout-2 directory (files, a nested
+  directory, a link out of the project directory) with layout-1 controls with and without spool
+  trees. The unit fakes model no subdirectories: only the reach test catches a missed tree.

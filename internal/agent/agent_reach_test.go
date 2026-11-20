@@ -524,3 +524,80 @@ func TestAgent_PurgeRefusedWhileClusterExists(t *testing.T) {
 		t.Fatalf("project directory after purge: %v", err)
 	}
 }
+
+// TestAgent_PurgeDirLayout2RemovesSpools: a layout-2 directory whose spool
+// trees hold files, a nested directory and a link to a directory outside the
+// project directory is purged; the link's target is untouched; a second
+// purge is nil. Controls on the same path: a layout-1 directory without spool
+// trees, and one given them by EnsureSpoolDirs (a switch rolled back).
+func TestAgent_PurgeDirLayout2RemovesSpools(t *testing.T) {
+	a, s := clNode(t, "nodetestcluster00008", 16, 700908)
+	ctx := context.Background()
+	tenant := func(s Spec, script string) {
+		t.Helper()
+		out, err := exec.Command("docker", "run", "--rm", "--network", "none", "--user", fmt.Sprintf("%d:%d", s.UID, s.GID),
+			"-v", a.p.ProjectDir(s.Ref)+":/p", "--entrypoint", "/bin/sh", a.cfg.Images.Postgres, "-c", script).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v: %s", script, err, out)
+		}
+	}
+	purge := func(s Spec) {
+		t.Helper()
+		if err := a.PurgeDir(ctx, s); err != nil {
+			t.Fatalf("PurgeDir %s: %v", s.Ref, err)
+		}
+		if _, err := os.Lstat(a.p.ProjectDir(s.Ref)); !os.IsNotExist(err) {
+			t.Fatalf("project directory %s after purge: %v", s.Ref, err)
+		}
+		if err := a.PurgeDir(ctx, s); err != nil {
+			t.Fatalf("second PurgeDir %s: %v", s.Ref, err)
+		}
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	keep := filepath.Join(outside, "keep")
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(a.p.ProjectDir(s.Ref)); err != nil { // clNode made it at layout 0
+		t.Fatal(err)
+	}
+	s.Layout = 2
+	if err := a.EnsureDir(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"spool", "rspool/req", "rspool/out"} {
+		if fi, err := os.Lstat(filepath.Join(a.p.ProjectDir(s.Ref), d)); err != nil || !fi.IsDir() {
+			t.Fatalf("layout 2 lacks %s: %v", d, err)
+		}
+	}
+	tenant(s, `echo x > /p/data/f && echo x > /p/spool/f && echo x > /p/rspool/out/f && `+
+		`mkdir -p /p/rspool/req/a/b && echo x > /p/rspool/req/a/b/f && ln -s `+outside+` /p/spool/link`)
+	purge(s)
+	if b, err := os.ReadFile(keep); err != nil || string(b) != "keep" {
+		t.Fatalf("the link's target was touched: %q %v", b, err)
+	}
+
+	for i, spools := range []bool{false, true} {
+		c := s
+		c.Ref, c.UID, c.GID, c.Layout = fmt.Sprintf("nodetestcluster0001%d", i), 700910+i, 700910+i, 1
+		t.Cleanup(func() {
+			os.RemoveAll(a.p.ProjectDir(c.Ref))
+			setQuota(a.p, c.UID, 0)
+		})
+		if err := a.EnsureDir(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		if spools {
+			if err := a.EnsureSpoolDirs(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+			tenant(c, `echo x > /p/spool/f && echo x > /p/rspool/out/f`)
+		}
+		tenant(c, `echo x > /p/data/f`)
+		purge(c)
+	}
+}

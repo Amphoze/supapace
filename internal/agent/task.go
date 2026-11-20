@@ -229,14 +229,15 @@ func (a *Agent) PromoteCandidate(ctx context.Context, ref string) error {
 	return os.Remove(filepath.Join(r, "candidate"))
 }
 
-// PurgeDir removes the project's tree: data/ and sock/ at the project's uid
-// by the tree-removal helper in a task container, then root's one call, a
-// non-recursive removal of the emptied project directory. The uid's quota
-// limits are cleared first: at a full block quota the helper could not move
-// entries and would fail on every retry. It refuses while pg-<ref> or
-// postgrest-<ref> exists in any state, so nothing can use the lifted limit.
-// An absent directory launches nothing (a mount of a missing path would
-// create it as root).
+// PurgeDir removes the project's tree: data/, sock/, spool/ and rspool/ at
+// the project's uid by the tree-removal helper in a task container (an absent
+// one is done: layouts 0 and 1 have no spool trees unless a switch to layout 2
+// was rolled back), then root's one call, a non-recursive removal of the
+// emptied project directory. The uid's quota limits are cleared first: at a
+// full block quota the helper could not move entries and would fail on every
+// retry. It refuses while pg-<ref> or postgrest-<ref> exists in any state, so
+// nothing can use the lifted limit. An absent directory launches nothing (a
+// mount of a missing path would create it as root).
 func (a *Agent) PurgeDir(ctx context.Context, s Spec) error {
 	if err := checkRef(s.Ref); err != nil {
 		return err
@@ -272,7 +273,7 @@ func (a *Agent) PurgeDir(ctx context.Context, s Spec) error {
 		return err
 	}
 	flags = append(flags, "-v", pd+":/p")
-	code, out, err := a.runTask(ctx, s, "purge", flags, "/supapaced", "rmtree", "/p/data", "/p/sock")
+	code, out, err := a.runTask(ctx, s, "purge", flags, "/supapaced", "rmtree", "/p/data", "/p/sock", "/p/spool", "/p/rspool")
 	if err != nil {
 		return err
 	}

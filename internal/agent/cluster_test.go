@@ -1646,7 +1646,7 @@ func TestPurgeDir_RunsAtProjectUID(t *testing.T) {
 	if n := len(flagValues(args, "-v")); n != 2 {
 		t.Errorf("purge mounts %d paths", n)
 	}
-	if got := positional(args); !slices.Equal(got, []string{a.cfg.Images.Postgres, "rmtree", "/p/data", "/p/sock"}) {
+	if got := positional(args); !slices.Equal(got, []string{a.cfg.Images.Postgres, "rmtree", "/p/data", "/p/sock", "/p/spool", "/p/rspool"}) {
 		t.Errorf("purge command %q", got)
 	}
 	calls := f.calls()
