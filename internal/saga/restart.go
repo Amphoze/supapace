@@ -1,6 +1,7 @@
 package saga
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Amphoze/supapace/internal/agent"
+	"github.com/Amphoze/supapace/internal/bklimit"
 	"github.com/Amphoze/supapace/internal/bootstrap"
 	"github.com/Amphoze/supapace/internal/pgsock"
 	"github.com/Amphoze/supapace/internal/store"
@@ -18,13 +20,36 @@ import (
 // project's desired generation stays g until R2, after the candidate passed
 // pre-validation. If R3 or R4 fails, the restart rolls forward to g+2 with
 // params.prev (the configuration of g, as stored), from R1.
+//
+// The S steps run only when the pass's target is at layout 2. S1 makes what
+// a layout-2 cluster needs before R2 bumps the generation and drains the
+// route, so its failure leaves the project serving. S2-S6 (the backup
+// role's grant and the project's first backup) run after the project is
+// served again, and only while it has no backup set, so a layout-1
+// project's restart to layout 2 (the switch) is completed by any later
+// restart.
 var restartSteps = []step{
 	{"R0", (*job).checkBase},
 	{"R1", (*job).prevalidate},
+	{"S1", (*job).prepareBackups},
 	{"R2", (*job).drain},
 	{"R3", (*job).restartCluster},
 	{"R4", (*job).health},
 	{"R5", (*job).resume},
+	{"S2", (*job).grantBackup},
+	{"S3", firstBackup((*job).stanzaCreate)},
+	{"S4", firstBackup(func(x *job, ctx context.Context) error { _, err := x.awaitJob(ctx, "backup"); return err })},
+	{"S5", firstBackup(func(x *job, ctx context.Context) error { _, err := x.awaitJob(ctx, "check"); return err })},
+	{"S6", firstBackup((*job).replicate)},
+}
+
+// restartLayout2 are the restart steps of a pass whose target is at layout 2.
+var restartLayout2 = map[string]bool{"S1": true, "S2": true, "S3": true, "S4": true, "S5": true, "S6": true}
+
+// toLayout2 reports whether this pass's target is at layout 2.
+func (x *job) toLayout2() bool {
+	_, cfg, err := x.target()
+	return err == nil && cfg.Layout == 2
 }
 
 type restartParams struct {
@@ -91,7 +116,7 @@ func (x *job) restartStart(ctx context.Context, table []step) (int, error) {
 		}
 		return indexOf(table, "R1"), nil
 	}
-	if i > indexOf(table, "R2") || rp.RollbackGen != 0 && i == indexOf(table, "R2") {
+	if i > indexOf(table, "R2") || rp.RollbackGen != 0 && i > indexOf(table, "R1") {
 		// Past this pass's bump: the project must carry it — the target
 		// generation, restarting, the target's configuration; from R5 on it
 		// may already be active at that target (R5's state write happened).
@@ -130,8 +155,16 @@ func (x *job) restartStart(ctx context.Context, table []step) (int, error) {
 	return i, nil
 }
 
+// sameConfig compares every field of two configurations; a nil and an empty
+// GUC map are the same.
 func sameConfig(a, b store.ProjectConfig) bool {
-	return a.DiskQuotaMB == b.DiskQuotaMB && a.MemMB == b.MemMB && maps.Equal(a.GUC, b.GUC)
+	if !maps.Equal(a.GUC, b.GUC) {
+		return false
+	}
+	a.GUC, b.GUC = nil, nil
+	x, errx := json.Marshal(a)
+	y, erry := json.Marshal(b)
+	return errx == nil && erry == nil && bytes.Equal(x, y)
 }
 
 // R0: the merge base must be the generation just below the target (a second
@@ -175,8 +208,37 @@ func (x *job) prevalidate(ctx context.Context) error {
 
 // R2: the desired generation and configuration, and the state restarting, in
 // one statement (a no-op when resumed); the route draining and the gateway at
-// that route file; PostgREST stopped.
+// that route file; PostgREST stopped; then, for a project that archives
+// (previous layout 2), push jobs until the spool is empty or DrainPushWait
+// is over — its outcome recorded as drain_push (skipped without a stanza),
+// never a failure of the step.
 func (x *job) drain(ctx context.Context) error {
+	if err := x.bumpAndDrain(ctx); err != nil {
+		return err
+	}
+	rp, err := x.restartParams()
+	if err != nil || rp.Prev.Layout != 2 {
+		return err
+	}
+	jobs, err := x.jobRunner()
+	if err != nil {
+		return err
+	}
+	bs, err := x.r.st.GetBackupState(ctx, x.op.Ref)
+	if errors.Is(err, store.ErrNotFound) || err == nil && !bs.StanzaCreated {
+		return x.r.patchParams(ctx, &x.op, "drain_push", "skipped") // nothing can be pushed yet
+	} else if err != nil {
+		return err
+	}
+	out, err := jobs.PushNow(ctx, x.op.Ref, bklimit.DrainPushWait)
+	if err != nil {
+		x.r.log.Warn("drain push failed", "op", x.op.ID, "ref", x.op.Ref, "err", x.r.text(err))
+		out = "failed"
+	}
+	return x.r.patchParams(ctx, &x.op, "drain_push", out)
+}
+
+func (x *job) bumpAndDrain(ctx context.Context) error {
 	gen, cfg, err := x.target()
 	if err != nil {
 		return err
@@ -283,16 +345,26 @@ func (x *job) health(ctx context.Context) error {
 	return final(code(err), fmt.Errorf("rollback to generation %d: %w", rp.RollbackGen, err))
 }
 
-// rollForward records the rollback target g+2 (and why) in the parameters.
+// rollForward records the rollback target g+2 (and why) in the parameters,
+// in one write that keeps every other member (job_floor, requeued,
+// drain_push and whatever else a step or the store wrote there).
 func (x *job) rollForward(ctx context.Context, rf *rollForward) error {
-	rp, err := x.restartParams()
-	if err != nil {
-		return err
+	m := map[string]json.RawMessage{}
+	if err := json.Unmarshal(x.op.Params, &m); err != nil {
+		return final("internal", errors.New("restart parameters do not parse"))
 	}
-	rp.RollbackGen = x.op.Generation + 1
-	rp.RollbackError = x.r.lastError(rf.err)
-	rp.RollbackStep = rf.step
-	b, err := json.Marshal(rp)
+	gen, msg := x.op.Generation+1, x.r.lastError(rf.err)
+	for k, v := range map[string]any{"rollback_gen": gen, "rollback_error": msg, "rollback_step": rf.step} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		m[k] = b
+	}
+	if rf.step == "" {
+		delete(m, "rollback_step") // absent after R4, as before
+	}
+	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
@@ -300,8 +372,82 @@ func (x *job) rollForward(ctx context.Context, rf *rollForward) error {
 		return err
 	}
 	x.op.Params = b
-	x.r.log.Warn("restart rolls forward", "op", x.op.ID, "ref", x.op.Ref, "generation", rp.RollbackGen, "err", rp.RollbackError)
+	x.r.log.Warn("restart rolls forward", "op", x.op.ID, "ref", x.op.Ref, "generation", gen, "err", msg)
 	return nil
+}
+
+// S1, on the candidate's spec before R2: what a layout-2 cluster needs —
+// the spool directories (made by a task at the project's uid), the
+// repository directory with its quota, the backup state and the stanza
+// passphrase; each is left as it is when it exists. A failure leaves the
+// project serving, as one of R1's.
+func (x *job) prepareBackups(ctx context.Context) error {
+	s, err := x.candidate(ctx)
+	if err != nil {
+		return err
+	}
+	if err := x.r.ag.EnsureSpoolDirs(ctx, s); err != nil {
+		return err
+	}
+	if err := x.r.ag.EnsureRepoDir(ctx, s); err != nil {
+		return err
+	}
+	if err := x.r.st.EnsureBackupState(ctx, x.op.Ref); err != nil {
+		return err
+	}
+	if _, _, err := x.r.st.GetSecret(ctx, x.op.Ref, stanzaPassName); !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	dek, err := x.r.dek(ctx, x.op.Ref, false)
+	if err != nil {
+		return err
+	}
+	defer clear(dek)
+	plain, err := password()
+	if err != nil {
+		return err
+	}
+	defer clear(plain)
+	return x.r.putSecret(ctx, dek, x.op.Ref, stanzaPassName, plain)
+}
+
+// S2: decides once, into first_backup, whether this restart takes the
+// project's first backup — no roll-forward recorded and no backup set —
+// and, if so, grants the backup role its membership. The project is
+// served again by then, so a failing grant leaves it serving.
+func (x *job) grantBackup(ctx context.Context) error {
+	if paramRaw(x.op.Params, "first_backup") == nil {
+		rp, err := x.restartParams()
+		if err != nil {
+			return err
+		}
+		sets, err := x.r.st.ListSets(ctx, x.op.Ref)
+		if err != nil {
+			return err
+		}
+		if err := x.r.patchParams(ctx, &x.op, "first_backup", rp.RollbackGen == 0 && len(sets) == 0); err != nil {
+			return err
+		}
+	}
+	return firstBackup(func(x *job, ctx context.Context) error {
+		s, err := x.current(ctx)
+		if err != nil {
+			return err
+		}
+		return x.r.ag.GrantBackupRole(ctx, s)
+	})(x, ctx)
+}
+
+// firstBackup is a step that runs only when S2 decided on the first backup.
+func firstBackup(do func(*job, context.Context) error) func(*job, context.Context) error {
+	return func(x *job, ctx context.Context) error {
+		var on bool
+		json.Unmarshal(paramRaw(x.op.Params, "first_backup"), &on)
+		if !on {
+			return nil
+		}
+		return do(x, ctx)
+	}
 }
 
 // R5: PostgREST, the active route and the end-to-end probe, then active at

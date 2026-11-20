@@ -4825,3 +4825,56 @@ Known limit: the model reads the first segment raw where the gateway reads
 it percent-decoded (/%61pi).
 test/browser: the log-out scenarios wait for signed-out?ended=0 (no session,
 or reached from another site) and signed-out?more=1 (from the sign-in host).
+
+### 2026-11-21 — saga: the switch in restart; the delete's final jobs; purge
+What it provides (internal/saga):
+- Restart steps R0 R1 S1 R2 R3 R4 R5 S2 S3 S4 S5 S6. The S steps run only
+  when the pass's target configuration is at layout 2; a rollback to a
+  layout-1 configuration skips them.
+- S1, before R2 on the candidate's spec: EnsureSpoolDirs, EnsureRepoDir,
+  EnsureBackupState and the stanza passphrase (secret backup.cipher_pass,
+  made once), all idempotent. Its failure leaves the project serving.
+- S2 decides once, into params first_backup: true when no roll-forward is
+  recorded and the project has no backup set; then the backup role's grant.
+  S3 stanza-create (skipped with a stanza), S4 backup, S5 check, S6
+  replicate run only when first_backup is true. The project is active
+  again from R5, so a failing grant or job leaves it serving; op retry or
+  any later restart completes the switch.
+- R2 of a project whose previous configuration is layout 2: after the
+  route drains, Jobs.PushNow(ref, bklimit.DrainPushWait); its outcome in
+  params drain_push (ok, incomplete, timeout, failed; skipped without a
+  stanza). Never fails R2.
+- The roll-forward (R3, R4) writes rollback_gen, rollback_error and
+  rollback_step (absent after R4) into the stored parameters and keeps
+  every other member, unknown ones included.
+- sameConfig compares every configuration field (JSON), a nil and an empty
+  GUC map equal: the same relation as the store's own config comparison.
+- Delete steps D1 D2 Db D3 Dp Dr D4 D5. D1: project deleting, then
+  Jobs.CancelSubject (layout 2), then the route. Db backup (cluster up),
+  Dp push until a push reports complete (at most PushLoopMax jobs), Dr
+  replicate (declared store only) are layout-2 steps and best effort.
+- The delete's result document: final_backup, final_push,
+  final_replication, each ok, skipped (no stanza; Dr: store not declared),
+  incomplete (push loop at its bound) or the failing job's code
+  (interrupted_limit among them). An interrupted job is submitted again.
+  None fails the delete.
+- Purge: P1 cancels the project's jobs before the stops; P4 cancels again,
+  then PurgeDir, PurgeRepo (every layout) and the off-site purge flag.
+  Nothing is deleted off-site.
+
+Store (internal/store/job.go):
+- A failed job of a delete moves neither the operation's attempts nor its
+  last_error (FinishJob); other kinds count as before.
+
+Caller rules:
+- Readers of backup_state must filter on layout 2: a failed S1 or a switch
+  rolled back to layout 1 leaves its row, passphrase, spool and repository
+  behind (the purge removes them).
+- Jobs queued for a deleting project after D1 are refused at pick by the
+  job runner (op-less jobs run only for active or restarting projects).
+
+Known limits:
+- A delete after a failed restore backs up whatever cluster runs; a failure
+  is recorded only.
+- A delete parked on a job that is never picked waits without a bound of
+  its own.

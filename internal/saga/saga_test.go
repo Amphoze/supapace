@@ -617,6 +617,8 @@ func (e *env) lanes(end func(j store.Job) jobEnd) {
 				out := okEnd
 				if j.Kind == "replicate" {
 					out = replDone
+				} else if j.Kind == "push" {
+					out = pushEnd(true)
 				}
 				if end != nil {
 					out = end(j)
@@ -1006,8 +1008,8 @@ func TestStepIDs_Fixed(t *testing.T) {
 		return out
 	}
 	wantSeq(t, ids(tables["create"]), createIDs2)
-	wantSeq(t, ids(tables["restart"]), []string{"R0", "R1", "R2", "R3", "R4", "R5"})
-	wantSeq(t, ids(tables["delete"]), []string{"D1", "D2", "D3", "D4", "D5"})
+	wantSeq(t, ids(tables["restart"]), []string{"R0", "R1", "S1", "R2", "R3", "R4", "R5", "S2", "S3", "S4", "S5", "S6"})
+	wantSeq(t, ids(tables["delete"]), []string{"D1", "D2", "Db", "D3", "Dp", "Dr", "D4", "D5"})
 	wantSeq(t, ids(tables["purge"]), []string{"P1", "P2", "P3", "P4", "P5"})
 	wantSeq(t, ids(compensation), []string{"C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7"})
 	wantSeq(t, ids(tables["restore"]), nil)

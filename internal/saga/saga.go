@@ -162,7 +162,7 @@ type job struct {
 	op     store.Operation
 	held   func(context.Context) error // the ref lock is still held
 	step   string                      // the step running
-	layout int                         // a create's project layout
+	layout int                         // a create's or a delete's project layout
 }
 
 // Run is the worker: it takes the next ready operation and runs one attempt
@@ -288,7 +288,7 @@ func (x *job) steps(ctx, actx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if x.op.Kind == "create" {
+	if x.op.Kind == "create" || x.op.Kind == "delete" {
 		p, err := x.r.st.GetProject(ctx, x.op.Ref)
 		if err != nil {
 			return err
@@ -297,7 +297,9 @@ func (x *job) steps(ctx, actx context.Context) error {
 	}
 	for ; i < len(table); i++ {
 		s := table[i]
-		if x.op.Kind == "create" && createLayout2[s.id] && x.layout != 2 {
+		if x.op.Kind == "create" && createLayout2[s.id] && x.layout != 2 ||
+			x.op.Kind == "delete" && deleteLayout2[s.id] && x.layout != 2 ||
+			x.op.Kind == "restart" && restartLayout2[s.id] && !x.toLayout2() {
 			continue
 		}
 		hitFailpoint(x.r.p, x.op.Kind+":"+s.id)

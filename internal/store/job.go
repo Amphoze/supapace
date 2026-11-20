@@ -202,11 +202,12 @@ func (s *Store) finishJob(ctx context.Context, id int64, state, code, message st
 }
 
 // resumeOp moves a waiting_job operation to pending, due now; count adds one
-// attempt and sets last_error.
+// attempt and sets last_error, except for a delete: its jobs are best effort
+// (the final backup, push and replication), and a failed one costs nothing.
 func resumeOp(ctx context.Context, tx pgx.Tx, op int64, count bool, lastError string) error {
 	_, err := tx.Exec(ctx, `update operation set state = 'pending', not_before = now(), updated_at = now(),
-		attempts = attempts + case when $2 then 1 else 0 end,
-		last_error = case when $2 then $3 else last_error end
+		attempts = attempts + case when $2 and kind <> 'delete' then 1 else 0 end,
+		last_error = case when $2 and kind <> 'delete' then $3 else last_error end
 		where id = $1 and state = 'waiting_job'`, op, count, lastError)
 	return err
 }

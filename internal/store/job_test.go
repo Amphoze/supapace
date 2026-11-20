@@ -258,6 +258,20 @@ func TestFinishJob_InterruptedDoesNotCount(t *testing.T) {
 	wantAttempts(t, s, op, "pending", 1, "crashed: x")
 }
 
+// A delete's jobs are its final, best-effort ones: a failure costs the
+// delete no attempt and leaves its last_error; the control, the same path
+// with another kind, counts one.
+func TestFinishJob_DeleteJobFailureCountsNone(t *testing.T) {
+	s := newStore(t, testConfig())
+	_, op, job := parkedRunning(t, s, 1)
+	sqlExec(t, s, "update operation set kind = 'delete', last_error = 'earlier: e' where id = $1", op)
+	jobFinish(t, s, job, "failed", "pgbackrest", "backup failed")
+	wantAttempts(t, s, op, "pending", 0, "earlier: e")
+	_, op, job = parkedRunning(t, s, 2)
+	jobFinish(t, s, job, "failed", "pgbackrest", "backup failed")
+	wantAttempts(t, s, op, "pending", 1, "pgbackrest: backup failed")
+}
+
 func TestFinishJob_CountsOnlyOnTheWaitingJobTransition(t *testing.T) {
 	s := newStore(t, testConfig())
 	ctx := context.Background()
