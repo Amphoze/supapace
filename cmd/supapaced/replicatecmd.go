@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/signal"
@@ -24,19 +25,20 @@ var (
 	replCred   = "/cred"
 	replRepo   = "/repo"
 	replIndex  = "/index"
+	replFetch  = "/fetch"
 	replEnv    = os.Environ
 	replBound  = repl.Bound
 	newS3      = s3x.New
 )
 
-// replicateCmd is `supapaced replicate copy|rebuild|probe`, the program of a
-// replication or probe job: it reads its credential file once, then its
-// input, runs the mode and prints the one result line. Exit 0 with a result,
+// replicateCmd is `supapaced replicate copy|rebuild|probe|fetch`, the program
+// of a replication, probe or fetch job: it reads its credential file once,
+// then its input, runs the mode and prints the one result line. Exit 0 with a result,
 // 1 with a failure document, 2 for a usage error — an empty address set among
 // them, refused before any client is made.
 func replicateCmd(args []string) int {
-	if len(args) != 1 || args[0] != "copy" && args[0] != "rebuild" && args[0] != "probe" {
-		fmt.Fprintln(stderr, "usage: supapaced replicate copy|rebuild|probe")
+	if len(args) != 1 || args[0] != "copy" && args[0] != "rebuild" && args[0] != "probe" && args[0] != "fetch" {
+		fmt.Fprintln(stderr, "usage: supapaced replicate copy|rebuild|probe|fetch")
 		return 2
 	}
 	mode := args[0]
@@ -48,7 +50,7 @@ func replicateCmd(args []string) int {
 	if err != nil {
 		return replFail("input", err)
 	}
-	pairs := 1
+	pairs := 1 // copy and rebuild: the write pair; fetch: the read-only pair
 	if mode == "probe" {
 		pairs = 2
 	}
@@ -67,7 +69,14 @@ func replicateCmd(args []string) int {
 	if err != nil {
 		return replFail("input", fmt.Errorf("the CA bundle: %w", err))
 	}
-	write, err := newS3(env.Config(env.Bucket, keys[0], ca))
+	bound := replBound(mode)
+	cfg := env.Config(env.Bucket, keys[0], ca)
+	if mode == "fetch" {
+		// One GET may move a whole set file: the fetch bounds each call itself.
+		bound = repl.FetchBound(in.MaxBytes)
+		cfg.Timeout = bound
+	}
+	write, err := newS3(cfg)
 	if err != nil {
 		return replFail("input", err)
 	}
@@ -76,9 +85,9 @@ func replicateCmd(args []string) int {
 	defer stop()
 	// The program's own bound, below its job's deadline: it always ends with a
 	// result line that records what it did.
-	ctx, cancel := context.WithTimeout(ctx, replBound(mode))
+	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
-	var res jobio.ReplResult
+	var res any
 	switch mode {
 	case "copy":
 		fd, oerr := syscall.Open(replIndex, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
@@ -95,6 +104,24 @@ func replicateCmd(args []string) int {
 		res, err = repl.Rebuild(ctx, in, st)
 	case "probe":
 		res, err = replProbe(ctx, in, env, keys, ca, write)
+	case "fetch":
+		var plan io.Reader
+		if !in.ListCurrent {
+			fd, oerr := syscall.Open(replJobDir+"/plan", syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+			if oerr != nil {
+				return replFail("input", fmt.Errorf("the plan: %w", oerr))
+			}
+			f := os.NewFile(uintptr(fd), "plan")
+			defer f.Close()
+			if fi, serr := f.Stat(); serr != nil || !fi.Mode().IsRegular() {
+				return replFail("input", errors.New("the plan is not a regular file"))
+			}
+			plan = f
+		}
+		res, err = repl.Fetch(ctx, in, plan, replFetch, st)
+		if code := fetchCode(err); code != "" {
+			return replFail(code, err)
+		}
 	}
 	if errors.Is(err, repl.ErrInput) {
 		return replFail("input", err)
@@ -135,6 +162,24 @@ func replProbe(ctx context.Context, in jobio.Input, env repl.Env, keys []repl.Ke
 	return repl.Probe(ctx, in, t, s)
 }
 
+// fetchCode is the code of a fetch's failure, "" for none: the one table
+// from the program's errors to its codes; any other error is the store's.
+func fetchCode(err error) string {
+	for _, c := range []struct {
+		err  error
+		code string
+	}{{repl.ErrInput, "input"}, {repl.ErrPath, "path"}, {repl.ErrMissing, "missing"}, {repl.ErrMismatch, "mismatch"},
+		{repl.ErrQuota, "quota"}, {repl.ErrTooLarge, "too_large"}} {
+		if errors.Is(err, c.err) {
+			return c.code
+		}
+	}
+	if err != nil {
+		return "store"
+	}
+	return ""
+}
+
 // replInput reads /job/input.json (at most 1 MiB, a regular file) and
 // checks it is an input of this mode.
 func replInput(mode string) (jobio.Input, error) {
@@ -156,10 +201,10 @@ func replInput(mode string) (jobio.Input, error) {
 		return jobio.Input{}, err
 	}
 	kind := "replicate"
-	if mode == "probe" {
-		kind = "probe"
+	if mode == "probe" || mode == "fetch" {
+		kind = mode
 	}
-	if in.Kind != kind || in.Repl == nil || in.Repl.Mode != mode {
+	if mode != "fetch" && (in.Kind != kind || in.Repl == nil || in.Repl.Mode != mode) {
 		return jobio.Input{}, fmt.Errorf("the input is not of kind %s, mode %s", kind, mode)
 	}
 	return in, nil

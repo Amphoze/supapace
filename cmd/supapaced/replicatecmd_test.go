@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -167,7 +170,7 @@ func TestReplicateCmd_RefusesAnotherRolesKeysOrInput(t *testing.T) {
 	if code := run([]string{"replicate", "rebuild"}); code != 1 || !strings.Contains(j.out.String(), `"code":"input"`) {
 		t.Errorf("exit %d %s", code, j.out.String())
 	}
-	for _, args := range [][]string{{"replicate"}, {"replicate", "fetch"}, {"replicate", "copy", "x"}} {
+	for _, args := range [][]string{{"replicate"}, {"replicate", "seed"}, {"replicate", "copy", "x"}, {"replicate", "fetch", "x"}} {
 		if code := run(args); code != 2 {
 			t.Errorf("%q: exit %d", args, code)
 		}
@@ -314,7 +317,7 @@ func TestReplicateCmd_EveryCodeIsInCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all := append(repl.Codes("replicate"), repl.Codes("probe")...)
+	all := append(append(repl.Codes("replicate"), repl.Codes("probe")...), repl.Codes("fetch")...)
 	n := 0
 	for _, m := range regexp.MustCompile(`replFail\("([a-z_-]+)"`).FindAllSubmatch(src, -1) {
 		n++
@@ -332,7 +335,156 @@ func TestReplicateCmd_EveryCodeIsInCodes(t *testing.T) {
 			t.Errorf("%s: code %s is not in repl.Codes(%s)", m[1], m[2], kind)
 		}
 	}
-	if n < 6 {
+	for _, m := range regexp.MustCompile(`\{repl\.Err[A-Za-z]+, "([a-z_-]+)"\}`).FindAllSubmatch(src, -1) {
+		n++
+		if !slices.Contains(repl.Codes("fetch"), string(m[1])) {
+			t.Errorf("fetch: code %s is not in repl.Codes(fetch)", m[1])
+		}
+	}
+	if n < 12 {
 		t.Errorf("the scan found %d codes", n)
+	}
+}
+
+// newFetchJob is a fetch job's files: its input (by plan, or the control
+// plane's list_current), its plan, one credential pair and an empty fetch
+// directory.
+func newFetchJob(t *testing.T, addrs string, in jobio.Input, plan []jobio.PlanRow) *replJob {
+	t.Helper()
+	j := newReplJob(t, "copy", addrs)
+	b, err := jobio.MarshalInput(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(replJobDir, "input.json"), b, 0o600)
+	if plan != nil {
+		var p bytes.Buffer
+		if err := jobio.WritePlan(&p, plan); err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(filepath.Join(replJobDir, "plan"), p.Bytes(), 0o600)
+	}
+	old := replFetch
+	replFetch = filepath.Join(j.dir, "fetch")
+	os.Mkdir(replFetch, 0o750)
+	t.Cleanup(func() { replFetch = old })
+	return j
+}
+
+func fetchInput(subject, stanza string, listCurrent bool) jobio.Input {
+	in := jobio.Input{Job: 3, Kind: "fetch", Subject: subject, Stanza: stanza, UID: os.Getuid(), MaxBytes: 1 << 20, ListCurrent: listCurrent}
+	if subject != "cp" {
+		in.Timelines = []uint32{1}
+	}
+	return in
+}
+
+// A store that answers a GET of one version of one key.
+func fetchStore(t *testing.T, key, vid, body string) (*httptest.Server, []byte) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/sp-projects/pre/"+key || r.URL.Query().Get("versionId") != vid {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("X-Amz-Version-Id", vid)
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+}
+
+// pointAt makes the job's endpoint the test server's name and port.
+func (j *replJob) pointAt(srv *httptest.Server, ca []byte) {
+	u, _ := url.Parse(srv.URL)
+	os.WriteFile(filepath.Join(replJobDir, "ca.pem"), ca, 0o644)
+	for i, kv := range j.env {
+		switch {
+		case strings.HasPrefix(kv, "SUPAPACE_S3_ENDPOINT="):
+			j.env[i] = "SUPAPACE_S3_ENDPOINT=https://example.com:" + u.Port()
+		case strings.HasPrefix(kv, "SUPAPACE_S3_ADDRS="):
+			j.env[i] = "SUPAPACE_S3_ADDRS=" + u.Host
+		}
+	}
+}
+
+// The fetch mode reads its plan, holds one credential pair (the read-only
+// one), writes below /fetch and prints a fetch result.
+func TestReplicateCmd_FetchByPlan(t *testing.T) {
+	rel := "archive/" + replRef + "-1/17-1/00000001.history"
+	srv, ca := fetchStore(t, replRef+"/"+rel, "v1", "history 1")
+	j := newFetchJob(t, closedPort(t).String(), fetchInput(replRef, replRef+"-1", false),
+		[]jobio.PlanRow{{Key: rel, VersionID: "v1", SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("history 1"))), Size: 9}})
+	j.pointAt(srv, ca)
+	var timeout time.Duration
+	newS3 = func(c s3x.Config) (*s3x.Client, error) { timeout = c.Timeout; return s3x.New(c) }
+	code := run([]string{"replicate", "fetch"})
+	v, _, err := jobio.ParseResult("fetch", bytes.TrimSpace(j.out.Bytes()))
+	if r, ok := v.(jobio.FetchResult); code != 0 || err != nil || !ok || r.Files != 1 || r.Bytes != 9 {
+		t.Fatalf("exit %d %v %s %s", code, err, j.out.String(), j.errb.String())
+	}
+	if b, _ := os.ReadFile(filepath.Join(replFetch, rel)); string(b) != "history 1" {
+		t.Errorf("fetched %q", b)
+	}
+	// One call may move a whole set file: the client's bound is the program's.
+	if timeout != repl.FetchBound(1<<20) {
+		t.Errorf("the client's bound is %v", timeout)
+	}
+	j.noKeys(t)
+}
+
+// The fetch mode's refusals, each with its code: two key pairs (another
+// role's file), list_current for a project, a plan that is a link, an
+// absent object.
+func TestReplicateCmd_FetchRefusals(t *testing.T) {
+	rel := "archive/" + replRef + "-1/17-1/00000001.history"
+	plan := []jobio.PlanRow{{Key: rel, VersionID: "v1", Size: 9}}
+	srv, ca := fetchStore(t, replRef+"/"+rel, "v1", "history 1")
+	for name, tc := range map[string]struct {
+		input jobio.Input
+		prep  func(j *replJob)
+		code  string
+	}{
+		"two key pairs": {fetchInput(replRef, replRef+"-1", false), func(j *replJob) {
+			os.WriteFile(replCred, []byte(replAccess+"\n"+replSecret+"\n"+replAccess+"\n"+replSecret), 0o600)
+		}, "credential"},
+		"list_current for a project": {fetchInput(replRef, replRef+"-1", true), nil, "path"},
+		"the plan is a link": {fetchInput(replRef, replRef+"-1", false), func(j *replJob) {
+			// A link to a good plan: refused for being a link.
+			real := filepath.Join(j.dir, "plan.real")
+			os.Rename(filepath.Join(replJobDir, "plan"), real)
+			os.Symlink(real, filepath.Join(replJobDir, "plan"))
+		}, "input"},
+		"the plan is a FIFO": {fetchInput(replRef, replRef+"-1", false), func(j *replJob) { // it would read as an empty plan
+			os.Remove(filepath.Join(replJobDir, "plan"))
+			syscall.Mkfifo(filepath.Join(replJobDir, "plan"), 0o600)
+		}, "input"},
+		"no plan":                  {fetchInput(replRef, replRef+"-1", false), func(j *replJob) { os.Remove(filepath.Join(replJobDir, "plan")) }, "input"},
+		"an input of another kind": {func() jobio.Input { in := fetchInput(replRef, replRef+"-1", false); in.Kind = "seed"; return in }(), nil, "input"},
+		"a row outside the layout": {fetchInput(replRef, replRef+"-1", false), func(j *replJob) {
+			var p bytes.Buffer
+			jobio.WritePlan(&p, []jobio.PlanRow{{Key: "archive/" + replRef + "-1/x", Size: 1}})
+			os.WriteFile(filepath.Join(replJobDir, "plan"), p.Bytes(), 0o600)
+		}, "path"},
+		"absent": {fetchInput(replRef, replRef+"-1", false), func(j *replJob) {
+			var p bytes.Buffer
+			jobio.WritePlan(&p, []jobio.PlanRow{{Key: rel, VersionID: "v2", Size: 9}})
+			os.WriteFile(filepath.Join(replJobDir, "plan"), p.Bytes(), 0o600)
+		}, "missing"},
+		"control plane without a set": {fetchInput("cp", "cp-1", true), nil, "store"}, // the test server lists nothing
+	} {
+		var pl []jobio.PlanRow
+		if !tc.input.ListCurrent {
+			pl = plan
+		}
+		j := newFetchJob(t, closedPort(t).String(), tc.input, pl)
+		j.pointAt(srv, ca)
+		if tc.prep != nil {
+			tc.prep(j)
+		}
+		newS3 = s3x.New
+		if code := run([]string{"replicate", "fetch"}); code != 1 || !strings.Contains(j.out.String(), `"code":"`+tc.code+`"`) {
+			t.Errorf("%s: exit %d %s %s", name, code, j.out.String(), j.errb.String())
+		}
+		j.noKeys(t)
 	}
 }

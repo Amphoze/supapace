@@ -4949,3 +4949,32 @@ Known limits:
 - The memory lifetime is counted on elapsed time (performance.now), not the wall clock.
 - Upstream's tests of the removed constants are skipped in place.
 - Unit tests: studio/build.sh test (an HTTP server of the test on a Unix socket).
+
+### 2026-11-21 — internal/repl: fetch (supapaced replicate fetch)
+`repl.Fetch(ctx, in, plan, dest, st)` writes objects of the store below the job's fetch
+directory with the subject's read-only credential; `supapaced replicate fetch` runs it (one key
+pair in /cred, the plan at /job/plan, a regular file; the destination /fetch).
+- By plan (a project): every jobio.PlanRow is checked before the first request — a repository
+  path of the job's own stanza (walname.RepoPath), an admitted timeline, a key built by Key, no
+  duplicate, a version id of the right shape, a size within its kind's bound — else code path.
+  A row without a version id takes the oldest version that is an object. Every body is checked
+  against its row: the version the store answered, the size (exact; an info file's row carries
+  its kind's bound), the sha256 when the row has one. At most 262,144 rows (too_large above).
+- list_current (subject cp only, no plan): lists the stanza's two trees ("archive/<stanza>/",
+  "backup/<stanza>/"), takes write-once kinds at their oldest object version and the four info
+  files at their newest, never a delete marker; keys the layout refuses are skipped. Reports
+  newest_set (the newest label whose backup.manifest it fetched; none is code missing) and
+  newest_segment (the highest segment number fetched, whatever its timeline; may be absent).
+- Writes: every directory opened from its parent's descriptor without following a link,
+  created 2750; files created exclusively (O_CREAT|O_EXCL, never through a link), 0640; a file
+  that fails is unlinked. A stale or linked target fails with code path; /fetch must be empty.
+- Bounds: at most max_bytes written in all (too_large); each version listing at most
+  ListCurrentMaxPages (2,048) pages (code store); the program ends within FetchBound(max_bytes),
+  the fetch deadline for that quota less 60 s; each listing page 60 s, each GET 60 s plus its
+  object's bound at 4 MiB/s; each connection attempt 10 s. The job's deadline and max_bytes must
+  come from one quota figure.
+- Codes, repl.Codes("fetch"): input, credential, path, missing, mismatch, quota (EDQUOT,
+  ENOSPC), too_large, store, result.
+- Trust: a holder of the write credential can offer older info files or deny the fetch, never
+  other content under a write-once name; whoever controls the listings can offer an older state
+  unseen.

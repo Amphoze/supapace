@@ -148,10 +148,10 @@ browsers:
 	docker build -t $(BROWSERS_IMAGE) -f test/harness/browsers/Dockerfile test/harness/browsers
 	scripts/cache-images.sh --save $(BROWSERS_IMAGE) supapace-browsers:local "$(BROWSERS_TAR)"
 
-# The object-store client's tests against the stand-in image (pulled by make images);
-# each such test is named TestStandin_*.
+# The object-store client's and the replication program's tests against the
+# stand-in image (pulled by make images); each such test is named TestStandin_*.
 standin-test:
-	SUPAPACE_STANDIN_TEST=1 $(GO) test -count=1 -run '^TestStandin_' ./internal/s3x/
+	SUPAPACE_STANDIN_TEST=1 $(GO) test -count=1 -run '^TestStandin_' ./internal/s3x/ ./internal/repl/
 
 unit: gate-test
 	$(GO) vet ./... && $(GO) test -race ./...

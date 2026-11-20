@@ -147,8 +147,9 @@ func ReadEnv(environ []string) (Env, error) {
 const CallTimeout = 60 * time.Second
 
 // The program's own time bounds, below its job's deadline (bklimit.Deadline),
-// so that it always ends with a result line that records what it did: an
-// upload cut by the bound fails and the copy stops upload-failed. cleanupMax
+// so that it always ends with a result line that records what it did: a copy
+// cut by the bound stops caps (what went up is recorded, the rest is the next
+// job's), while a stop signal keeps upload-failed. cleanupMax
 // bounds the aborts and deletes that run after a cut.
 const (
 	CopyBound  = 240 * time.Second // copy and rebuild; their job kind is replicate
@@ -168,13 +169,15 @@ func Bound(mode string) time.Duration {
 var ErrInput = errors.New("repl: input")
 
 // Codes are the failure codes the program prints for a job of kind
-// (replicate: copy and rebuild; probe), the one list of them.
+// (replicate: copy and rebuild; probe; fetch), the one list of them.
 func Codes(kind string) []string {
 	switch kind {
 	case "replicate":
 		return []string{"input", "credential", "index", "repository", "store", "result"}
 	case "probe":
 		return []string{"input", "credential", "store", "result"}
+	case "fetch":
+		return []string{"input", "credential", "path", "missing", "mismatch", "quota", "too_large", "store", "result"}
 	}
 	return nil
 }
