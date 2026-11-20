@@ -1,0 +1,1782 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] context: the control-plane client
+
+resolve and keys ask the control plane's dashboard socket, a Unix socket, presenting the
+assertion. A call is bounded in time and its answer in size; an answer is checked member by
+member before use, the connection strings against the one accepted form, and only checked
+members are kept. A resolve answer lives in memory per (ref, iss, sub, role class), its 60 s
+counted as elapsed time, and, encrypted with AES-256-GCM under the node's cache key and bound
+to the project and role class, on disk. The disk entry is read only when the socket gives no
+answer, and not once the socket's last answer is older than the entry's lifetime, by the
+file's time and by the time inside the answer; a refusal is final. Temporary files an
+interrupted write left are removed before the next write. The module's settings are read at
+the first use, or by checkSettings; a missing or malformed one stops the process.
+---
+ .../lib/api/self-hosted/dash-socket.test.ts   | 1208 +++++++++++++++++
+ .../studio/lib/api/self-hosted/dash-socket.ts |  540 ++++++++
+ 2 files changed, 1748 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/dash-socket.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/dash-socket.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/dash-socket.test.ts b/apps/studio/lib/api/self-hosted/dash-socket.test.ts
+new file mode 100644
+index 00000000..cd0fbd6a
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/dash-socket.test.ts
+@@ -0,0 +1,1208 @@
++// SPDX-License-Identifier: Apache-2.0
++import { createDecipheriv } from 'node:crypto'
++import {
++  copyFileSync,
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  readdirSync,
++  readFileSync,
++  rmSync,
++  statSync,
++  utimesSync,
++  writeFileSync,
++} from 'node:fs'
++import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
++import { createRequire } from 'node:module'
++import { tmpdir } from 'node:os'
++import { join, resolve as resolvePath } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { Assertion, ResolveAnswer } from './project-context'
++
++const VECTORS = resolvePath(import.meta.dirname, '../../../../../vectors')
++const LIMITS = readFileSync(join(VECTORS, 'limits.json'), 'utf8').trim()
++const DSN = JSON.parse(readFileSync(join(VECTORS, 'dsn.json'), 'utf8'))
++
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++const ISS = 'https://issuer.test'
++const PGCAP = '10.212.0.6:20000:21023'
++const DAY = 86_400_000
++// An answer's own time: the clock's, as the control plane writes it.
++const AT = new Date().toISOString().replace(/\.\d+Z$/, 'Z')
++
++const dsn = (login: string, password: string, port: number) =>
++  `postgresql://${login}:${password}@10.212.0.6:${port}/postgres?sslmode=disable`
++
++function answer(ref: string, port: number, over: Record<string, unknown> = {}): ResolveAnswer {
++  return {
++    ref,
++    name: `project ${port}`,
++    state: 'active',
++    db_version: '17.6.1',
++    pg_meta: port % 2,
++    dsn_rw: dsn('postgres', `rw-secret-${port}`, port),
++    dsn_ro: dsn('supabase_read_only_user', `ro-secret-${port}`, port),
++    api_url: `https://${ref}.example.test`,
++    data_api: {
++      schemas: ['public', 'graphql_public'],
++      extra_search_path: ['public', 'extensions'],
++      max_rows: null,
++    },
++    generation: 4,
++    at: AT,
++    ...over,
++  } as ResolveAnswer
++}
++
++// What a read_only member is answered: the same without the read-write string.
++function roAnswer(ref: string, port: number): ResolveAnswer {
++  const a = answer(ref, port)
++  delete (a as any).dsn_rw
++  return a
++}
++
++function who(ref: string, sub: string, role: Assertion['role'] = 'owner'): Assertion {
++  return {
++    text: `v1.assertion-of-${sub}-for-${ref}.signature`,
++    ref,
++    iss: ISS,
++    sub,
++    name: sub,
++    role,
++    purpose: '',
++  }
++}
++
++type Seen = {
++  method?: string
++  url?: string
++  headers: IncomingMessage['headers']
++  raw: string[]
++  body: number
++}
++type Handler = (req: IncomingMessage, res: ServerResponse, seen: Seen) => void
++
++const json =
++  (status: number, body: unknown): Handler =>
++  (_req, res) => {
++    const text = typeof body === 'string' ? body : JSON.stringify(body)
++    res.writeHead(status, { 'Content-Type': 'application/json' }).end(text)
++  }
++const refuse = (status: number, code: string) => json(status, { code })
++const silent: Handler = () => {}
++
++describe('api/self-hosted/dash-socket', () => {
++  let dir: string
++  let server: Server | undefined
++  let handler: Handler
++  let seen: Seen[]
++  let exit: ReturnType<typeof vi.spyOn>
++  let said: string[]
++
++  const sock = () => join(dir, 'dash.sock')
++  const cacheFile = (ref: string, cls: string) => join(dir, 'data', ref, 'cache', `${cls}.bin`)
++
++  async function listen() {
++    server = createServer((req, res) => {
++      const s: Seen = {
++        method: req.method,
++        url: req.url,
++        headers: req.headers,
++        raw: req.rawHeaders,
++        body: 0,
++      }
++      seen.push(s)
++      req.on('data', (c) => (s.body += c.length))
++      req.on('end', () => handler(req, res, s))
++    })
++    await new Promise<void>((done) => server!.listen(sock(), done))
++  }
++  async function stopListening() {
++    if (!server) return
++    server.closeAllConnections()
++    await new Promise((done) => server!.close(done))
++    server = undefined
++    rmSync(sock(), { force: true })
++  }
++
++  // The module as a server process loads it: environment first, then the import.
++  async function load(env: Record<string, string | undefined> = {}) {
++    vi.resetModules()
++    const all: Record<string, string | undefined> = {
++      SUPAPACE_DASH_SOCKET: sock(),
++      SUPAPACE_DASH_KEYS: join(dir, 'keys'),
++      SUPAPACE_DASH_DATA: join(dir, 'data'),
++      SUPAPACE_PGCAP: PGCAP,
++      SUPAPACE_LIMITS: LIMITS,
++      ...env,
++    }
++    for (const [name, value] of Object.entries(all)) {
++      vi.stubEnv(name, value ?? '')
++      if (value === undefined) delete process.env[name]
++    }
++    return await import('./dash-socket')
++  }
++  const quick = (ms: number) => ({
++    SUPAPACE_LIMITS: LIMITS.replace(/"socket_call_ms":\d+/, `"socket_call_ms":${ms}`),
++  })
++
++  beforeEach(async () => {
++    dir = mkdtempSync(join(tmpdir(), 'dash-'))
++    mkdirSync(join(dir, 'keys'))
++    mkdirSync(join(dir, 'data'))
++    writeFileSync(join(dir, 'keys', 'cache.key'), Buffer.alloc(32, 7).toString('base64url') + '\n')
++    seen = []
++    said = []
++    handler = json(200, answer(REF_A, 20001))
++    for (const level of ['log', 'info', 'warn', 'error'] as const) {
++      vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
++        said.push(args.map(String).join(' '))
++      })
++    }
++    exit = vi.spyOn(process, 'exit').mockImplementation(() => {
++      throw new Error('the process exited')
++    })
++    await listen()
++  })
++  afterEach(async () => {
++    await stopListening()
++    vi.unstubAllEnvs()
++    vi.restoreAllMocks()
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  // Nothing a caller could log or answer with may carry a credential.
++  function expectNoSecret(text: string) {
++    for (const secret of [
++      'rw-secret',
++      'ro-secret',
++      'postgresql://',
++      'v1.assertion-of',
++      '.signature',
++      'service-token',
++    ]) {
++      expect(text).not.toContain(secret)
++    }
++  }
++  async function refusal(p: Promise<unknown>) {
++    const e: any = await p.then(
++      () => undefined,
++      (e) => e
++    )
++    expect(e, 'the call was answered instead of refused').toBeDefined()
++    expect(e.name).toBe('ProjectError')
++    expectNoSecret(JSON.stringify(e) + e.message + e.stack)
++    return { status: e.status, code: e.code }
++  }
++
++  describe('resolve', () => {
++    it('asks the socket with the assertion and returns its answer, member for member', async () => {
++      const { resolve } = await load()
++      const a = who(REF_A, 'u-owner')
++      const got = await resolve(a)
++      expect(got).toEqual(answer(REF_A, 20001))
++      expect(Object.keys(got)).toEqual(Object.keys(answer(REF_A, 20001)))
++      expect(seen).toHaveLength(1)
++      expect(seen[0].method).toBe('POST')
++      expect(seen[0].url).toBe('/v1/resolve')
++      expect(seen[0].body).toBe(0)
++      expect(seen[0].headers['content-length']).toBe('0')
++      const names = seen[0].raw.filter((_, i) => i % 2 === 0).map((n) => n.toLowerCase())
++      // exactly these headers: the assertion once, and nowhere else
++      expect(names.sort()).toEqual(['connection', 'content-length', 'host', 'x-supapace-assertion'])
++      expect(seen[0].raw.filter((v) => v.includes('assertion-of'))).toEqual([a.text])
++      expect(seen[0].headers['x-supapace-assertion']).toBe(a.text)
++      expect(Object.isFrozen(got)).toBe(true)
++      expect(Object.isFrozen(got.data_api.schemas)).toBe(true)
++    })
++
++    it('answers a read_only member without a read-write string', async () => {
++      handler = json(200, roAnswer(REF_A, 20001))
++      const { resolve } = await load()
++      const got = await resolve(who(REF_A, 'u-ro', 'read_only'))
++      expect(got.dsn_rw).toBeUndefined()
++      expect('dsn_rw' in got).toBe(false)
++      expect(got.dsn_ro).toBe(dsn('supabase_read_only_user', 'ro-secret-20001', 20001))
++    })
++
++    it('drops a member it does not know, and keeps no member it has not checked', async () => {
++      handler = json(200, answer(REF_A, 20001, { surprise: 'postgresql://x', keys: { a: 1 } }))
++      const { resolve } = await load()
++      const got = await resolve(who(REF_A, 'u-owner'))
++      expect(got).toEqual(answer(REF_A, 20001))
++    })
++
++    it('keeps an answer in memory 60 s per (ref, iss, sub, role class)', async () => {
++      // the 60 s are elapsed time: the clock that only moves forward
++      const now = vi.spyOn(performance, 'now')
++      const t0 = 5_000_000
++      now.mockReturnValue(t0)
++      const { resolve } = await load()
++      const x = who(REF_A, 'u-x')
++      await resolve(x)
++      expect(seen).toHaveLength(1)
++
++      // warm: the same principal, also as the other role of its class, asks nothing
++      now.mockReturnValue(t0 + 59_999)
++      await resolve(x)
++      await resolve({ ...x, role: 'developer' })
++      await resolve({
++        ...x,
++        text: 'v1.assertion-of-a-later-request.signature',
++        name: 'renamed',
++      })
++      expect(seen).toHaveLength(1)
++
++      // each other member of the key asks the socket
++      handler = (req, res, s) =>
++        (req.headers['x-supapace-assertion'] as string).includes(REF_B)
++          ? json(200, answer(REF_B, 20002))(req, res, s)
++          : (req.headers['x-supapace-assertion'] as string).includes('u-ro')
++            ? json(200, roAnswer(REF_A, 20001))(req, res, s)
++            : json(200, answer(REF_A, 20001))(req, res, s)
++      await resolve(who(REF_A, 'u-y'))
++      expect(seen).toHaveLength(2)
++      await resolve({ ...x, iss: 'https://other-issuer.test' })
++      expect(seen).toHaveLength(3)
++      await resolve(who(REF_B, 'u-x'))
++      expect(seen).toHaveLength(4)
++      await resolve({ ...who(REF_A, 'u-ro', 'read_only'), sub: 'u-x' })
++      expect(seen).toHaveLength(5)
++
++      // at 60 s the entry is gone
++      now.mockReturnValue(t0 + 60_000)
++      await resolve(x)
++      expect(seen).toHaveLength(6)
++    })
++
++    it('does not join the parts of the key ambiguously', async () => {
++      const { resolve } = await load()
++      await resolve({ ...who(REF_A, 'u'), iss: 'a","b', sub: 'c' })
++      await resolve({ ...who(REF_A, 'u'), iss: 'a', sub: 'b","c' })
++      expect(seen).toHaveLength(2)
++    })
++
++    it('never serves a member from an entry another member warmed', async () => {
++      const { resolve } = await load()
++      const x = who(REF_A, 'u-x')
++      const y = who(REF_A, 'u-y')
++      await resolve(x)
++      handler = refuse(403, 'not_a_member')
++      // Y, of the same project and role class, is asked about and refused, X's entry notwithstanding
++      expect(await refusal(resolve(y))).toEqual({
++        status: 403,
++        code: 'not_a_member',
++      })
++      expect(seen).toHaveLength(2)
++      expect(seen[1].headers['x-supapace-assertion']).toBe(y.text)
++      // control: X's entry is warm and still answers X
++      expect(await resolve(x)).toEqual(answer(REF_A, 20001))
++      expect(seen).toHaveLength(2)
++    })
++
++    it('asks once for requests of one member that arrive together', async () => {
++      let release!: () => void
++      const held = new Promise<void>((r) => (release = r))
++      handler = (req, res, s) => void held.then(() => json(200, answer(REF_A, 20001))(req, res, s))
++      const { resolve } = await load()
++      const x = who(REF_A, 'u-x')
++      const all = Promise.all([resolve(x), resolve(x), resolve(x), resolve(who(REF_A, 'u-y'))])
++      await vi.waitFor(() => expect(seen).toHaveLength(2))
++      release()
++      for (const got of await all) expect(got).toEqual(answer(REF_A, 20001))
++      expect(seen).toHaveLength(2)
++    })
++
++    it('holds a bounded number of entries', async () => {
++      vi.spyOn(performance, 'now').mockReturnValue(5_000_000)
++      handler = (req, res, s) => json(200, answer(REF_A, 20001))(req, res, s)
++      const m = await load()
++      for (let i = 0; i <= m.MEMORY_ENTRIES; i++) await m.resolve(who(REF_A, `u-${i}`))
++      expect(seen).toHaveLength(m.MEMORY_ENTRIES + 1)
++      // the oldest was dropped for the newest; the second oldest is still warm
++      await m.resolve(who(REF_A, 'u-1'))
++      expect(seen).toHaveLength(m.MEMORY_ENTRIES + 1)
++      await m.resolve(who(REF_A, 'u-0'))
++      expect(seen).toHaveLength(m.MEMORY_ENTRIES + 2)
++    }, 60_000)
++  })
++
++  describe('the disk entry', () => {
++    it('is written by rename, encrypted, under the project and role class', async () => {
++      const now = vi.spyOn(performance, 'now')
++      now.mockReturnValue(1_000)
++      const { resolve } = await load()
++      await resolve(who(REF_A, 'u-x'))
++      const file = cacheFile(REF_A, 'rw')
++      const first = statSync(file)
++      expect(readdirSync(join(dir, 'data', REF_A, 'cache'))).toEqual(['rw.bin'])
++      expect(first.mode & 0o777).toBe(0o600)
++      expect(statSync(join(dir, 'data', REF_A, 'cache')).mode & 0o777).toBe(0o700)
++
++      const bytes = readFileSync(file)
++      expectNoSecret(bytes.toString('latin1'))
++      expect(bytes.toString('latin1')).not.toContain(REF_A)
++      expect(bytes.toString('latin1')).not.toContain('10.212.0.6')
++      // 12-byte nonce, the answer's JSON, the 16-byte tag
++      expect(bytes.length).toBe(12 + Buffer.byteLength(JSON.stringify(answer(REF_A, 20001))) + 16)
++      // AES-256-GCM under the cache key, bound to the project and the role class
++      const open = (bound: string) => {
++        const d = createDecipheriv('aes-256-gcm', Buffer.alloc(32, 7), bytes.subarray(0, 12))
++        d.setAAD(Buffer.from(bound))
++        d.setAuthTag(bytes.subarray(bytes.length - 16))
++        return Buffer.concat([
++          d.update(bytes.subarray(12, bytes.length - 16)),
++          d.final(),
++        ]).toString()
++      }
++      expect(JSON.parse(open(`${REF_A}:rw`))).toEqual(answer(REF_A, 20001))
++      for (const other of [`${REF_B}:rw`, `${REF_A}:ro`, REF_A, 'rw', ''])
++        expect(() => open(other)).toThrow()
++
++      // the next answer replaces the file by a new one (a rename), never writes into it
++      now.mockReturnValue(61_000)
++      await resolve(who(REF_A, 'u-x'))
++      expect(seen).toHaveLength(2)
++      const second = statSync(file)
++      expect(second.ino).not.toBe(first.ino)
++      expect(readFileSync(file).subarray(0, 12)).not.toEqual(bytes.subarray(0, 12))
++      expect(readdirSync(join(dir, 'data', REF_A, 'cache'))).toEqual(['rw.bin'])
++    })
++
++    it('is kept per role class: a read_only entry holds no read-write string', async () => {
++      handler = json(200, roAnswer(REF_A, 20001))
++      const m = await load()
++      await m.resolve(who(REF_A, 'u-ro', 'read_only'))
++      expect(readdirSync(join(dir, 'data', REF_A, 'cache'))).toEqual(['ro.bin'])
++      await stopListening()
++      const again = await load()
++      const got = await again.resolve(who(REF_A, 'u-other', 'read_only'))
++      expect(got).toEqual(roAnswer(REF_A, 20001))
++      // and a read-write member finds no entry of its class
++      expect(await refusal(again.resolve(who(REF_A, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++    })
++
++    it('fails to open under another project’s or another class’s name', async () => {
++      handler = (req, res, s) =>
++        (req.headers['x-supapace-assertion'] as string).includes(REF_B)
++          ? json(200, answer(REF_B, 20002))(req, res, s)
++          : json(200, answer(REF_A, 20001))(req, res, s)
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      await first.resolve(who(REF_B, 'u-x'))
++      await stopListening()
++
++      // control: on silence each project's own entry opens
++      const own = await load()
++      expect((await own.resolve(who(REF_A, 'u-x'))).ref).toBe(REF_A)
++      expect((await own.resolve(who(REF_B, 'u-x'))).ref).toBe(REF_B)
++
++      // A's file under B's name, and A's read-write file under A's read-only name
++      copyFileSync(cacheFile(REF_A, 'rw'), cacheFile(REF_B, 'rw'))
++      copyFileSync(cacheFile(REF_A, 'rw'), cacheFile(REF_A, 'ro'))
++      const moved = await load()
++      expect(await refusal(moved.resolve(who(REF_B, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      expect(await refusal(moved.resolve(who(REF_A, 'u-ro', 'read_only')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      expect((await moved.resolve(who(REF_A, 'u-x'))).ref).toBe(REF_A)
++    })
++
++    it('does not open under another key, cut short, or changed in one byte', async () => {
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      await stopListening()
++      const file = cacheFile(REF_A, 'rw')
++      const good = readFileSync(file)
++      const unavailable = { status: 503, code: 'project_unavailable' }
++      const m = await load()
++
++      writeFileSync(file, good.subarray(0, good.length - 1))
++      expect(await refusal(m.resolve(who(REF_A, 'u-x')))).toEqual(unavailable)
++      const flipped = Buffer.from(good)
++      flipped[20] ^= 1
++      writeFileSync(file, flipped)
++      expect(await refusal(m.resolve(who(REF_A, 'u-x')))).toEqual(unavailable)
++      writeFileSync(file, Buffer.alloc(5))
++      expect(await refusal(m.resolve(who(REF_A, 'u-x')))).toEqual(unavailable)
++      writeFileSync(file, good)
++      expect((await m.resolve(who(REF_A, 'u-x'))).ref).toBe(REF_A)
++
++      writeFileSync(
++        join(dir, 'keys', 'cache.key'),
++        Buffer.alloc(32, 8).toString('base64url') + '\n'
++      )
++      const rekeyed = await load()
++      expect(await refusal(rekeyed.resolve(who(REF_A, 'u-x')))).toEqual(unavailable)
++    })
++
++    it('is used when the socket refuses the connection', async () => {
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      await stopListening()
++
++      // a new process: nothing in memory; no listener at the path (the file is gone)
++      const gone = await load()
++      expect(await gone.resolve(who(REF_A, 'u-y'))).toEqual(answer(REF_A, 20001))
++      // and with a socket file nobody listens on
++      writeFileSync(sock(), '')
++      const stale = await load()
++      expect(await stale.resolve(who(REF_A, 'u-y'))).toEqual(answer(REF_A, 20001))
++      // control: a project with no entry is unavailable
++      expect(await refusal(stale.resolve(who(REF_B, 'u-y')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++    })
++
++    it('is used when the socket gives no answer inside the call’s bound', async () => {
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      handler = silent
++      const m = await load(quick(150))
++      expect(await m.resolve(who(REF_A, 'u-y'))).toEqual(answer(REF_A, 20001))
++      expect(seen).toHaveLength(2)
++      expect(await refusal(m.resolve(who(REF_B, 'u-y')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      // nothing read on silence is kept in memory: the next request asks again
++      await m.resolve(who(REF_A, 'u-y'))
++      expect(seen).toHaveLength(4)
++    })
++
++    it('is used when the socket closes the connection without an answer', async () => {
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      handler = (req) => req.socket.destroy()
++      const m = await load()
++      expect(await m.resolve(who(REF_A, 'u-y'))).toEqual(answer(REF_A, 20001))
++    })
++
++    const refusals: [string, Handler, { status: number; code: string }][] = [
++      ['401 bad_assertion', refuse(401, 'bad_assertion'), { status: 401, code: 'bad_assertion' }],
++      ['403 not_a_member', refuse(403, 'not_a_member'), { status: 403, code: 'not_a_member' }],
++      ['404 not_here', refuse(404, 'not_here'), { status: 404, code: 'not_here' }],
++      ['429 rate_limited', refuse(429, 'rate_limited'), { status: 429, code: 'rate_limited' }],
++      ['503 unavailable', refuse(503, 'unavailable'), { status: 503, code: 'unavailable' }],
++      ['403 peer', refuse(403, 'peer'), { status: 503, code: 'project_unavailable' }],
++      ['404 not_found', refuse(404, 'not_found'), { status: 503, code: 'project_unavailable' }],
++      [
++        'a code under another status',
++        refuse(403, 'not_here'),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a known status with an unknown code',
++        refuse(403, 'postgresql://x'),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a plain-text 431',
++        (_q, res) =>
++          void res
++            .writeHead(431, { 'Content-Type': 'text/plain' })
++            .end('Request Header Fields Too Large'),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a whole answer under another status than 200',
++        (_q, res) => void res.writeHead(201).end(JSON.stringify(answer(REF_A, 20001))),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a whole answer followed by a broken connection, short of its announced length',
++        (req, res) => {
++          res.writeHead(200, { 'Content-Length': 4096 })
++          res.write(JSON.stringify(answer(REF_A, 20001)), () => req.socket.destroy())
++        },
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a redirect',
++        (_q, res) => void res.writeHead(302, { Location: '/v1/keys' }).end(),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a 200 that is not JSON',
++        json(200, 'postgresql://postgres:rw-secret@x'),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a 200 for another project',
++        json(200, answer(REF_B, 20001)),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'a 200 whose answer is cut by the bound',
++        (_q, res) => void res.writeHead(200).write('{"ref":"' + REF_A + '",'),
++        { status: 503, code: 'project_unavailable' },
++      ],
++      [
++        'an answer that is not HTTP',
++        (req) => void req.socket.end('postgresql://postgres:rw-secret@x\r\n\r\n'),
++        { status: 503, code: 'project_unavailable' },
++      ],
++    ]
++    it.each(refusals)(
++      'is never used after an answer — %s — a fresh entry notwithstanding',
++      async (_, h, want) => {
++        const first = await load()
++        await first.resolve(who(REF_A, 'u-x'))
++        expect(existsSync(cacheFile(REF_A, 'rw'))).toBe(true)
++        const before = readFileSync(cacheFile(REF_A, 'rw'))
++
++        handler = h
++        const m = await load(quick(300))
++        expect(await refusal(m.resolve(who(REF_A, 'u-x')))).toEqual(want)
++        expect(seen).toHaveLength(2)
++        // the refusal neither read nor replaced the entry
++        expect(readFileSync(cacheFile(REF_A, 'rw'))).toEqual(before)
++
++        // control, on the same path: silence does use the entry
++        await stopListening()
++        expect(await m.resolve(who(REF_A, 'u-x'))).toEqual(answer(REF_A, 20001))
++        expectNoSecret(said.join('\n'))
++      }
++    )
++
++    it('is not used once the socket’s last answer is older than 7 days', async () => {
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      await stopListening()
++      const file = cacheFile(REF_A, 'rw')
++      const m = await load()
++      const at = (ms: number) => utimesSync(file, new Date(ms), new Date(ms))
++
++      at(Date.now() - 7 * DAY + 3_600_000)
++      expect(await m.resolve(who(REF_A, 'u-x'))).toEqual(answer(REF_A, 20001))
++      at(Date.now() - 7 * DAY - 60_000)
++      expect(await refusal(m.resolve(who(REF_A, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      // a time ahead of the clock is no proof of a recent answer
++      at(Date.now() + 3_600_000)
++      expect(await refusal(m.resolve(who(REF_A, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++    })
++
++    it.each([
++      [
++        'a day ahead of the clock',
++        () => new Date(Date.now() + DAY).toISOString().replace(/\.\d+Z$/, 'Z'),
++      ],
++      ['no time at all, though it has the form of one', () => '2026-13-45T99:99:99Z'],
++    ])('is not used when the time inside its answer is %s', async (_, at) => {
++      handler = json(200, answer(REF_A, 20001, { at: at() }))
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      expect(existsSync(cacheFile(REF_A, 'rw'))).toBe(true)
++      await stopListening()
++      const m = await load()
++      expect(await refusal(m.resolve(who(REF_A, 'u-y')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      // control: within the clock's allowance the entry is used
++      await listen()
++      handler = json(200, answer(REF_A, 20001, { at: new Date(Date.now() + 5_000).toISOString() }))
++      await m.resolve(who(REF_A, 'u-x'))
++      await stopListening()
++      expect((await (await load()).resolve(who(REF_A, 'u-y'))).ref).toBe(REF_A)
++    })
++
++    it('keeps its modification time when it is read on silence', async () => {
++      const first = await load()
++      await first.resolve(who(REF_A, 'u-x'))
++      await stopListening()
++      const file = cacheFile(REF_A, 'rw')
++      const then = new Date(Date.now() - 3 * DAY)
++      utimesSync(file, then, then)
++      const before = statSync(file)
++
++      const m = await load()
++      for (let i = 0; i < 3; i++) expect((await m.resolve(who(REF_A, `u-${i}`))).ref).toBe(REF_A)
++      const after = statSync(file)
++      expect(after.mtimeMs).toBe(before.mtimeMs)
++      expect(after.ino).toBe(before.ino)
++      expect(readdirSync(join(dir, 'data', REF_A, 'cache'))).toEqual(['rw.bin'])
++
++      // control: an answer of the socket does move it
++      await listen()
++      await m.resolve(who(REF_A, 'u-x'))
++      expect(statSync(file).mtimeMs).toBeGreaterThan(before.mtimeMs + DAY)
++    })
++
++    it('removes the temporary files an interrupted write left, by their name, before a write', async () => {
++      const cacheA = join(dir, 'data', REF_A, 'cache')
++      const cacheB = join(dir, 'data', REF_B, 'cache')
++      mkdirSync(cacheA, { recursive: true })
++      mkdirSync(cacheB, { recursive: true })
++      const leftovers = ['rw.0123456789abcdef.tmp', 'ro.fedcba9876543210.tmp']
++      const others = [
++        'rw.0123.tmp',
++        'rw.0123456789ABCDEF.tmp',
++        'notes.tmp',
++        'rw.bin.bak',
++        'xx.0123456789abcdef.tmp',
++      ]
++      for (const name of [...leftovers, ...others]) writeFileSync(join(cacheA, name), 'x')
++      writeFileSync(join(cacheB, leftovers[0]), 'x')
++
++      const { resolve } = await load()
++      await resolve(who(REF_A, 'u-x'))
++      // this client's leftovers are gone; nothing of another name, and nothing of another project
++      expect(readdirSync(cacheA).sort()).toEqual([...others, 'rw.bin'].sort())
++      expect(readdirSync(cacheB)).toEqual([leftovers[0]])
++    })
++
++    it('looks at a bounded number of names before a write', async () => {
++      const cache = join(dir, 'data', REF_A, 'cache')
++      mkdirSync(cache, { recursive: true })
++      const hex = (n: number) => n.toString(16).padStart(16, '0')
++      for (let n = 0; n < 200; n++) writeFileSync(join(cache, `rw.${hex(n)}.tmp`), 'x')
++      const left = () => readdirSync(cache).filter((name) => name.endsWith('.tmp')).length
++
++      const m = await load()
++      await m.resolve(who(REF_A, 'u-0'))
++      expect(left()).toBeGreaterThanOrEqual(200 - m.SWEEP_NAMES)
++      expect(left()).toBeLessThan(200)
++      // each later write removes more, until none is left
++      for (let n = 1; n <= 8; n++) await m.resolve(who(REF_A, `u-${n}`))
++      expect(left()).toBe(0)
++      expect(readdirSync(cache)).toEqual(['rw.bin'])
++    })
++
++    it('writes the entry though a leftover cannot be removed', async () => {
++      const cache = join(dir, 'data', REF_A, 'cache')
++      // a directory under a leftover's name: removing it as a file fails
++      mkdirSync(join(cache, 'rw.0123456789abcdef.tmp'), { recursive: true })
++      const { resolve } = await load()
++      expect(await resolve(who(REF_A, 'u-x'))).toEqual(answer(REF_A, 20001))
++      expect(readdirSync(cache).sort()).toEqual(['rw.0123456789abcdef.tmp', 'rw.bin'])
++      expect(said).toEqual([])
++    })
++
++    it('that cannot be written does not fail the request', async () => {
++      writeFileSync(join(dir, 'data', REF_A), 'in the way')
++      const { resolve } = await load()
++      expect(await resolve(who(REF_A, 'u-x'))).toEqual(answer(REF_A, 20001))
++      expect(said.join('\n')).toContain(REF_A)
++      expectNoSecret(said.join('\n'))
++    })
++  })
++
++  describe('an answer is checked before it is used', () => {
++    const base = () => answer(REF_A, 20001) as any
++    const without = (member: string) => {
++      const a = base()
++      delete a[member]
++      return a
++    }
++    const cases: [string, unknown][] = [
++      ['a list', [base()]],
++      ['null', null],
++      ['a ref of another shape', { ...base(), ref: REF_A.toUpperCase() }],
++      ['no name', without('name')],
++      ['a name that is not text', { ...base(), name: { toString: 'x' } }],
++      ['a name of 300 bytes', { ...base(), name: 'n'.repeat(300) }],
++      ['a state it does not know', { ...base(), state: 'deleting' }],
++      ['a version with a space', { ...base(), db_version: '17.6 beta' }],
++      ['a third postgres-meta instance', { ...base(), pg_meta: 2 }],
++      ['a fractional instance', { ...base(), pg_meta: 0.5 }],
++      ['an instance as text', { ...base(), pg_meta: '1' }],
++      ['no read-write string for a read-write member', without('dsn_rw')],
++      [
++        'a read-write string to another host',
++        {
++          ...base(),
++          dsn_rw: 'postgresql://postgres:x@10.212.0.7:20001/postgres?sslmode=disable',
++        },
++      ],
++      [
++        'a read-write string with the read-only login',
++        { ...base(), dsn_rw: dsn('supabase_read_only_user', 'x', 20001) },
++      ],
++      [
++        'a read-only string with the read-write login',
++        { ...base(), dsn_ro: dsn('postgres', 'x', 20001) },
++      ],
++      [
++        'two strings to two ports',
++        { ...base(), dsn_ro: dsn('supabase_read_only_user', 'x', 20002) },
++      ],
++      ['a string that is not text', { ...base(), dsn_rw: [dsn('postgres', 'x', 20001)] }],
++      ['an empty read-only string', { ...base(), dsn_ro: '' }],
++      [
++        'an API address of another project',
++        { ...base(), api_url: `https://${REF_B}.example.test` },
++      ],
++      ['an API address with a path', { ...base(), api_url: `https://${REF_A}.example.test/x` }],
++      ['an API address over plain HTTP', { ...base(), api_url: `http://${REF_A}.example.test` }],
++      ['an API address with an at sign', { ...base(), api_url: `https://${REF_A}.example.test@` }],
++      ['no data API settings', without('data_api')],
++      [
++        'schemas that are not a list',
++        { ...base(), data_api: { ...base().data_api, schemas: 'public' } },
++      ],
++      ['a schema that is not text', { ...base(), data_api: { ...base().data_api, schemas: [1] } }],
++      [
++        '65 schemas',
++        {
++          ...base(),
++          data_api: { ...base().data_api, schemas: Array(65).fill('s') },
++        },
++      ],
++      ['a negative row limit', { ...base(), data_api: { ...base().data_api, max_rows: -1 } }],
++      ['a row limit as text', { ...base(), data_api: { ...base().data_api, max_rows: '10' } }],
++      ['a fractional generation', { ...base(), generation: 1.5 }],
++      ['a time of another form', { ...base(), at: 'yesterday' }],
++    ]
++    it.each(cases)('refuses %s', async (_, body) => {
++      handler = json(200, body)
++      const { resolve } = await load()
++      expect(await refusal(resolve(who(REF_A, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      expect(existsSync(cacheFile(REF_A, 'rw'))).toBe(false)
++      expectNoSecret(said.join('\n'))
++      // control: the same answer unchanged is accepted
++      handler = json(200, base())
++      expect((await resolve(who(REF_A, 'u-x'))).ref).toBe(REF_A)
++    })
++
++    it('refuses a read-write string in a read_only member’s answer', async () => {
++      const { resolve } = await load()
++      expect(await refusal(resolve(who(REF_A, 'u-ro', 'read_only')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      handler = json(200, roAnswer(REF_A, 20001))
++      expect((await resolve(who(REF_A, 'u-ro', 'read_only'))).ref).toBe(REF_A)
++    })
++
++    it('accepts a project without a read-only login, and a row limit', async () => {
++      const a = without('dsn_ro')
++      a.data_api = { ...a.data_api, max_rows: 1000 }
++      handler = json(200, a)
++      const { resolve } = await load()
++      expect(await resolve(who(REF_A, 'u-x'))).toEqual(a)
++    })
++
++    it('reads no more than the bound of an answer', async () => {
++      let sent = 0
++      handler = (_req, res) => {
++        res.writeHead(200, { 'Content-Type': 'application/json' })
++        const chunk = Buffer.alloc(16_384, 0x20)
++        const more = () => {
++          while (sent < 64 * 1024 * 1024 && res.write(chunk)) sent += chunk.length
++          if (sent < 64 * 1024 * 1024 && !res.destroyed) res.once('drain', more)
++        }
++        res.on('close', () => res.removeAllListeners('drain'))
++        more()
++      }
++      const m = await load()
++      expect(await refusal(m.resolve(who(REF_A, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      expect(sent).toBeLessThan(m.MAX_ANSWER_BYTES + 4 * 1024 * 1024)
++    })
++
++    it('refuses a call for a ref, or as a role, that is not one', async () => {
++      const { resolve, keys } = await load()
++      for (const a of [
++        { ...who(REF_A, 'u-x'), ref: '../../../etc/passwd0000' },
++        { ...who(REF_A, 'u-x'), ref: REF_A + '/' },
++        { ...who(REF_A, 'u-x'), role: 'admin' as any },
++        { ...who(REF_A, 'u-x'), text: 'v1.two\r\nX-Other: lines' },
++        { ...who(REF_A, 'u-x'), text: '' },
++        { ...who(REF_A, 'u-x'), ref: [REF_A] as any },
++        { ...who(REF_A, 'u-x'), sub: '' },
++        { ...who(REF_A, 'u-x'), iss: { toString: () => 'i' } as any },
++      ]) {
++        await refusal(resolve(a))
++        await refusal(keys(a))
++      }
++      expect(seen).toHaveLength(0)
++      expect(readdirSync(join(dir, 'data'))).toEqual([])
++    })
++  })
++
++  describe('dropProject', () => {
++    it('drops one project’s entries, in memory and on disk, and leaves another’s', async () => {
++      handler = (req, res, s) =>
++        (req.headers['x-supapace-assertion'] as string).includes(REF_B)
++          ? json(200, answer(REF_B, 20002))(req, res, s)
++          : json(200, answer(REF_A, 20001))(req, res, s)
++      const m = await load()
++      await m.resolve(who(REF_A, 'u-x'))
++      await m.resolve(who(REF_A, 'u-y'))
++      await m.resolve(who(REF_B, 'u-x'))
++      expect(seen).toHaveLength(3)
++
++      m.dropProject(REF_A)
++      expect(existsSync(cacheFile(REF_A, 'rw'))).toBe(false)
++      expect(existsSync(cacheFile(REF_B, 'rw'))).toBe(true)
++      // B is still warm; both members of A ask again
++      await m.resolve(who(REF_B, 'u-x'))
++      expect(seen).toHaveLength(3)
++      await m.resolve(who(REF_A, 'u-x'))
++      await m.resolve(who(REF_A, 'u-y'))
++      expect(seen).toHaveLength(5)
++
++      // on silence, after a drop: B's disk entry answers, A has none
++      m.dropProject(REF_A)
++      await stopListening()
++      const cold = await load()
++      expect((await cold.resolve(who(REF_B, 'u-z'))).ref).toBe(REF_B)
++      expect(await refusal(cold.resolve(who(REF_A, 'u-z')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++    })
++
++    it('touches nothing for a name that is not a ref', async () => {
++      const m = await load()
++      await m.resolve(who(REF_A, 'u-x'))
++      for (const name of ['..', '.', '', REF_A + '/..', '../' + REF_A, REF_A.toUpperCase()]) {
++        expect(() => m.dropProject(name)).toThrow()
++      }
++      expect(existsSync(cacheFile(REF_A, 'rw'))).toBe(true)
++      expect(existsSync(join(dir, 'keys', 'cache.key'))).toBe(true)
++    })
++  })
++
++  describe('keys', () => {
++    const keysAnswer = (over: Record<string, unknown> = {}) => ({
++      anon_key: 'eyJhbGciOiJSUzI1NiJ9.anon.sig',
++      signing_keys: [
++        {
++          kid: 'k1',
++          class: 'project',
++          alg: 'RS256',
++          kty: 'RSA',
++          n: 'AQAB-_x',
++          e: 'AQAB',
++        },
++      ],
++      ...over,
++    })
++
++    it('asks the socket every time and returns the answer', async () => {
++      handler = json(200, keysAnswer())
++      const { keys } = await load()
++      const a = who(REF_A, 'u-x')
++      expect(await keys(a)).toEqual(keysAnswer())
++      expect(await keys(a)).toEqual(keysAnswer())
++      expect(seen.map((s) => s.url)).toEqual(['/v1/keys', '/v1/keys'])
++      expect(seen[0].headers['x-supapace-assertion']).toBe(a.text)
++      expect(existsSync(join(dir, 'data', REF_A))).toBe(false)
++    })
++
++    it('returns the service_role key to an owner under the purpose reveal alone', async () => {
++      handler = json(200, keysAnswer({ service_role_key: 'eyJ.service-token.sig' }))
++      const { keys } = await load()
++      const owner = { ...who(REF_A, 'u-x'), purpose: 'reveal' as const }
++      expect((await keys(owner)).service_role_key).toBe('eyJ.service-token.sig')
++      const unavailable = { status: 503, code: 'project_unavailable' }
++      expect(await refusal(keys(who(REF_A, 'u-x')))).toEqual(unavailable)
++      expect(await refusal(keys({ ...owner, role: 'developer' }))).toEqual(unavailable)
++      expect(await refusal(keys({ ...owner, role: 'read_only' }))).toEqual(unavailable)
++      expectNoSecret(said.join('\n'))
++    })
++
++    it.each([
++      ['no anon key', keysAnswer({ anon_key: undefined })],
++      ['an anon key with a space', keysAnswer({ anon_key: 'a b' })],
++      ['signing keys that are not a list', keysAnswer({ signing_keys: {} })],
++      [
++        '17 signing keys',
++        keysAnswer({
++          signing_keys: Array(17).fill(keysAnswer().signing_keys[0]),
++        }),
++      ],
++      [
++        'a key of another algorithm',
++        keysAnswer({
++          signing_keys: [{ ...keysAnswer().signing_keys[0], alg: 'HS256' }],
++        }),
++      ],
++      [
++        'a key of another type',
++        keysAnswer({
++          signing_keys: [{ ...keysAnswer().signing_keys[0], kty: 'oct' }],
++        }),
++      ],
++      [
++        'a key with a private member',
++        keysAnswer({
++          signing_keys: [{ ...keysAnswer().signing_keys[0], n: 'not base64url!' }],
++        }),
++      ],
++      ['an empty service_role key', keysAnswer({ service_role_key: '' })],
++    ])('refuses %s', async (_, body) => {
++      handler = json(200, body)
++      const { keys } = await load()
++      expect(await refusal(keys({ ...who(REF_A, 'u-x'), purpose: 'reveal' }))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++    })
++
++    it('drops members of a signing key it does not know', async () => {
++      handler = json(
++        200,
++        keysAnswer({
++          signing_keys: [{ ...keysAnswer().signing_keys[0], d: 'private' }],
++        })
++      )
++      const { keys } = await load()
++      expect(await keys(who(REF_A, 'u-x'))).toEqual(keysAnswer())
++    })
++
++    it('has no entry to fall back on: silence is 503, a refusal is passed on', async () => {
++      handler = refuse(403, 'not_a_member')
++      const m = await load(quick(150))
++      expect(await refusal(m.keys(who(REF_A, 'u-x')))).toEqual({
++        status: 403,
++        code: 'not_a_member',
++      })
++      handler = silent
++      expect(await refusal(m.keys(who(REF_A, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++      await stopListening()
++      expect(await refusal(m.keys(who(REF_A, 'u-x')))).toEqual({
++        status: 503,
++        code: 'project_unavailable',
++      })
++    })
++  })
++
++  describe('checkDsn', () => {
++    const addrs = {
++      addr: DSN.pgcap,
++      lo: DSN.meta_port_lo,
++      hi: DSN.meta_port_hi,
++    }
++    // The connection-string parser of the database client postgres-meta uses, as this
++    // workspace resolves it.
++    const pgRequire = createRequire(
++      resolvePath(import.meta.dirname, '../../../../../packages/pg-meta/package.json')
++    )
++    const parse: (s: string) => Record<string, unknown> = createRequire(pgRequire.resolve('pg'))(
++      'pg-connection-string'
++    ).parse
++
++    it('has vectors of both kinds', () => {
++      expect(DSN.accepted.length).toBeGreaterThanOrEqual(3)
++      expect(DSN.refused.length).toBeGreaterThanOrEqual(40)
++    })
++
++    it.each(DSN.accepted as { dsn: string; login: string; subnet_index: number }[])(
++      'accepts $dsn',
++      async (v) => {
++        const { checkDsn } = await load()
++        const got = checkDsn(v.dsn, addrs)
++        expect(got.login).toBe(v.login)
++        expect(got.port - addrs.lo).toBe(v.subnet_index)
++        // what the database client makes of it: these members and no other with a value
++        const parsed = Object.fromEntries(
++          Object.entries(parse(v.dsn)).filter(
++            ([, value]) => value !== undefined && value !== null && value !== ''
++          )
++        )
++        expect(parsed).toEqual({
++          user: v.login,
++          password: got.password,
++          host: addrs.addr,
++          port: String(got.port),
++          database: 'postgres',
++          ssl: false,
++          sslmode: 'disable',
++        })
++      }
++    )
++
++    it.each(DSN.refused as { why: string; dsn: string }[])('refuses $why', async (v) => {
++      const { checkDsn } = await load()
++      expect(() => checkDsn(v.dsn, addrs)).toThrow(/^dsn: /)
++      try {
++        checkDsn(v.dsn, addrs)
++      } catch (e) {
++        if (v.dsn.length > 8) expect(String((e as Error).message)).not.toContain(v.dsn.slice(0, 24))
++      }
++    })
++
++    it('refuses a string of 513 bytes and accepts one of 512', async () => {
++      const { checkDsn } = await load()
++      const fixed = dsn('postgres', '', 20000).length
++      expect(
++        checkDsn(dsn('postgres', 'a'.repeat(512 - fixed), 20000), addrs).password
++      ).toHaveLength(512 - fixed)
++      expect(() => checkDsn(dsn('postgres', 'a'.repeat(513 - fixed), 20000), addrs)).toThrow(
++        'dsn: '
++      )
++    })
++
++    it('accepts nothing without the proxy’s address and port range', async () => {
++      const { checkDsn } = await load()
++      const good = DSN.accepted[0].dsn
++      expect(checkDsn(good, addrs).login).toBe('postgres')
++      expect(() => checkDsn(good, { addr: '', lo: 0, hi: 0 })).toThrow('dsn: ')
++      expect(() => checkDsn(good, { addr: addrs.addr, lo: 0, hi: 65535 })).toThrow('dsn: ')
++      expect(() => checkDsn(good, { addr: addrs.addr, lo: 20001, hi: 20000 })).toThrow('dsn: ')
++    })
++
++    it('uses the proxy of SUPAPACE_PGCAP when given none', async () => {
++      const { checkDsn } = await load({
++        SUPAPACE_PGCAP: '10.212.0.6:20000:20000',
++      })
++      expect(checkDsn(DSN.accepted[0].dsn).port).toBe(20000)
++      expect(() => checkDsn(dsn('postgres', 'a1B2c3', 20001))).toThrow('dsn: ')
++    })
++  })
++
++  describe('without its settings', () => {
++    it('loads, as the build loads it, and reads nothing until it is used', async () => {
++      rmSync(join(dir, 'keys', 'cache.key'))
++      const m = await load({
++        SUPAPACE_DASH_SOCKET: undefined,
++        SUPAPACE_DASH_KEYS: undefined,
++        SUPAPACE_DASH_DATA: undefined,
++        SUPAPACE_PGCAP: undefined,
++        SUPAPACE_LIMITS: undefined,
++      })
++      expect(exit).not.toHaveBeenCalled()
++      expect(said).toEqual([])
++      // the form check needs none of them when it is given the proxy
++      const addrs = { addr: DSN.pgcap, lo: DSN.meta_port_lo, hi: DSN.meta_port_hi }
++      expect(m.checkDsn(DSN.accepted[0].dsn, addrs).login).toBe('postgres')
++      expect(exit).not.toHaveBeenCalled()
++    })
++
++    const badSettings: [string, Record<string, string | undefined>, string][] = [
++      ['no socket path', { SUPAPACE_DASH_SOCKET: undefined }, 'SUPAPACE_DASH_SOCKET'],
++      ['a relative socket path', { SUPAPACE_DASH_SOCKET: 'dash.sock' }, 'SUPAPACE_DASH_SOCKET'],
++      ['no data directory', { SUPAPACE_DASH_DATA: undefined }, 'SUPAPACE_DASH_DATA'],
++      ['no key directory', { SUPAPACE_DASH_KEYS: undefined }, 'SUPAPACE_DASH_KEYS'],
++      ['no proxy address', { SUPAPACE_PGCAP: undefined }, 'SUPAPACE_PGCAP'],
++      ['a proxy host name', { SUPAPACE_PGCAP: 'pgcap:20000:21023' }, 'SUPAPACE_PGCAP'],
++      [
++        'a proxy address with a leading zero',
++        { SUPAPACE_PGCAP: '10.212.0.06:20000:21023' },
++        'SUPAPACE_PGCAP',
++      ],
++      [
++        'a proxy address with an octet past 255',
++        { SUPAPACE_PGCAP: '10.212.0.256:20000:21023' },
++        'SUPAPACE_PGCAP',
++      ],
++      ['a port range past 65535', { SUPAPACE_PGCAP: '10.212.0.6:20000:65536' }, 'SUPAPACE_PGCAP'],
++      ['an empty port range', { SUPAPACE_PGCAP: '10.212.0.6:20001:20000' }, 'SUPAPACE_PGCAP'],
++      ['a port range without its end', { SUPAPACE_PGCAP: '10.212.0.6:20000' }, 'SUPAPACE_PGCAP'],
++      ['no limits', { SUPAPACE_LIMITS: undefined }, 'SUPAPACE_LIMITS'],
++      [
++        'neither limits nor a socket path',
++        { SUPAPACE_LIMITS: undefined, SUPAPACE_DASH_SOCKET: undefined },
++        'SUPAPACE_LIMITS',
++      ],
++    ]
++    it.each(badSettings)('stops the server at the first use with %s', async (_, env, named) => {
++      const m = await load(env)
++      expect(exit).not.toHaveBeenCalled()
++      await expect(m.resolve(who(REF_A, 'u-x'))).rejects.toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(said).toHaveLength(1)
++      expect(said[0]).toContain(named)
++      // nothing was asked of the socket, and nothing written
++      expect(seen).toHaveLength(0)
++      expect(readdirSync(join(dir, 'data'))).toEqual([])
++    })
++
++    const badKeys: [string, string | undefined][] = [
++      ['no cache key', undefined],
++      ['a key of 31 bytes', Buffer.alloc(31, 7).toString('base64url') + '\n'],
++      ['a key of 33 bytes', Buffer.alloc(33, 7).toString('base64url') + '\n'],
++      ['a key in the standard alphabet', Buffer.alloc(32, 0xff).toString('base64') + '\n'],
++      [
++        'a key with unused bits set',
++        Buffer.alloc(32, 7).toString('base64url').slice(0, 42) + 'd\n',
++      ],
++      ['a key followed by a second line', Buffer.alloc(32, 7).toString('base64url') + '\n\n'],
++    ]
++    it.each(badKeys)('stops the server at the first use with %s', async (_, content) => {
++      rmSync(join(dir, 'keys', 'cache.key'))
++      if (content !== undefined) writeFileSync(join(dir, 'keys', 'cache.key'), content)
++      const m = await load()
++      await expect(m.keys(who(REF_A, 'u-x'))).rejects.toThrow('the process exited')
++      expect(seen).toHaveLength(0)
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(said.join('\n')).not.toContain('Bwc')
++    })
++
++    it.each(badSettings)(
++      'checkSettings stops the server with %s, as the first use does',
++      async (_, env, named) => {
++        const m = await load(env)
++        expect(() => m.checkSettings()).toThrow('the process exited')
++        expect(exit).toHaveBeenCalledWith(1)
++        expect(said).toHaveLength(1)
++        expect(said[0]).toContain(named)
++        expect(seen).toHaveLength(0)
++        expect(readdirSync(join(dir, 'data'))).toEqual([])
++        // the line is the one the first use gives
++        const line = said[0]
++        said.length = 0
++        const again = await load(env)
++        await expect(again.resolve(who(REF_A, 'u-x'))).rejects.toThrow('the process exited')
++        expect(said).toEqual([line])
++      }
++    )
++
++    it.each(badKeys)('checkSettings stops the server with %s', async (_, content) => {
++      rmSync(join(dir, 'keys', 'cache.key'))
++      if (content !== undefined) writeFileSync(join(dir, 'keys', 'cache.key'), content)
++      const m = await load()
++      expect(() => m.checkSettings()).toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(said).toHaveLength(1)
++      expect(said[0]).toContain('cache key')
++      expect(said[0]).not.toContain('Bwc')
++    })
++
++    it('checkSettings returns with every setting in place, and asks and writes nothing', async () => {
++      const m = await load()
++      expect(m.checkSettings()).toBeUndefined()
++      expect(m.checkSettings()).toBeUndefined()
++      expect(exit).not.toHaveBeenCalled()
++      expect(said).toEqual([])
++      expect(seen).toHaveLength(0)
++      expect(readdirSync(join(dir, 'data'))).toEqual([])
++      // and the client then works
++      expect((await m.resolve(who(REF_A, 'u-x'))).ref).toBe(REF_A)
++    })
++
++    it('accepts the key without a line end', async () => {
++      writeFileSync(join(dir, 'keys', 'cache.key'), Buffer.alloc(32, 7).toString('base64url'))
++      const { resolve } = await load()
++      expect((await resolve(who(REF_A, 'u-x'))).ref).toBe(REF_A)
++      expect(exit).not.toHaveBeenCalled()
++    })
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/dash-socket.ts b/apps/studio/lib/api/self-hosted/dash-socket.ts
+new file mode 100644
+index 00000000..d5a3ee19
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/dash-socket.ts
+@@ -0,0 +1,540 @@
++// SPDX-License-Identifier: Apache-2.0
++// The control-plane client. What the dashboard knows about a project it asks the dashboard
++// socket — a Unix socket of the control plane — presenting the gateway's assertion; the
++// control plane checks the assertion and the membership again and answers for that project
++// alone. Every answer is bounded and checked before it is used.
++//
++// An answer to `resolve` is kept in memory for a short time, per principal, and encrypted on
++// disk per project and role class. The disk entry stands in only when the socket gives no
++// answer at all; whatever the socket answers, a refusal included, is final.
++
++import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
++import {
++  mkdirSync,
++  opendirSync,
++  readFileSync,
++  renameSync,
++  rmSync,
++  statSync,
++  writeFileSync,
++} from 'node:fs'
++import { request } from 'node:http'
++import { isAbsolute, join } from 'node:path'
++import z from 'zod'
++
++import { limits, orStop } from './limits'
++import {
++  ProjectError,
++  roleClass,
++  type Assertion,
++  type ResolveAnswer,
++  type RoleClass,
++} from './project-context'
++
++/** The answer to `keys`. The service_role key is there for an owner under the purpose reveal alone. */
++export type KeysAnswer = {
++  anon_key: string
++  signing_keys: readonly {
++    kid: string
++    class: string
++    alg: 'RS256'
++    kty: 'RSA'
++    n: string
++    e: string
++  }[]
++  service_role_key?: string
++}
++
++/** The wire proxy's address and the port range of its postgres-meta class. */
++export type Pgcap = { addr: string; lo: number; hi: number }
++
++/** An answer of the socket is read up to this size; a longer one is not an answer. */
++export const MAX_ANSWER_BYTES = 64 * 1024
++/** The memory cache holds at most this many entries. */
++export const MEMORY_ENTRIES = 4096
++/** Before a write, at most this many names of the cache directory are looked at for leftovers. */
++export const SWEEP_NAMES = 64
++
++const HEADER = 'X-Supapace-Assertion'
++const REF = /^[a-z0-9]{20}$/
++const TOKEN = /^[A-Za-z0-9._-]{1,4096}$/
++const DAY_MS = 86_400_000
++// A disk entry dated further ahead of the clock than this is no proof of a recent answer.
++const CLOCK_SKEW_MS = 60_000
++const NONCE_BYTES = 12
++const TAG_BYTES = 16
++
++// --- configuration, read once, at the first use ----------------------------------------------
++
++function absolute(name: string, value: string | undefined): string {
++  if (!value || !isAbsolute(value)) throw new Error(`${name} is not set to an absolute path`)
++  return value
++}
++
++/** `<IPv4 address>:<first port>:<last port>`, each in its canonical decimal form. */
++function parsePgcap(text: string | undefined): Pgcap {
++  const octet = '(?:0|[1-9][0-9]{0,2})'
++  const port = '([1-9][0-9]{0,4})'
++  const m = new RegExp(`^(${octet}(?:\\.${octet}){3}):${port}:${port}$`).exec(text ?? '')
++  const pgcap = m && { addr: m[1], lo: Number(m[2]), hi: Number(m[3]) }
++  if (
++    !pgcap ||
++    pgcap.addr.split('.').some((o) => Number(o) > 255) ||
++    pgcap.lo > pgcap.hi ||
++    pgcap.hi > 65535
++  ) {
++    throw new Error('SUPAPACE_PGCAP is not <address>:<first port>:<last port>')
++  }
++  return pgcap
++}
++
++/** The cache key file: 32 bytes as 43 base64url characters and at most one line end. */
++function readCacheKey(file: string): Buffer {
++  let text: string
++  try {
++    text = readFileSync(file, 'latin1')
++  } catch {
++    throw new Error('the cache key file cannot be read')
++  }
++  const encoded = text.replace(/=?\n?$/, '')
++  const key = Buffer.from(encoded, 'base64url')
++  // 43 characters with no unused bit set are exactly 32 bytes
++  if (!/^[A-Za-z0-9_-]{43}$/.test(encoded) || key.toString('base64url') !== encoded) {
++    throw new Error('the cache key file does not hold 32 bytes in base64url')
++  }
++  return key
++}
++
++type Config = { socket: string; data: string; cacheKey: Buffer; pgcap: Pgcap }
++let loaded: Config | undefined
++
++/**
++ * The node's settings of this module, read and checked at the first call — never when the
++ * module loads, which the build does too. A missing or malformed one stops the process.
++ */
++function config(): Config {
++  return (loaded ??= orStop(() => ({
++    socket: absolute('SUPAPACE_DASH_SOCKET', process.env.SUPAPACE_DASH_SOCKET),
++    data: absolute('SUPAPACE_DASH_DATA', process.env.SUPAPACE_DASH_DATA),
++    cacheKey: readCacheKey(
++      join(absolute('SUPAPACE_DASH_KEYS', process.env.SUPAPACE_DASH_KEYS), 'cache.key')
++    ),
++    pgcap: parsePgcap(process.env.SUPAPACE_PGCAP),
++  })))
++}
++
++/**
++ * Reads and checks every setting of the control-plane client now; a missing or malformed one
++ * stops the process, with the line the first use would give. For a server start hook: the
++ * modules themselves read nothing when they load.
++ */
++export function checkSettings() {
++  limits()
++  config()
++}
++
++// --- the connection string ------------------------------------------------------------------
++
++const DSN_SCHEME = 'postgresql://'
++const DSN_TAIL = '/postgres?sslmode=disable'
++const LOGIN_RW = 'postgres'
++const LOGIN_RO = 'supabase_read_only_user'
++const UNRESERVED = /[A-Za-z0-9\-._~]/
++
++/**
++ * Accepts the one form of connection string the control plane renders and nothing else:
++ * `postgresql://<login>:<password>@<proxy address>:<port>/postgres?sslmode=disable` — one of
++ * the two logins; a password of one or more printable ASCII bytes, every byte outside
++ * `A-Z a-z 0-9 - . _ ~` written `%XX` in upper case; the proxy's address; a port of its
++ * range in canonical decimal; at most 512 bytes. The control plane makes the same check on
++ * the same vectors. A refusal's message never holds the string.
++ */
++export function checkDsn(
++  dsn: string,
++  pgcap: Pgcap = config().pgcap
++): {
++  login: typeof LOGIN_RW | typeof LOGIN_RO
++  port: number
++  password: string
++} {
++  const refuse = (why: string): never => {
++    throw new Error(`dsn: ${why}`)
++  }
++  if (typeof dsn !== 'string' || Buffer.byteLength(dsn) > 512) return refuse('too long')
++  if (!pgcap.addr || pgcap.lo < 1 || pgcap.hi < pgcap.lo) return refuse('no proxy address')
++  if (!dsn.startsWith(DSN_SCHEME)) return refuse('not postgresql://')
++  if (!dsn.endsWith(DSN_TAIL)) return refuse('not database postgres with sslmode=disable alone')
++  const rest = dsn.slice(DSN_SCHEME.length, dsn.length - DSN_TAIL.length)
++  const at = rest.indexOf('@')
++  if (at < 0) return refuse('no login')
++  const user = rest.slice(0, at)
++  const hostPort = rest.slice(at + 1)
++  const colon = user.indexOf(':')
++  const login = user.slice(0, colon)
++  if (colon < 0 || (login !== LOGIN_RW && login !== LOGIN_RO))
++    return refuse('not one of the two logins')
++
++  const encoded = user.slice(colon + 1)
++  let password = ''
++  for (let i = 0; i < encoded.length; i++) {
++    let byte = encoded.charCodeAt(i)
++    if (encoded[i] === '%') {
++      const hex = encoded.slice(i + 1, i + 3)
++      if (!/^[0-9A-F]{2}$/.test(hex)) return refuse('password not in the canonical encoding')
++      byte = parseInt(hex, 16)
++      i += 2
++      if (UNRESERVED.test(String.fromCharCode(byte)))
++        return refuse('password not in the canonical encoding')
++    } else if (!UNRESERVED.test(encoded[i])) {
++      return refuse('password not in the canonical encoding')
++    }
++    if (byte < 0x20 || byte > 0x7e) return refuse('password not in the canonical encoding')
++    password += String.fromCharCode(byte)
++  }
++  if (password === '') return refuse('password not in the canonical encoding')
++
++  const sep = hostPort.indexOf(':')
++  if (sep < 0 || hostPort.slice(0, sep) !== pgcap.addr) return refuse("not the proxy's address")
++  const portText = hostPort.slice(sep + 1)
++  const port = /^[1-9][0-9]{0,4}$/.test(portText) ? Number(portText) : 0
++  if (port < pgcap.lo || port > pgcap.hi) return refuse('port outside the meta range')
++  return { login, port, password }
++}
++
++// --- the answers, checked ---------------------------------------------------------------------
++
++const count = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
++const names = z.array(z.string().min(1).max(128)).max(64)
++
++const resolveSchema = z.object({
++  ref: z.string().regex(REF),
++  name: z.string().max(255),
++  state: z.enum(['active', 'restarting', 'restoring']),
++  db_version: z.string().regex(/^[0-9A-Za-z._-]{1,64}$/),
++  pg_meta: z.union([z.literal(0), z.literal(1)]),
++  dsn_rw: z.string().optional(),
++  dsn_ro: z.string().optional(),
++  api_url: z.string().regex(/^https:\/\/[a-z0-9]{20}\.[a-z0-9.-]{1,253}$/),
++  data_api: z.object({
++    schemas: names,
++    extra_search_path: names,
++    max_rows: count.nullable(),
++  }),
++  generation: count,
++  at: z.string().regex(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,9})?Z$/),
++})
++
++const keysSchema = z.object({
++  anon_key: z.string().regex(TOKEN),
++  signing_keys: z
++    .array(
++      z.object({
++        kid: z.string().min(1).max(128),
++        class: z.string().min(1).max(32),
++        alg: z.literal('RS256'),
++        kty: z.literal('RSA'),
++        n: z.string().regex(/^[A-Za-z0-9_-]{1,1024}$/),
++        e: z.string().regex(/^[A-Za-z0-9_-]{1,16}$/),
++      })
++    )
++    .max(16),
++  service_role_key: z.string().regex(TOKEN).optional(),
++})
++
++const invalid = (): never => {
++  throw new Error('invalid answer')
++}
++
++/**
++ * An answer to `resolve` for `ref` and a role class, or a throw. Only the members checked
++ * here are kept. A read-write member's answer has the read-write string; a read_only
++ * member's must not; both strings, where present, name the two logins at one port.
++ */
++function checkResolve(value: unknown, ref: string, cls: RoleClass): ResolveAnswer {
++  const answer = resolveSchema.parse(value)
++  if (answer.ref !== ref || answer.api_url.slice(8, 28) !== ref) invalid()
++  if ((answer.dsn_rw !== undefined) !== (cls === 'rw')) invalid()
++  const rw = answer.dsn_rw === undefined ? undefined : checkDsn(answer.dsn_rw)
++  const ro = answer.dsn_ro === undefined ? undefined : checkDsn(answer.dsn_ro)
++  if (rw && rw.login !== LOGIN_RW) invalid()
++  if (ro && ro.login !== LOGIN_RO) invalid()
++  if (rw && ro && rw.port !== ro.port) invalid()
++  Object.freeze(answer.data_api.schemas)
++  Object.freeze(answer.data_api.extra_search_path)
++  Object.freeze(answer.data_api)
++  return Object.freeze(answer)
++}
++
++function checkKeys(value: unknown, a: Assertion): KeysAnswer {
++  const answer = keysSchema.parse(value)
++  if (answer.service_role_key !== undefined && !(a.role === 'owner' && a.purpose === 'reveal'))
++    invalid()
++  return answer
++}
++
++// --- one call ---------------------------------------------------------------------------------
++
++const unavailable = () =>
++  new ProjectError(503, 'project_unavailable', 'The project is not available')
++
++// The refusals of the control plane that are the request's answer, with the status each has.
++const REFUSALS = new Map([
++  ['bad_assertion', 401],
++  ['not_a_member', 403],
++  ['not_here', 404],
++  ['rate_limited', 429],
++  ['unavailable', 503],
++])
++
++/** Who asks, checked before anything of it is used in a path, a header or a cache key. */
++function checkCaller(a: Assertion): RoleClass {
++  const cls = roleClass(a.role)
++  const texts = [a.ref, a.text, a.iss, a.sub].every((s) => typeof s === 'string' && s !== '')
++  if (!texts || !REF.test(a.ref) || !TOKEN.test(a.text)) {
++    throw new ProjectError(401, 'bad_assertion', 'The request carries no valid assertion')
++  }
++  return cls
++}
++
++type Reply = { status: number; body?: Buffer }
++
++/**
++ * One request to the socket, within the call's bound. Resolves with the answer's status and
++ * its body — no body when it did not arrive whole or is longer than the bound — or with
++ * undefined when the socket gave no answer: no connection, or no response in time.
++ */
++function call(path: string, assertion: string): Promise<Reply | undefined> {
++  const bound = limits().socket_call_ms
++  const { socket } = config()
++  return new Promise((done) => {
++    let reply: Reply | undefined
++    const finish = (r: Reply | undefined) => {
++      clearTimeout(timer)
++      req.destroy()
++      done(r)
++    }
++    const req = request({
++      socketPath: socket,
++      path,
++      method: 'POST',
++      agent: false,
++      maxHeaderSize: 8192,
++      headers: { [HEADER]: assertion, 'Content-Length': 0 },
++    })
++    const timer = setTimeout(() => finish(reply), bound)
++    req.on('response', (res) => {
++      const status = res.statusCode ?? 0
++      reply = { status }
++      const chunks: Buffer[] = []
++      let size = 0
++      res.on('data', (chunk: Buffer) => {
++        size += chunk.length
++        if (size > MAX_ANSWER_BYTES) finish(reply)
++        else chunks.push(chunk)
++      })
++      res.on('end', () => finish(res.complete ? { status, body: Buffer.concat(chunks) } : reply))
++      res.on('error', () => finish(reply))
++      res.on('close', () => finish(reply))
++    })
++    // Bytes that are not HTTP are an answer, if a useless one; anything else before a
++    // response is the socket not answering.
++    req.on('error', (error: NodeJS.ErrnoException) =>
++      finish(reply ?? (error.code?.startsWith('HPE_') ? { status: 0 } : undefined))
++    )
++    req.end()
++  })
++}
++
++/**
++ * Asks the socket. Returns the checked answer, or undefined when the socket gave none.
++ * A refusal throws with its status and code; an answer that cannot be used throws 503.
++ */
++async function ask<T>(
++  path: string,
++  a: Assertion,
++  check: (value: unknown) => T
++): Promise<T | undefined> {
++  const reply = await call(path, a.text)
++  if (!reply) return undefined
++  let value: unknown
++  try {
++    value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(reply.body))
++  } catch {
++    value = undefined
++  }
++  if (reply.status !== 200) {
++    const code = z.object({ code: z.string() }).safeParse(value).data?.code ?? ''
++    if (REFUSALS.get(code) !== reply.status) throw unavailable()
++    throw new ProjectError(reply.status, code, 'The control plane refused the request')
++  }
++  try {
++    return check(value)
++  } catch {
++    console.error(`supapace: the control plane's answer to ${path} for ${a.ref} cannot be used`)
++    throw unavailable()
++  }
++}
++
++// --- the disk entry -----------------------------------------------------------------------------
++
++const cacheDir = (ref: string) => join(config().data, ref, 'cache')
++const errno = (error: unknown) => (error as NodeJS.ErrnoException)?.code ?? 'error'
++
++// A temporary file of this client: `<class>.<16 hex>.tmp`. One is left when the process ends
++// between a write and its rename. A write and its rename run without a pause in between and
++// one process writes the directory, so any that is found before a write is such a leftover.
++const LEFTOVER = /^(?:rw|ro)\.[0-9a-f]{16}\.tmp$/
++
++/** Removes leftovers from a cache directory, looking at a bounded number of its names. */
++function sweepLeftovers(dir: string) {
++  try {
++    const names = opendirSync(dir)
++    try {
++      for (let seen = 0; seen < SWEEP_NAMES; seen++) {
++        const entry = names.readSync()
++        if (!entry) break
++        if (LEFTOVER.test(entry.name)) rmSync(join(dir, entry.name), { force: true })
++      }
++    } finally {
++      names.closeSync()
++    }
++  } catch {
++    // a leftover that stays is harmless; the write goes on
++  }
++}
++
++/** Writes the entry of (ref, class): nonce, AES-256-GCM of the answer's JSON, tag; by rename. */
++function writeEntry(ref: string, cls: RoleClass, answer: ResolveAnswer) {
++  try {
++    const dir = cacheDir(ref)
++    mkdirSync(dir, { recursive: true, mode: 0o700 })
++    sweepLeftovers(dir)
++    const nonce = randomBytes(NONCE_BYTES)
++    const cipher = createCipheriv('aes-256-gcm', config().cacheKey, nonce)
++    cipher.setAAD(Buffer.from(`${ref}:${cls}`))
++    const sealed = Buffer.concat([
++      nonce,
++      cipher.update(JSON.stringify(answer), 'utf8'),
++      cipher.final(),
++      cipher.getAuthTag(),
++    ])
++    const tmp = join(dir, `${cls}.${randomBytes(8).toString('hex')}.tmp`)
++    try {
++      writeFileSync(tmp, sealed, { mode: 0o600 })
++      renameSync(tmp, join(dir, `${cls}.bin`))
++    } catch (error) {
++      rmSync(tmp, { force: true })
++      throw error
++    }
++  } catch (error) {
++    console.error(`supapace: the cache entry of ${ref} could not be written (${errno(error)})`)
++  }
++}
++
++/**
++ * The entry of (ref, class), if the socket last answered for it within the entry's lifetime
++ * and it opens under this project's and class's name. Reading changes nothing on disk.
++ */
++function readEntry(ref: string, cls: RoleClass): ResolveAnswer | undefined {
++  try {
++    const file = join(cacheDir(ref), `${cls}.bin`)
++    const stat = statSync(file)
++    const age = Date.now() - stat.mtimeMs
++    if (age > limits().resolve_disk_days * DAY_MS || age < -CLOCK_SKEW_MS) return undefined
++    if (!stat.isFile() || stat.size > NONCE_BYTES + MAX_ANSWER_BYTES + TAG_BYTES) return undefined
++    const sealed = readFileSync(file)
++    const decipher = createDecipheriv(
++      'aes-256-gcm',
++      config().cacheKey,
++      sealed.subarray(0, NONCE_BYTES)
++    )
++    decipher.setAAD(Buffer.from(`${ref}:${cls}`))
++    decipher.setAuthTag(sealed.subarray(sealed.length - TAG_BYTES))
++    const plain = Buffer.concat([
++      decipher.update(sealed.subarray(NONCE_BYTES, sealed.length - TAG_BYTES)),
++      decipher.final(),
++    ])
++    const kept = checkResolve(JSON.parse(plain.toString('utf8')), ref, cls)
++    // the answer's own time bounds the entry too: a file time can be a copy's
++    const answered = Date.now() - Date.parse(kept.at)
++    if (!(answered <= limits().resolve_disk_days * DAY_MS && answered >= -CLOCK_SKEW_MS)) {
++      return undefined
++    }
++    return kept
++  } catch (error) {
++    if (errno(error) !== 'ENOENT')
++      console.error(`supapace: the cache entry of ${ref} cannot be used`)
++    return undefined
++  }
++}
++
++// --- resolve, keys --------------------------------------------------------------------------------
++
++// `until` is a reading of the clock that only moves forward (performance.now): an entry's
++// life is elapsed time, whatever is done to the wall clock.
++type Entry = { ref: string; answer: ResolveAnswer; until: number }
++// Keyed per principal — (ref, iss, sub, role class): a member is never answered from an entry
++// another member warmed.
++const memory = new Map<string, Entry>()
++const flights = new Map<string, Promise<ResolveAnswer>>()
++
++function remember(key: string, entry: Entry) {
++  // ponytail: a full map is swept on insert, O(entries); a heap by expiry if that ever shows.
++  if (memory.size >= MEMORY_ENTRIES) {
++    for (const [k, e] of memory) if (e.until <= performance.now()) memory.delete(k)
++  }
++  if (memory.size >= MEMORY_ENTRIES) memory.delete(memory.keys().next().value!)
++  memory.delete(key)
++  memory.set(key, entry)
++}
++
++async function fresh(a: Assertion, cls: RoleClass, key: string): Promise<ResolveAnswer> {
++  const answer = await ask('/v1/resolve', a, (value) => checkResolve(value, a.ref, cls))
++  if (answer) {
++    remember(key, {
++      ref: a.ref,
++      answer,
++      until: performance.now() + limits().resolve_memory_s * 1000,
++    })
++    writeEntry(a.ref, cls, answer)
++    return answer
++  }
++  // The socket gave no answer. Only now, and without keeping it in memory, the disk entry.
++  const kept = readEntry(a.ref, cls)
++  if (!kept) throw unavailable()
++  return kept
++}
++
++/**
++ * What the control plane answers about the assertion's project, for the assertion's
++ * principal. Throws a ProjectError: the control plane's refusal, or 503 when there is
++ * neither an answer nor a usable disk entry.
++ */
++export async function resolve(a: Assertion): Promise<ResolveAnswer> {
++  const cls = checkCaller(a)
++  const key = JSON.stringify([a.ref, a.iss, a.sub, cls])
++  const warm = memory.get(key)
++  if (warm && warm.until > performance.now()) return warm.answer
++  // requests of one principal that arrive together share one call
++  let flight = flights.get(key)
++  if (!flight) {
++    flight = fresh(a, cls, key).finally(() => flights.delete(key))
++    flights.set(key, flight)
++  }
++  return flight
++}
++
++/** The project's keys, asked every time: nothing of this answer is kept anywhere. */
++export async function keys(a: Assertion): Promise<KeysAnswer> {
++  checkCaller(a)
++  const answer = await ask('/v1/keys', a, (value) => checkKeys(value, a))
++  if (!answer) throw unavailable()
++  return answer
++}
++
++/** Drops every entry of one project, in memory and on disk; other projects' stay. */
++export function dropProject(ref: string) {
++  if (!REF.test(ref)) throw new Error('not a project ref')
++  for (const [key, entry] of memory) if (entry.ref === ref) memory.delete(key)
++  rmSync(cacheDir(ref), { recursive: true, force: true })
++}

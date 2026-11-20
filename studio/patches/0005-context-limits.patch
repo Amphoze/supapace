@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] context: the dashboard's bounds from SUPAPACE_LIMITS
+
+The control plane renders the dashboard's bounds into one environment value, a JSON object
+of fourteen positive integers. It is parsed at the first use, not when the module loads:
+the build loads the server's modules too, without the node's environment. A missing value,
+a missing or unknown member or a value that is not a positive integer stops the process.
+---
+ .../studio/lib/api/self-hosted/limits.test.ts | 133 ++++++++++++++++++
+ apps/studio/lib/api/self-hosted/limits.ts     |  77 ++++++++++
+ 2 files changed, 210 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/limits.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/limits.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/limits.test.ts b/apps/studio/lib/api/self-hosted/limits.test.ts
+new file mode 100644
+index 00000000..cae358e2
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/limits.test.ts
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: Apache-2.0
++import { readFileSync } from 'node:fs'
++import { resolve } from 'node:path'
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// The value the control plane renders for SUPAPACE_LIMITS; the build writes it beside the tree.
++const VECTOR = readFileSync(
++  resolve(import.meta.dirname, '../../../../../vectors/limits.json'),
++  'utf8'
++).trim()
++const MEMBERS = [
++  'socket_call_ms',
++  'slot_wait_ms',
++  'meta_call_ms',
++  'handover_ms',
++  'result_bytes',
++  'instance_calls',
++  'project_calls',
++  'project_waiting',
++  'parser_slots',
++  'resolve_memory_s',
++  'resolve_disk_days',
++  'snippet_bytes',
++  'snippet_entries',
++  'audit_file_bytes',
++]
++
++describe('api/self-hosted/limits', () => {
++  describe('parseLimits', () => {
++    let parseLimits: (text: string | undefined) => Record<string, number>
++    beforeAll(async () => {
++      parseLimits = (await import('./limits')).parseLimits
++    })
++
++    it('parses the control plane’s string, member for member', () => {
++      const limits = parseLimits(VECTOR)
++      expect(Object.keys(limits)).toEqual(MEMBERS)
++      expect(limits).toEqual(JSON.parse(VECTOR))
++      for (const m of MEMBERS) expect(Number.isSafeInteger((limits as any)[m])).toBe(true)
++      expect(Object.isFrozen(limits)).toBe(true)
++    })
++
++    it.each(MEMBERS)('refuses a value without %s', (member) => {
++      const v = JSON.parse(VECTOR)
++      delete v[member]
++      expect(() => parseLimits(JSON.stringify(v))).toThrow(member)
++    })
++
++    it('refuses an unknown member', () => {
++      const v = { ...JSON.parse(VECTOR), socket_call_s: 1 }
++      expect(() => parseLimits(JSON.stringify(v))).toThrow('unknown member')
++    })
++
++    it.each([
++      ['a string', '"1000"'],
++      ['a fraction', '1.5'],
++      ['zero', '0'],
++      ['a negative number', '-1'],
++      ['a number past the safe integers', '9007199254740993'],
++      ['null', 'null'],
++      ['a list', '[1000]'],
++    ])('refuses %s as a member’s value', (_, text) => {
++      const malformed = VECTOR.replace(/"socket_call_ms":\d+/, `"socket_call_ms":${text}`)
++      expect(malformed).not.toBe(VECTOR)
++      expect(() => parseLimits(malformed)).toThrow('socket_call_ms')
++    })
++
++    it.each([
++      ['no value', undefined],
++      ['an empty value', ''],
++      ['text that is not JSON', '{"socket_call_ms":'],
++      ['a list', '[]'],
++      ['null', 'null'],
++      ['a number', '7'],
++    ])('refuses %s', (_, text) => {
++      expect(() => parseLimits(text)).toThrow('SUPAPACE_LIMITS')
++    })
++  })
++
++  describe('limits, at the first use', () => {
++    let exit: ReturnType<typeof vi.spyOn>
++    let said: ReturnType<typeof vi.spyOn>
++
++    beforeEach(() => {
++      vi.resetModules()
++      exit = vi.spyOn(process, 'exit').mockImplementation(() => {
++        throw new Error('the process exited')
++      })
++      said = vi.spyOn(console, 'error').mockImplementation(() => {})
++    })
++    afterEach(() => {
++      vi.unstubAllEnvs()
++      vi.restoreAllMocks()
++    })
++
++    it('reads nothing when the module loads, as the build loads it', async () => {
++      vi.stubEnv('SUPAPACE_LIMITS', '')
++      delete process.env.SUPAPACE_LIMITS
++      await import('./limits')
++      expect(exit).not.toHaveBeenCalled()
++      expect(said).not.toHaveBeenCalled()
++    })
++
++    it('holds the parsed value, read once', async () => {
++      vi.stubEnv('SUPAPACE_LIMITS', VECTOR)
++      const { limits } = await import('./limits')
++      expect(limits()).toEqual(JSON.parse(VECTOR))
++      vi.stubEnv('SUPAPACE_LIMITS', '{}')
++      expect(limits()).toEqual(JSON.parse(VECTOR))
++      expect(exit).not.toHaveBeenCalled()
++    })
++
++    it.each([
++      ['missing', undefined],
++      ['malformed', '{"socket_call_ms":"soon"}'],
++      ['one member short', VECTOR.replace(/,"audit_file_bytes":\d+/, '')],
++      ['one member long', VECTOR.replace('{', '{"more":1,')],
++    ])('stops the server at the first use when the value is %s', async (_, value) => {
++      if (value === undefined) {
++        vi.stubEnv('SUPAPACE_LIMITS', '')
++        delete process.env.SUPAPACE_LIMITS
++      } else {
++        expect(value).not.toBe(VECTOR)
++        vi.stubEnv('SUPAPACE_LIMITS', value)
++      }
++      const { limits } = await import('./limits')
++      expect(() => limits()).toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(said).toHaveBeenCalledTimes(1)
++      expect(String(said.mock.calls[0][0])).toContain('SUPAPACE_LIMITS')
++    })
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/limits.ts b/apps/studio/lib/api/self-hosted/limits.ts
+new file mode 100644
+index 00000000..88fb909f
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/limits.ts
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: Apache-2.0
++// The dashboard's bounds. The control plane renders them into SUPAPACE_LIMITS, one JSON object;
++// a server without them, or with a value it does not understand, does not serve. Nothing is
++// read when the module loads — the build loads the server's modules too, without the node's
++// environment — but at the first use.
++
++const MEMBERS = [
++  'socket_call_ms',
++  'slot_wait_ms',
++  'meta_call_ms',
++  'handover_ms',
++  'result_bytes',
++  'instance_calls',
++  'project_calls',
++  'project_waiting',
++  'parser_slots',
++  'resolve_memory_s',
++  'resolve_disk_days',
++  'snippet_bytes',
++  'snippet_entries',
++  'audit_file_bytes',
++] as const
++
++export type Limits = Readonly<Record<(typeof MEMBERS)[number], number>>
++
++/**
++ * Parses the value of SUPAPACE_LIMITS: one JSON object holding exactly the known members,
++ * each a positive integer. Anything else throws.
++ */
++export function parseLimits(text: string | undefined): Limits {
++  if (!text) throw new Error('SUPAPACE_LIMITS is not set')
++  let value: unknown
++  try {
++    value = JSON.parse(text)
++  } catch {
++    throw new Error('SUPAPACE_LIMITS is not JSON')
++  }
++  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
++    throw new Error('SUPAPACE_LIMITS is not a JSON object')
++  }
++  const given: Record<string, unknown> = { ...value }
++  const known: readonly string[] = MEMBERS
++  if (Object.keys(given).some((name) => !known.includes(name))) {
++    throw new Error('SUPAPACE_LIMITS has an unknown member')
++  }
++  const limits: Record<string, number> = {}
++  for (const name of MEMBERS) {
++    const n = given[name]
++    if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) {
++      throw new Error(`SUPAPACE_LIMITS: ${name} is missing or not a positive integer`)
++    }
++    limits[name] = n
++  }
++  return Object.freeze(limits) as Limits
++}
++
++/**
++ * Runs a read of the server's configuration. A value that is missing or malformed stops
++ * the process: the dashboard serves nothing rather than serve on a default.
++ */
++export function orStop<T>(read: () => T): T {
++  try {
++    return read()
++  } catch (error) {
++    console.error(
++      `supapace: ${error instanceof Error ? error.message : 'bad configuration'}; the server stops`
++    )
++    process.exit(1)
++  }
++}
++
++let loaded: Limits | undefined
++
++/** The bounds, read and checked at the first call; a bad value stops the process. */
++export function limits(): Limits {
++  return (loaded ??= orStop(() => parseLimits(process.env.SUPAPACE_LIMITS)))
++}

@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] context: type generation names the request's project
+
+Type generation asked postgres-meta with the headers it was handed, so the database was the
+one a caller's x-connection-encrypted header named, or postgres-meta's default. It now sends
+the connection string of the request's project, replacing that header under any spelling;
+outside a request it throws before anything is sent.
+---
+ .../api/self-hosted/generate-types.test.ts    | 120 ++++++++++++++++--
+ .../lib/api/self-hosted/generate-types.ts     |   9 +-
+ 2 files changed, 113 insertions(+), 16 deletions(-)
+
+diff --git a/apps/studio/lib/api/self-hosted/generate-types.test.ts b/apps/studio/lib/api/self-hosted/generate-types.test.ts
+index 4124e291..a20a8be7 100644
+--- a/apps/studio/lib/api/self-hosted/generate-types.test.ts
++++ b/apps/studio/lib/api/self-hosted/generate-types.test.ts
+@@ -1,6 +1,7 @@
+ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { generateTypescriptTypes } from './generate-types'
++import { projectContext, runWithProject, type Assertion } from './project-context'
+ 
+ vi.mock('@/data/fetchers', () => ({
+   fetchGet: vi.fn(),
+@@ -10,8 +11,12 @@ vi.mock('@/lib/constants', () => ({
+   PG_META_URL: 'http://localhost:8080',
+ }))
+ 
+-vi.mock('./util', () => ({
++// The connection string is the real one, of the request's project; only the encryption
++// is replaced, by a mark that shows what was encrypted.
++vi.mock('./util', async (original) => ({
++  ...(await original<typeof import('./util')>()),
+   assertSelfHosted: vi.fn(),
++  encryptString: (text: string) => `encrypted(${text})`,
+ }))
+ 
+ // A distinctive, non-default value so the assertions verify the URL reflects the
+@@ -22,6 +27,31 @@ vi.mock('./constants', () => ({
+   DEFAULT_EXPOSED_SCHEMAS: 'public,custom_schema,graphql_public',
+ }))
+ 
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++const dsn = (login: string, port: number) =>
++  `postgresql://${login}:pw${port}@10.212.0.6:${port}/postgres?sslmode=disable`
++
++function context(ref: string, port: number, role: Assertion['role'] = 'owner') {
++  return projectContext(
++    { text: 'v1.a.b', ref, iss: 'https://issuer.test', sub: 'u', name: 'U', role, purpose: '' },
++    {
++      ref,
++      name: 'p',
++      state: 'active',
++      db_version: '17.6.1',
++      pg_meta: port % 2,
++      ...(role === 'read_only' ? {} : { dsn_rw: dsn('postgres', port) }),
++      dsn_ro: dsn('supabase_read_only_user', port),
++      api_url: `https://${ref}.example.test`,
++      data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
++      generation: 1,
++      at: '2026-11-19T10:00:00Z',
++    }
++  )
++}
++const forA = <T>(fn: () => T) => runWithProject(context(REF_A, 20001), fn)
++
+ describe('api/self-hosted/generate-types', () => {
+   let mockFetchGet: ReturnType<typeof vi.fn>
+   let mockAssertSelfHosted: ReturnType<typeof vi.fn>
+@@ -31,6 +61,7 @@ describe('api/self-hosted/generate-types', () => {
+     const util = await import('./util')
+ 
+     mockFetchGet = vi.mocked(fetchers.fetchGet)
++    mockFetchGet.mockReset()
+     mockAssertSelfHosted = vi.mocked(util.assertSelfHosted)
+   })
+ 
+@@ -38,7 +69,7 @@ describe('api/self-hosted/generate-types', () => {
+     it('should call assertSelfHosted', async () => {
+       mockFetchGet.mockResolvedValue({ types: 'export type User = {}' })
+ 
+-      await generateTypescriptTypes({ headers: {} })
++      await forA(() => generateTypescriptTypes({ headers: {} }))
+ 
+       expect(mockAssertSelfHosted).toHaveBeenCalled()
+     })
+@@ -46,7 +77,7 @@ describe('api/self-hosted/generate-types', () => {
+     it('should request types for the configured exposed schemas', async () => {
+       mockFetchGet.mockResolvedValue({ types: 'export type User = {}' })
+ 
+-      await generateTypescriptTypes({ headers: {} })
++      await forA(() => generateTypescriptTypes({ headers: {} }))
+ 
+       const callUrl = mockFetchGet.mock.calls[0][0]
+       expect(callUrl).toContain('http://localhost:8080/generators/typescript')
+@@ -56,26 +87,83 @@ describe('api/self-hosted/generate-types', () => {
+       expect(callUrl).not.toContain('excluded_schemas=')
+     })
+ 
+-    it('should pass headers to fetchGet', async () => {
++    it('should pass headers to fetchGet, with the connection string of the request’s project', async () => {
+       mockFetchGet.mockResolvedValue({ types: 'export type User = {}' })
+ 
+-      const customHeaders = {
+-        Authorization: 'Bearer token',
+-        'Custom-Header': 'value',
++      await forA(() =>
++        generateTypescriptTypes({
++          headers: { Authorization: 'Bearer token', 'Custom-Header': 'value' },
++        })
++      )
++
++      expect(mockFetchGet).toHaveBeenCalledWith(expect.any(String), {
++        headers: {
++          authorization: 'Bearer token',
++          'custom-header': 'value',
++          'x-connection-encrypted': `encrypted(${dsn('postgres', 20001)})`,
++        },
++      })
++    })
++
++    it('never forwards a connection string the caller handed in, in any spelling of the header', async () => {
++      mockFetchGet.mockResolvedValue({ types: '' })
++      const planted = `encrypted(${dsn('postgres', 20002)})`
++
++      for (const name of [
++        'x-connection-encrypted',
++        'X-Connection-Encrypted',
++        'X-CONNECTION-ENCRYPTED',
++      ]) {
++        mockFetchGet.mockClear()
++        await forA(() => generateTypescriptTypes({ headers: { [name]: planted } }))
++        expect(mockFetchGet.mock.calls[0][1]).toEqual({
++          headers: { 'x-connection-encrypted': `encrypted(${dsn('postgres', 20001)})` },
++        })
++      }
++      mockFetchGet.mockClear()
++      await forA(() =>
++        generateTypescriptTypes({ headers: new Headers({ 'X-Connection-Encrypted': planted }) })
++      )
++      expect(JSON.stringify(mockFetchGet.mock.calls[0][1])).not.toContain('20002')
++    })
++
++    it('names each of two interleaved requests’ own project, and a read_only member’s read-only login', async () => {
++      mockFetchGet.mockImplementation(async (_url: string, options: any) => {
++        await new Promise((r) => setTimeout(r, Math.random() * 5))
++        return { types: options.headers['x-connection-encrypted'] }
++      })
++      const request = async (ref: string, port: number, role: Assertion['role']) => {
++        const got: any = await runWithProject(context(ref, port, role), async () => {
++          await new Promise((r) => setTimeout(r, Math.random() * 5))
++          return generateTypescriptTypes({ headers: {} })
++        })
++        const login = role === 'read_only' ? 'supabase_read_only_user' : 'postgres'
++        expect(got.types).toBe(`encrypted(${dsn(login, port)})`)
+       }
++      await Promise.all(
++        Array.from({ length: 30 }, (_, n) =>
++          n % 2
++            ? request(REF_A, 20001, n % 3 ? 'owner' : 'read_only')
++            : request(REF_B, 20002, n % 3 ? 'developer' : 'read_only')
++        )
++      )
++      expect(mockFetchGet).toHaveBeenCalledTimes(30)
++    })
+ 
+-      await generateTypescriptTypes({ headers: customHeaders })
++    it('throws outside a request, and asks postgres-meta nothing', async () => {
++      mockFetchGet.mockResolvedValue({ types: '' })
+ 
+-      expect(mockFetchGet).toHaveBeenCalledWith(expect.any(String), {
+-        headers: customHeaders,
++      await expect(generateTypescriptTypes({ headers: {} })).rejects.toMatchObject({
++        code: 'no_project_context',
+       })
++      expect(mockFetchGet).not.toHaveBeenCalled()
+     })
+ 
+     it('should return types from fetchGet response', async () => {
+       const mockTypes = 'export type User = { id: number; name: string }'
+       mockFetchGet.mockResolvedValue({ types: mockTypes })
+ 
+-      const result = await generateTypescriptTypes({ headers: {} })
++      const result = await forA(() => generateTypescriptTypes({ headers: {} }))
+ 
+       expect(result).toEqual({ types: mockTypes })
+     })
+@@ -84,15 +172,19 @@ describe('api/self-hosted/generate-types', () => {
+       const mockError = new Error('Network error')
+       mockFetchGet.mockRejectedValue(mockError)
+ 
+-      await expect(generateTypescriptTypes({ headers: {} })).rejects.toThrow('Network error')
++      await expect(forA(() => generateTypescriptTypes({ headers: {} }))).rejects.toThrow(
++        'Network error'
++      )
+     })
+ 
+     it('should work without headers parameter', async () => {
+       mockFetchGet.mockResolvedValue({ types: '' })
+ 
+-      await generateTypescriptTypes({})
++      await forA(() => generateTypescriptTypes({}))
+ 
+-      expect(mockFetchGet).toHaveBeenCalledWith(expect.any(String), { headers: undefined })
++      expect(mockFetchGet).toHaveBeenCalledWith(expect.any(String), {
++        headers: { 'x-connection-encrypted': `encrypted(${dsn('postgres', 20001)})` },
++      })
+     })
+   })
+ })
+diff --git a/apps/studio/lib/api/self-hosted/generate-types.ts b/apps/studio/lib/api/self-hosted/generate-types.ts
+index 5111bb65..62b0f8a2 100644
+--- a/apps/studio/lib/api/self-hosted/generate-types.ts
++++ b/apps/studio/lib/api/self-hosted/generate-types.ts
+@@ -1,5 +1,5 @@
+ import { DEFAULT_EXPOSED_SCHEMAS } from './constants'
+-import { assertSelfHosted } from './util'
++import { assertSelfHosted, encryptString, getConnectionString } from './util'
+ import { fetchGet } from '@/data/fetchers'
+ import { PG_META_URL } from '@/lib/constants'
+ import type { StudioError } from '@/lib/errors/studio-errors'
+@@ -22,13 +22,18 @@ export async function generateTypescriptTypes({
+ }: GenerateTypescriptTypesOptions): Promise<GenerateTypescriptTypesResult | StudioError> {
+   assertSelfHosted()
+ 
++  // The database is the one of the request's project, and no other: a connection string a
++  // caller hands in, under any spelling of the header, is replaced, never forwarded.
++  const named = new Headers(headers)
++  named.set('x-connection-encrypted', encryptString(getConnectionString({ readOnly: false })))
++
+   // Use the schemas actually exposed via PostgREST (PGRST_DB_SCHEMAS) so generated
+   // types match the Data API surface, instead of a hardcoded include/exclude list.
+   // Note the param is `included_schemas` (plural) — pg-meta treats a non-empty list
+   // as a strict allowlist; the singular spelling is silently ignored (includes all).
+   const response = await fetchGet<GenerateTypescriptTypesResult>(
+     `${PG_META_URL}/generators/typescript?included_schemas=${DEFAULT_EXPOSED_SCHEMAS}`,
+-    { headers }
++    { headers: Object.fromEntries(named) }
+   )
+ 
+   return response

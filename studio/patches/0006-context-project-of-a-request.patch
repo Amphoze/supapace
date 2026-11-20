@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] context: the project of a request
+
+One server process serves many projects. What it knows about the project of a request is
+the control plane's answer for the gateway's assertion, held with the assertion's principal,
+role and purpose in an AsyncLocalStorage context for that request alone. The accessor
+throws outside a request: there is no default project.
+---
+ .../api/self-hosted/project-context.test.ts   | 127 ++++++++++++++++++
+ .../lib/api/self-hosted/project-context.ts    | 109 +++++++++++++++
+ 2 files changed, 236 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/project-context.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/project-context.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/project-context.test.ts b/apps/studio/lib/api/self-hosted/project-context.test.ts
+new file mode 100644
+index 00000000..e8781fea
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/project-context.test.ts
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: Apache-2.0
++import { setTimeout as sleep } from 'node:timers/promises'
++import { describe, expect, it } from 'vitest'
++
++import {
++  getProjectContext,
++  projectContext,
++  ProjectError,
++  roleClass,
++  runWithProject,
++  type Assertion,
++  type ResolveAnswer,
++} from './project-context'
++
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++
++function answer(ref: string, port: number): ResolveAnswer {
++  return {
++    ref,
++    name: `project ${port}`,
++    state: 'active',
++    db_version: '17.6.1',
++    pg_meta: port % 2,
++    dsn_rw: `postgresql://postgres:rw${port}@10.212.0.6:${port}/postgres?sslmode=disable`,
++    dsn_ro: `postgresql://supabase_read_only_user:ro${port}@10.212.0.6:${port}/postgres?sslmode=disable`,
++    api_url: `https://${ref}.example.test`,
++    data_api: {
++      schemas: ['public'],
++      extra_search_path: ['public', 'extensions'],
++      max_rows: null,
++    },
++    generation: 4,
++    at: '2026-11-19T10:00:00Z',
++  }
++}
++
++function assertion(ref: string, sub: string, role: Assertion['role'] = 'owner'): Assertion {
++  return {
++    text: `v1.${sub}.${ref}`,
++    ref,
++    iss: 'https://issuer.test',
++    sub,
++    name: `N ${sub}`,
++    role,
++    purpose: '',
++  }
++}
++
++describe('api/self-hosted/project-context', () => {
++  it('has no context outside a request: the accessor throws', () => {
++    expect(() => getProjectContext()).toThrow(ProjectError)
++    try {
++      getProjectContext()
++    } catch (e) {
++      expect(e).toMatchObject({ status: 500, code: 'no_project_context' })
++    }
++  })
++
++  it('has no context after the request has ended', async () => {
++    const ctx = projectContext(assertion(REF_A, 'u1'), answer(REF_A, 20001))
++    await runWithProject(ctx, async () => {
++      await sleep(1)
++      expect(getProjectContext()).toBe(ctx)
++    })
++    expect(() => getProjectContext()).toThrow(ProjectError)
++  })
++
++  it('makes the context of the answer, member for member, with the principal, role and purpose', () => {
++    const a = {
++      ...assertion(REF_A, 'u1', 'developer'),
++      purpose: 'reveal' as const,
++    }
++    const ans = answer(REF_A, 20001)
++    const ctx = projectContext(a, ans)
++    expect(ctx).toEqual({
++      ...ans,
++      principal: { iss: a.iss, sub: a.sub, name: a.name },
++      role: 'developer',
++      purpose: 'reveal',
++      assertion: a.text,
++    })
++    expect(Object.keys(ctx).sort()).toEqual(
++      [...Object.keys(ans), 'principal', 'role', 'purpose', 'assertion'].sort()
++    )
++    expect(Object.isFrozen(ctx)).toBe(true)
++    expect(Object.isFrozen(ctx.principal)).toBe(true)
++  })
++
++  it('refuses an answer for another project than the assertion’s', () => {
++    expect(() => projectContext(assertion(REF_A, 'u1'), answer(REF_B, 20002))).toThrow(ProjectError)
++  })
++
++  it('keeps interleaved requests of two projects apart', async () => {
++    const seen: string[] = []
++    const request = (ref: string, port: number, n: number) =>
++      runWithProject(projectContext(assertion(ref, `u${n}`), answer(ref, port)), async () => {
++        for (let i = 0; i < 5; i++) {
++          await sleep((n * 7 + i * 3) % 5)
++          const ctx = getProjectContext()
++          seen.push(
++            `${ref}:${ctx.ref}:${ctx.dsn_rw!.includes(`:${port}/`)}:${ctx.principal.sub}:u${n}`
++          )
++        }
++      })
++    await Promise.all(
++      Array.from({ length: 40 }, (_, n) =>
++        n % 2 ? request(REF_A, 20001, n) : request(REF_B, 20002, n)
++      )
++    )
++    expect(seen).toHaveLength(200)
++    for (const s of seen) {
++      const [asked, got, port, sub, want] = s.split(':')
++      expect(got).toBe(asked)
++      expect(port).toBe('true')
++      expect(sub).toBe(want)
++    }
++  })
++
++  it('classes owner and developer as rw and read_only as ro, and nothing else', () => {
++    expect(roleClass('owner')).toBe('rw')
++    expect(roleClass('developer')).toBe('rw')
++    expect(roleClass('read_only')).toBe('ro')
++    expect(() => roleClass('admin' as any)).toThrow(ProjectError)
++    expect(() => roleClass('' as any)).toThrow(ProjectError)
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/project-context.ts b/apps/studio/lib/api/self-hosted/project-context.ts
+new file mode 100644
+index 00000000..9e8d5627
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/project-context.ts
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: Apache-2.0
++// The project of a request. One server process serves many projects; everything it knows
++// about the one a request is for is held here, for that request alone, and comes from the
++// control plane's answer to the gateway's signed assertion. Outside a request there is no
++// project: the accessor throws.
++
++import { AsyncLocalStorage } from 'node:async_hooks'
++
++export type Role = 'owner' | 'developer' | 'read_only'
++export type RoleClass = 'rw' | 'ro'
++
++/** The gateway's assertion, as verified: who asks, for which project, in which role. */
++export type Assertion = {
++  /** the signed text, as received; presented to the control plane unchanged */
++  text: string
++  ref: string
++  iss: string
++  sub: string
++  name: string
++  role: Role
++  purpose: '' | 'reveal'
++}
++
++/** The control plane's answer for a project (the dashboard socket's `resolve`). */
++export type ResolveAnswer = {
++  ref: string
++  name: string
++  state: 'active' | 'restarting' | 'restoring'
++  db_version: string
++  /** which postgres-meta instance serves the project */
++  pg_meta: number
++  /** present for owner and developer only */
++  dsn_rw?: string
++  /** present when the project has its read-only login */
++  dsn_ro?: string
++  api_url: string
++  data_api: {
++    schemas: readonly string[]
++    extra_search_path: readonly string[]
++    max_rows: number | null
++  }
++  generation: number
++  at: string
++}
++
++/** Exactly the answer's members, the assertion's principal, role and purpose, and its text. */
++export type ProjectContext = Readonly<
++  ResolveAnswer & {
++    principal: Readonly<{ iss: string; sub: string; name: string }>
++    role: Role
++    purpose: '' | 'reveal'
++    assertion: string
++  }
++>
++
++/**
++ * A refusal the server itself gives; the body of its answer is `{code, message}`. It holds
++ * nothing but these three: never a connection string, a key or an assertion.
++ */
++export class ProjectError extends Error {
++  constructor(
++    readonly status: number,
++    readonly code: string,
++    message: string
++  ) {
++    super(message)
++    this.name = 'ProjectError'
++  }
++}
++
++/** `rw` for owner and developer, `ro` for read_only; any other role is refused. */
++export function roleClass(role: Role): RoleClass {
++  if (role === 'owner' || role === 'developer') return 'rw'
++  if (role === 'read_only') return 'ro'
++  throw new ProjectError(401, 'bad_assertion', 'The request names no known role')
++}
++
++const store = new AsyncLocalStorage<ProjectContext>()
++
++/** The context of a request: the answer for the assertion's project, and who asked. */
++export function projectContext(assertion: Assertion, answer: ResolveAnswer): ProjectContext {
++  if (answer.ref !== assertion.ref) {
++    throw new ProjectError(503, 'project_unavailable', 'The project is not available')
++  }
++  return Object.freeze({
++    ...answer,
++    principal: Object.freeze({
++      iss: assertion.iss,
++      sub: assertion.sub,
++      name: assertion.name,
++    }),
++    role: assertion.role,
++    purpose: assertion.purpose,
++    assertion: assertion.text,
++  })
++}
++
++/** Runs `fn`, and everything it awaits, as a request for the context's project. */
++export function runWithProject<T>(context: ProjectContext, fn: () => T): T {
++  return store.run(context, fn)
++}
++
++/** The project of the current request. Throws when there is none: no default project exists. */
++export function getProjectContext(): ProjectContext {
++  const context = store.getStore()
++  if (!context)
++    throw new ProjectError(500, 'no_project_context', 'No project context for this request')
++  return context
++}

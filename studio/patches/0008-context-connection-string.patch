@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] context: connection string from the request's project
+
+getConnectionString returns the string the control plane answered for the request's
+project: the read-only one when the call site asks for it and whenever the member's role
+is read_only. The connection constants read from the environment, and their built-in
+defaults, are removed: outside a request there is no connection string.
+---
+ .../lib/api/self-hosted/constants.test.ts     |  12 +-
+ apps/studio/lib/api/self-hosted/constants.ts  |   6 -
+ apps/studio/lib/api/self-hosted/util.test.ts  | 122 +++++++++++++++++-
+ apps/studio/lib/api/self-hosted/util.ts       |  30 +++--
+ 4 files changed, 145 insertions(+), 25 deletions(-)
+
+diff --git a/apps/studio/lib/api/self-hosted/constants.test.ts b/apps/studio/lib/api/self-hosted/constants.test.ts
+index 9c5455ed..6404eeef 100644
+--- a/apps/studio/lib/api/self-hosted/constants.test.ts
++++ b/apps/studio/lib/api/self-hosted/constants.test.ts
+@@ -33,7 +33,9 @@ describe('api/self-hosted/constants', () => {
+     })
+   })
+ 
+-  describe('POSTGRES_HOST', () => {
++  // Skipped, here and below: the connection constants are removed in this build; a
++  // connection string is the one of the request's project (util.test.ts).
++  describe.skip('POSTGRES_HOST', () => {
+     it('should use POSTGRES_HOST when set', async () => {
+       vi.stubEnv('POSTGRES_HOST', 'my-db-host.example.com')
+       const { POSTGRES_HOST } = await import('./constants')
+@@ -47,7 +49,7 @@ describe('api/self-hosted/constants', () => {
+     })
+   })
+ 
+-  describe('POSTGRES_DATABASE', () => {
++  describe.skip('POSTGRES_DATABASE', () => {
+     it('should use POSTGRES_DB when set', async () => {
+       vi.stubEnv('POSTGRES_DB', 'my_database')
+       const { POSTGRES_DATABASE } = await import('./constants')
+@@ -61,7 +63,7 @@ describe('api/self-hosted/constants', () => {
+     })
+   })
+ 
+-  describe('POSTGRES_PASSWORD', () => {
++  describe.skip('POSTGRES_PASSWORD', () => {
+     it('should use POSTGRES_PASSWORD when set', async () => {
+       vi.stubEnv('POSTGRES_PASSWORD', 'super-secret-password')
+       const { POSTGRES_PASSWORD } = await import('./constants')
+@@ -75,7 +77,7 @@ describe('api/self-hosted/constants', () => {
+     })
+   })
+ 
+-  describe('POSTGRES_USER_READ_WRITE', () => {
++  describe.skip('POSTGRES_USER_READ_WRITE', () => {
+     it('should use POSTGRES_USER_READ_WRITE when set', async () => {
+       vi.stubEnv('POSTGRES_USER_READ_WRITE', 'custom_admin')
+       const { POSTGRES_USER_READ_WRITE } = await import('./constants')
+@@ -89,7 +91,7 @@ describe('api/self-hosted/constants', () => {
+     })
+   })
+ 
+-  describe('POSTGRES_USER_READ_ONLY', () => {
++  describe.skip('POSTGRES_USER_READ_ONLY', () => {
+     it('should use POSTGRES_USER_READ_ONLY when set', async () => {
+       vi.stubEnv('POSTGRES_USER_READ_ONLY', 'custom_readonly')
+       const { POSTGRES_USER_READ_ONLY } = await import('./constants')
+diff --git a/apps/studio/lib/api/self-hosted/constants.ts b/apps/studio/lib/api/self-hosted/constants.ts
+index 8df9f154..c42dab41 100644
+--- a/apps/studio/lib/api/self-hosted/constants.ts
++++ b/apps/studio/lib/api/self-hosted/constants.ts
+@@ -6,12 +6,6 @@ export const DEFAULT_EXPOSED_SCHEMAS = process.env.PGRST_DB_SCHEMAS ?? 'public,g
+ 
+ export const ENCRYPTION_KEY = process.env.PG_META_CRYPTO_KEY || 'SAMPLE_KEY'
+ export const POSTGRES_PORT = parseInt(process.env.POSTGRES_PORT || '5432', 10)
+-export const POSTGRES_HOST = process.env.POSTGRES_HOST || 'db'
+-export const POSTGRES_DATABASE = process.env.POSTGRES_DB || 'postgres'
+-export const POSTGRES_PASSWORD = process.env.POSTGRES_PASSWORD || 'postgres'
+-export const POSTGRES_USER_READ_WRITE = process.env.POSTGRES_USER_READ_WRITE || 'supabase_admin'
+-export const POSTGRES_USER_READ_ONLY =
+-  process.env.POSTGRES_USER_READ_ONLY || 'supabase_read_only_user'
+ 
+ // Fallback used when AUTH_JWT_SECRET is not provided to the Studio container
+ // (e.g. local dev without docker-compose). The string is the same default
+diff --git a/apps/studio/lib/api/self-hosted/util.test.ts b/apps/studio/lib/api/self-hosted/util.test.ts
+index ceba9eb7..ab32dba3 100644
+--- a/apps/studio/lib/api/self-hosted/util.test.ts
++++ b/apps/studio/lib/api/self-hosted/util.test.ts
+@@ -1,6 +1,12 @@
+ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { assertSelfHosted, encryptString } from './util'
++import {
++  projectContext,
++  runWithProject,
++  type Assertion,
++  type ResolveAnswer,
++} from './project-context'
++import { assertSelfHosted, encryptString, getConnectionString } from './util'
+ 
+ vi.mock('@/lib/constants', () => ({
+   IS_PLATFORM: false,
+@@ -66,7 +72,9 @@ describe('api/self-hosted/util', () => {
+     })
+   })
+ 
+-  describe('getConnectionString', () => {
++  // Skipped: these cases build the string of one project from the environment, which this
++  // build removes. The cases that follow hold what replaces it.
++  describe.skip('getConnectionString, from the environment', () => {
+     beforeEach(() => {
+       vi.resetModules()
+     })
+@@ -117,4 +125,114 @@ describe('api/self-hosted/util', () => {
+       expect(resultReadOnly).toBe('postgresql://supabase_read_only_user:postgres@db:5432/postgres')
+     })
+   })
++
++  describe('getConnectionString', () => {
++    const REF_A = 'abcdefghij0123456789'
++    const REF_B = 'bcdefghij0123456789a'
++    const dsn = (login: string, port: number) =>
++      `postgresql://${login}:pw${port}@10.212.0.6:${port}/postgres?sslmode=disable`
++
++    function context(ref: string, port: number, role: Assertion['role'], readOnlyLogin = true) {
++      const answer: ResolveAnswer = {
++        ref,
++        name: 'p',
++        state: 'active',
++        db_version: '17.6.1',
++        pg_meta: port % 2,
++        api_url: `https://${ref}.example.test`,
++        data_api: {
++          schemas: ['public'],
++          extra_search_path: [],
++          max_rows: null,
++        },
++        generation: 1,
++        at: '2026-11-19T10:00:00Z',
++      }
++      if (role !== 'read_only') answer.dsn_rw = dsn('postgres', port)
++      if (readOnlyLogin) answer.dsn_ro = dsn('supabase_read_only_user', port)
++      return projectContext(
++        {
++          text: 'v1.a.b',
++          ref,
++          iss: 'https://issuer.test',
++          sub: 'u',
++          name: 'U',
++          role,
++          purpose: '',
++        },
++        answer
++      )
++    }
++
++    it('is the string of the request’s project, never one built from the environment', () => {
++      vi.stubEnv('POSTGRES_HOST', 'env-host')
++      vi.stubEnv('POSTGRES_PORT', '5999')
++      vi.stubEnv('POSTGRES_DB', 'env-db')
++      vi.stubEnv('POSTGRES_PASSWORD', 'env-password')
++      vi.stubEnv('POSTGRES_USER_READ_WRITE', 'env-admin')
++      vi.stubEnv('POSTGRES_USER_READ_ONLY', 'env-reader')
++      for (const role of ['owner', 'developer'] as const) {
++        runWithProject(context(REF_A, 20001, role), () => {
++          expect(getConnectionString({ readOnly: false })).toBe(dsn('postgres', 20001))
++          expect(getConnectionString({ readOnly: true })).toBe(
++            dsn('supabase_read_only_user', 20001)
++          )
++        })
++      }
++      vi.unstubAllEnvs()
++    })
++
++    it('is the read-only string for a read_only member, whatever the call site asks', () => {
++      runWithProject(context(REF_A, 20001, 'read_only'), () => {
++        expect(getConnectionString({ readOnly: false })).toBe(dsn('supabase_read_only_user', 20001))
++        expect(getConnectionString({ readOnly: true })).toBe(dsn('supabase_read_only_user', 20001))
++      })
++    })
++
++    it('refuses where the read-only string is needed and the project has no read-only login', () => {
++      const refused = { status: 403, code: 'no_read_only_login' }
++      runWithProject(context(REF_A, 20001, 'read_only', false), () => {
++        expect(() => getConnectionString({ readOnly: false })).toThrow(
++          expect.objectContaining(refused)
++        )
++        expect(() => getConnectionString({ readOnly: true })).toThrow(
++          expect.objectContaining(refused)
++        )
++      })
++      runWithProject(context(REF_A, 20001, 'owner', false), () => {
++        expect(() => getConnectionString({ readOnly: true })).toThrow(
++          expect.objectContaining(refused)
++        )
++        // control: the same member's read-write call is served
++        expect(getConnectionString({ readOnly: false })).toBe(dsn('postgres', 20001))
++      })
++    })
++
++    it('throws outside a request: there is no default project', () => {
++      expect(() => getConnectionString({ readOnly: false })).toThrow(
++        expect.objectContaining({ code: 'no_project_context' })
++      )
++      expect(() => getConnectionString({ readOnly: true })).toThrow(
++        expect.objectContaining({ code: 'no_project_context' })
++      )
++    })
++
++    it('gives interleaved requests of two projects each their own', async () => {
++      const got: boolean[] = []
++      const request = (ref: string, port: number, n: number) =>
++        runWithProject(context(ref, port, n % 3 ? 'owner' : 'read_only'), async () => {
++          for (let i = 0; i < 4; i++) {
++            await new Promise((r) => setTimeout(r, (n + i) % 4))
++            got.push(getConnectionString({ readOnly: false }).includes(`@10.212.0.6:${port}/`))
++          }
++        })
++      await Promise.all(
++        Array.from({ length: 40 }, (_, n) =>
++          n % 2 ? request(REF_A, 20001, n) : request(REF_B, 20002, n)
++        )
++      )
++      expect(got).toHaveLength(160)
++      expect(got.every(Boolean)).toBe(true)
++    })
++  })
+ })
+diff --git a/apps/studio/lib/api/self-hosted/util.ts b/apps/studio/lib/api/self-hosted/util.ts
+index 968db780..e138219b 100644
+--- a/apps/studio/lib/api/self-hosted/util.ts
++++ b/apps/studio/lib/api/self-hosted/util.ts
+@@ -1,14 +1,7 @@
+ import crypto from 'crypto-js'
+ 
+-import {
+-  ENCRYPTION_KEY,
+-  POSTGRES_DATABASE,
+-  POSTGRES_HOST,
+-  POSTGRES_PASSWORD,
+-  POSTGRES_PORT,
+-  POSTGRES_USER_READ_ONLY,
+-  POSTGRES_USER_READ_WRITE,
+-} from './constants'
++import { ENCRYPTION_KEY } from './constants'
++import { getProjectContext, ProjectError } from './project-context'
+ import { IS_PLATFORM } from '@/lib/constants'
+ 
+ /**
+@@ -24,8 +17,21 @@ export function encryptString(stringToEncrypt: string): string {
+   return crypto.AES.encrypt(stringToEncrypt, ENCRYPTION_KEY).toString()
+ }
+ 
++/**
++ * The connection string of the request's project, as the control plane answered it: the
++ * read-only one when the call site asks for it and whenever the member's role is read_only.
++ * There is no default project: outside a request this throws.
++ */
+ export function getConnectionString({ readOnly }: { readOnly: boolean }) {
+-  const postgresUser = readOnly ? POSTGRES_USER_READ_ONLY : POSTGRES_USER_READ_WRITE
+-
+-  return `postgresql://${postgresUser}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DATABASE}`
++  const context = getProjectContext()
++  if (readOnly || context.role === 'read_only') {
++    if (!context.dsn_ro) {
++      throw new ProjectError(403, 'no_read_only_login', 'The project has no read-only login')
++    }
++    return context.dsn_ro
++  }
++  if (!context.dsn_rw) {
++    throw new ProjectError(503, 'project_unavailable', 'The project is not available')
++  }
++  return context.dsn_rw
+ }

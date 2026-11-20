@@ -1,0 +1,391 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] context: tests of a kept answer's lifetime and of every
+ sender of a statement
+
+Tests only. A disk entry is bounded by the time inside its sealed answer as well as by its
+file time; a memory entry by elapsed time, whatever the wall clock does; an answer must name
+the project asked about in its ref and in its address; one member's refusal is that
+member's alone. Every function that sends a statement or a type-generation request names
+the request's project whatever headers, ref or connection string a caller hands in, and
+sends nothing outside a request.
+---
+ .../lib/api/self-hosted/kept-answer.test.ts   | 175 +++++++++++++++++
+ .../api/self-hosted/statement-senders.test.ts | 185 ++++++++++++++++++
+ 2 files changed, 360 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/kept-answer.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/statement-senders.test.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/kept-answer.test.ts b/apps/studio/lib/api/self-hosted/kept-answer.test.ts
+new file mode 100644
+index 00000000..46019b80
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/kept-answer.test.ts
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: Apache-2.0
++// The control-plane client: what bounds the life of a kept answer.
++import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
++import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
++import { tmpdir } from 'node:os'
++import { join, resolve as resolvePath } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { Assertion } from './project-context'
++
++const VECTORS = resolvePath(import.meta.dirname, '../../../../../vectors')
++const LIMITS = readFileSync(join(VECTORS, 'limits.json'), 'utf8').trim()
++const REF_A = 'abcdefghij0123456789'
++const DAY = 86_400_000
++
++const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z')
++const answer = (at: string) => ({
++  ref: REF_A,
++  name: 'p',
++  state: 'active',
++  db_version: '17.6.1',
++  pg_meta: 1,
++  dsn_rw: 'postgresql://postgres:pw@10.212.0.6:20001/postgres?sslmode=disable',
++  api_url: `https://${REF_A}.example.test`,
++  data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
++  generation: 1,
++  at,
++})
++const who = (sub: string): Assertion => ({
++  text: `v1.${sub}.s`,
++  ref: REF_A,
++  iss: 'https://issuer.test',
++  sub,
++  name: sub,
++  role: 'owner',
++  purpose: '',
++})
++
++describe('the control-plane client: a kept answer', () => {
++  let dir: string
++  let server: Server | undefined
++  let handler: (req: IncomingMessage, res: ServerResponse) => void
++  let asked: number
++
++  const sock = () => join(dir, 'dash.sock')
++  async function listen() {
++    server = createServer((req, res) => {
++      asked++
++      req.resume().on('end', () => handler(req, res))
++    })
++    await new Promise<void>((done) => server!.listen(sock(), done))
++  }
++  async function stopListening() {
++    if (!server) return
++    server.closeAllConnections()
++    await new Promise((done) => server!.close(done))
++    server = undefined
++    rmSync(sock(), { force: true })
++  }
++  async function load() {
++    vi.resetModules()
++    vi.stubEnv('SUPAPACE_DASH_SOCKET', sock())
++    vi.stubEnv('SUPAPACE_DASH_KEYS', join(dir, 'keys'))
++    vi.stubEnv('SUPAPACE_DASH_DATA', join(dir, 'data'))
++    vi.stubEnv('SUPAPACE_PGCAP', '10.212.0.6:20000:21023')
++    vi.stubEnv('SUPAPACE_LIMITS', LIMITS)
++    return await import('./dash-socket')
++  }
++  const reply = (status: number, body: unknown) => (_q: IncomingMessage, res: ServerResponse) =>
++    void res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(body))
++
++  beforeEach(async () => {
++    dir = mkdtempSync(join(tmpdir(), 'dash-kept-'))
++    mkdirSync(join(dir, 'keys'))
++    mkdirSync(join(dir, 'data'))
++    writeFileSync(join(dir, 'keys', 'cache.key'), Buffer.alloc(32, 9).toString('base64url') + '\n')
++    asked = 0
++    vi.spyOn(console, 'error').mockImplementation(() => {})
++    await listen()
++  })
++  afterEach(async () => {
++    await stopListening()
++    vi.unstubAllEnvs()
++    vi.restoreAllMocks()
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  // A copy or a restore of the data volume that does not keep file times gives every entry
++  // the time of the copy. The answer's own time is inside the sealed bytes; the entry must
++  // not be used past its lifetime counted from that time either.
++  it('does not use a disk entry whose answer is older than its lifetime, whatever the file time', async () => {
++    handler = reply(200, answer(iso(Date.now() - 30 * DAY)))
++    const first = await load()
++    await first.resolve(who('u-x'))
++    await stopListening()
++    const file = join(dir, 'data', REF_A, 'cache', 'rw.bin')
++    // the file itself is as fresh as a restore leaves it
++    expect(Date.now() - statSync(file).mtimeMs).toBeLessThan(60_000)
++
++    const m = await load()
++    await expect(m.resolve(who('u-y'))).rejects.toMatchObject({
++      status: 503,
++      code: 'project_unavailable',
++    })
++  })
++
++  // control of the test above: an entry whose answer is recent is used on silence
++  it('uses a disk entry whose answer and file time are both recent', async () => {
++    handler = reply(200, answer(iso(Date.now() - 3 * DAY)))
++    const first = await load()
++    await first.resolve(who('u-x'))
++    await stopListening()
++    const m = await load()
++    expect((await m.resolve(who('u-y'))).ref).toBe(REF_A)
++  })
++
++  // The memory entry lives 60 s. A wall clock set back (a time correction) must not make a
++  // warm entry live longer: its life is counted on a clock that only moves forward.
++  it('ends a memory entry after its 60 s of elapsed time when the wall clock is set back', async () => {
++    const t0 = 1_800_000_000_000
++    const wall = vi.spyOn(Date, 'now').mockReturnValue(t0)
++    const mono = vi.spyOn(performance, 'now').mockReturnValue(5_000)
++    handler = reply(200, answer(iso(t0)))
++    const m = await load()
++    await m.resolve(who('u-x'))
++    expect(asked).toBe(1)
++    // the clock is corrected by an hour, backwards; 61 s pass
++    wall.mockReturnValue(t0 - 3_600_000 + 61_000)
++    mono.mockReturnValue(5_000 + 61_000)
++    await m.resolve(who('u-x'))
++    expect(asked).toBe(2)
++  })
++
++  // The answer must be for the project asked about in both places that name it.
++  it.each([
++    ['its ref', { ref: 'bcdefghij0123456789a' }],
++    ['its address', { api_url: 'https://bcdefghij0123456789a.example.test' }],
++  ])('refuses an answer that names another project in %s alone', async (_, over) => {
++    handler = reply(200, { ...answer(iso(Date.now())), ...over })
++    const m = await load()
++    await expect(m.resolve(who('u-x'))).rejects.toMatchObject({
++      status: 503,
++      code: 'project_unavailable',
++    })
++  })
++
++  // One member's refusal is that member's alone, also when two members ask together.
++  it('refuses one of two members who ask together and answers the other', async () => {
++    let release!: () => void
++    const held = new Promise<void>((r) => (release = r))
++    handler = (req, res) =>
++      void held.then(() =>
++        (req.headers['x-supapace-assertion'] as string).includes('u-gone')
++          ? reply(403, { code: 'not_a_member' })(req, res)
++          : reply(200, answer(iso(Date.now())))(req, res)
++      )
++    const m = await load()
++    const all = Promise.allSettled([
++      m.resolve(who('u-stays')),
++      m.resolve(who('u-gone')),
++      m.resolve(who('u-stays')),
++      m.resolve(who('u-gone')),
++    ])
++    await vi.waitFor(() => expect(asked).toBe(2))
++    release()
++    const [a, b, c, d] = await all
++    expect(a.status).toBe('fulfilled')
++    expect(c.status).toBe('fulfilled')
++    expect(b).toMatchObject({ status: 'rejected', reason: { status: 403, code: 'not_a_member' } })
++    expect(d).toMatchObject({ status: 'rejected', reason: { status: 403, code: 'not_a_member' } })
++    // the refused member has no entry: asked again, and refused again
++    await expect(m.resolve(who('u-gone'))).rejects.toMatchObject({ status: 403 })
++    expect(asked).toBe(3)
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/statement-senders.test.ts b/apps/studio/lib/api/self-hosted/statement-senders.test.ts
+new file mode 100644
+index 00000000..1bbf3c2e
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/statement-senders.test.ts
+@@ -0,0 +1,185 @@
++// SPDX-License-Identifier: Apache-2.0
++// Every path of the server that sends a statement or a type-generation request
++// names the request's project, whatever a caller hands in — the handlers behind the opt-in
++// routes included, which take a ref and a connection string from the request body.
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { projectContext, runWithProject, type Assertion } from './project-context'
++
++vi.mock('@sentry/react', () => ({
++  startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
++  captureException: () => {},
++}))
++vi.mock('@/lib/constants', async (original) => ({
++  ...(await original<Record<string, unknown>>()),
++  IS_PLATFORM: false,
++  PG_META_URL: 'http://meta.test',
++}))
++vi.mock('@/lib/constants/index', async (original) => ({
++  ...(await original<Record<string, unknown>>()),
++  IS_PLATFORM: false,
++  PG_META_URL: 'http://meta.test',
++}))
++vi.mock('./util', async (original) => ({
++  ...(await original<typeof import('./util')>()),
++  assertSelfHosted: () => {},
++  encryptString: (text: string) => `encrypted(${text})`,
++}))
++
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++const dsn = (login: string, port: number) =>
++  `postgresql://${login}:pw${port}@10.212.0.6:${port}/postgres?sslmode=disable`
++const PLANTED = `encrypted(${dsn('postgres', 20002)})`
++
++function context(ref: string, port: number, role: Assertion['role'] = 'owner') {
++  return projectContext(
++    { text: 'v1.a.b', ref, iss: 'https://issuer.test', sub: 'u', name: 'U', role, purpose: '' },
++    {
++      ref,
++      name: 'p',
++      state: 'active',
++      db_version: '17.6.1',
++      pg_meta: port % 2,
++      ...(role === 'read_only' ? {} : { dsn_rw: dsn('postgres', port) }),
++      dsn_ro: dsn('supabase_read_only_user', port),
++      api_url: `https://${ref}.example.test`,
++      data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
++      generation: 1,
++      at: '2026-11-19T10:00:00Z',
++    }
++  )
++}
++
++describe('statements name the project of the request', () => {
++  let sent: { url: string; headers: Headers }[]
++
++  beforeEach(() => {
++    sent = []
++    vi.stubGlobal(
++      'fetch',
++      vi.fn(async (url: string, init: RequestInit) => {
++        sent.push({ url: String(url), headers: new Headers(init.headers) })
++        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
++      })
++    )
++  })
++
++  // every shape a caller's headers can take, each naming another project's database
++  const hostile: [string, HeadersInit][] = [
++    ['the header as the route passes it', { 'x-connection-encrypted': PLANTED }],
++    ['the header in another spelling', { 'X-Connection-Encrypted': PLANTED } as HeadersInit],
++    [
++      'both spellings',
++      { 'x-connection-encrypted': PLANTED, 'X-CONNECTION-ENCRYPTED': PLANTED } as HeadersInit,
++    ],
++    ['a Headers object', new Headers({ 'x-connection-encrypted': PLANTED })],
++    ['a list of pairs', [['x-connection-encrypted', PLANTED]]],
++  ]
++
++  it.each(hostile)('executeQuery sends the context’s string, given %s', async (_, headers) => {
++    const { executeQuery } = await import('./query')
++    await runWithProject(context(REF_A, 20001), () => executeQuery({ query: 'select 1', headers }))
++    expect(sent).toHaveLength(1)
++    expect(sent[0].url).toBe('http://meta.test/query')
++    expect(sent[0].headers.get('x-connection-encrypted')).toBe(
++      `encrypted(${dsn('postgres', 20001)})`
++    )
++    expect(JSON.stringify([...sent[0].headers])).not.toContain('20002')
++  })
++
++  it('a read_only member’s statement uses the read-only login whatever the call site asks', async () => {
++    const { executeQuery } = await import('./query')
++    await runWithProject(context(REF_A, 20001, 'read_only'), () =>
++      executeQuery({ query: 'select 1', readOnly: false, headers: hostile[0][1] })
++    )
++    expect(sent[0].headers.get('x-connection-encrypted')).toBe(
++      `encrypted(${dsn('supabase_read_only_user', 20001)})`
++    )
++  })
++
++  it('the client-side SQL helper, handed the server’s fetcher, a foreign ref and a foreign string, reaches the context’s project', async () => {
++    const { executeSql } = await import('@/data/sql/execute-sql-mutation')
++    const { executeQuery } = await import('./query')
++    await runWithProject(context(REF_A, 20001), () =>
++      executeSql(
++        { projectRef: REF_B, connectionString: PLANTED, sql: 'select 1' } as any,
++        undefined,
++        { 'x-connection-encrypted': PLANTED, 'X-Connection-Encrypted': PLANTED } as HeadersInit,
++        executeQuery as any
++      )
++    )
++    expect(sent).toHaveLength(1)
++    expect(sent[0].headers.get('x-connection-encrypted')).toBe(
++      `encrypted(${dsn('postgres', 20001)})`
++    )
++  }, 120_000) // the helper's module graph is large; its first import is slow on a busy host
++
++  it(
++    'the operations behind the opt-in tool route ignore the ref they are handed',
++    { timeout: 120_000 },
++    async () => {
++      const { getDatabaseOperations } = await import('./mcp')
++      const ops = getDatabaseOperations({ headers: { 'x-connection-encrypted': PLANTED } })
++      await runWithProject(context(REF_A, 20001), async () => {
++        await ops.executeSql(REF_B, { query: 'select 1', read_only: false } as any)
++        await ops.listMigrations(REF_B as any)
++      })
++      expect(sent).toHaveLength(2)
++      for (const s of sent) {
++        expect(s.headers.get('x-connection-encrypted')).toBe(`encrypted(${dsn('postgres', 20001)})`)
++      }
++    }
++  )
++
++  it('an owner\u2019s context without a read-write string is unavailable, not served read-only', async () => {
++    const { getConnectionString } = await import('./util')
++    const ctx = { ...context(REF_A, 20001), dsn_rw: undefined } as any
++    expect(() => runWithProject(ctx, () => getConnectionString({ readOnly: false }))).toThrow(
++      expect.objectContaining({ status: 503, code: 'project_unavailable' })
++    )
++  })
++
++  it('outside a request nothing is sent, whatever is handed in', async () => {
++    const { executeQuery } = await import('./query')
++    const { getDatabaseOperations } = await import('./mcp')
++    await expect(executeQuery({ query: 'select 1', headers: hostile[0][1] })).rejects.toMatchObject(
++      { code: 'no_project_context' }
++    )
++    await expect(
++      getDatabaseOperations({ headers: hostile[0][1] }).executeSql(REF_B, {
++        query: 'select 1',
++      } as any)
++    ).rejects.toMatchObject({ code: 'no_project_context' })
++    expect(sent).toHaveLength(0)
++  })
++
++  it('two projects’ statements, interleaved with failures, never carry the other’s string', async () => {
++    const { executeQuery } = await import('./query')
++    vi.stubGlobal(
++      'fetch',
++      vi.fn(async (url: string, init: RequestInit) => {
++        const h = new Headers(init.headers)
++        await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 5)))
++        sent.push({ url: String(init.body), headers: h })
++        if (Math.random() < 0.3) throw new Error('connection lost')
++        return new Response('[]', { status: 200 })
++      })
++    )
++    const one = (ref: string, port: number, i: number) =>
++      runWithProject(context(ref, port), async () => {
++        for (let k = 0; k < 4; k++) {
++          await executeQuery({ query: `select '${ref}:${i}:${k}'` }).catch(() => undefined)
++        }
++      })
++    await Promise.all(
++      Array.from({ length: 60 }, (_, i) => (i % 2 ? one(REF_A, 20001, i) : one(REF_B, 20002, i)))
++    )
++    expect(sent).toHaveLength(240)
++    const ports = sent.map((s) => /:(2000\d)\//.exec(s.headers.get('x-connection-encrypted')!)![1])
++    expect(ports.filter((p) => p === '20001')).toHaveLength(120)
++    expect(ports.filter((p) => p === '20002')).toHaveLength(120)
++    // each statement went with the string of the project that issued it
++    sent.forEach((s, n) => expect(s.url.includes(REF_A)).toBe(ports[n] === '20001'))
++  })
++})

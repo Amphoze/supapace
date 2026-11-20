@@ -4878,3 +4878,74 @@ Known limits:
   is recorded only.
 - A delete parked on a job that is never picked waits without a bound of
   its own.
+
+### 2026-11-21 — Studio: the project of a request and the control-plane client
+Patches 0005-0009 (topic context), files under apps/studio/lib/api/self-hosted/. One server
+process serves many projects; what it knows of a request's project comes from the control
+plane's answer and is held for that request alone. No route calls these yet: the request guard
+(a later patch) verifies the assertion, calls resolve and runs the route inside the context.
+- limits.ts: limits() - SUPAPACE_LIMITS parsed at the first call: exactly the fourteen members,
+  each a positive safe integer. parseLimits(text) throws; orStop(read) logs one line and exits
+  1. Nothing is read at import: the build's prerender starts the server without the node's
+  environment. So a bad setting stops the process at the first use, not at start;
+  checkSettings() (exported: limits, then the key file) is for a start hook of a later patch.
+- project-context.ts: Assertion {text, ref, iss, sub, name, role, purpose} (as verified);
+  ResolveAnswer (the socket's members); ProjectContext = the answer + principal {iss, sub,
+  name}, role, purpose, assertion (the text); projectContext(assertion, answer) (frozen;
+  refuses another ref); runWithProject(context, fn); getProjectContext() throws ProjectError
+  500 no_project_context outside a request. ProjectError(status, code, message) holds nothing
+  else. roleClass(role): rw for owner and developer, ro for read_only, else 401 bad_assertion.
+- dash-socket.ts: resolve(assertion), keys(assertion), dropProject(ref), checkDsn(dsn, pgcap?),
+  MAX_ANSWER_BYTES (64 KiB), MEMORY_ENTRIES (4096). Settings at the first call, a bad one stops
+  the process: SUPAPACE_DASH_SOCKET, SUPAPACE_DASH_DATA, SUPAPACE_DASH_KEYS (absolute paths),
+  SUPAPACE_PGCAP (<IPv4>:<first port>:<last port>), <keys>/cache.key (43 base64url
+  characters, an optional = and line end).
+- util.ts: getConnectionString({readOnly}) - the context's dsn_ro when asked or when the role
+  is read_only (none: ProjectError 403 no_read_only_login), else dsn_rw. The POSTGRES_*
+  connection constants and their defaults are gone; outside a request it throws.
+- generate-types.ts: sends x-connection-encrypted for the context's string; a caller's header
+  of any spelling is replaced.
+Caller rules:
+- resolve and keys take an assertion whose signature the caller has verified; a warm entry is
+  answered without asking the socket.
+- Read the context before waiting on anything another request may complete: a callback run by
+  another request runs in that request's context.
+- A ProjectError is the answer {code, message} with its status; mapping it is the caller's.
+One call: POST /v1/resolve or /v1/keys on the Unix socket, header X-Supapace-Assertion, no
+body; bounded by socket_call_ms from its creation, response head 8 KiB, body 64 KiB.
+- 200: fatal UTF-8, JSON, a closed schema (unknown members dropped); ref and api_url must be
+  this project's; dsn_rw present exactly for the class rw; each string through checkDsn; both
+  logins on one port; service_role_key only for an owner under purpose reveal. A 200 that
+  fails a check is 503 project_unavailable.
+- Passed on with status and code: 401 bad_assertion, 403 not_a_member, 404 not_here, 429
+  rate_limited, 503 unavailable. Every other answer is 503 project_unavailable.
+- No answer (no connection, no response head in time, connection ended before a head): for
+  resolve the disk entry, else 503 project_unavailable; for keys always 503. Once a head has
+  arrived the socket has answered: no disk entry, whatever follows.
+Caches (resolve only):
+- memory: key (ref, iss, sub, role class), resolve_memory_s (60 s), at most 4096 entries
+  (expired swept, then the oldest dropped); requests of one principal that arrive together
+  share one call. A member removed from a project can be answered from a warm entry for up to
+  that time.
+- disk: <SUPAPACE_DASH_DATA>/<ref>/cache/<rw|ro>.bin = 12-byte nonce, AES-256-GCM of the
+  answer's JSON, 16-byte tag; associated data <ref>:<class>; 0600 in a 0700 directory; written
+  by rename at every answer of the socket; never written or touched on a read; not used when
+  its modification time, or the answer's own `at` inside the sealed bytes, is older than
+  resolve_disk_days or more than 60 s ahead of the clock (so a restore that drops file times
+  revives nothing). Before a write, at most 64 leftover <rw|ro>.<16 hex>.tmp names are removed.
+  Per role class, not per member: on silence any member the gateway admits gets the class's
+  entry. Never copied into memory.
+- dropProject(ref) removes the project's memory entries and its cache directory.
+checkDsn accepts postgresql://<login>:<password>@<proxy address>:<port>/postgres?sslmode=disable
+and nothing else: login postgres or supabase_read_only_user; password of printable ASCII,
+every byte outside A-Z a-z 0-9 - . _ ~ as %XX in upper case; the port in the proxy's range,
+canonical decimal; at most 512 bytes. Same vectors as internal/dashcfg (testdata/dsn.json).
+Its messages never hold the string.
+Known limits:
+- Which postgres-meta is asked, the header-encryption key, and every route that answers from
+  the process (project, settings, configuration, keys, snippets, profile) are unchanged here.
+- A stand-in or fixture that seals an answer must take `at` from the clock: a fixed date stops
+  being served from disk seven days later.
+- The memory lifetime is counted on elapsed time (performance.now), not the wall clock.
+- Upstream's tests of the removed constants are skipped in place.
+- Unit tests: studio/build.sh test (an HTTP server of the test on a Unix socket).
