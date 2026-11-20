@@ -22,18 +22,29 @@ import (
 )
 
 // Create steps. Step 1 (the project row and this operation) is the admin
-// API's; steps 5, 8 and 10 do not exist in this phase.
+// API's; steps 7a, 8 and 10 do not exist in this phase. 5a-5d, 12a and 12b
+// are steps of a layout-2 project only.
 var createSteps = []step{
-	{"2", (*job).createSecrets},
-	{"3", (*job).place},
-	{"4a", (*job).clusterFirstBoot},
-	{"4", (*job).clusterFirstBoot},
-	{"6", (*job).putKeys},
-	{"7", (*job).mintTokens},
-	{"9", (*job).postgrest},
-	{"11", (*job).publish},
-	{"12", (*job).activate},
+	{id: "2", do: (*job).createSecrets},
+	{id: "3", do: (*job).place},
+	{id: "4a", do: (*job).clusterFirstBoot},
+	{id: "4", do: (*job).clusterFirstBoot},
+	{id: "5a", do: (*job).stanzaCreate},
+	{id: "5b", do: func(x *job, ctx context.Context) error { _, err := x.awaitJob(ctx, "backup"); return err }},
+	{id: "5c", do: func(x *job, ctx context.Context) error { _, err := x.awaitJob(ctx, "check"); return err }},
+	{id: "5d", do: (*job).replicate},
+	{id: "6", do: (*job).putKeys},
+	{id: "7", do: (*job).mintTokens},
+	{id: "9", do: (*job).postgrest},
+	{id: "11", do: (*job).publish},
+	{id: "12a", do: (*job).switchCP},
+	{id: "12b", do: (*job).waitCP},
+	{id: "12", do: (*job).activate},
 }
+
+// createLayout2 are the create steps of a layout-2 project only: at any other
+// layout they are skipped, not recorded and their failpoints never fire.
+var createLayout2 = map[string]bool{"5a": true, "5b": true, "5c": true, "5d": true, "12a": true, "12b": true}
 
 // Secret names and how each is made. A secret is written once: a present
 // row is never generated again.
@@ -189,6 +200,11 @@ func (r *Runner) spec(ctx context.Context, p store.Project, epoch, gen int64, cf
 		}
 	}
 	s.Secrets = sec
+	if cfg.Layout == 2 {
+		if s.Stanza, s.StanzaPass, err = r.stanza(ctx, dek, p.Ref); err != nil {
+			return s, err
+		}
+	}
 	rows, err := r.st.ListKeys(ctx, p.Ref)
 	if err != nil {
 		return s, err
@@ -210,7 +226,8 @@ func bareSpec(p store.Project, epoch, gen int64, cfg store.ProjectConfig) (agent
 		return agent.Spec{}, fmt.Errorf("project %s is not placed", p.Ref)
 	}
 	s := agent.Spec{Ref: p.Ref, Epoch: epoch, Generation: gen, UID: *p.UID, GID: *p.UID,
-		DiskQuotaMB: cfg.DiskQuotaMB, MemMB: cfg.MemMB, Pids: clusterPids, GUC: cfg.GUC, UserRoles: p.UserRoles}
+		DiskQuotaMB: cfg.DiskQuotaMB, MemMB: cfg.MemMB, Pids: clusterPids, GUC: cfg.GUC, UserRoles: p.UserRoles,
+		Layout: cfg.Layout, RepoQuotaMB: cfg.DiskQuotaMB}
 	if p.SubnetIndex != nil {
 		s.SubnetIndex = *p.SubnetIndex
 	}
@@ -267,7 +284,7 @@ func (x *job) createSecrets(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	return x.backupSecrets(ctx, dek)
 }
 
 // 3: placement (a resumed step gets the stored placement back), the project
@@ -282,6 +299,14 @@ func (x *job) place(ctx context.Context) error {
 	}
 	if err := x.r.ag.EnsureDir(ctx, s); err != nil {
 		return err
+	}
+	if s.Layout == 2 {
+		if err := x.r.ag.EnsureRepoDir(ctx, s); err != nil {
+			return err
+		}
+		if err := x.r.st.EnsureBackupState(ctx, x.op.Ref); err != nil {
+			return err
+		}
 	}
 	return x.r.ag.EnsureNetwork(ctx, s)
 }
@@ -519,3 +544,126 @@ func strictJSON(b []byte, v any) error {
 // a test seam (no-op otherwise), used to land
 // an abort in that window.
 var beforeFinishCreate = func() {}
+
+// stanzaPassName is the secret that holds a project's stanza passphrase.
+const stanzaPassName = "backup.cipher_pass"
+
+// stanza is a project's stanza name and passphrase, each empty while it
+// does not exist yet (before create steps 2 and 3, or a switch's S1).
+func (r *Runner) stanza(ctx context.Context, dek []byte, ref string) (name, pass string, err error) {
+	bs, err := r.st.GetBackupState(ctx, ref)
+	switch {
+	case err == nil:
+		name = ref + "-" + bs.Incarnation
+	case !errors.Is(err, store.ErrNotFound):
+		return "", "", err
+	}
+	b, err := r.secret(ctx, dek, ref, stanzaPassName)
+	if errors.Is(err, store.ErrNotFound) {
+		return name, "", nil
+	}
+	return name, string(b), err
+}
+
+// The rest of step 2 at layout 2: the stanza passphrase (written once) and
+// the control plane's WAL position before the create's later writes
+// (cp_lsn), which 12a switches past.
+func (x *job) backupSecrets(ctx context.Context, dek []byte) error {
+	if x.layout != 2 {
+		return nil
+	}
+	if _, _, err := x.r.st.GetSecret(ctx, x.op.Ref, stanzaPassName); errors.Is(err, store.ErrNotFound) {
+		plain, err := password()
+		if err != nil {
+			return err
+		}
+		err = x.r.putSecret(ctx, dek, x.op.Ref, stanzaPassName, plain)
+		clear(plain)
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if param(x.op.Params, "cp_lsn") != "" {
+		return nil
+	}
+	lsn, err := x.r.st.WALPosition(ctx)
+	if err != nil {
+		return err
+	}
+	return x.r.patchParams(ctx, &x.op, "cp_lsn", lsn)
+}
+
+// 5a: the stanza, unless it exists.
+func (x *job) stanzaCreate(ctx context.Context) error {
+	bs, err := x.r.st.GetBackupState(ctx, x.op.Ref)
+	if err != nil || bs.StanzaCreated {
+		return err
+	}
+	_, err = x.awaitJob(ctx, "stanza-create")
+	return err
+}
+
+// 12a: the control plane's WAL switched past the position step 2 recorded,
+// the segment that holds it recorded (cp_segment), and a push of it asked
+// for.
+func (x *job) switchCP(ctx context.Context) error {
+	jobs, err := x.jobRunner()
+	if err != nil {
+		return err
+	}
+	if param(x.op.Params, "cp_segment") == "" {
+		lsn := param(x.op.Params, "cp_lsn")
+		if lsn == "" {
+			return final("internal", errors.New("step 2 recorded no WAL position"))
+		}
+		seg, err := x.r.st.SwitchWAL(ctx, lsn)
+		if err != nil {
+			return err
+		}
+		if err := x.r.patchParams(ctx, &x.op, "cp_segment", seg); err != nil {
+			return err
+		}
+	}
+	_, err = jobs.PushNow(ctx, "cp", 0)
+	return err
+}
+
+// 12b: with the off-site store declared, the create waits — no job, no
+// worker held — until the control plane's segment of 12a is replicated, so
+// that a recovery from the store knows the project; at most cpWait from the
+// step's first entry (wait_started).
+func (x *job) waitCP(ctx context.Context) error {
+	jobs, err := x.jobRunner()
+	if err != nil {
+		return err
+	}
+	if jobs.Offsite() != "declared" {
+		return nil
+	}
+	seg := param(x.op.Params, "cp_segment")
+	ok, err := x.r.st.SegmentReplicated(ctx, "cp", seg)
+	if err != nil || ok {
+		return err
+	}
+	first := false
+	started, err := time.Parse(time.RFC3339Nano, param(x.op.Params, "wait_started"))
+	if err != nil {
+		first, started = true, time.Now()
+		if err := x.r.patchParams(ctx, &x.op, "wait_started", started.UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+	}
+	if time.Since(started) > x.r.cpWait {
+		return &failure{code: "cp_not_replicated", err: fmt.Errorf("the control plane's segment %s was not replicated within %s", seg, x.r.cpWait)}
+	}
+	return &later{d: x.r.waitEvery, first: first}
+}
+
+// param is a string member of operation parameters, "" when absent.
+func param(params json.RawMessage, key string) string {
+	var s string
+	json.Unmarshal(paramRaw(params, key), &s)
+	return s
+}

@@ -60,6 +60,31 @@ type Agent interface {
 	RemoveRender(context.Context, string) error                       // purge P3, abort C5
 	PurgeDir(context.Context, agent.Spec) error                       // purge P4, abort C6
 	ContainmentFailed() bool                                          // Run takes no operation while true
+
+	EnsureRepoDir(context.Context, agent.Spec) error                // create 3, restart S1, restore T1
+	EnsureSpoolDirs(context.Context, agent.Spec) error              // restart S1
+	GrantBackupRole(context.Context, agent.Spec) error              // restart S2
+	PurgeRepo(context.Context, agent.Spec) error                    // purge P4, abort C6
+	RemoveFetch(context.Context, agent.Spec) error                  // restore T5a, T11
+	RenderCluster(context.Context, agent.Spec) error                // restore T1 (replaced node)
+	WipeData(context.Context, agent.Spec) error                     // restore T5
+	HostState(context.Context, agent.Spec) (agent.HostState, error) // restore submit and T1
+}
+
+// Jobs is what the steps need from the backup job runner; *backup.Runner
+// satisfies it.
+type Jobs interface {
+	Cancel(ctx context.Context, opID int64) error            // abort C0
+	CancelSubject(ctx context.Context, subject string) error // delete D1, purge P1 and P4
+	// PushNow asks for push jobs of subject until one is complete or wait is
+	// over: ok, incomplete, timeout or failed; wait 0 asks and returns.
+	PushNow(ctx context.Context, subject string, wait time.Duration) (outcome string, err error) // restart R2, create 12a
+	Offsite() string                                                                             // "undeclared", "partial" or "declared"
+}
+
+// Recoverer re-keys a restored cluster and returns its timeline (restore T8).
+type Recoverer interface {
+	Rekey(context.Context, agent.Spec) (timeline int, err error)
 }
 
 const (
@@ -88,14 +113,26 @@ type Runner struct {
 	probeWindow      time.Duration // how long create 11 and restart R5 retry the end-to-end probe
 	probeEvery       time.Duration
 	idle             time.Duration // between polls of an empty or paused queue
+	waitEvery        time.Duration // how soon a step that waits without a job (create 12b) is taken again
+	cpWait           time.Duration // how long create 12b waits for the control plane's segment off-site
+
+	jobs Jobs      // nil: a step that needs a job fails with code internal
+	rc   Recoverer // nil: restore T8 fails with code internal
 }
 
 func New(st *store.Store, ag Agent, kek secrets.KEK, c nodecfg.Config, p nodecfg.Paths) *Runner {
 	return &Runner{st: st, ag: ag, kek: kek, cfg: c, p: p, log: slog.Default(),
 		backoff:      []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second},
 		stepDeadline: 300 * time.Second, attemptDeadline: 900 * time.Second, containmentRetry: 10 * time.Second,
-		probeWindow: 60 * time.Second, probeEvery: time.Second, idle: time.Second}
+		probeWindow: 60 * time.Second, probeEvery: time.Second, idle: time.Second,
+		waitEvery: 5 * time.Second, cpWait: 900 * time.Second}
 }
+
+// SetJobs gives the runner its job runner; call it before Run.
+func (r *Runner) SetJobs(j Jobs) { r.jobs = j }
+
+// SetRecoverer gives the runner the restore's re-key; call it before Run.
+func (r *Runner) SetRecoverer(rc Recoverer) { r.rc = rc }
 
 func (r *Runner) backoffAfter(n int) time.Duration {
 	return r.backoff[max(min(n, len(r.backoff)), 1)-1]
@@ -116,13 +153,16 @@ var tables = map[string][]step{
 	"restart": restartSteps,
 	"delete":  deleteSteps,
 	"purge":   purgeSteps,
+	"restore": restoreSteps,
 }
 
 // job is one attempt at one operation.
 type job struct {
-	r    *Runner
-	op   store.Operation
-	held func(context.Context) error // the ref lock is still held
+	r      *Runner
+	op     store.Operation
+	held   func(context.Context) error // the ref lock is still held
+	step   string                      // the step running
+	layout int                         // a create's project layout
 }
 
 // Run is the worker: it takes the next ready operation and runs one attempt
@@ -188,7 +228,13 @@ func (r *Runner) attempt(ctx context.Context, op store.Operation) {
 	x.op.State, x.op.Attempts = "running", cur.Attempts+1
 	// Attempts are counted when started, so a step that ends the process
 	// every time cannot be resumed forever.
+	// The fifth counted failure of a job is ended here, with its own code and
+	// message, kept in last_error.
 	if x.op.Attempts-requeues(x.op.Params) > maxAttempts {
+		if cur.LastError != "" {
+			x.finishFailedMsg(ctx, cur.LastError)
+			return
+		}
 		x.finishFailed(ctx, final("internal", errors.New("interrupted too many times before finishing a step (the daemon stopped during each attempt); the operator can retry it")))
 		return
 	}
@@ -213,10 +259,14 @@ func (x *job) record(ctx context.Context) error {
 }
 
 func (x *job) finishFailed(ctx context.Context, err error) {
+	x.finishFailedMsg(ctx, x.r.lastError(err))
+}
+
+func (x *job) finishFailedMsg(ctx context.Context, msg string) {
 	if x.record(ctx) != nil {
 		return
 	}
-	msg := x.stranded(ctx, x.r.lastError(err))
+	msg = x.stranded(ctx, msg)
 	if err := x.r.st.FinishOperation(ctx, x.op.ID, "failed", msg); err != nil {
 		x.r.log.Error("recording a failed operation", "op", x.op.ID, "ref", x.op.Ref, "err", x.r.text(err))
 		return
@@ -238,12 +288,42 @@ func (x *job) steps(ctx, actx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if x.op.Kind == "create" {
+		p, err := x.r.st.GetProject(ctx, x.op.Ref)
+		if err != nil {
+			return err
+		}
+		x.layout = p.Config.Layout
+	}
 	for ; i < len(table); i++ {
 		s := table[i]
+		if x.op.Kind == "create" && createLayout2[s.id] && x.layout != 2 {
+			continue
+		}
 		hitFailpoint(x.r.p, x.op.Kind+":"+s.id)
+		x.step = s.id
 		sctx, cancel := context.WithTimeout(actx, x.r.stepDeadline)
 		err := s.do(x, sctx)
 		cancel()
+		var pk *parked
+		if errors.As(err, &pk) {
+			return x.park(ctx, pk.job)
+		}
+		var lt *later
+		if errors.As(err, &lt) {
+			return x.requeue(ctx, lt)
+		}
+		var rw *rewind
+		if errors.As(err, &rw) {
+			if err := x.rewind(ctx, table, rw); err != nil {
+				return err
+			}
+			if actx.Err() != nil {
+				return actx.Err()
+			}
+			i = indexOf(table, rw.to) - 1
+			continue
+		}
 		var rf *rollForward
 		if errors.As(err, &rf) {
 			// Restart R3 or R4 failed: write the rollback target first, so a resumed
@@ -492,6 +572,9 @@ func (r *Runner) patchParams(ctx context.Context, op *store.Operation, key strin
 // "next": <target>} and is refused with store.ErrConflict when the project is
 // no longer at generation N. A delete takes no params.
 func (r *Runner) Submit(ctx context.Context, kind, ref string, params json.RawMessage) (int64, error) {
+	if kind == "restore" {
+		return r.submitRestore(ctx, ref, params)
+	}
 	if kind != "restart" && kind != "delete" {
 		return 0, fmt.Errorf("%w: operation kind %q cannot be submitted", store.ErrConflict, kind)
 	}

@@ -163,6 +163,7 @@ type call struct {
 	State       string // SetRoute: "" = removed
 	FirstBoot   bool
 	Token       string
+	Op          int64 // Jobs.Cancel
 }
 
 // fakeAgent models the node objects so that a repeated call can be told
@@ -176,6 +177,7 @@ type fakeAgent struct {
 	cluster      map[string]int64
 	pgrest       map[string]int64
 	render       map[string]bool
+	repo         map[string]bool
 	route        map[string]routes.Project
 	routeGen     int64
 	specs        []agent.Spec
@@ -194,7 +196,7 @@ type fakeAgent struct {
 
 func newFake() *fakeAgent {
 	return &fakeAgent{effects: map[string]int{}, dir: map[string]bool{}, network: map[string]bool{},
-		cluster: map[string]int64{}, pgrest: map[string]int64{}, render: map[string]bool{}, route: map[string]routes.Project{}}
+		cluster: map[string]int64{}, pgrest: map[string]int64{}, render: map[string]bool{}, repo: map[string]bool{}, route: map[string]routes.Project{}}
 }
 
 func (f *fakeAgent) enter(ctx context.Context, c call, s *agent.Spec) error {
@@ -429,6 +431,53 @@ func (f *fakeAgent) PurgeDir(ctx context.Context, s agent.Spec) error {
 
 func (f *fakeAgent) ContainmentFailed() bool { return f.failed.Load() }
 
+// The backup methods: each is recorded; the repository and its purge are
+// modelled so that a repeated call can be told from one with effect.
+func (f *fakeAgent) effect(ctx context.Context, method string, s agent.Spec, key string, set bool) error {
+	if err := f.enter(ctx, sc(method, s), &s); err != nil {
+		return err
+	}
+	if key != "" {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.repo[s.Ref] != set {
+			f.repo[s.Ref] = set
+			f.effects[key+" "+s.Ref]++
+		}
+	}
+	return nil
+}
+
+func (f *fakeAgent) EnsureRepoDir(ctx context.Context, s agent.Spec) error {
+	return f.effect(ctx, "EnsureRepoDir", s, "repo", true)
+}
+func (f *fakeAgent) PurgeRepo(ctx context.Context, s agent.Spec) error {
+	return f.effect(ctx, "PurgeRepo", s, "purgerepo", false)
+}
+func (f *fakeAgent) EnsureSpoolDirs(ctx context.Context, s agent.Spec) error {
+	return f.effect(ctx, "EnsureSpoolDirs", s, "", false)
+}
+func (f *fakeAgent) GrantBackupRole(ctx context.Context, s agent.Spec) error {
+	return f.effect(ctx, "GrantBackupRole", s, "", false)
+}
+func (f *fakeAgent) RemoveFetch(ctx context.Context, s agent.Spec) error {
+	return f.effect(ctx, "RemoveFetch", s, "", false)
+}
+func (f *fakeAgent) RenderCluster(ctx context.Context, s agent.Spec) error {
+	return f.effect(ctx, "RenderCluster", s, "", false)
+}
+func (f *fakeAgent) WipeData(ctx context.Context, s agent.Spec) error {
+	return f.effect(ctx, "WipeData", s, "", false)
+}
+func (f *fakeAgent) HostState(ctx context.Context, s agent.Spec) (agent.HostState, error) {
+	if err := f.enter(ctx, sc("HostState", s), &s); err != nil {
+		return agent.HostState{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return agent.HostState{ProjectDir: f.dir[s.Ref], StateFile: f.cluster[s.Ref] != 0, ClusterRunning: f.cluster[s.Ref] != 0}, nil
+}
+
 func (f *fakeAgent) setErr(fn func(c call) error) {
 	f.mu.Lock()
 	f.err = fn
@@ -479,6 +528,195 @@ func (f *fakeAgent) reset() {
 	f.mu.Unlock()
 }
 
+// ───────── fake job runner and re-key ─────────
+
+// fakeJobs is saga.Jobs over the real store: Cancel and CancelSubject end
+// the queued jobs in the store and the running ones as the runner's lane
+// would. Its calls go into the fake agent's call list, so that their order
+// against the agent's is visible.
+type fakeJobs struct {
+	ag      *fakeAgent
+	st      *store.Store
+	offsite atomic.Value // string
+	pushes  atomic.Int32
+	onPush  func(subject string)
+}
+
+func (f *fakeJobs) cancel(ctx context.Context, running []store.Job, err error) error {
+	if err != nil {
+		return err
+	}
+	for _, j := range running {
+		if err := f.st.FinishJob(ctx, j.ID, "failed", "cancelled", "cancelled", nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeJobs) Cancel(ctx context.Context, opID int64) error {
+	if err := f.ag.enter(ctx, call{Method: "Jobs.Cancel", Op: opID}, nil); err != nil {
+		return err
+	}
+	running, err := f.st.CancelJobs(ctx, opID)
+	return f.cancel(ctx, running, err)
+}
+
+func (f *fakeJobs) CancelSubject(ctx context.Context, subject string) error {
+	if err := f.ag.enter(ctx, call{Method: "Jobs.CancelSubject", Ref: subject}, nil); err != nil {
+		return err
+	}
+	running, err := f.st.CancelSubjectJobs(ctx, subject)
+	return f.cancel(ctx, running, err)
+}
+
+func (f *fakeJobs) PushNow(ctx context.Context, subject string, wait time.Duration) (string, error) {
+	if err := f.ag.enter(ctx, call{Method: "Jobs.PushNow", Ref: subject}, nil); err != nil {
+		return "", err
+	}
+	f.pushes.Add(1)
+	if f.onPush != nil {
+		f.onPush(subject)
+	}
+	return "ok", nil
+}
+
+func (f *fakeJobs) Offsite() string { return f.offsite.Load().(string) }
+
+type fakeRecoverer struct{}
+
+func (fakeRecoverer) Rekey(context.Context, agent.Spec) (int, error) { return 2, nil }
+
+// jobEnd is how the fake lanes end a job.
+type jobEnd struct {
+	state, code, msg string
+	result           string
+}
+
+var okEnd = jobEnd{state: "done", result: `{"ok":true}`}
+
+// replDone is a copy job that uploaded something and is complete.
+var replDone = jobEnd{state: "done", result: `{"ok":true,"mode":"copy","complete":true,"stopped":"","uploaded":1,"adopted":0}`}
+
+// lanes runs the queue's jobs as the runner's lanes would, ending each as
+// end says (nil: every job done, a replication complete), until the test
+// ends. A stanza-create that ends done marks the stanza, as the runner does.
+func (e *env) lanes(end func(j store.Job) jobEnd) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			picked := false
+			for _, lane := range []string{"push", "backup"} {
+				j, ok, err := e.st.NextJob(ctx, lane)
+				if err != nil || !ok {
+					continue
+				}
+				picked = true
+				out := okEnd
+				if j.Kind == "replicate" {
+					out = replDone
+				}
+				if end != nil {
+					out = end(j)
+				}
+				var res json.RawMessage
+				if out.result != "" {
+					res = json.RawMessage(out.result)
+				}
+				if out.state == "done" && j.Kind == "stanza-create" {
+					e.st.MarkStanza(ctx, j.Subject)
+				}
+				if err := e.st.FinishJob(ctx, j.ID, out.state, out.code, out.msg, res); err != nil && ctx.Err() == nil {
+					e.t.Errorf("finishing job %d: %v", j.ID, err)
+				}
+			}
+			if !picked {
+				select {
+				case <-ctx.Done():
+				case <-time.After(2 * time.Millisecond):
+				}
+			}
+		}
+	}()
+	e.t.Cleanup(func() { cancel(); <-done })
+}
+
+// jobsOf returns operation id's jobs, oldest first (id, step, kind, state,
+// code only).
+func (e *env) jobsOf(id int64) []store.Job {
+	e.t.Helper()
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig("")
+	must(e.t, err)
+	cfg.Host, cfg.Port, cfg.Database, cfg.User = sockDir, 5432, "supapaced", "supapaced"
+	cfg.TLSConfig, cfg.Fallbacks = nil, nil
+	c, err := pgx.ConnectConfig(ctx, cfg)
+	must(e.t, err)
+	defer c.Close(ctx)
+	rows, err := c.Query(ctx, "select id, op_step, kind, state, coalesce(code, '') from backup_job where op_id = $1 order by id", id)
+	must(e.t, err)
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (store.Job, error) {
+		var j store.Job
+		err := r.Scan(&j.ID, &j.OpStep, &j.Kind, &j.State, &j.Code)
+		return j, err
+	})
+	must(e.t, err)
+	return out
+}
+
+// jobSteps returns "<step>/<kind>" of operation id's jobs, oldest first.
+func (e *env) jobSteps(id int64) []string {
+	var out []string
+	for _, j := range e.jobsOf(id) {
+		out = append(out, j.OpStep+"/"+j.Kind)
+	}
+	return out
+}
+
+// layout2 is the configuration of a project at layout 2.
+var layout2 = store.ProjectConfig{DiskQuotaMB: 8192, MemMB: 512, GUC: map[string]string{}, Layout: 2}
+
+// create2 inserts a layout-2 project with cfg and its create operation.
+func (e *env) create2(cfg store.ProjectConfig) (string, int64) {
+	e.t.Helper()
+	r := e.ref()
+	id, err := e.st.CreateProject(context.Background(), store.NewProject{Ref: r, Name: "demo", Config: cfg,
+		UserRoles: []string{"authenticated"}, Params: issuerJWKS(e.t, issuerKey)})
+	must(e.t, err)
+	return r, id
+}
+
+// replicateCP records the control plane's segment that create id switched
+// to at 12a as replicated, once 12a has written it.
+func (e *env) replicateCP(id int64) {
+	e.t.Helper()
+	op := e.wait(id, "at 12a", func(op store.Operation) bool { return paramOf(op, "cp_segment") != "" })
+	seg := paramOf(op, "cp_segment")
+	must(e.t, e.st.EnsureBackupState(context.Background(), "cp"))
+	bs, err := e.st.GetBackupState(context.Background(), "cp")
+	must(e.t, err)
+	key := "archive/cp-" + bs.Incarnation + "/17-1/" + seg[:16] + "/" + seg + "-" + strings.Repeat("a", 40) + ".zst"
+	sql(e.t, "insert into offsite_object (subject, key, size, uploaded_at, launch) values ('cp', $1, 1, now() - interval '1 second', 0)", key)
+	sql(e.t, "update backup_state set last_repl_ok = now() where subject = 'cp'")
+}
+
+// paramOf is a string or number member of op's parameters as text.
+func paramOf(op store.Operation, key string) string {
+	var m map[string]json.RawMessage
+	json.Unmarshal(op.Params, &m)
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(v, &s) == nil {
+		return s
+	}
+	return string(v)
+}
+
 // ───────── environment ─────────
 
 type logBuf struct {
@@ -514,6 +752,7 @@ type env struct {
 	t    *testing.T
 	st   *store.Store
 	ag   *fakeAgent
+	jobs *fakeJobs
 	kek  secrets.KEK
 	cfg  nodecfg.Config
 	p    nodecfg.Paths
@@ -543,6 +782,8 @@ func newEnvWith(t *testing.T, c nodecfg.Config) *env {
 	must(t, st.Migrate(ctx))
 	must(t, st.EnsureNode(ctx, c))
 	e := &env{t: t, st: st, ag: newFake(), cfg: c, p: nodecfg.Paths{Root: t.TempDir()}, logs: &logBuf{}}
+	e.jobs = &fakeJobs{ag: e.ag, st: st}
+	e.jobs.offsite.Store("undeclared")
 	rand.Read(e.kek[:])
 	// A development node: the failpoint is live. In tests a failpoint ends
 	// the worker's goroutine instead of the process.
@@ -565,6 +806,9 @@ func (e *env) runner() *Runner {
 	r.probeEvery = time.Millisecond
 	r.probeWindow = 200 * time.Millisecond
 	r.containmentRetry = 20 * time.Millisecond
+	r.waitEvery = 5 * time.Millisecond
+	r.SetJobs(e.jobs)
+	r.SetRecoverer(fakeRecoverer{})
 	r.log = slog.New(slog.NewJSONHandler(e.logs, nil))
 	return r
 }
@@ -747,7 +991,9 @@ func failOn(method string) func(c call) error {
 	}
 }
 
+// createIDs are the steps of a create at layout 0 or 1; createIDs2 at layout 2.
 var createIDs = []string{"2", "3", "4a", "4", "6", "7", "9", "11", "12"}
+var createIDs2 = []string{"2", "3", "4a", "4", "5a", "5b", "5c", "5d", "6", "7", "9", "11", "12a", "12b", "12"}
 
 // ───────── tables ─────────
 
@@ -759,12 +1005,13 @@ func TestStepIDs_Fixed(t *testing.T) {
 		}
 		return out
 	}
-	wantSeq(t, ids(tables["create"]), createIDs)
+	wantSeq(t, ids(tables["create"]), createIDs2)
 	wantSeq(t, ids(tables["restart"]), []string{"R0", "R1", "R2", "R3", "R4", "R5"})
 	wantSeq(t, ids(tables["delete"]), []string{"D1", "D2", "D3", "D4", "D5"})
 	wantSeq(t, ids(tables["purge"]), []string{"P1", "P2", "P3", "P4", "P5"})
-	wantSeq(t, ids(compensation), []string{"C1", "C2", "C3", "C4", "C5", "C6", "C7"})
-	if len(tables) != 4 {
+	wantSeq(t, ids(compensation), []string{"C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7"})
+	wantSeq(t, ids(tables["restore"]), nil)
+	if len(tables) != 5 {
 		t.Fatalf("tables %v", tables)
 	}
 }
@@ -779,6 +1026,7 @@ func TestCreate_StepOrder(t *testing.T) {
 	}
 	e.start(e.runner())
 	op := e.waitState(id, "done")
+	e.summaries(id, 1) // the last step's line is written after the state
 	wantSeq(t, e.steps(id), createIDs)
 	if op.Step != "12" || op.Attempts != 1 || op.LastError != "" {
 		t.Fatalf("op = %+v", op)
@@ -1392,7 +1640,7 @@ func TestRun_RoundRobinPerProject(t *testing.T) {
 
 // ───────── abort ─────────
 
-var compensationCalls = []string{"SetRoute", "StopPostgREST", "StopCluster", "RemoveRender", "RemoveNetwork", "PurgeDir"}
+var compensationCalls = []string{"SetRoute", "StopPostgREST", "StopCluster", "RemoveRender", "RemoveNetwork", "PurgeDir", "PurgeRepo"}
 
 // The whole compensation list, in order, whichever step failed.
 func TestAbort_RunsWholeListInOrder(t *testing.T) {

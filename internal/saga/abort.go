@@ -15,18 +15,36 @@ import (
 // its object is absent. Keys die (C4) before the render tree (C5) and the
 // directory purge (C6).
 var compensation = []step{
-	{"C1", func(x *job, ctx context.Context) error { _, err := x.r.ag.SetRoute(ctx, x.op.Ref, nil); return err }},
-	{"C2", func(x *job, ctx context.Context) error { return x.r.ag.StopPostgREST(ctx, x.op.Ref) }},
-	{"C3", func(x *job, ctx context.Context) error { return x.r.ag.StopCluster(ctx, x.op.Ref) }},
-	{"C4", func(x *job, ctx context.Context) error { return x.r.st.DestroyKeys(ctx, x.op.Ref) }},
-	{"C5", func(x *job, ctx context.Context) error { return x.r.ag.RemoveRender(ctx, x.op.Ref) }},
-	{"C6", func(x *job, ctx context.Context) error {
+	{id: "C0", do: (*job).cancelJobs},
+	{id: "C1", do: func(x *job, ctx context.Context) error { _, err := x.r.ag.SetRoute(ctx, x.op.Ref, nil); return err }},
+	{id: "C2", do: func(x *job, ctx context.Context) error { return x.r.ag.StopPostgREST(ctx, x.op.Ref) }},
+	{id: "C3", do: func(x *job, ctx context.Context) error { return x.r.ag.StopCluster(ctx, x.op.Ref) }},
+	{id: "C4", do: func(x *job, ctx context.Context) error { return x.r.st.DestroyKeys(ctx, x.op.Ref) }},
+	{id: "C5", do: func(x *job, ctx context.Context) error { return x.r.ag.RemoveRender(ctx, x.op.Ref) }},
+	{id: "C6", do: func(x *job, ctx context.Context) error {
 		if err := x.r.ag.RemoveNetwork(ctx, x.op.Ref); err != nil {
 			return err
 		}
-		return x.purgeDir(ctx)
+		if err := x.purgeDir(ctx); err != nil {
+			return err
+		}
+		return x.purgeRepo(ctx)
 	}},
-	{"C7", func(x *job, ctx context.Context) error { return x.r.st.MarkAborted(ctx, x.op.Ref) }},
+	{id: "C7", do: func(x *job, ctx context.Context) error { return x.r.st.MarkAborted(ctx, x.op.Ref) }},
+}
+
+// C0: a layout-2 create's queued jobs cancelled and its running one ended
+// before anything is removed (a layout-1 project has no job).
+func (x *job) cancelJobs(ctx context.Context) error {
+	p, err := x.r.st.GetProject(ctx, x.op.Ref)
+	if err != nil || p.Config.Layout != 2 {
+		return err
+	}
+	jobs, err := x.jobRunner()
+	if err != nil {
+		return err
+	}
+	return jobs.Cancel(ctx, x.op.ID)
 }
 
 // compensate runs the whole list for an aborting create, under the ref lock
@@ -142,3 +160,25 @@ func (x *job) compensationFailed(ctx context.Context, id string, err error) {
 
 // requestAbort is store.RequestAbort; tests replace it to make it fail.
 var requestAbort = (*store.Store).RequestAbort
+
+// purgeRepo (abort C6, every layout): the project's repository directories
+// emptied and removed and both quotas cleared — the cluster, PostgREST and
+// the create's jobs are gone by then (C0, C2, C3) — then the off-site
+// objects recorded as owed a purge. A project never placed has nothing.
+func (x *job) purgeRepo(ctx context.Context) error {
+	p, err := x.r.st.GetProject(ctx, x.op.Ref)
+	if err != nil || p.UID == nil {
+		return err
+	}
+	s, err := bareSpec(p, x.op.Epoch, p.Generation, p.Config)
+	if err != nil {
+		return err
+	}
+	if err := x.r.ag.PurgeRepo(ctx, s); err != nil {
+		return err
+	}
+	if err := x.r.st.SetOffsitePurge(ctx, x.op.Ref); !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	return nil
+}

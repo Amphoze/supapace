@@ -4364,3 +4364,73 @@ proxy's and the client's images loaded. `sp-probe fakepg` gained the modes `scra
   cannot reach, and derive deadlines from the one under test.
 - When two real timers decide an outcome, widen their gap or assert a property that does not
   depend on the order; add a clock seam only if neither works.
+
+### 2026-11-21 — Operations that wait for backup jobs; create steps 5 and 12; abort C0
+
+What it provides (internal/saga):
+- Agent gains EnsureRepoDir, EnsureSpoolDirs, GrantBackupRole, PurgeRepo,
+  RemoveFetch, RenderCluster, WipeData, HostState (all on *agent.Agent).
+- Jobs: Cancel(op), CancelSubject(subject), PushNow(subject, wait) and
+  Offsite(); *backup.Runner satisfies it. Runner.SetJobs(j) before Run.
+- Recoverer: Rekey(ctx, Spec) (timeline, err). Runner.SetRecoverer before Run.
+- A nil Jobs or Recoverer: the step that needs it fails final, code internal.
+  No layout-1 step needs either.
+- Submit("restore") answers ErrConflict: the restore table is empty for now.
+- SpecFor fills Layout and RepoQuotaMB (= DiskQuotaMB) at every layout, and
+  at layout 2 Stanza ("<ref>-<incarnation>") and StanzaPass (secret
+  backup.cipher_pass). Each of the last two is empty while it does not exist.
+
+Parking (worker):
+- A step returns a park on a new job. SubmitJobAndPark queues it and moves
+  the operation to waiting_job in one transaction. The attempt ends and the
+  ref lock is released. The job's end puts the operation back to pending.
+- Re-entry reads LatestJob(op, step, job_floor): done -> consume; failed or
+  none -> submit again. A queued or running job seen by a running operation
+  is an error (it cannot happen through the store).
+- Five interrupted jobs of one step above the floor: final, code
+  interrupted_limit. Cancelled jobs cost nothing.
+- The start-of-attempt check ends an operation past its attempts with the
+  stored last_error when there is one (the fifth failed job's own code and
+  message), else with its own "interrupted too many times" text.
+- A step may return later(d): Requeue, the attempt given back, last_error
+  kept, one INFO line per wait.
+- A step may return a rewind to an earlier step. RaiseJobFloor (counting an
+  attempt unless a counted failed job caused it) comes first, then
+  AdvanceStep to the step before the target, then a re-read of the
+  operation. Past the limit (attempts less params.requeued above five) the
+  operation fails with the cause's code.
+
+Create at layout 2 (layout 0 and 1 run exactly the as-built steps):
+- 2: the stanza passphrase (once) and cp_lsn (the control plane's WAL
+  insert position, once).
+- 3: EnsureRepoDir and EnsureBackupState between EnsureDir and
+  EnsureNetwork.
+- 5a stanza-create (skipped when stanza_created), 5b backup, 5c check:
+  each waits for its job.
+- 5d replicate: rebuild pages and copies with complete false and stopped
+  caps repeat the step. It ends on a complete copy or a skipped result.
+  Other stopped values fail final: replication_stopped. Bounds, final with
+  code replication_incomplete: ReplLoopMax(Qd) counted copies, and
+  RebuildMaxPages from backup_state. Rebuild pages and adoption-only copies
+  are not counted (params member repl_free = {step, floor, last, n}).
+- 12a: SwitchWAL(cp_lsn) into cp_segment (once), then PushNow("cp", 0).
+- 12b: waits without a job (later 5 s) until SegmentReplicated("cp",
+  cp_segment). It fails after 900 s from wait_started (code
+  cp_not_replicated). wait_started survives op retry.
+- 5d and 12b complete at once unless Offsite() is "declared".
+
+Abort of a create:
+- C0 (layout 2): Jobs.Cancel(op) before anything is removed.
+- C6: RemoveNetwork, PurgeDir, PurgeRepo (every layout, placed projects),
+  then SetOffsitePurge (a missing backup_state row is fine).
+
+Caller rules:
+- A code path that rewrites a whole parameter document must carry every
+  member steps write (job_floor, repl_free, requeued); patchParams keeps
+  them.
+- Re-read the operation after any store call that changes params in SQL.
+
+Known limits:
+- A parked operation has no wait bound of its own until its job is picked.
+- Until the daemon wires SetJobs, a layout-2 create fails at 5a and its
+  abort at C0, both with code internal.
