@@ -4565,3 +4565,40 @@ is at most 86400):
 - Known limits: held requests sit outside the in-flight caps (bounded at 512 above); a tenant
   owning many projects whose wakes stall can keep the four places busy; the declared body
   length is checked before the wake, a chunked body over the cap is refused while streaming.
+
+### 2026-11-21 — bkjob: the job environment, the tool runner, the push job; supapaced job
+internal/bkjob runs inside a backup job container; cmd/supapaced/jobcmd.go dispatches it.
+- Env(stanza, kind, controlPlane): the pgBackRest environment of a job kind, every option pinned,
+  PGBACKREST_CONFIG=/dev/null for all; push has no PG1 options; stanza-create, backup and check
+  add the socket, the user (supapace_backup, control plane supapaced) and PGOPTIONS from
+  pgsock.StartupParams(false) ("-c name=value", space and backslash escaped). Environ adds the
+  passphrase (PassName) for push, stanza-create, backup, check, restore and serve only.
+- Run(ctx, args...): execs Tool (/usr/bin/pgbackrest) without a shell, the job's environment;
+  stdout and stderr captured together, the last 64 KiB kept, never written to the job's stdout.
+  A tool that exits: (code, output, nil); err only when it could not start or was signalled.
+- Error{Code, Message}: a job program's failure; the message is cut to 256 bytes on a character
+  boundary. Codes(kind): the failure codes a kind's program can end with — the one list; the
+  recorder (internal/backup) records any other code of a listed kind as crashed. Kinds that
+  are not listed keep the rule that refuses the runner's own codes. A new job program lists
+  its codes here; a nested push's codes must be mapped to the outer kind's.
+- Push(ctx, in, spool): lists the spool in batches of 1,024, keeps the lowest candidates up to
+  in.MaxEntries (cap bklimit.PushMaxEntries, 56): histories first, then by name. Each entry is
+  opened O_NOFOLLOW|O_NONBLOCK and must be a regular file of in.UID within SegmentMax (segments,
+  at least 1 MiB) or SmallMax; it is copied below /tmp and that copy is pushed; the spool entry
+  is unlinked only after exit 0. Set aside (renamed <name>.quarantined-<16 hex>, bytes kept):
+  a timeline not admitted (timeline), any other shape (shape), the tool's exit 29 (shape) and
+  44/45/46 (refused-<n>) — only once the pass has its result, which lists them. Failure codes:
+  repository_quota (exit 104 naming error 122), repository, spool, stopped (context ended); a
+  failed or stopped pass sets nothing aside. Old .tmp- entries (bklimit.SpoolTmpAge) are
+  unlinked unopened, 1,024 a pass; other names are counted in other_entries.
+- Result: newest = per admitted timeline the highest segment in /repo when the job ends (names
+  checked with walname.RepoPath, the 64 highest timelines); histories = every history name in
+  the repository, the 64 highest, [] when none; spool_entries/bytes/oldest = matching entries
+  left untaken (spool_entries == remaining).
+- supapaced job KIND reads /job/input.json (strict, kind must match), replaces every PG*
+  variable by Environ (passphrase from the container), stops on SIGTERM/SIGINT, prints one
+  result line: exit 0 result, 1 failure, 2 usage, 3 internal (no line: recorded crashed).
+  Only push is dispatched (jobKinds); later kinds add their entries.
+- Known limits: exit 29 as content-only is a property of pgBackRest 2.58, re-check at a tool
+  bump. A kill between the renames and the result line leaves renamed entries unlisted. A
+  synchronous archive-push takes no lock.

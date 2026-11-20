@@ -168,6 +168,7 @@ func TestConstants_All(t *testing.T) {
 		"JobRowAge":         {int64(JobRowAge), int64(48 * time.Hour)},
 		"PruneBatch":        {PruneBatch, 10000},
 		"PruneEvery":        {int64(PruneEvery), int64(time.Hour)},
+		"SpoolTmpAge":       {int64(SpoolTmpAge), int64(time.Hour)},
 	} {
 		if c[0] != c[1] {
 			t.Errorf("%s = %d, want %d", name, c[0], c[1])

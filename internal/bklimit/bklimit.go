@@ -36,6 +36,10 @@ const (
 	PruneEvery = time.Hour
 
 	ResultMax = 1 << 20 // one job's result line
+
+	// A .tmp- spool entry (the archive binary's temporary) older than this is
+	// removed by the push job: its writer was killed.
+	SpoolTmpAge = time.Hour
 )
 
 // Object bounds: a segment, a small file (info, history, label), a set file.

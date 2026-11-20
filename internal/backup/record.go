@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/Amphoze/supapace/internal/agent"
+	"github.com/Amphoze/supapace/internal/bkjob"
 	"github.com/Amphoze/supapace/internal/bklimit"
 	"github.com/Amphoze/supapace/internal/jobio"
 	"github.com/Amphoze/supapace/internal/store"
@@ -46,11 +48,20 @@ func isHostState(err error) bool {
 // runnerCodes are the codes the runner or the store assigns, and the codes of
 // an operation's step: a job's own failure document never carries one. Some
 // count no attempt (cancelled, interrupted), so a job that could claim them
-// would make its operation retry for ever. A deny-list: the job programs'
-// codes are not a closed list (seed and replicate name none).
+// would make its operation retry for ever. A kind whose program lists its
+// codes (bkjob.Codes) takes those and no other; this deny-list holds for the
+// kinds whose programs list none yet.
 var runnerCodes = map[string]bool{"deadline": true, "interrupted": true, "cancelled": true, "crashed": true,
 	"host_state": true, "record_not_rebuilt": true, "fetch_too_large": true, "internal": true, "recovered": true,
 	"recovery_failed": true, "target_not_reached": true, "interrupted_limit": true}
+
+// jobCode reports whether a job of kind may end with its own failure code.
+func jobCode(kind, code string) bool {
+	if codes, ok := bkjob.Codes(kind); ok {
+		return slices.Contains(codes, code)
+	}
+	return !runnerCodes[code]
+}
 
 var (
 	tliKeyRE = regexp.MustCompile(`^[0-9A-F]{8}$`)
@@ -81,8 +92,8 @@ func (r *Runner) record(ctx context.Context, j store.Job, s subject, res agent.J
 		return crashed(err)
 	case fail != nil && res.ExitCode != 1, fail == nil && res.ExitCode != 0:
 		return failed("crashed", fmt.Sprintf("exit %d does not match the result", res.ExitCode))
-	case fail != nil && runnerCodes[fail.Code]:
-		return failed("crashed", "the job claimed a code the runner assigns: "+fail.Code)
+	case fail != nil && !jobCode(j.Kind, fail.Code):
+		return failed("crashed", "the job claimed a code its kind does not end with: "+fail.Code)
 	case fail != nil:
 		r.failureNotice(ctx, j, fail.Code)
 		return failed(fail.Code, fail.Message)

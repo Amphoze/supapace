@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Amphoze/supapace/internal/agent"
+	"github.com/Amphoze/supapace/internal/bkjob"
 	"github.com/Amphoze/supapace/internal/jobio"
 	"github.com/Amphoze/supapace/internal/store"
 )
@@ -236,5 +237,30 @@ func TestRecord_PushWithAnUnknownGapCauseOrAMalformedSegmentIsCrashed(t *testing
 	gaps, _, _ := e.st.ListGaps(context.Background(), ref)
 	if len(gaps) != 0 {
 		t.Fatalf("gaps %+v", gaps)
+	}
+}
+
+// A kind whose program is known takes only its program's failure codes: any
+// other, a code another kind may report among them, is recorded crashed. A
+// kind without one keeps the rule that refuses the runner's own codes.
+func TestRecord_PushFailureCodesAreItsProgramsOnly(t *testing.T) {
+	e := newEnv(t)
+	ref := e.project("active")
+	codes, ok := bkjob.Codes("push")
+	if !ok || len(codes) == 0 {
+		t.Fatal("control: the push program lists no codes")
+	}
+	for _, code := range codes {
+		if got := e.push(ref, agent.JobResult{ExitCode: 1, Result: failLine(code, "x")}); got.Code != code {
+			t.Errorf("the push program's own %q was recorded %+v", code, got)
+		}
+	}
+	for _, code := range []string{"login", "archive_timeout", "missing", "timeline_conflict", "cancelled", "made-up"} {
+		if got := e.push(ref, agent.JobResult{ExitCode: 1, Result: failLine(code, "x")}); got.Code != "crashed" {
+			t.Errorf("a push claiming %q was recorded %+v", code, got)
+		}
+	}
+	if got := e.runWith("check", agent.JobResult{ExitCode: 1, Result: failLine("made-up", "x")}, nil); got.Code != "made-up" {
+		t.Errorf("a kind without a listed program (check): %+v", got)
 	}
 }
