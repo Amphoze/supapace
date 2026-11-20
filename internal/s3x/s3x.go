@@ -73,6 +73,11 @@ var (
 	ErrChecksum = errors.New("s3x: body digest refused")                 // 400 BadDigest or XAmzContentSHA256Mismatch
 )
 
+// dialMax bounds one connection attempt to one address, so that an address
+// that drops packets costs seconds before the next is tried, not the
+// kernel's SYN timeout or the whole call.
+const dialMax = 10 * time.Second
+
 const (
 	maxHeader = 64 << 10
 	maxXML    = 4 << 20
@@ -108,7 +113,7 @@ func New(c Config) (*Client, error) {
 			return nil, errors.New("s3x: no certificate in the CA bundle")
 		}
 	}
-	d := &net.Dialer{Timeout: c.Timeout}
+	d := &net.Dialer{Timeout: min(c.Timeout, dialMax)}
 	tr := &http.Transport{
 		Proxy:                  nil,
 		DialContext:            d.DialContext,

@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/Amphoze/supapace/internal/agent"
 	"github.com/Amphoze/supapace/internal/bkjob"
 	"github.com/Amphoze/supapace/internal/jobio"
+	"github.com/Amphoze/supapace/internal/repl"
 	"github.com/Amphoze/supapace/internal/store"
 )
 
@@ -262,5 +264,35 @@ func TestRecord_PushFailureCodesAreItsProgramsOnly(t *testing.T) {
 	}
 	if got := e.runWith("check", agent.JobResult{ExitCode: 1, Result: failLine("made-up", "x")}, nil); got.Code != "made-up" {
 		t.Errorf("a kind without a listed program (check): %+v", got)
+	}
+}
+
+// The replication program's kinds take its codes (repl.Codes) and no other:
+// a code of another kind's program is recorded crashed.
+func TestRecord_ReplicationFailureCodesAreItsProgramsOnly(t *testing.T) {
+	e := newEnv(t)
+	pushCodes, _ := bkjob.Codes("push")
+	for _, kind := range []string{"replicate", "probe"} {
+		codes := repl.Codes(kind)
+		if len(codes) == 0 {
+			t.Fatalf("control: the program lists no codes for %s", kind)
+		}
+		others := append([]string{"missing", "too_large", "made-up"}, pushCodes...)
+		for _, c := range repl.Codes("replicate") {
+			if !slices.Contains(codes, c) {
+				others = append(others, c) // probe: the copy's own index and repository
+			}
+		}
+		for _, code := range codes {
+			if got := e.r.record(context.Background(), store.Job{Kind: kind}, subject{}, agent.JobResult{ExitCode: 1, Result: failLine(code, "x")}, nil); got.state != "failed" || got.code != code {
+				t.Errorf("%s: its own %q was recorded %+v", kind, code, got)
+			}
+		}
+		others = slices.DeleteFunc(others, func(c string) bool { return slices.Contains(codes, c) })
+		for _, code := range others {
+			if got := e.r.record(context.Background(), store.Job{Kind: kind}, subject{}, agent.JobResult{ExitCode: 1, Result: failLine(code, "x")}, nil); got.code != "crashed" {
+				t.Errorf("%s claiming %q was recorded %+v", kind, code, got)
+			}
+		}
 	}
 }

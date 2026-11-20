@@ -4602,3 +4602,41 @@ internal/bkjob runs inside a backup job container; cmd/supapaced/jobcmd.go dispa
 - Known limits: exit 29 as content-only is a property of pgBackRest 2.58, re-check at a tool
   bump. A kill between the renames and the result line leaves renamed entries unlisted. A
   synchronous archive-push takes no lock.
+
+### 2026-11-21 — internal/repl: the replication program; supapaced replicate
+Runs only inside a replication or probe job (replicator uid, the project's group). Reads
+/job/input.json, /cred, /job/ca.pem (optional), /repo (read-only), /index (copy only).
+- `supapaced replicate copy|rebuild|probe`: one result line (jobio.MarshalResult), exit 0; a
+  failure document, exit 1, code from `repl.Codes(kind)` (replicate: input, credential, index,
+  repository, store, result; probe: input, credential, store, result); exit 2 for usage and for
+  an empty SUPAPACE_S3_ADDRS (refused before any client exists: the name is never resolved).
+- `Key(prefix, subject, rel)`: the one key constructor, "<prefix>/<subject>/<rel>" (no leading
+  slash for an empty prefix); rel must pass walname.RepoPath for a stanza of that subject; ErrPath.
+- `Copy`: info files read first, uploaded last, only when they changed and the job stopped
+  nowhere, walked the whole tree and found nothing unreadable, changed or held. Data files by
+  conditional create (multipart above 32 MiB; an unfinished upload is aborted). An existing key is
+  compared by HEAD (size and the sha256 metadata): equal is adopted, different is the notice
+  offsite-differs; nothing is overwritten. Ascending key order; a timeline's segments wait for its
+  history; stops at the first failed upload, at max_files (uploads + adoptions + info), max_bytes,
+  the day's budget and its own time bound (stop reason caps).
+- Walk: never follows a link at any level, never blocks on a FIFO, depth 12, at most max_entries
+  (250,000) entries newest name first, regular files of the project's uid only, size bound per
+  kind; a directory read error is unreadable-entry, never a short listing.
+- `Rebuild`: one page of at most page_rows (4,000) listed versions, delete markers counted; a row
+  per key with its oldest version on the page; next markers and last; keys outside the layout are
+  dropped and counted in the one notice a page may carry, unlisted-entry.
+- `Probe(ctx, in, ProbeTargets, Deleter)`: the operator check's twelve rows, each denial with a
+  positive control on the same credential; an undecidable row is ok:false with "unknown: ...".
+  It writes and deletes only below "<prefix>/.probe/" (`Signer` refuses any other DELETE and any
+  multi-object delete) and aborts every upload it opened. The credential file holds 4 lines:
+  the write pair, then the read-only pair (copy and rebuild: 2 lines).
+- `Store` is the subset of *s3x.Client the program calls, plus `Prefix()`; `NewBucket` makes one.
+- Index file: jobio index rows, read once at 40 bytes a row (about 230 MB peak at 2.95 M rows
+  with a full walk); a malformed file is code index.
+- Bounds: copy and rebuild end within CopyBound (240 s), the probe within ProbeBound (100 s),
+  below their job deadlines; CallTimeout 60 s per call; s3x bounds each connection attempt at
+  10 s, so at most five dropping addresses ahead of a good one are tolerated.
+- Secrets: never in the environment (a name with PASS, SECRET, KEY or TOKEN is refused); keys
+  are printable ASCII and scrubbed, with every prefix of 8 bytes or more, from all printed text.
+- Tests against the object-store stand-in: SUPAPACE_STANDIN_TEST=1, TestStandin_* (this
+  package's TestMain starts it; a later file of the package reuses it).

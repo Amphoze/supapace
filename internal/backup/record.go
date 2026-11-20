@@ -15,6 +15,7 @@ import (
 	"github.com/Amphoze/supapace/internal/bkjob"
 	"github.com/Amphoze/supapace/internal/bklimit"
 	"github.com/Amphoze/supapace/internal/jobio"
+	"github.com/Amphoze/supapace/internal/repl"
 	"github.com/Amphoze/supapace/internal/store"
 	"github.com/Amphoze/supapace/internal/walname"
 )
@@ -58,6 +59,9 @@ var runnerCodes = map[string]bool{"deadline": true, "interrupted": true, "cancel
 // jobCode reports whether a job of kind may end with its own failure code.
 func jobCode(kind, code string) bool {
 	if codes, ok := bkjob.Codes(kind); ok {
+		return slices.Contains(codes, code)
+	}
+	if codes := repl.Codes(kind); codes != nil {
 		return slices.Contains(codes, code)
 	}
 	return !runnerCodes[code]
