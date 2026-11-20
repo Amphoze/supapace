@@ -4245,3 +4245,108 @@ an answer is lost, the commands name where to look (call.look).
 - poolcfg.ValidAllowListOn: ValidAllowList, plus a refusal of any prefix holding one of the
   node's addresses (named by its position, never by its text). An empty address list is an
   error.
+
+### 2026-11-20 — pgcap: admission, the reloadable table and the program
+
+`cmd/pgcap TABLE` is the wire proxy's program: one argument, the path of its table. It exits 2
+on a wrong argument list, 1 when the first table cannot be read or served, 0 at SIGTERM or
+SIGINT. Its log is JSON lines on standard error. `deploy/pgcap/Dockerfile` puts the static
+binary alone in an empty image, with a numeric user and the command `/pgcap
+/etc/pgcap/pgcap.json` (a command, not an entry point: whoever starts the container passes the
+whole command or none). The image needs no capability, no shell and nothing writable. Its
+`GOMEMLIMIT` fits a 64 MiB container: pass another at creation for another limit.
+
+`internal/pgcap` gains one export:
+- `Run(ctx, path, logw) error` — serves the table at `path` until `ctx` ends, then closes every
+  listening socket and connection and returns nil. It returns an error only when the first
+  table cannot be read or served, and then leaves nothing open.
+
+One listening socket per placed slice and class, at `listen`, port `port_base` + the slice's
+index, with the class's socket buffers (accepted sockets inherit them). A slice that is not in
+the table has no socket: the kernel refuses its port. The cluster of slice i is host 2 of the
+slice, port 5432, and the proxy dials it from host 4; one function (`sliceAddrs`) computes
+both and nothing else may.
+
+From accept to a decision, in this order:
+1. The socket's local address must be `listen` and its remote address a peer of the class,
+   or it is closed at once: nothing read, nothing counted.
+2. With `max_conns` units held it is closed. A kept socket holds one unit until it is closed.
+3. It needs a place in its class's pool (`refusals_max`) or is closed, and keeps the place
+   until it is admitted as a connection or a cancel. So every unit belongs to a connection, a
+   cancel or a place: a class never holds more than its own terms, and a table whose
+   `max_conns` covers `Terms()` does not reach the ceiling. No socket is exempt from the pool.
+4. The first eight bytes are read within `preamble_ms` of the accept. A TLS or GSS encryption
+   request is answered `N`, never forwarded, and the next eight bytes are read in its place;
+   the second request of one kind closes the socket.
+5. A cancel request (length 16, code 80877102) is admitted outside the connection caps, under
+   `cancels_per_project` for the slice and `cancels_per_peer` for the peer (0: none); over
+   either it is closed. Admitted, its other eight bytes are read, the cluster is dialled and
+   exactly the sixteen bytes are written, all within `cancel_ms`; nothing is read back.
+6. Any other code whose high sixteen bits are 1234 closes the socket: it is no startup.
+7. Anything else is a startup, admitted against the slice's allowance, then `conns_per_peer`
+   (0: none), then the slice's rate — a bucket of `conns_burst` tokens refilled at
+   `conns_per_second`, full when the slice enters the table. A refusal spends no token.
+   Admitted, the socket goes to `Relay` with the accept time: every clock runs from the
+   accept. `Relay`'s reason is logged; a peer's close is not.
+8. Refused, the rest of the startup packet is read (a stated length outside 8 to 10,000
+   closes the socket) within what is left of `preamble_ms`, nothing is dialled, and the client
+   reads FATAL 53300 "too many connections" and an orderly close.
+Every wait above ends when the slice leaves the table, and a socket that has ended keeps no
+memory, however it ended.
+
+The table's file is looked at every second (inode, size, modification time) and read when one
+changed, if it is a regular file of at most 1 MiB. A file `ParseTable` refuses keeps the table
+in use. Applied from a new file: caps, rates and deadlines for sockets accepted from then on;
+allowances (a lowered one is reached as connections end: none is cut); slices and classes of
+slices that enter or leave. A slice's place in a class that leaves has its listening socket
+closed and every socket of it closed — relayed connections, cancels and refusals — and new
+listening sockets open only after those have ended. A slice whose port cannot be opened is
+logged and tried again at every look until it opens. Not applied by a reload, the table's
+shape: `listen`, the block, the slice prefix, `max_conns`, the set of classes and each class's
+name, port base, peers, pool and two buffer sizes. A file that differs there keeps the shape
+in use and has the rest applied if the result is still a valid table; a file with another
+`listen`, block or prefix is kept out whole. `ParseTable` refuses the unspecified address as
+`listen`.
+
+Log lines: `{"class","index","reason"}`, at most one a second per class and index, with
+`"not_printed":N` for what was held back. A reason is one of the proxy's fixed texts, at most
+followed by the text of a failed read, dial or listen (addresses); nothing a peer sent is
+logged. Table events are `{"table":"…"}`: `kept the table in use: …` for a file that was kept
+out, a line for a file that changed the shape, and `cannot look at the table: …` once for
+each change of that state (a missing file, one that is not regular or is too large).
+
+The dashboard's defaults are in `internal/dashcfg` (`Limits.Proxy`): a ceiling of 80, a pool
+of 32, a burst of 60 connections refilled at 30 a second. `Limits.Check()` requires the pool
+to be at least twice the per-instance cap.
+
+Rules for whoever writes the table and starts the container
+- Write the table before the container is created, with `Marshal`, by rename.
+- A class with per-peer caps gets a pool of at least `conns_per_peer` × its peers, so that
+  every connection its peers may open can wait for its first bytes at once. A class without
+  them cannot have that: measure its reconnect burst against its pool and rate.
+- The dashboard's database client opens one connection per statement and keeps none, and a
+  page's statements arrive two at a time as fast as they are answered: the rate must hold a
+  page as a burst. The refill is one page's worth a second and the burst two, a page taken
+  as thirty statements until a real page load is measured.
+- A change of the shape needs the container re-created; a new class is one.
+- Connection strings for clients behind the proxy carry no request for TLS: the proxy answers
+  `N` and such a client fails.
+
+Known limits
+- A count falls when `Relay` has returned, a moment after the client's close: a client that
+  runs at exactly its allowance back to back is refused now and then.
+- A port that stays unavailable is logged once a second for its slice.
+- A connection cut with its slice is logged as `context canceled` or not at all.
+- The proof with the real client sends its page of thirty statements five at a time over two
+  seconds, which the default rate cannot refuse; the two-at-a-time shape is measured where a
+  real page is loaded.
+
+Tests: `go test ./internal/pgcap ./cmd/pgcap`; the tag `nopeer` builds a test binary without
+the address check (`nopeer.go`; the product build has the check on and nothing that turns it
+off), the tag `faulthook` one with the marker of the relay. The unit tests give every test
+proxy a loopback block 127.X.0.0/16 of its own and bind port 5432 on addresses of it: a server
+on port 5432 of every address fails them. Test helpers live at package level: new tests must
+not reuse their names. The proof with the real client
+(`TestRelay_RealClientLibrary`, tag `reach`) runs as root on a bare test node with the
+proxy's and the client's images loaded. `sp-probe fakepg` gained the modes `scram-low`,
+`copy-both` and `param-flood`.

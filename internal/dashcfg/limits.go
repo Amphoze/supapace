@@ -52,9 +52,9 @@ var Limits = LimitSet{
 	StudioMemMB: 896, PgMetaMemMB: 768, PgcapMemMB: 64,
 	SliceHoldSecs: 8 * 86400,
 	Proxy: ProxyLimits{
-		MaxConns: 64, RefusalsMax: 16, PreambleMS: 2000, ConnsPerProject: 5, ConnsPerPeer: 16,
+		MaxConns: 80, RefusalsMax: 32, PreambleMS: 2000, ConnsPerProject: 5, ConnsPerPeer: 16,
 		CancelsPerProject: 2, CancelsPerPeer: 8, CancelMS: 2000,
-		ConnsPerSecond: 20, ConnsBurst: 10, CopyBufBytes: 64 * kib, SockBufBytes: 32 * kib,
+		ConnsPerSecond: 30, ConnsBurst: 60, CopyBufBytes: 64 * kib, SockBufBytes: 32 * kib,
 		ScramIter: 4096, ParamStatusMax: 64, RowFieldsMax: 1664,
 	},
 }
@@ -82,6 +82,9 @@ func (l LimitSet) Check() error {
 	// milliseconds, so no part is truncated.
 	need(int64(l.ResolveDiskDays*86400+l.ResolveMemorySecs)*1000+int64(l.StudioHeaderMS+l.ProxyWallMS) < int64(l.SliceHoldSecs)*1000,
 		"resolve disk days + resolve memory + row 2 + row 6 < slice hold")
+	// Every connection the two postgres-meta instances may open can wait for its
+	// first bytes at the same moment.
+	need(l.Proxy.RefusalsMax >= 2*l.Proxy.ConnsPerPeer, "the proxy's pool holds both instances' connections at once")
 	return errors.Join(errs...)
 }
 

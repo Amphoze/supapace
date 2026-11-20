@@ -198,7 +198,7 @@ func startModeFake(t *testing.T, mode string) (string, string) {
 	if err := os.WriteFile(pw, []byte(testPassword+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if mode == "sasl-iter" {
+	if saltModes[mode] && !postAuth[mode] {
 		return startFake(t, "--mode", mode, "--salt", testSaltHex)
 	}
 	if !postAuth[mode] {
@@ -275,6 +275,49 @@ func TestFakePG_Modes(t *testing.T) {
 			if want, _ := hex.DecodeString(testSaltHex); !strings.HasPrefix(sf, "r=abc") || !strings.HasSuffix(sf, ",i=10000000") ||
 				!strings.Contains(sf, ",s="+base64.StdEncoding.EncodeToString(want)+",") {
 				t.Fatalf("server-first %q, want the given salt and ten million iterations", sf)
+			}
+		}},
+		{"scram-low", func(t *testing.T, c *recConn) {
+			expectAuth(t, c, 10)
+			first := "n=,r=abc"
+			writeMsg(t, c, 'p', []byte("SCRAM-SHA-256\x00"), binary.BigEndian.AppendUint32(nil, uint32(3+len(first))), []byte("n,,"+first))
+			if sf := string(expectAuth(t, c, 11)); !strings.HasPrefix(sf, "r=abc") || !strings.HasSuffix(sf, ",i=1024") {
+				t.Fatalf("server-first %q, want 1,024 iterations, below the platform's 4,096", sf)
+			}
+		}},
+		{"copy-both", func(t *testing.T, c *recConn) {
+			login(t, c)
+			query(t, c, false)
+			if typ, b := readMsg(t, c); typ != 'W' || !bytes.Equal(b, []byte{0, 0, 0}) {
+				t.Fatalf("got %q %q, want a CopyBothResponse", typ, b)
+			}
+			for range 5000 {
+				if typ, b := readMsg(t, c); typ != 'd' || len(b)+5 != 1024 {
+					t.Fatalf("got %q of %d bytes, want 1 KiB CopyData", typ, len(b)+5)
+				}
+			}
+		}},
+		{"param-flood", func(t *testing.T, c *recConn) {
+			login(t, c)
+			for range 2 { // each query gets the whole flood
+				query(t, c, false)
+				params, most, responses := 0, 0, 0
+				for responses < 1000 {
+					switch typ, _ := readMsg(t, c); typ {
+					case 'S':
+						params++
+						most = max(most, params)
+					case 'Z':
+						responses++
+						params = 0
+					case 'C':
+					default:
+						t.Fatalf("got %q", typ)
+					}
+				}
+				if most != 16 {
+					t.Fatalf("at most %d parameter-status messages in one response, want 16 in each", most)
+				}
 			}
 		}},
 		{"stall-auth", func(t *testing.T, c *recConn) {

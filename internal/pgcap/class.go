@@ -106,8 +106,8 @@ func (t Table) sliceCount() int { return 1 << (t.SlicePrefix - t.ProjectBlock.Bi
 
 func (t Table) check() error {
 	switch {
-	case !t.Listen.Is4():
-		return errors.New("listen is not an IPv4 address")
+	case !t.Listen.Is4() || t.Listen.IsUnspecified():
+		return errors.New("listen is not one IPv4 address")
 	case !t.ProjectBlock.IsValid() || !t.ProjectBlock.Addr().Is4() || t.ProjectBlock != t.ProjectBlock.Masked():
 		return errors.New("project_block is not an IPv4 network")
 	// A slice holds at least the cluster's and the proxy's addresses (.2, .4).

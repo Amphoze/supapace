@@ -263,6 +263,10 @@ func TestUsage_ExitCodes(t *testing.T) {
 		{"fakepg", "--socket", "s", "--listen", "127.0.0.1:0", "--log", "l"},
 		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "scram-bad-signature"},
 		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "sasl", "--salt", "00"},
+		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "scram-low"},
+		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "scram-low", "--password-file", "/dev/null", "--salt", "00"},
+		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "copy-both", "--salt", "00"},
+		{"fakepg", "--listen", "127.0.0.1:0", "--log", "l", "--mode", "param-flood", "--password-file", "/dev/null"},
 		{"tcp", "127.0.0.1:1", "--bogus"},
 		{"tcp", "127.0.0.1"},
 	} {

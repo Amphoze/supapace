@@ -38,11 +38,11 @@ func TestLimits_DefaultsPassCheck(t *testing.T) {
 		{"studio mem", int64(l.StudioMemMB), 896}, {"pgmeta mem", int64(l.PgMetaMemMB), 768},
 		{"pgcap mem", int64(l.PgcapMemMB), 64},
 		{"slice hold", int64(l.SliceHoldSecs), 691200},
-		{"max conns", int64(l.Proxy.MaxConns), 64}, {"refusals", int64(l.Proxy.RefusalsMax), 16},
+		{"max conns", int64(l.Proxy.MaxConns), 80}, {"refusals", int64(l.Proxy.RefusalsMax), 32},
 		{"preamble", int64(l.Proxy.PreambleMS), 2000}, {"conns/project", int64(l.Proxy.ConnsPerProject), 5},
 		{"conns/peer", int64(l.Proxy.ConnsPerPeer), 16}, {"cancels/project", int64(l.Proxy.CancelsPerProject), 2},
 		{"cancels/peer", int64(l.Proxy.CancelsPerPeer), 8}, {"cancel", int64(l.Proxy.CancelMS), 2000},
-		{"rate", int64(l.Proxy.ConnsPerSecond), 20}, {"burst", int64(l.Proxy.ConnsBurst), 10},
+		{"rate", int64(l.Proxy.ConnsPerSecond), 30}, {"burst", int64(l.Proxy.ConnsBurst), 60},
 		{"copy buf", int64(l.Proxy.CopyBufBytes), 64 << 10}, {"sock buf", int64(l.Proxy.SockBufBytes), 32 << 10},
 		{"scram", int64(l.Proxy.ScramIter), 4096}, {"param status", int64(l.Proxy.ParamStatusMax), 64},
 		{"row fields", int64(l.Proxy.RowFieldsMax), 1664},
@@ -67,6 +67,7 @@ func TestLimits_CheckRefusesEachBrokenNesting(t *testing.T) {
 		{"row a (parse) = row b", func(l *LimitSet) { l.ParseBodyBytes = l.MetaBodyMB << 20 }},
 		{"row d = row c", func(l *LimitSet) { l.ProxyWindowBytes = int64(l.MetaResultMB) << 20 }},
 		{"row e at 320 KiB/s = row 1", func(l *LimitSet) { l.TransferMS = int(l.StudioResultBytes * 1000 / (320 << 10)) }},
+		{"the proxy's pool one below both instances' connections", func(l *LimitSet) { l.Proxy.RefusalsMax = 2*l.Proxy.ConnsPerPeer - 1 }},
 		{"disk + memory cache + row 2 + row 6 = slice hold", func(l *LimitSet) {
 			l.SliceHoldSecs = l.ResolveDiskDays*86400 + l.ResolveMemorySecs + (l.StudioHeaderMS+l.ProxyWallMS)/1000
 		}},

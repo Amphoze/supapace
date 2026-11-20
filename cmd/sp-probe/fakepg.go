@@ -32,12 +32,13 @@ const (
 var (
 	fakeModes = map[string]bool{"sasl": true, "cleartext": true, "md5": true, "authok": true, "sasl-iter": true,
 		"huge": true, "flood": true, "stall": true, "trickle": true,
-		"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true, "scram-bad-signature": true}
+		"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true, "scram-bad-signature": true,
+		"scram-low": true, "copy-both": true, "param-flood": true}
 	postAuth = map[string]bool{"row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true,
-		"scram-bad-signature": true}
+		"scram-bad-signature": true, "copy-both": true, "param-flood": true}
 	// saltModes take the salt the server-first message carries.
 	saltModes = map[string]bool{"sasl-iter": true, "row-huge": true, "rows-endless": true, "stall-auth": true, "escapes": true,
-		"scram-bad-signature": true}
+		"scram-bad-signature": true, "scram-low": true, "copy-both": true, "param-flood": true}
 )
 
 const (
@@ -48,6 +49,9 @@ const (
 	// fakeMaxMessage bounds a client message the fake parses; after a longer one
 	// it only logs.
 	fakeMaxMessage = 10000
+	// param-flood answers each query with paramResponses responses of
+	// paramsPerResponse parameter-status messages each.
+	paramResponses, paramsPerResponse = 1000, 16
 )
 
 type fakeConfig struct {
@@ -194,6 +198,10 @@ var (
 		msg('K', u32(4242), u32(4242)),
 		msg('Z', []byte("I")),
 	}, nil)
+	// One response of param-flood: paramsPerResponse parameter-status messages,
+	// then CommandComplete and ReadyForQuery.
+	paramResponse = append(bytes.Repeat(msg('S', []byte("fake_parameter\x00fake value\x00")), paramsPerResponse),
+		append(msg('C', []byte("SELECT 0\x00")), msg('Z', []byte("I"))...)...)
 	rowDescription = msg('T', []byte{0, 1}, []byte("c\x00"), u32(0), []byte{0, 0}, u32(25), []byte{0xff, 0xff},
 		u32(0xffffffff), []byte{0, 0})
 	// Text a terminal or log viewer would interpret: CSI and OSC sequences,
@@ -251,10 +259,12 @@ func serveFake(c net.Conn, r io.Reader, cfg fakeConfig) {
 		}
 		streamWhileLogging(r, func() { streamN(c, nil, chunk, fakeStreamCap) })
 		return
-	case "sasl-iter":
+	case "sasl-iter", "scram-low":
+		// An iteration count above any cap, or below the platform's floor.
+		iter := map[string]string{"sasl-iter": "10000000", "scram-low": "1024"}[cfg.mode]
 		c.Write(saslRequest)
 		if cnonce, _, ok := clientFirst(r); ok {
-			c.Write(authMsg(11, []byte("r="+cnonce+rand.Text()+",s="+base64.StdEncoding.EncodeToString(cfg.salt)+",i=10000000")))
+			c.Write(authMsg(11, []byte("r="+cnonce+rand.Text()+",s="+base64.StdEncoding.EncodeToString(cfg.salt)+",i="+iter)))
 		}
 	default: // post-authentication modes
 		if scramLogin(c, r, cfg) {
@@ -422,6 +432,17 @@ func afterLogin(c net.Conn, r io.Reader, mode string) {
 			row := msg('D', []byte{0, 1}, u32(1024-11), bytes.Repeat([]byte{'x'}, 1024-11))
 			streamWhileLogging(r, func() { streamN(c, append(prefix, rowDescription...), bytes.Repeat(row, 64), fakeStreamCap) })
 			return
+		case "copy-both":
+			// A both-ways copy, then copy data as fast as the client takes it.
+			head := append(prefix, msg('W', []byte{0}, []byte{0, 0})...)
+			streamWhileLogging(r, func() { streamN(c, head, bytes.Repeat(msg('d', bytes.Repeat([]byte{'x'}, 1019)), 64), fakeStreamCap) })
+			return
+		case "param-flood":
+			// Many complete responses, each with a few parameter-status
+			// messages: more than any cap over the connection, few in one response.
+			if _, err := c.Write(append(prefix, bytes.Repeat(paramResponse, paramResponses)...)); err != nil {
+				return
+			}
 		}
 		// stall-auth: no reply.
 	}

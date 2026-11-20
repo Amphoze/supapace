@@ -23,7 +23,8 @@
 //	                                            byte sent, as "conn N LEN" + LEN bytes per
 //	                                            chunk; --password-file and --salt are given
 //	                                            for the post-authentication modes, --salt
-//	                                            alone for sasl-iter; refused for the others
+//	                                            alone for sasl-iter and scram-low; refused for
+//	                                            the others
 //	sp-probe s3 SUB … --endpoint URL --keys FILE --bucket B
 //	                                            object-store calls for the harness
 //	                                            (s3.go)
