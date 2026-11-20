@@ -7,6 +7,9 @@
 #               client's tests against the stand-in image
 #   reach-host  the suite on the runner VM itself, installed by scripts/install-node.sh
 #               (no stand-in)
+#   dash        the dashboard: the Studio image (cached), the browser harness's own
+#               tests in a bare node, then the suite on a node with a studio domain,
+#               for a studio domain off the public suffix list and one on it
 #
 # Pull requests from forks get no secrets: the public job then runs the gate's built-in
 # rules with a stand-in deny-list and says so.
@@ -100,6 +103,8 @@ jobs:
           [ -z "$out" ] || { printf 'not gofmt-formatted:\n%s\n' "$out"; exit 1; }
       - run: go vet ./...
       - run: go vet -tags reach ./...
+      - run: go vet -tags 'reach dash' ./...
+      - run: go vet -tags browser ./...
       # The Docker tests skip when their pinned image is absent: pull both so they run.
       - name: Pinned images
         run: |
@@ -272,3 +277,121 @@ jobs:
         run: |
           sudo systemctl status docker.service --no-pager -l || true
           sudo journalctl -u docker.service --no-pager -n 80 || true
+
+  # A dashboard node: the node of the reach job with a studio domain and 6 GiB, the
+  # Studio and wire-proxy archives loaded. Two configurations: a studio domain off
+  # the public suffix list, which runs everything, and one on it, which runs only
+  # the suite's tests that drive a browser engine, whose names hold "Browser"
+  # (TestDash14_SignIn_Browser, TestDash15_CrossSite_Browser): the step fails when
+  # a dashboard test file exists and no test matches. Until the
+  # suite has a dashboard test file (test/reach/dash_*_test.go) the first runs
+  # make reach on the dashboard node instead of make reach-dash, and the second
+  # stops after its checkout.
+  dash:
+    needs: [public, unit]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: unlisted
+            domain: studio.test
+          - config: listed
+            domain: dyndns.org
+    concurrency:
+      group: dash-${{ matrix.config }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    timeout-minutes: 150
+    env:
+      CONFIG: ${{ matrix.config }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: What this configuration runs
+        run: |
+          set -- test/reach/dash_*_test.go
+          if [ -e "$1" ]; then echo "DASH_TESTS=1" >>"$GITHUB_ENV"
+          elif [ "$CONFIG" = listed ]; then echo "::notice title=dash (listed)::no dashboard test file yet: nothing to run"; fi
+      - uses: actions/setup-go@v5
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # A node's ruleset may use nft_connlimit. The product never loads a kernel
+      # module: the host does, so the runner loads it before a node starts.
+      - name: Kernel modules
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        run: |
+          sudo modprobe nft_connlimit
+          grep -qw xfs /proc/filesystems || sudo modprobe xfs
+          sudo modprobe nf_conntrack_bridge
+      - name: Containerd image store
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        run: |
+          f=/etc/docker/daemon.json
+          sudo test -s "$f" || echo '{}' | sudo tee "$f" >/dev/null
+          sudo jq '.features["containerd-snapshotter"] = true' "$f" | sudo tee "$f.new" >/dev/null
+          sudo mv "$f.new" "$f"
+          sudo systemctl restart docker
+      # The reach job's image cache, restored only: this job's archives stay out of it.
+      - uses: actions/cache/restore@v4
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        with:
+          path: ~/.cache/supapace/images
+          key: images-${{ runner.arch }}-${{ hashFiles('internal/nodecfg/images.lock') }}
+      # The Studio archive and build record, keyed on everything the build reads from
+      # the tree. A miss builds it: a cold build of 15 to 25 minutes.
+      - id: studio
+        uses: actions/cache@v4
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        with:
+          path: |
+            ~/.cache/supapace/images/dash/supapace-studio.tar
+            ~/.cache/supapace/images/dash/supapace-studio.build-record.json
+          key: studio-${{ runner.arch }}-${{ hashFiles('studio/**', 'internal/dashcfg/**', 'internal/dashtok/testdata/**', 'cmd/sp-dashstub/limits.go', 'cmd/sp-dashstub/main.go', 'internal/nodecfg/**', 'go.mod', 'go.sum') }}
+      - name: make studio
+        if: (env.CONFIG == 'unlisted' || env.DASH_TESTS == '1') && steps.studio.outputs.cache-hit != 'true'
+        run: make studio
+      - name: Studio build record
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-build-record-${{ matrix.config }}
+          path: ~/.cache/supapace/images/dash/supapace-studio.build-record.json
+      - name: make images and browsers
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        run: make images browsers DASH=1
+      # The harness's own tests run both configurations themselves: once is enough.
+      - name: make browser-test
+        if: env.CONFIG == 'unlisted'
+        run: |
+          set -o pipefail
+          trap 'make node-down NODE=sp-browsers SP_OFFSITE=0' EXIT
+          make node-bare NODE=sp-browsers SP_OFFSITE=0
+          make browser-test NODE=sp-browsers 2>&1 | tee "$RUNNER_TEMP/browser.log"
+      - name: make node-up DASH=1
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        run: make node-up DASH=1 STUDIO_DOMAIN=${{ matrix.domain }}
+      - name: the suite on the dashboard node
+        if: env.CONFIG == 'unlisted' || env.DASH_TESTS == '1'
+        run: |
+          set -o pipefail
+          if [ "${DASH_TESTS:-}" = 1 ] && [ "$CONFIG" = listed ]; then
+            CGO_ENABLED=0 go test -c -tags 'reach dash' -o "$RUNNER_TEMP/dash.test" ./test/reach
+            "$RUNNER_TEMP/dash.test" -test.list Browser | grep . ||
+              { echo "no test of the suite matches Browser: this configuration would run nothing" >&2; exit 1; }
+          fi
+          if [ "${DASH_TESTS:-}" != 1 ]; then make reach
+          elif [ "$CONFIG" = unlisted ]; then make reach-dash
+          else make reach-dash REACH_ARGS="-test.run Browser"; fi 2>&1 | tee "$RUNNER_TEMP/reach.log"
+      - name: Skipped suite tests
+        if: always() && (env.CONFIG == 'unlisted' || env.DASH_TESTS == '1')
+        run: echo "::notice title=skipped suite tests (dash ${{ matrix.config }})::$(grep -c -- '--- SKIP' "$RUNNER_TEMP/reach.log" 2>/dev/null) skipped"
+      - name: Node logs
+        if: failure()
+        run: |
+          docker logs --tail 50 sp-node || true
+          docker exec sp-node tail -n 200 /var/log/supapaced.log || true
+      - name: Node down
+        if: always()
+        run: make node-down

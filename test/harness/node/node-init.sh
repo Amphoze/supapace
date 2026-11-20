@@ -72,6 +72,16 @@ if [ "$mode" = full ] && [ ! -x "$BIN/supapaced" ]; then
 	[ $# -gt 0 ] || log "$BIN/supapaced absent, booting bare"
 	mode=bare
 fi
+# A dashboard node (make node-up DASH=1): init is given the studio domain, and the
+# archives of /images/dash are loaded too, when the daemon binary knows the flag.
+studio=''
+if [ "$mode" = full ] && [ -n "${SP_STUDIO_DOMAIN:-}" ]; then
+	if "$BIN/supapaced" init -h 2>&1 | grep -q -- '-studio-domain'; then
+		studio=$SP_STUDIO_DOMAIN
+	else
+		[ $# -gt 0 ] || log "supapaced has no --studio-domain: the node starts without a dashboard"
+	fi
+fi
 if [ "${1:-}" = declare-offsite ]; then
 	[ "$mode" != full ] || declare_offsite
 	exit
@@ -129,7 +139,8 @@ mount_xfs "$STATE/repo.img" 8G "$REPO" usrquota,nosuid,nodev,noexec
 # root reads, never to the node's log.
 if [ "$mode" = full ]; then
 	if [ ! -e /etc/supapace/node.json ]; then
-		(umask 077 && "$BIN/supapaced" init --dev --no-systemd --ack-escrow --domain sp.test >"$STATE/init.out" 2>&1) ||
+		(umask 077 && "$BIN/supapaced" init --dev --no-systemd --ack-escrow --domain sp.test \
+			${studio:+--studio-domain "$studio"} >"$STATE/init.out" 2>&1) ||
 			{ log "supapaced init failed; its output is in $STATE/init.out"; exit 1; }
 	fi
 	declare_offsite || { log "declaring the object-store stand-in failed"; exit 1; }
@@ -154,8 +165,10 @@ done
 # every later boot would skip: an error in its output fails the boot too, after
 # removing that name.
 loaded=0 refs=
-for tar in /images/*.tar; do
+for tar in /images/*.tar ${studio:+/images/dash/*.tar}; do
 	[ -e "$tar" ] || continue
+	# A Studio variant (supapace-studio-NAME.tar) is loaded only by the test that wants it.
+	case $tar in /images/dash/supapace-studio-*.tar) continue ;; esac
 	ref=$(tar -xOf "$tar" index.json | sed -n 's/.*"io.containerd.image.name":"\([^"]*\)".*/\1/p')
 	[ -n "$ref" ] || { log "$tar names no image; run make images"; exit 1; }
 	refs="$refs $ref"

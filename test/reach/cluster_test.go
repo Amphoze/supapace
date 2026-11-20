@@ -1465,15 +1465,34 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 		if g := showPlacement(t, S1.Ref); g.State != "purged" || g.UID == nil || *g.UID != *p1.UID || g.SubnetIndex != nil {
 			t.Fatalf("purged S1: %+v, want uid %d kept and no slice", g, *p1.UID)
 		}
-		// Admission: A, B, S2 and S3 fill the node's memory ceiling, so a
-		// create is refused at once with node_full and writes no row (no
-		// tombstone, no ref burned). Control: after S3 is deleted a fourth
+		// Admission: A, B, S2 and S3, and scratch projects up to the node's
+		// own ceiling, fill its memory, so a create is refused at once with
+		// node_full and writes no row (no tombstone, no ref burned). Control:
+		// after the scratch projects are removed and S3 is deleted a further
 		// project fits (S4 below); S3's slice stays held.
-		// The test node is sized so that four projects fill it; a host install
-		// has the machine's own memory, so there the refusal is not asserted.
+		// A 4 GiB test node holds four projects of 768 MiB (its ceiling is
+		// three quarters of its memory) and needs no scratch project; the
+		// 6 GiB node of a dashboard holds six. A host install has the
+		// machine's own memory, so there the refusal is not asserted.
 		if os.Getenv("SUPAPACE_HOST") == "1" {
 			t.Log("host install: four projects do not fill this machine; the full-node refusal is asserted in the test node")
 		} else {
+			const projectMemMB = 512 + 256 // a cluster and its PostgREST, as admission counts them
+			live := 0
+			for _, p := range listPlacements(t) {
+				if slices.Contains([]string{"provisioning", "active", "restarting", "restoring", "deleting"}, p.State) {
+					live++
+				}
+			}
+			var fill []string
+			for range nodeConf(t).MemAllocMB/projectMemMB - live {
+				P, id := extraProject(t)
+				waitDone(t, "a create below the node's admission ceiling", id)
+				fill = append(fill, P.Ref)
+			}
+			if nodeConf(t).StudioDomain == "" && len(fill) != 0 {
+				t.Fatalf("a 4 GiB test node admits %d more projects than A, B, S2 and S3", len(fill))
+			}
 			rows := len(listPlacements(t))
 			_, _, jwks := newIssuer(t)
 			out, code = cli(t, "project", "create", "--name", scratchName, "--issuer-jwks", jwks, "--no-wait")
@@ -1490,6 +1509,11 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 			}
 			if n := len(listPlacements(t)); n != rows {
 				t.Fatalf("a create refused with node_full changed the project list from %d to %d rows", rows, n)
+			}
+			for _, ref := range fill {
+				if !removeProject(t, ref) {
+					t.Fatalf("the scratch project %s that filled the node cannot be removed", ref)
+				}
 			}
 		}
 		out, code = cli(t, "project", "delete", S3.Ref)

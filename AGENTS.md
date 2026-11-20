@@ -4690,3 +4690,69 @@ when a copy launch finds it missing, another mode, owner or type, a bad or torn 
 line count. A file the runner wrote or parsed is remembered (inode, size, mtime) and not re-read;
 a restart parses each file once. Known limit: a file changed in place by root to the same size
 and mtime is taken as known. Stale temporaries `.<subject>.idx-*` go at the next rebuild.
+
+### 2026-11-21 — harness: dashboard node mode, issuer and delay stand-ins, dashboard test build
+
+Make (all without DASH behave as before, but for the memory check):
+- `make node-up` / `node-bare` refuse unless MemAvailable (whole GiB) >= NODE_MEM + 2. NODE_MEM is
+  4, or 6 with DASH=1. On a 16 GiB CI runner that is about 8 GiB of margin.
+- `make build` also builds `bin/pgcap-nopeer` and `bin/pgcap-faulthook` (tags nopeer, faulthook);
+  test binaries for bind mounts, never in an image.
+- `make studio`: `studio/build.sh image` with IMAGE_CACHE=$(IMAGE_CACHE)/dash (archive, build
+  record and the build's own cache under dash/). Never part of `make images`.
+- `make images DASH=1`: also `supapace-pgcap:local` and `dash/supapace-pgcap.tar`; refuses when
+  `dash/supapace-studio.tar` is missing. DASH=1 exports SP_DASH=1 for scripts/cache-images.sh.
+- `make browsers`: `supapace-browsers:local` and `$(IMAGE_CACHE)/browsers/supapace-browsers.tar`
+  (needs the network; not under dash/, so dashboard nodes do not load it at boot).
+- `make node-up DASH=1 [STUDIO_DOMAIN=studio.test]`: 6 GiB node; node-init.sh passes
+  `--studio-domain` to init only when the variable is set and `supapaced init -h` lists the flag,
+  and only then loads `/images/dash/*.tar`. init runs on first boot only: run `make node-down`
+  before switching a node between modes.
+- `make reach-dash [REACH_ARGS=…]`: builds `bin/dash.test` (tags `reach dash`), loads the browser
+  archive into the node when it exists, runs bracketed by the suite reset like `make reach`.
+- `make node-proof PKG=<dir> [RUN=<re>]`: `go test -c -tags reach` of that package, run as root in
+  a bare node (loads the dash/ archives it lacks, never a `supapace-studio-*.tar` variant); without
+  RUN it runs `^TestNode_` only, since a package's unit tests may read the source tree.
+- `make browser-test [RUN=<re>]`: test/browser (tag browser) in a bare node, browser image loaded.
+
+Suite (test/reach):
+- `suiteHooks []func(testing.TB)`: run once in TestMain after fixtures A and B; a failing hook
+  stops the run ("a suite hook failed; no test ran"). Empty in reach.test.
+- dash.test = reach.test + `//go:build reach && dash` files; `-test.list` is identical until a
+  `dash_<topic>_test.go` exists. New package-level names in dash files start with `dash`.
+- dashSetup (hook): fails at once on a node without a studio domain; starts `sp-dashstub issuer`
+  on 127.0.0.1:<random> as issuer.<base domain> (leaf from the node's dev CA), registers it with
+  `supapace dashboard issuer set`, adds members a-owner, a-developer, a-read-only on A and
+  b-owner on B. On a rerun a member with another role fails the run, naming it.
+- Helpers: needDash(t) the studio domain; issuer(t) *dashIssuer (Iss, Host, AuthorizeURL, Addr,
+  Priv, KID, SetSubject); signIn(t, ref, sub) the session cookie via login, callback and session
+  post; dash(t, ref, cookies...) *dashClient{Origin, Addr, H1, H2} ("_" is the sign-in host;
+  clients send browser Sec-Fetch-* headers, keep any header the test set, never follow
+  redirects); addMember(t, ref, sub, role); bypassGateway(t) a client dialling Studio from the
+  gateway's netns (the test sets the assertion; dashAssert(key, a, now), dashNodeKey(t));
+  socket(t, uid) a client of the dashboard socket whose connects run as uid:uid on a locked
+  thread that is never reused (supplementary groups dropped first); withRTT(t, d) the delay
+  relay's address towards the gateway (set
+  dashClient.Addr); studioMem, pgmetaMem(t, i), proxyMem: cgroup current and peak bytes;
+  browsers(t, scenario) the browser image's JSON result (same container shape as test/browser).
+- Untagged: dashNewIssuer, dashIDToken (300 s), dashAssert (30 s), dashScenario, dashFetch,
+  dashPathForms(p, ref, foreign) map of named path forms.
+- TestReach14 full-node clause: fills with scratch projects up to mem_alloc_mb / 768, asserts
+  node_full, removes them; a node without a studio domain must need no filler.
+
+sp-dashstub:
+- `issuer --listen --cert --key --signing-key (PKCS #8 DER RSA) --issuer --client-id
+  --subject-file`: GET /authorize (response_type id_token, response_mode form_post, client_id,
+  nonce, https redirect_uri; else 400; other path 404, other method 405; empty subject 409)
+  answers a form posting id_token (RS256, 300 s), state unchanged and session_state; the page
+  submits itself unless the request carries the cookie hold=1. Subject file read per request.
+- `delay --listen --to --rtt`: TCP relay; each chunk (<= 32 KiB) delivered rtt/2 after it was
+  read; at most 16 chunks queued per direction, then reading stops; EOF passed on as half close.
+- Usage errors exit 2, runtime errors 1; both print "listening ADDR" on stdout once bound.
+
+CI: job `dash` (matrix: studio.test, and the public-suffix name of test/browser), Studio archive
+cached on the hash of its inputs; loads nft_connlimit; runs browser-test once, then `make reach`
+on the dashboard node until a test/reach/dash_*_test.go exists, then `make reach-dash` (second
+configuration: `-test.run Browser`, i.e. TestDash14_SignIn_Browser and
+TestDash15_CrossSite_Browser; the step fails when a dashboard test file exists and no test
+matches). unit also vets tags `reach dash` and `browser`.

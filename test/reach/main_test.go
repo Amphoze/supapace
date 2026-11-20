@@ -53,10 +53,24 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "reach: fixture projects A and B could not be built; no test ran")
 		os.Exit(1)
 	}
+	if !mt.run(func(t testing.TB) {
+		for _, h := range suiteHooks {
+			h(t)
+		}
+	}) {
+		mt.cleanup()
+		fmt.Fprintln(os.Stderr, "reach: a suite hook failed; no test ran")
+		os.Exit(1)
+	}
 	code := m.Run()
 	mt.cleanup()
 	os.Exit(code)
 }
+
+// suiteHooks run in TestMain after the fixtures are built, before any test;
+// files of other build tags register them in init. None is registered in a
+// build with the reach tag alone.
+var suiteHooks []func(testing.TB)
 
 // preflight names every missing piece the suite needs.
 func preflight() string {
