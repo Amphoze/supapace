@@ -4640,3 +4640,53 @@ Runs only inside a replication or probe job (replicator uid, the project's group
   are printable ASCII and scrubbed, with every prefix of 8 bytes or more, from all printed text.
 - Tests against the object-store stand-in: SUPAPACE_STANDIN_TEST=1, TestStandin_* (this
   package's TestMain starts it; a later file of the package reuses it).
+
+### 2026-11-21 — backup runner: replication records, index files, budgets, rebuild, fetch plan
+`internal/backup` `replication.go`, `rebuild.go`, `index.go`, `fetchplan.go`: replicate and fetch
+halves of the runner. Their `init()` assigns the four seam variables of `jobspec.go`
+(`buildReplicate`, `buildFetch`, `recordReplicate`, `recordFetch`); nothing is exported.
+
+Launch, replicate. While `backup_state.rebuild_epoch` is below the epoch the job is a rebuild page
+from the markers stored at its launch (never from a result or memory); past
+`bklimit.RebuildMaxPages` pages it is refused, code `internal`, no container. Otherwise a copy:
+a subject paused for its budget is refused, code `budget` (and `queueReplicate` queues none while
+paused); input = what is left of today's budgets (never negative; -1 for `cp`, which has none)
+and each info file's newest recorded hash. `MemMB = bklimit.ReplMemMB(ObjectCount)`.
+Launch, fetch. `fetchPlan` builds `/job/plan` from the record alone: the set's files, other sets'
+files recorded at or before its `listed_at`, each info file at its newest version at or before it
+(sized `bklimit.SmallMax`: an upper bound, the record keeps no size), the history of every
+timeline row (recorded, pending, abandoned), archive files of admitted timelines from the set's
+start segment: all for `latest`, through the segment of a position (16 MiB segments), or up to a
+time plus `bklimit.FetchMargin(archive_timeout, extra)` and the lowest later segment per timeline.
+Refused as a failed job without a container: `record_not_rebuilt`; `fetch_too_large` (sum above
+the repository quota, saturating; notice `fetch-too-large`). `max_bytes` = the repository quota;
+`SetReplicatorQuota(2 x largest quota)` just before the launch. `cp` is refused (`internal`):
+`recover` fetches it. The plan's history names are kept in memory per runner and subject until
+that job's record; a record without its own plan is `crashed`.
+
+Record. Every bound is checked before the first store write; a failure is `crashed` and nothing
+is recorded. Copy: probe rows <= 32, notices <= 16, info <= 4, uploaded+adopted <= 2,048, figures
+not negative, stop in {"", caps, budget, upload-failed, held}, every key a repository path of the
+subject's stanza and of an admitted timeline within its kind's size. Rows and info versions are
+recorded at the runner's own time, never the job's `at`. `complete` is false while segments are
+held, and `stopped` becomes `held` when the job gave no other stop. Over budget, or stopped at
+it: paused until 00:00 UTC, notice `budget-exceeded` with the projected time to a full quota.
+Rebuild page: no copy lists; last page complete with no stop, others stopped `rebuild` with a
+next key marker that sorts after the launch markers (or the same key, another version); merged
+with the job row's launch number; `store.ErrConflict` (already rebuilt) is a late page, done.
+Notices: copy codes as listed in `copyNotices`, rebuild only `unlisted-entry`; count not
+negative, detail <= 1,024 bytes (the store cleans and cuts it to 256). The store keeps one row
+per subject and code: its count is the number of reports, the detail the last report's.
+Stored documents: replication = counts, not lists: {ok, mode, complete, stopped, uploaded,
+adopted, info, sets_complete, rows, notices, bytes, objects, walked, truncated, held, last};
+fetch = {ok, files, bytes, histories (from the plan)}. Readers must not use `jobio.ParseResult`.
+
+Index file `nodecfg.Paths.IndexFile(subject)`: the daemon's regular file, 0444, in a root 0700
+directory; one `jobio.IndexRow` line per record row; no promised order (a rebuild writes key byte
+order, appends follow); at launch its line count equals the record's and every line parses with
+`jobio.ParseIndexRow`; keys unique then; never written while the subject's job runs. Appended
+all or none after a copy; rebuilt by rename after an adoption, after the last rebuild page, and
+when a copy launch finds it missing, another mode, owner or type, a bad or torn line, or another
+line count. A file the runner wrote or parsed is remembered (inode, size, mtime) and not re-read;
+a restart parses each file once. Known limit: a file changed in place by root to the same size
+and mtime is taken as known. Stale temporaries `.<subject>.idx-*` go at the next rebuild.

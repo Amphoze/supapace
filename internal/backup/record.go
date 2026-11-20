@@ -300,6 +300,9 @@ func (r *Runner) queueReplicate(ctx context.Context, s subject) {
 	if r.Offsite() != "declared" {
 		return
 	}
+	if bs, err := r.st.GetBackupState(ctx, s.name); err == nil && bs.ReplPausedUntil != nil && r.now().Before(*bs.ReplPausedUntil) {
+		return // paused for its budget: the first push after the pause queues it
+	}
 	j, ok, err := r.ts.LastJob(ctx, s.name, "replicate")
 	if err == nil && !(ok && busy(j)) {
 		_, err = r.submit(ctx, s.name, "replicate", s.diskMB, s.repoMB)
