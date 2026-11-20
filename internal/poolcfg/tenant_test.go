@@ -216,3 +216,39 @@ func TestConnString_CarriesNoPassword(t *testing.T) {
 		t.Errorf("userinfo %v", u.User)
 	}
 }
+
+func TestValidAllowListOn_RefusesAPrefixHoldingANodeAddress(t *testing.T) {
+	c := defaultCfg()
+	iface := netip.MustParseAddr("198.51.100.7")    // on an interface
+	declared := netip.MustParseAddr("203.0.113.40") // declared public, on no interface
+	own := []netip.Addr{iface, declared, netip.MustParseAddr("2001:db8::1")}
+	for _, entry := range []string{"198.51.100.7/32", "198.51.100.0/24", "203.0.113.40/32", "203.0.113.0/24"} {
+		_, err := ValidAllowListOn(c, own, []string{"192.0.2.0/24", entry})
+		if err == nil {
+			t.Fatalf("%s accepted", entry)
+		}
+		if !strings.Contains(err.Error(), "entry 2 of 2") || strings.Contains(err.Error(), iface.String()) || strings.Contains(err.Error(), declared.String()) {
+			t.Errorf("%s: the error must name the entry and no node address: %v", entry, err)
+		}
+	}
+	// Control: a prefix beside them passes.
+	got, err := ValidAllowListOn(c, own, []string{"192.0.2.0/24", "203.0.113.48/28"})
+	if err != nil || len(got) != 2 {
+		t.Fatalf("beside the node's addresses: %v %v", got, err)
+	}
+	// An empty list of the node's addresses is an error.
+	for _, o := range [][]netip.Addr{nil, {}} {
+		if _, err := ValidAllowListOn(c, o, []string{"192.0.2.0/24"}); err == nil {
+			t.Errorf("own %v accepted", o)
+		}
+	}
+	// Everything ValidAllowList refuses is refused still.
+	for _, s := range []string{"10.213.5.0/24", "0.0.0.0/0", "x", "127.0.0.1/32"} {
+		if _, err := ValidAllowListOn(c, own, []string{s}); err == nil {
+			t.Errorf("%q accepted", s)
+		}
+	}
+	if _, err := ValidAllowListOn(c, own, nil); err == nil {
+		t.Error("an empty list accepted")
+	}
+}

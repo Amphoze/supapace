@@ -280,15 +280,15 @@ func TestRecordUploads_BudgetDayRollover(t *testing.T) {
 		}
 		return out
 	}
-	bsUpload(t, s, r, Uploads{Rows: rows(1), At: bsT0})
-	bsUpload(t, s, r, Uploads{Rows: rows(3), At: bsT0.Add(11 * time.Hour)}) // 23:00 UTC, same day
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: rows(1), At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: rows(3), At: bsT0.Add(11 * time.Hour)}) // 23:00 UTC, same day
 	b := bsState(t, s, r)
 	if b.BytesToday != 40 || b.ObjectsToday != 4 || b.BudgetDay == nil || b.BudgetDay.Format(time.DateOnly) != "2026-11-10" {
 		t.Fatalf("same day: %d bytes, %d objects, day %v", b.BytesToday, b.ObjectsToday, b.BudgetDay)
 	}
 	// 00:30 on the next UTC day, given in another zone: the counters start again.
 	next := time.Date(2026, 11, 11, 0, 30, 0, 0, time.UTC).In(time.FixedZone("west", -5*3600))
-	bsUpload(t, s, r, Uploads{Rows: rows(5)[:1], At: next})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: rows(5)[:1], At: next})
 	b = bsState(t, s, r)
 	if b.BytesToday != 10 || b.ObjectsToday != 1 || b.BudgetDay.Format(time.DateOnly) != "2026-11-11" {
 		t.Fatalf("next day: %d bytes, %d objects, day %v", b.BytesToday, b.ObjectsToday, b.BudgetDay)
@@ -299,19 +299,19 @@ func TestRecordUploads_OverBudgetReported(t *testing.T) {
 	s := newStore(t, testConfig())
 	r, st := bsProject(t, s, 1)
 	row := func(n int) ObjectRow { return bsRow(bsSegKey(st, "17-1", bsSeg(1, n)), 1, "v", bsT0) }
-	if bsUpload(t, s, r, Uploads{Rows: []ObjectRow{row(1), row(2)}, BudgetBytes: 20, BudgetObjects: 2, At: bsT0}) {
+	if bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{row(1), row(2)}, BudgetBytes: 20, BudgetObjects: 2, At: bsT0}) {
 		t.Fatal("reaching the budget exactly reported over budget")
 	}
-	if !bsUpload(t, s, r, Uploads{Rows: []ObjectRow{row(3)}, BudgetBytes: 25, At: bsT0}) {
+	if !bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{row(3)}, BudgetBytes: 25, At: bsT0}) {
 		t.Fatal("30 bytes against 25 not reported")
 	}
-	if !bsUpload(t, s, r, Uploads{BudgetObjects: 2, At: bsT0}) {
+	if !bsUpload(t, s, r, Uploads{Launch: 1, BudgetObjects: 2, At: bsT0}) {
 		t.Fatal("3 objects against 2 not reported")
 	}
-	if bsUpload(t, s, r, Uploads{Rows: []ObjectRow{row(4)}, At: bsT0}) {
+	if bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{row(4)}, At: bsT0}) {
 		t.Fatal("budgets of 0 reported over budget")
 	}
-	if bsUpload(t, s, r, Uploads{BudgetBytes: 1 << 40, BudgetObjects: 1 << 20, At: bsT0}) {
+	if bsUpload(t, s, r, Uploads{Launch: 1, BudgetBytes: 1 << 40, BudgetObjects: 1 << 20, At: bsT0}) {
 		t.Fatal("under both budgets reported over budget")
 	}
 }
@@ -322,11 +322,11 @@ func TestRecordUploads_DuplicateKeyKeepsFirst(t *testing.T) {
 	r, st := bsProject(t, s, 1)
 	k := bsSegKey(st, "17-1", bsSeg(1, 1))
 	first := bsRow(k, 0xaa, "v1", bsT0)
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{first}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{first}, At: bsT0})
 	// The same version id and another one, other hashes, inodes, sizes, times.
 	for _, ver := range []string{"v1", "v2", ""} {
 		again := ObjectRow{Key: k, Size: 99, SHA256: bsHash(0xbb), Ino: 77, CtimeNS: 78, VersionID: ver, UploadedAt: bsT0.Add(time.Hour)}
-		bsUpload(t, s, r, Uploads{Rows: []ObjectRow{again}, At: bsT0.Add(time.Hour)})
+		bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{again}, At: bsT0.Add(time.Hour)})
 	}
 	got, _, _ := bsObject(t, s, r, k)
 	if !bytes.Equal(got.SHA256, first.SHA256) || got.Size != 10 || got.Ino != 11 || got.CtimeNS != 12 || got.VersionID != "v1" ||
@@ -338,7 +338,7 @@ func TestRecordUploads_DuplicateKeyKeepsFirst(t *testing.T) {
 	}
 	// Twice in one call: the first is recorded.
 	k2 := bsSegKey(st, "17-1", bsSeg(1, 2))
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{bsRow(k2, 0x01, "a", bsT0), bsRow(k2, 0x02, "b", bsT0)}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{bsRow(k2, 0x01, "a", bsT0), bsRow(k2, 0x02, "b", bsT0)}, At: bsT0})
 	if got, _, _ := bsObject(t, s, r, k2); !bytes.Equal(got.SHA256, bsHash(0x01)) || got.VersionID != "a" {
 		t.Fatalf("a key twice in one call recorded %+v", got)
 	}
@@ -354,15 +354,15 @@ func TestRecordUploads_ARepeatedInfoVersionIsOneRow(t *testing.T) {
 	v := InfoVersion{Name: "backup.info", VersionID: "ver-1", SHA256: bsHash(1), UploadedAt: bsT0}
 	other := v
 	other.SHA256, other.UploadedAt = bsHash(2), bsT0.Add(time.Hour)
-	bsUpload(t, s, r, Uploads{Info: []InfoVersion{v, v}, At: bsT0})
-	bsUpload(t, s, r, Uploads{Info: []InfoVersion{other}, At: bsT0.Add(time.Hour)})
+	bsUpload(t, s, r, Uploads{Launch: 1, Info: []InfoVersion{v, v}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Info: []InfoVersion{other}, At: bsT0.Add(time.Hour)})
 	vs, err := s.ListInfoVersions(ctx, r, 16)
 	must(t, err)
 	if len(vs) != 1 || !bytes.Equal(vs[0].SHA256, v.SHA256) || !vs[0].UploadedAt.Equal(bsT0) {
 		t.Fatalf("info versions = %+v, want the first one only", vs)
 	}
 	// Control: another version id is another row; newest first, at most limit.
-	bsUpload(t, s, r, Uploads{Info: []InfoVersion{{Name: "backup.info", VersionID: "ver-2", SHA256: bsHash(3), UploadedAt: bsT0.Add(2 * time.Hour)}}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Info: []InfoVersion{{Name: "backup.info", VersionID: "ver-2", SHA256: bsHash(3), UploadedAt: bsT0.Add(2 * time.Hour)}}, At: bsT0})
 	vs, _ = s.ListInfoVersions(ctx, r, 16)
 	if len(vs) != 2 || vs[0].VersionID != "ver-2" {
 		t.Fatalf("info versions = %+v", vs)
@@ -393,12 +393,12 @@ func TestRecordUploads_ListedAtOnlyWithInfo(t *testing.T) {
 		return BackupSet{}
 	}
 	set("20261110-110000F", bsT0.Add(-time.Hour))
-	bsUpload(t, s, r, Uploads{SetsComplete: []string{"20261110-110000F"}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, SetsComplete: []string{"20261110-110000F"}, At: bsT0})
 	if b := get("20261110-110000F"); !b.Replicated || b.ListedAt != nil {
 		t.Fatalf("without info: %+v", b)
 	}
 	t1 := bsT0.Add(time.Minute)
-	bsUpload(t, s, r, Uploads{SetsComplete: []string{"20261110-110000F"}, At: t1,
+	bsUpload(t, s, r, Uploads{Launch: 1, SetsComplete: []string{"20261110-110000F"}, At: t1,
 		Info: []InfoVersion{{Name: "backup.info", VersionID: "i1", SHA256: bsHash(1), UploadedAt: t1}}})
 	timeIs(t, "listed_at with info", get("20261110-110000F").ListedAt, t1)
 
@@ -406,7 +406,7 @@ func TestRecordUploads_ListedAtOnlyWithInfo(t *testing.T) {
 	set("20261110-115900F", t1.Add(-time.Second))
 	set("20261110-130000F", bsT0.Add(time.Hour))
 	t2 := bsT0.Add(2 * time.Minute)
-	bsUpload(t, s, r, Uploads{SetsComplete: []string{"20261110-115900F", "20261110-130000F"}, At: t2})
+	bsUpload(t, s, r, Uploads{Launch: 1, SetsComplete: []string{"20261110-115900F", "20261110-130000F"}, At: t2})
 	timeIs(t, "listed_at from an earlier info version", get("20261110-115900F").ListedAt, t2)
 	if b := get("20261110-130000F"); !b.Replicated || b.ListedAt != nil {
 		t.Fatalf("a set newer than every info version: %+v", b)
@@ -414,16 +414,16 @@ func TestRecordUploads_ListedAtOnlyWithInfo(t *testing.T) {
 	// archive.info lists no set: a version of it after the stop does not count;
 	// a backup.info.copy version does.
 	late := bsT0.Add(2 * time.Hour)
-	bsUpload(t, s, r, Uploads{At: late, Info: []InfoVersion{{Name: "archive.info", VersionID: "a1", SHA256: bsHash(3), UploadedAt: late}}})
-	bsUpload(t, s, r, Uploads{SetsComplete: []string{"20261110-130000F"}, At: late.Add(time.Minute)})
+	bsUpload(t, s, r, Uploads{Launch: 1, At: late, Info: []InfoVersion{{Name: "archive.info", VersionID: "a1", SHA256: bsHash(3), UploadedAt: late}}})
+	bsUpload(t, s, r, Uploads{Launch: 1, SetsComplete: []string{"20261110-130000F"}, At: late.Add(time.Minute)})
 	if b := get("20261110-130000F"); b.ListedAt != nil {
 		t.Fatalf("an archive.info version listed a set: %+v", b)
 	}
-	bsUpload(t, s, r, Uploads{At: late, Info: []InfoVersion{{Name: "backup.info.copy", VersionID: "c1", SHA256: bsHash(4), UploadedAt: late}}})
-	bsUpload(t, s, r, Uploads{SetsComplete: []string{"20261110-130000F"}, At: late.Add(2 * time.Minute)})
+	bsUpload(t, s, r, Uploads{Launch: 1, At: late, Info: []InfoVersion{{Name: "backup.info.copy", VersionID: "c1", SHA256: bsHash(4), UploadedAt: late}}})
+	bsUpload(t, s, r, Uploads{Launch: 1, SetsComplete: []string{"20261110-130000F"}, At: late.Add(2 * time.Minute)})
 	timeIs(t, "listed_at from a backup.info.copy version", get("20261110-130000F").ListedAt, late.Add(2*time.Minute))
 	// Once set, listed_at stays.
-	bsUpload(t, s, r, Uploads{SetsComplete: []string{"20261110-110000F"}, At: t2.Add(time.Hour),
+	bsUpload(t, s, r, Uploads{Launch: 1, SetsComplete: []string{"20261110-110000F"}, At: t2.Add(time.Hour),
 		Info: []InfoVersion{{Name: "backup.info", VersionID: "i2", SHA256: bsHash(2), UploadedAt: t2.Add(time.Hour)}}})
 	timeIs(t, "listed_at after a later upload", get("20261110-110000F").ListedAt, t1)
 }
@@ -490,7 +490,7 @@ func TestRecordUploads_RefusesRowsThatDoNotFit(t *testing.T) {
 		"too many sets":        {SetsComplete: slices.Repeat([]string{"20261110-110000F"}, bklimit.ReplMaxFiles+1)},
 	}
 	for name, u := range cases {
-		u.Complete, u.At = true, bsT0
+		u.Complete, u.At, u.Launch = true, bsT0, 1
 		if _, err := s.RecordUploads(ctx, r, u); err == nil {
 			t.Fatalf("%s: accepted", name)
 		}
@@ -501,11 +501,11 @@ func TestRecordUploads_RefusesRowsThatDoNotFit(t *testing.T) {
 	}
 	// Control: the fitting row, and a key of 1,024 bytes.
 	long := mod(func(o *ObjectRow) { o.Key = strings.Repeat("k", 1024) })
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{good, long}, Complete: true, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{good, long}, Complete: true, At: bsT0})
 	if n, _ := s.ObjectCount(ctx, r); n != 2 {
 		t.Fatalf("ObjectCount = %d", n)
 	}
-	_, err := s.RecordUploads(ctx, ref(99), Uploads{At: bsT0})
+	_, err := s.RecordUploads(ctx, ref(99), Uploads{Launch: 1, At: bsT0})
 	wantErr(t, err, ErrNotFound)
 }
 
@@ -521,11 +521,11 @@ func TestRecordUploads_AnAdoptionFillsANullHashAndChangesNoRowThatHasOne(t *test
 		{Key: k2, Size: 10, VersionID: "v1", UploadedAt: bsT0},
 		{Key: long, Size: 10, VersionID: "v1", UploadedAt: bsT0},
 	}
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: listed, Last: true}, 2))
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: listed, Last: true}, 2))
 
 	// The same version id: the hash, inode and ctime are filled; nothing else changes.
 	adopt := ObjectRow{Key: k1, Size: 55, SHA256: bsHash(0xaa), Ino: 5, CtimeNS: 6, VersionID: "v1", UploadedAt: bsT0.Add(time.Hour)}
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{adopt}, At: bsT0.Add(time.Hour)})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{adopt}, At: bsT0.Add(time.Hour)})
 	got, _, _ := bsObject(t, s, r, k1)
 	if !bytes.Equal(got.SHA256, adopt.SHA256) || got.Ino != 5 || got.CtimeNS != 6 || got.Size != 10 || got.VersionID != "v1" || !got.UploadedAt.Equal(bsT0) {
 		t.Fatalf("adopted row = %+v", got)
@@ -534,7 +534,7 @@ func TestRecordUploads_AnAdoptionFillsANullHashAndChangesNoRowThatHasOne(t *test
 		t.Fatal("an adoption with the stored version id raised offsite-differs")
 	}
 	// Now it has a hash: a second adoption changes nothing and raises nothing.
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{{Key: k1, Size: 10, SHA256: bsHash(0xcc), Ino: 9, CtimeNS: 9, VersionID: "v1", UploadedAt: bsT0}}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{{Key: k1, Size: 10, SHA256: bsHash(0xcc), Ino: 9, CtimeNS: 9, VersionID: "v1", UploadedAt: bsT0}}, At: bsT0})
 	if got, _, _ := bsObject(t, s, r, k1); !bytes.Equal(got.SHA256, adopt.SHA256) || got.Ino != 5 {
 		t.Fatalf("a row with a hash changed: %+v", got)
 	}
@@ -543,7 +543,7 @@ func TestRecordUploads_AnAdoptionFillsANullHashAndChangesNoRowThatHasOne(t *test
 	}
 
 	// Another version id: the row is left as it is and offsite-differs is raised.
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{{Key: k2, Size: 10, SHA256: bsHash(0xbb), Ino: 7, CtimeNS: 8, VersionID: "v2", UploadedAt: bsT0}}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{{Key: k2, Size: 10, SHA256: bsHash(0xbb), Ino: 7, CtimeNS: 8, VersionID: "v2", UploadedAt: bsT0}}, At: bsT0})
 	if got, _, _ := bsObject(t, s, r, k2); got.SHA256 != nil || got.Ino != 0 || got.VersionID != "v1" {
 		t.Fatalf("an adoption under another version id changed the row: %+v", got)
 	}
@@ -551,7 +551,7 @@ func TestRecordUploads_AnAdoptionFillsANullHashAndChangesNoRowThatHasOne(t *test
 	if !ok || n.Count != 1 || n.Detail != k2 {
 		t.Fatalf("notice = %+v, %v", n, ok)
 	}
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{{Key: long, Size: 10, SHA256: bsHash(0xbb), VersionID: "", UploadedAt: bsT0}}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{{Key: long, Size: 10, SHA256: bsHash(0xbb), VersionID: "", UploadedAt: bsT0}}, At: bsT0})
 	if got, _, _ := bsObject(t, s, r, long); got.SHA256 != nil {
 		t.Fatalf("an adoption without a version id filled the hash: %+v", got)
 	}
@@ -567,8 +567,8 @@ func TestObjectRows_Streams(t *testing.T) {
 	r, _ := bsProject(t, s, 1)
 	const n = 100000
 	pad := strings.Repeat("p", 150)
-	sqlExec(t, s, `insert into offsite_object (subject, key, size, sha256, ino, ctime_ns, version_id, uploaded_at)
-		select $1, $2 || lpad(to_hex(i * 7919 % $3), 8, '0'), i, sha256(int4send(i)), i, i, 'v', now() from generate_series(0, $3 - 1) i`, r, pad, n)
+	sqlExec(t, s, `insert into offsite_object (subject, key, size, sha256, ino, ctime_ns, version_id, uploaded_at, launch)
+		select $1, $2 || lpad(to_hex(i * 7919 % $3), 8, '0'), i, sha256(int4send(i)), i, i, 'v', now(), 1 from generate_series(0, $3 - 1) i`, r, pad, n)
 	if c, _ := s.ObjectCount(ctx, r); c != n {
 		t.Fatalf("ObjectCount = %d", c)
 	}
@@ -633,7 +633,7 @@ func TestRecordLookups_MatchAnyArchiveID(t *testing.T) {
 	other := r + "-12" // a stanza whose name starts with this one's
 	segA, segB, segC := bsSeg(1, 3), bsSeg(1, 4), bsSeg(1, 9)
 	label := bsSeg(1, 3) + ".00000028.backup"
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{
 		bsRow(bsSegKey(st, "17-1", segA), 1, "v", bsT0),
 		bsRow(bsSegKey(st, "17-2", segB), 1, "v", bsT0),
 		bsRow(bsHistKey(st, "17-2", 2), 1, "v", bsT0),
@@ -678,7 +678,7 @@ func TestMergeListing_PagedAcrossCalls(t *testing.T) {
 		for i := range rows {
 			rows[i] = ObjectRow{Key: bsSegKey(st, "17-1", bsSeg(1, p*per+i)), Size: 100, VersionID: "v" + strconv.Itoa(i), UploadedAt: bsT0}
 		}
-		pg := ListingPage{Rows: rows, NextKeyMarker: rows[per-1].Key, NextVersionMarker: "m" + strconv.Itoa(p), Last: p == pages-1}
+		pg := ListingPage{Launch: 1, Rows: rows, NextKeyMarker: rows[per-1].Key, NextVersionMarker: "m" + strconv.Itoa(p), Last: p == pages-1}
 		must(t, s.MergeListing(ctx, r, pg, 2))
 		b := bsState(t, s, r)
 		if !pg.Last && (b.RebuildKeyMarker != pg.NextKeyMarker || b.RebuildVersionMarker != pg.NextVersionMarker || b.RebuildPages != p+1 || b.RebuildEpoch != 0) {
@@ -703,15 +703,15 @@ func TestMergeListing_KeepsHashes_AddsMissing(t *testing.T) {
 	k1, k2, k3 := bsSegKey(st, "17-1", bsSeg(1, 1)), bsSegKey(st, "17-1", bsSeg(1, 2)), bsSegKey(st, "17-1", bsSeg(1, 3))
 	k4 := bsSegKey(st, "17-1", bsSeg(1, 4))
 	up := bsRow(k1, 0xaa, "v1", bsT0)
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{up}, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{up}, At: bsT0})
 	// Versions are listed newest first, so a rebuilt row takes the last listed:
 	// k3 across two pages, k4 twice in one.
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: []ObjectRow{
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: []ObjectRow{
 		{Key: k1, Size: 999, VersionID: "planted", UploadedAt: bsT0.Add(time.Hour)},
 		{Key: k2, Size: 20, VersionID: "v2", UploadedAt: bsT0.Add(time.Minute)},
 		{Key: k3, Size: 1, VersionID: "newer", UploadedAt: bsT0.Add(2 * time.Hour)},
 	}, NextKeyMarker: k3, NextVersionMarker: "newer"}, 2))
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: []ObjectRow{
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: []ObjectRow{
 		{Key: k3, Size: 30, VersionID: "oldest", UploadedAt: bsT0},
 		{Key: k4, Size: 2, VersionID: "newer", UploadedAt: bsT0.Add(time.Hour)},
 		{Key: k4, Size: 40, VersionID: "oldest", UploadedAt: bsT0},
@@ -741,12 +741,12 @@ func TestMergeListing_FlagsRowsNoPageListed(t *testing.T) {
 	for i := 1; i <= 4; i++ {
 		rows = append(rows, bsRow(bsSegKey(st, "17-1", bsSeg(1, i)), 1, "v", bsT0))
 	}
-	bsUpload(t, s, r, Uploads{Rows: rows, At: bsT0})
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: rows[:1], NextKeyMarker: rows[0].Key}, 2))
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: rows, At: bsT0})
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: rows[:1], NextKeyMarker: rows[0].Key}, 2))
 	if _, ok := bsNotice(t, s, r, "record-not-in-store"); ok {
 		t.Fatal("flagged before the last page")
 	}
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: rows[1:2], Last: true}, 2))
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: rows[1:2], Last: true}, 2))
 	n, ok := bsNotice(t, s, r, "record-not-in-store")
 	if !ok || !strings.HasPrefix(n.Detail, "2 ") {
 		t.Fatalf("notice = %+v, %v; want a count of 2", n, ok)
@@ -761,8 +761,8 @@ func TestRebuild_ListedHistoryBecomesAbandoned(t *testing.T) {
 	ctx := context.Background()
 	r, st := bsProject(t, s, 1)
 	op := bsOp(t, s, r)
-	sqlExec(t, s, "insert into backup_timeline (subject, tli, state, op_id) values ($1, 3, 'pending', $2)", r, op)
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: []ObjectRow{
+	sqlExec(t, s, "insert into backup_timeline (subject, tli, state, op_id, launch) values ($1, 3, 'pending', $2, 0)", r, op)
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: []ObjectRow{
 		{Key: bsHistKey(st, "17-1", 2), Size: 1, VersionID: "v", UploadedAt: bsT0},
 		{Key: bsHistKey(st, "17-2", 3), Size: 1, VersionID: "v", UploadedAt: bsT0},
 		{Key: bsHistKey(st, "17-1", 1), Size: 1, VersionID: "v", UploadedAt: bsT0},
@@ -776,7 +776,7 @@ func TestRebuild_ListedHistoryBecomesAbandoned(t *testing.T) {
 	must(t, s.EnsureBackupState(ctx, "cp"))
 	must(t, s.MarkStanza(ctx, "cp"))
 	cp := "cp-" + bsState(t, s, "cp").Incarnation
-	must(t, s.MergeListing(ctx, "cp", ListingPage{Rows: []ObjectRow{{Key: bsHistKey(cp, "17-1", 2), Size: 1, VersionID: "v", UploadedAt: bsT0}}, Last: true}, 2))
+	must(t, s.MergeListing(ctx, "cp", ListingPage{Launch: 1, Rows: []ObjectRow{{Key: bsHistKey(cp, "17-1", 2), Size: 1, VersionID: "v", UploadedAt: bsT0}}, Last: true}, 2))
 	wantTimelines(t, s, "cp", "")
 }
 
@@ -784,10 +784,10 @@ func TestMergeListing_RefusedOnceRebuilt(t *testing.T) {
 	s := newStore(t, testConfig())
 	ctx := context.Background()
 	r, st := bsProject(t, s, 1)
-	page := ListingPage{Rows: []ObjectRow{{Key: bsSegKey(st, "17-1", bsSeg(1, 1)), Size: 1, VersionID: "v", UploadedAt: bsT0}}, Last: true}
+	page := ListingPage{Launch: 1, Rows: []ObjectRow{{Key: bsSegKey(st, "17-1", bsSeg(1, 1)), Size: 1, VersionID: "v", UploadedAt: bsT0}}, Last: true}
 	must(t, s.MergeListing(ctx, r, page, 2))
 	wantErr(t, s.MergeListing(ctx, r, page, 2), ErrConflict)
-	wantErr(t, s.MergeListing(ctx, r, ListingPage{NextKeyMarker: "k"}, 2), ErrConflict)
+	wantErr(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, NextKeyMarker: "k"}, 2), ErrConflict)
 	wantErr(t, s.MergeListing(ctx, r, page, 1), ErrConflict)
 	if b := bsState(t, s, r); b.RebuildPages != 0 || b.RebuildKeyMarker != "" {
 		t.Fatalf("a refused page wrote: %+v", b)
@@ -810,6 +810,7 @@ func TestMergeListing_RefusesPagesThatDoNotFit(t *testing.T) {
 		"bad key marker": {Rows: []ObjectRow{row}, NextKeyMarker: "a\x00"},
 		"long marker":    {Rows: []ObjectRow{row}, NextVersionMarker: strings.Repeat("m", 1025)},
 	} {
+		p.Launch = 1
 		if err := s.MergeListing(ctx, r, p, 2); err == nil {
 			t.Fatalf("%s: accepted", name)
 		}
@@ -817,7 +818,7 @@ func TestMergeListing_RefusesPagesThatDoNotFit(t *testing.T) {
 	if b := bsState(t, s, r); b.RebuildPages != 0 || count(t, s, "select count(*) from offsite_object") != 0 {
 		t.Fatalf("a refused page wrote: %+v", b)
 	}
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: []ObjectRow{row}, NextKeyMarker: row.Key}, 2))
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: []ObjectRow{row}, NextKeyMarker: row.Key}, 2))
 }
 
 func TestSegmentReplicated_ThatSegmentAndACompleteReplicationAfterIt(t *testing.T) {
@@ -832,22 +833,22 @@ func TestSegmentReplicated_ThatSegmentAndACompleteReplicationAfterIt(t *testing.
 	}
 	s1, s2, s3 := bsSeg(1, 1), bsSeg(1, 2), bsSeg(1, 3)
 	t1, t2, t3, t4 := bsT0, bsT0.Add(time.Minute), bsT0.Add(2*time.Minute), bsT0.Add(3*time.Minute)
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{bsRow(bsSegKey(st, "17-1", s2), 1, "v", t1)}, At: t1})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{bsRow(bsSegKey(st, "17-1", s2), 1, "v", t1)}, At: t1})
 	if repl(s2) {
 		t.Fatal("replicated without any complete replication")
 	}
-	bsUpload(t, s, r, Uploads{Complete: true, At: t2})
+	bsUpload(t, s, r, Uploads{Launch: 1, Complete: true, At: t2})
 	if !repl(s2) {
 		t.Fatal("recorded and a complete replication after it: not replicated")
 	}
 	if repl(s1) {
 		t.Fatal("a later segment alone counted for an earlier one")
 	}
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{bsRow(bsSegKey(st, "17-1", s3), 1, "v", t3)}, At: t3})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{bsRow(bsSegKey(st, "17-1", s3), 1, "v", t3)}, At: t3})
 	if repl(s3) {
 		t.Fatal("a key without a complete replication after it counted")
 	}
-	bsUpload(t, s, r, Uploads{Complete: true, At: t4})
+	bsUpload(t, s, r, Uploads{Launch: 1, Complete: true, At: t4})
 	if !repl(s3) {
 		t.Fatal("not replicated after a complete replication")
 	}
@@ -877,7 +878,7 @@ func TestNewestRecordedSegment(t *testing.T) {
 		rows = append(rows, bsRow(bsSegKey(st, "17-1", sg), 1, "v", bsT0))
 	}
 	rows = append(rows, bsRow(bsHistKey(st, "17-1", 1), 1, "v", bsT0))
-	bsUpload(t, s, r, Uploads{Rows: rows, At: bsT0})
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: rows, At: bsT0})
 	// Keys no allow-list admits, each sorting above the real ones: a listing can hold them.
 	planted := []ObjectRow{
 		{Key: fmt.Sprintf("archive/%s/17-1/0000000100000009/%s-%040x.zst", st, bsSeg(1, 9), 1), Size: 1, VersionID: "v"}, // directory mismatch
@@ -885,7 +886,7 @@ func TestNewestRecordedSegment(t *testing.T) {
 		{Key: bsSegKey(r+"-12", "17-1", bsSeg(1, 7)), Size: 1, VersionID: "v"},
 		{Key: bsSegKey(st, "x7-1", bsSeg(1, 6)), Size: 1, VersionID: "v"},
 	}
-	must(t, s.MergeListing(ctx, r, ListingPage{Rows: planted, NextKeyMarker: "k"}, 2))
+	must(t, s.MergeListing(ctx, r, ListingPage{Launch: 1, Rows: planted, NextKeyMarker: "k"}, 2))
 	for tli, want := range map[int]string{1: bsSeg(1, 5), 2: bsSeg(2, 0x100000000), 3: ""} {
 		if got := newest(tli); got != want {
 			t.Fatalf("timeline %d: %q, want %q", tli, got, want)
@@ -1053,7 +1054,7 @@ func TestTimeline_SupersededPendingNotHeld(t *testing.T) {
 
 	// A pending row above N that is not held is left as it is.
 	must(t, s.ConfirmTimeline(ctx, r, op, 2))
-	sqlExec(t, s, "insert into backup_timeline (subject, tli, state, op_id) values ($1, 4, 'pending', $2)", r, old)
+	sqlExec(t, s, "insert into backup_timeline (subject, tli, state, op_id, launch) values ($1, 4, 'pending', $2, 0)", r, old)
 	op3 := bsOp(t, s, r)
 	n, err = s.BeginRecoveryAttempt(ctx, r, st, op3, []int{2})
 	if err != nil || n != 3 {
@@ -1109,8 +1110,8 @@ func TestTimeline_OffsiteButNotHeldConflicts(t *testing.T) {
 	ctx := context.Background()
 	r, st := bsProject(t, s, 1)
 	op1, op2, op3 := bsOp(t, s, r), bsOp(t, s, r), bsOp(t, s, r)
-	sqlExec(t, s, "insert into backup_timeline (subject, tli, state, op_id) values ($1, 2, 'pending', $2), ($1, 3, 'recorded', $3)", r, op1, op2)
-	bsUpload(t, s, r, Uploads{Rows: []ObjectRow{bsRow(bsHistKey(st, "17-3", 3), 1, "v", bsT0)}, At: bsT0})
+	sqlExec(t, s, "insert into backup_timeline (subject, tli, state, op_id, launch) values ($1, 2, 'pending', $2, 0), ($1, 3, 'recorded', $3, 1)", r, op1, op2)
+	bsUpload(t, s, r, Uploads{Launch: 1, Rows: []ObjectRow{bsRow(bsHistKey(st, "17-3", 3), 1, "v", bsT0)}, At: bsT0})
 	before := bsTimelines(t, s, r)
 	_, err := s.BeginRecoveryAttempt(ctx, r, st, op3, []int{2})
 	wantErr(t, err, ErrTimelineConflict)
@@ -1197,15 +1198,15 @@ func TestLagCounts(t *testing.T) {
 	must(t, s.RecordPush(ctx, "cp", PushRecord{Complete: true, At: old}))
 	a, _ := bsProject(t, s, 1) // push old, replication fresh
 	must(t, s.RecordPush(ctx, a, PushRecord{Complete: true, At: old}))
-	bsUpload(t, s, a, Uploads{Complete: true, At: fresh})
+	bsUpload(t, s, a, Uploads{Launch: 1, Complete: true, At: fresh})
 	b, _ := bsProject(t, s, 2) // both fresh
 	must(t, s.RecordPush(ctx, b, PushRecord{Complete: true, At: fresh}))
-	bsUpload(t, s, b, Uploads{Complete: true, At: fresh})
+	bsUpload(t, s, b, Uploads{Launch: 1, Complete: true, At: fresh})
 	c, _ := bsProject(t, s, 3) // replication old, never a complete push
-	bsUpload(t, s, c, Uploads{Complete: true, At: old})
+	bsUpload(t, s, c, Uploads{Launch: 1, Complete: true, At: old})
 	d, _ := bsProject(t, s, 4) // old, but deleted: not expected to push
 	must(t, s.RecordPush(ctx, d, PushRecord{Complete: true, At: old}))
-	bsUpload(t, s, d, Uploads{Complete: true, At: old})
+	bsUpload(t, s, d, Uploads{Launch: 1, Complete: true, At: old})
 	sqlExec(t, s, "update project set state = 'deleted' where ref = $1", d)
 	e, _ := bsProject(t, s, 5) // restarting counts
 	must(t, s.RecordPush(ctx, e, PushRecord{Complete: true, At: old}))
@@ -1231,6 +1232,7 @@ func TestBackupState_OnlyTheListedFunctionsInsertObjectOrTimelineRows(t *testing
 		"MarkStanza backup_timeline",
 		"MergeListing backup_timeline",
 		"MergeListing offsite_object",
+		"MergeUnrecorded offsite_object",
 		"RecordUploads offsite_object",
 	}
 	// Every statement that writes rows into a table: its target as written

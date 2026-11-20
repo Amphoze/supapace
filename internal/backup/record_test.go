@@ -80,7 +80,7 @@ func TestRecord_PushRepositoryQuotaRaisesItsNotice(t *testing.T) {
 func TestRecord_PushNewestIsTheHighestTimelinesEntry(t *testing.T) {
 	e := newEnv(t)
 	ref := e.project("active")
-	_, err := e.db.Exec(context.Background(), `insert into backup_timeline (subject, tli, state) values ($1, 2, 'recorded'), ($1, 3, 'abandoned')`, ref)
+	_, err := e.db.Exec(context.Background(), `insert into backup_timeline (subject, tli, state, launch) values ($1, 2, 'recorded', 1), ($1, 3, 'abandoned', 0)`, ref)
 	must(t, err)
 	p := okPush()
 	p.Newest = map[string]string{"00000001": "0000000100000000000000FF", "00000003": "000000030000000000000002", "00000002": "000000020000000000000010"}

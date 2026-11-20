@@ -233,12 +233,18 @@ func TestMigrate_V2ToV3(t *testing.T) {
 	if before == "" || strings.Contains(before, "readonly_cleanup") {
 		t.Fatal("fixture is not a version-2 database")
 	}
+	// Version 3 alone, as the migrator applies it, against the whole schema;
+	// the later versions have tests of their own.
+	v3, err := migrationFiles.ReadFile(migrations[1])
+	must(t, err)
+	sqlExec(t, s, string(v3))
+	sqlExec(t, s, "update cp_meta set schema_ver = 3")
+	if after := migrationSchemaText(t, s, added...); after != before {
+		t.Fatalf("version 2's schema changed:\nbefore\n%s\nafter\n%s", before, after)
+	}
 	must(t, s.Migrate(ctx))
 	if v := schemaVer(t, s); v != schemaVersion {
 		t.Fatalf("schema version %d, want %d", v, schemaVersion)
-	}
-	if after := migrationSchemaText(t, s, added...); after != before {
-		t.Fatalf("version 2's schema changed:\nbefore\n%s\nafter\n%s", before, after)
 	}
 	for _, tbl := range added {
 		if n := count(t, s, "select count(*) from information_schema.tables where table_schema = 'public' and table_name = $1", tbl); n != 1 {
@@ -1061,7 +1067,7 @@ func TestAdmit_CountsRestoring(t *testing.T) {
 	mustCreate(t, s, ref(2))
 	_, err := s.Place(ctx, ref(2))
 	wantErr(t, err, ErrNodeFull) // restoring: it holds its cluster's memory
-	wantErr(t, s.CheckAdmission(ctx, 512), ErrNodeFull)
+	wantErr(t, s.CheckAdmission(ctx, 512, defaultShare), ErrNodeFull)
 	sqlExec(t, s, "update project set state = 'aborted', subnet_index = null where ref = $1", r)
 	mustPlace(t, s, ref(2)) // control
 }

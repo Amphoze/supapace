@@ -141,6 +141,11 @@ func newStore(t *testing.T, c nodecfg.Config) *Store {
 	if err := s.EnsureNode(ctx, c); err != nil {
 		t.Fatal(err)
 	}
+	// The connection and descriptor ceilings out of the way, as testConfig's
+	// memory and process ceilings are; the tests of those terms set their own.
+	if err := s.SetNodeAllocs(ctx, 1<<30, 1<<50); err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 
@@ -2078,12 +2083,12 @@ func TestCheckAdmission(t *testing.T) {
 	c.MemAllocMB = 2 * 768 // two default projects
 	s := newStore(t, c)
 	ctx := context.Background()
-	must(t, s.CheckAdmission(ctx, 512))
+	must(t, s.CheckAdmission(ctx, 512, defaultShare))
 	mustCreate(t, s, ref(1))
 	mustPlace(t, s, ref(1))
-	must(t, s.CheckAdmission(ctx, 512))
+	must(t, s.CheckAdmission(ctx, 512, defaultShare))
 	mustCreate(t, s, ref(2)) // not placed yet: counted all the same
-	err := s.CheckAdmission(ctx, 512)
+	err := s.CheckAdmission(ctx, 512, defaultShare)
 	wantErr(t, err, ErrNodeFull)
 	if want := "2 projects hold 1536 of the node's 1536 MiB; a project needs 768 MiB"; !strings.Contains(err.Error(), want) {
 		t.Fatalf("error %q lacks %q", err, want)
@@ -2099,7 +2104,7 @@ func TestCheckAdmission(t *testing.T) {
 	// An aborted project no longer counts.
 	must(t, s.MarkAborted(ctx, ref(1)))
 	must(t, s.MarkAborted(ctx, ref(3)))
-	must(t, s.CheckAdmission(ctx, 512))
+	must(t, s.CheckAdmission(ctx, 512, defaultShare))
 }
 
 // TestCheckAdmission_Pids: the process ceiling refuses on its own, with its
@@ -2109,9 +2114,9 @@ func TestCheckAdmission_Pids(t *testing.T) {
 	c.PidsAlloc = 2*projectPids - 1 // room for one project's processes, not two
 	s := newStore(t, c)
 	ctx := context.Background()
-	must(t, s.CheckAdmission(ctx, 512))
+	must(t, s.CheckAdmission(ctx, 512, defaultShare))
 	mustCreate(t, s, ref(1))
-	err := s.CheckAdmission(ctx, 512)
+	err := s.CheckAdmission(ctx, 512, defaultShare)
 	wantErr(t, err, ErrNodeFull)
 	if want := fmt.Sprintf("1 projects hold %d of the node's %d processes; a project needs %d", projectPids, 2*projectPids-1, projectPids); !strings.Contains(err.Error(), want) {
 		t.Fatalf("error %q lacks %q", err, want)
@@ -2126,7 +2131,7 @@ func TestCheckAdmission_NoNode(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, "delete from node"); err != nil {
 		t.Fatal(err)
 	}
-	err := s.CheckAdmission(ctx, 512)
+	err := s.CheckAdmission(ctx, 512, defaultShare)
 	wantErr(t, err, ErrConflict)
 	if errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "not initialised") {
 		t.Fatalf("error %v", err)

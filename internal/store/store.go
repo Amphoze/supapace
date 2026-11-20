@@ -47,7 +47,21 @@ type ProjectConfig struct {
 	Layout              int               `json:"layout,omitempty"`                 // 0 or 1: as built; 2: with backups
 	UploadMBPerDay      int               `json:"upload_mb_per_day,omitempty"`      // 0: 2 × disk_quota_mb
 	UploadObjectsPerDay int               `json:"upload_objects_per_day,omitempty"` // 0: the default budget
+	Outbound            bool              `json:"outbound,omitempty"`
+	Image               string            `json:"image,omitempty"`         // name@sha256:<64 hex>; empty: the node's
+	ImageVersion        string            `json:"image_version,omitempty"` // the version the image was admitted with
+	IO                  *IOLimits         `json:"io,omitempty"`            // nil: DefaultIO
 }
+
+// IOLimits are a cluster's device limits: bytes and operations a second.
+type IOLimits struct {
+	ReadBPS   int64 `json:"read_bps"`
+	WriteBPS  int64 `json:"write_bps"`
+	ReadIOPS  int64 `json:"read_iops"`
+	WriteIOPS int64 `json:"write_iops"`
+}
+
+var DefaultIO = IOLimits{128 << 20, 64 << 20, 2000, 1000}
 
 type Project struct {
 	Ref, Name, NodeID, State      string

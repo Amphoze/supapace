@@ -45,9 +45,14 @@ func (s *Store) CreateProject(ctx context.Context, np NewProject) (opID int64, e
 	if len(roles) == 0 {
 		roles = nil // the column default
 	}
+	conns, err := ProjectShare(np.Config)
+	if err != nil {
+		return 0, err
+	}
 	err = s.tx(ctx, func(tx pgx.Tx) error {
 		var epoch int64
-		if err := tx.QueryRow(ctx, "select epoch from cp_meta").Scan(&epoch); err != nil {
+		var v4 bool
+		if err := tx.QueryRow(ctx, "select epoch, schema_ver >= 4 from cp_meta").Scan(&epoch, &v4); err != nil {
 			return err
 		}
 		// One node until multi-node placement exists.
@@ -65,6 +70,11 @@ func (s *Store) CreateProject(ctx context.Context, np NewProject) (opID int64, e
 		}
 		if tag.RowsAffected() == 0 {
 			return ErrRefExists
+		}
+		if v4 {
+			if _, err := tx.Exec(ctx, "update project set conns = $2 where ref = $1", np.Ref, conns); err != nil {
+				return err
+			}
 		}
 		return tx.QueryRow(ctx, `insert into operation (ref, kind, state, step, params, epoch, generation)
 			values ($1, 'create', 'pending', '1', $2, $3, 1) returning id`, np.Ref, orEmpty(np.Params), epoch).Scan(&opID)
@@ -160,8 +170,13 @@ func (s *Store) release(ctx context.Context, ref, to string, allowed func(tx pgx
 			return fmt.Errorf("%w: project is %s", ErrConflict, state)
 		}
 		// A slice freed by a purge is held: something may still name it. One freed
-		// by an abort was never named.
-		if hold := time.Duration(sliceHold.Load()); to == "purged" && hold > 0 {
+		// by an abort is held only when the abort hold is set: a pooler may have
+		// served the create.
+		hold := time.Duration(sliceHold.Load())
+		if to == "aborted" {
+			hold = time.Duration(abortHold.Load())
+		}
+		if hold > 0 {
 			if _, err := tx.Exec(ctx, `insert into slice_hold (node_id, subnet_index, free_after)
 					select node_id, subnet_index, now() + $2 * interval '1 microsecond' from project where ref = $1 and subnet_index is not null
 				on conflict (node_id, subnet_index) do update set free_after = greatest(slice_hold.free_after, excluded.free_after)`,
@@ -223,7 +238,7 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 			Scan(&base, &count, &next, &memAlloc, &pidsAlloc, &slices); err != nil {
 			return err
 		}
-		if err := admit(ctx, tx, node, ref, false, mem, pids, memAlloc, pidsAlloc); err != nil {
+		if err := admit(ctx, tx, node, ref, false, mem, pids, 0, memAlloc, pidsAlloc); err != nil {
 			return err
 		}
 		if next >= base+count {
@@ -232,7 +247,7 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 		// With a hold set, an index held until later than now is not free, and a
 		// hold that has passed is dropped. With none set the allocator is the
 		// as-built one and reads no hold.
-		holding := sliceHold.Load() > 0
+		holding := sliceHold.Load() > 0 || abortHold.Load() > 0
 		q := `select min(i) from generate_series(0, $2 - 1) i
 			where not exists (select 1 from project where node_id = $1 and subnet_index = i)`
 		if holding {
@@ -275,10 +290,11 @@ func (s *Store) Place(ctx context.Context, ref string) (Placement, error) {
 // are the projects other than ref in provisioning, active, restarting,
 // restoring (it holds its cluster's memory) or
 // deleting — placed ones only, or with unplaced also those not placed yet.
+// Two more terms follow (connTerm): the proxy's connections, with ref's
+// stored share — a project not created yet (ref "") at the share conns
+// given —, and the descriptors its memory admission counts.
 // ErrNodeFull carries the figures.
-func admit(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, node, ref string, unplaced bool, mem, pids, memAlloc, pidsAlloc int64) error {
+func admit(ctx context.Context, q pgx.Tx, node, ref string, unplaced bool, mem, pids, conns, memAlloc, pidsAlloc int64) error {
 	var n, usedMem, usedPids int64
 	if err := q.QueryRow(ctx, `select count(*), coalesce(sum(mem_mb), 0), coalesce(sum(pids), 0) from project
 			where node_id = $1 and ref <> $2 and (uid is not null or $3) and state in ('provisioning', 'active', 'restarting', 'restoring', 'deleting')`,
@@ -293,7 +309,15 @@ func admit(ctx context.Context, q interface {
 		return fmt.Errorf("%w: admission ceiling reached: %d projects hold %d of the node's %d processes; a project needs %d",
 			ErrNodeFull, n, usedPids, pidsAlloc, pids)
 	}
-	return nil
+	if v4, err := atV4(ctx, q); err != nil || !v4 {
+		return err
+	}
+	if ref != "" {
+		if err := q.QueryRow(ctx, "select conns from project where ref = $1", ref).Scan(&conns); err != nil {
+			return err
+		}
+	}
+	return connTerm(ctx, q, node, ref, unplaced, conns, mem)
 }
 
 // QuotaHeadroomMB is the room a new disk quota must leave above the project's
@@ -329,8 +353,12 @@ func CheckQuota(quotaMB int, usedBytes int64) error {
 
 // CheckAdmission answers whether a new project whose cluster has clusterMemMB
 // would be admitted now, by the rule Place applies, also counting projects not
-// placed yet. It is advisory: Place remains the authority.
-func (s *Store) CheckAdmission(ctx context.Context, clusterMemMB int) error {
+// placed yet, at the connection share conns (ProjectShare of its
+// configuration). It is advisory: Place remains the authority.
+func (s *Store) CheckAdmission(ctx context.Context, clusterMemMB, conns int) error {
+	if err := validShare(conns); err != nil {
+		return err
+	}
 	return s.tx(ctx, func(tx pgx.Tx) error {
 		var node string
 		var memAlloc, pidsAlloc int64
@@ -340,7 +368,7 @@ func (s *Store) CheckAdmission(ctx context.Context, clusterMemMB int) error {
 		} else if err != nil {
 			return err
 		}
-		return admit(ctx, tx, node, "", true, int64(clusterMemMB+postgrestMemMB), projectPids, memAlloc, pidsAlloc)
+		return admit(ctx, tx, node, "", true, int64(clusterMemMB+postgrestMemMB), projectPids, int64(conns), memAlloc, pidsAlloc)
 	})
 }
 

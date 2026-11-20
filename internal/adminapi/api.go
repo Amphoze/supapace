@@ -674,7 +674,11 @@ func (a *api) create(r *http.Request) (any, error) {
 			return nil, err
 		}
 	}
-	if err := a.st.CheckAdmission(r.Context(), clusterMemMB); errors.Is(err, store.ErrNodeFull) {
+	share, err := store.ProjectShare(np.Config)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.st.CheckAdmission(r.Context(), clusterMemMB, share); errors.Is(err, store.ErrNodeFull) {
 		return nil, &apiError{http.StatusConflict, "node_full", strings.TrimPrefix(err.Error(), store.ErrNodeFull.Error()+": ")}
 	} else if err != nil {
 		return nil, err

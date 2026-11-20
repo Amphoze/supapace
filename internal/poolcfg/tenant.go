@@ -139,3 +139,27 @@ func ValidAllowList(c nodecfg.Config, list []string) ([]netip.Prefix, error) {
 
 // OpenAllowList is the list of a project without restrictions.
 func OpenAllowList() []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")} }
+
+// ValidAllowListOn is ValidAllowList that also refuses a prefix containing
+// one of own, the node's addresses (its interfaces' and those it declared as
+// seen from outside): what the node or another project's outbound traffic
+// sends there would arrive from such an address. An empty own is an error.
+// A refusal names the entry by its position, never by its text: a /32 entry
+// is the node's address itself.
+func ValidAllowListOn(c nodecfg.Config, own []netip.Addr, list []string) ([]netip.Prefix, error) {
+	if len(own) == 0 {
+		return nil, errors.New("poolcfg: an allow list is validated against the node's addresses, and none were given")
+	}
+	out, err := ValidAllowList(c, list)
+	if err != nil {
+		return nil, err
+	}
+	for i, p := range out {
+		for _, a := range own {
+			if p.Contains(a.Unmap()) {
+				return nil, fmt.Errorf("poolcfg: allow-list entry %d of %d holds an address of this node", i+1, len(out))
+			}
+		}
+	}
+	return out, nil
+}

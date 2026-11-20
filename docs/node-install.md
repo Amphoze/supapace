@@ -79,6 +79,14 @@ The node's firewall tables and checks assume nothing else runs on the host:
   admission ceiling of 75 % of the host's memory (or of the daemon's cgroup limit, if lower);
   the platform containers come on top (gateway limit 768 MiB, control-plane database
   256 MiB). A 4 GiB host admits 4 projects.
+- **Connections.** Admission also counts each project's share of the node's connection proxy:
+  72 connections at the default `max_connections` (120), more above it (`max_connections`
+  − 48), against a node ceiling of 2,128. So a node admits at most 28 projects at the default
+  connection settings, and fewer when projects raise `max_connections` (5 at 400), whatever
+  its memory. A create beyond that is refused with `409 node_full` and a message such as
+  "admission ceiling reached: 28 projects hold 2016 of the node's 2128 connections through
+  the proxy; a project needs 72". This release has no setting for the ceiling; a per-node
+  override arrives with a later release.
 - Go 1.25 and make to build the binaries (`make build`), or the binaries from a release.
 
 ## Install

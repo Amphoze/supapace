@@ -85,7 +85,7 @@ func (e *env) backupFixture(t *testing.T, ref string) {
 	must(t, e.st.RecordSet(ctx, store.BackupSet{Subject: ref, Label: "20261118-104332F", TLI: 1,
 		StartSegment: seg(1, 6), StopSegment: seg(1, 7), StartLSN: "0/6000028", StopLSN: "0/7000050",
 		StartAt: bkT0.Add(-10 * time.Minute), StopAt: bkT0.Add(-9 * time.Minute), JobID: job}))
-	_, err = e.st.RecordUploads(ctx, ref, store.Uploads{
+	_, err = e.st.RecordUploads(ctx, ref, store.Uploads{Launch: 1,
 		Rows: []store.ObjectRow{{Key: "archive/" + ref + "-1/16-1/0000000100000000/" + seg(1, 6), Size: 100,
 			SHA256: bytes.Repeat([]byte{1}, 32), VersionID: "v-seg", UploadedAt: bkT0.Add(-8 * time.Minute)}},
 		Info: []store.InfoVersion{{Name: "backup.info", VersionID: "v-info", SHA256: bytes.Repeat([]byte{0xab}, 32),

@@ -1783,3 +1783,20 @@ func TestAPI_AbortMessageFitsTheState(t *testing.T) {
 		t.Errorf("purged: %q", eb.Message)
 	}
 }
+
+// TestAPI_CreateRefusedWhenTheProxyIsFull: a create whose connection share
+// does not fit is refused at once with node_full, not admitted and then left
+// to fail at placement.
+func TestAPI_CreateRefusedWhenTheProxyIsFull(t *testing.T) {
+	e := newEnv(t)
+	e.active(t, demoRef)
+	// Room for one more share less one connection.
+	must(t, e.st.SetNodeAllocs(context.Background(), 112+72+71, 1<<40))
+	eb := e.wantCode(t, "POST", "/v1/projects", createBody(t, "full0000000000000000"), 409, "node_full")
+	if want := "admission ceiling reached: 1 projects hold 72 of the node's 255 connections through the proxy; a project needs 72"; eb.Message != want {
+		t.Fatalf("message %q, want %q", eb.Message, want)
+	}
+	// Control: with that connection the create is accepted.
+	must(t, e.st.SetNodeAllocs(context.Background(), 112+72+72, 1<<40))
+	e.create(t, "free0000000000000000")
+}

@@ -510,7 +510,11 @@ work, refresh it within 15 minutes only if needed, and remove it afterwards.
 ## Known limits
 
 - No backups, no restore of a deleted project, one node.
-- Ports and address ranges are fixed; the admission ceiling counts 768 MiB per project.
+- Ports and address ranges are fixed; the admission ceiling counts 768 MiB per project, and
+  the node's connection ceiling (2,128) holds at most 28 projects at the default
+  `max_connections`, fewer above it, whatever the memory: the next create is refused with
+  `409 node_full` ("… connections through the proxy; a project needs 72"). There is no
+  setting for that ceiling in this release; a per-node override arrives with a later release.
 - The repair round does not re-check running containers: an unadoptable or disconnected
   running container is handled at the next daemon start or containment clear. A route left
   draining by a failed operation of an active project is not restored by the round. A cluster

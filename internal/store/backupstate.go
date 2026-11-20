@@ -100,12 +100,14 @@ type Uploads struct {
 	BudgetBytes   int64
 	BudgetObjects int
 	At            time.Time
+	Launch        int64 // the launch number of the job whose result this is (Job.Launch)
 }
 
 type ListingPage struct {
 	Rows                             []ObjectRow
 	NextKeyMarker, NextVersionMarker string
 	Last                             bool
+	Launch                           int64 // the launch number of the job whose result this is (Job.Launch)
 }
 
 var ErrTimelineConflict = errors.New("store: timeline is off-site but not in the repository")
@@ -198,7 +200,7 @@ func (s *Store) MarkStanza(ctx context.Context, subject string) error {
 		if subject == "cp" {
 			return nil
 		}
-		_, err = tx.Exec(ctx, `insert into backup_timeline (subject, tli, state) values ($1, 1, 'recorded')
+		_, err = tx.Exec(ctx, `insert into backup_timeline (subject, tli, state, launch) values ($1, 1, 'recorded', 0)
 			on conflict (subject, tli) do nothing`, subject)
 		return err
 	})
@@ -285,7 +287,12 @@ func (s *Store) MarkForcedFull(ctx context.Context, subject string, day time.Tim
 // takes the new hash, inode and ctime only under the same version id (a
 // missing one never matches),
 // and otherwise stays as it is and raises notice offsite-differs.
+// A new row takes u.Launch, the copy job's launch number; one that is not
+// above zero is ErrNoLaunch, and nothing is written.
 func (s *Store) RecordUploads(ctx context.Context, subject string, u Uploads) (overBudget bool, err error) {
+	if u.Launch <= 0 {
+		return false, ErrNoLaunch
+	}
 	if len(u.Rows) > bklimit.ReplMaxFiles || len(u.Info) > 4 || len(u.SetsComplete) > bklimit.ReplMaxFiles {
 		return false, fmt.Errorf("store: %d rows, %d info versions, %d sets: above the job's caps", len(u.Rows), len(u.Info), len(u.SetsComplete))
 	}
@@ -325,14 +332,14 @@ func (s *Store) RecordUploads(ctx context.Context, subject string, u Uploads) (o
 		// row had no hash and was not adopted by the insert differs.
 		differs, _ := tx.Query(ctx, `with i as (select * from unnest($2::text[], $3::bigint[], $4::bytea[], $5::bigint[], $6::bigint[],
 				$7::text[], $8::timestamptz[]) as t(key, size, sha256, ino, ctime_ns, version_id, uploaded_at)),
-			w as (insert into offsite_object (subject, key, size, sha256, ino, ctime_ns, version_id, uploaded_at)
-				select $1, key, size, sha256, ino, ctime_ns, nullif(version_id, ''), uploaded_at from i
+			w as (insert into offsite_object (subject, key, size, sha256, ino, ctime_ns, version_id, uploaded_at, launch)
+				select $1, key, size, sha256, ino, ctime_ns, nullif(version_id, ''), uploaded_at, $9 from i
 				on conflict (subject, key) do update set sha256 = excluded.sha256, ino = excluded.ino, ctime_ns = excluded.ctime_ns
 				where offsite_object.sha256 is null and offsite_object.version_id = excluded.version_id
 				returning key)
 			select o.key from offsite_object o join i on o.key = i.key
 			where o.subject = $1 and o.sha256 is null and o.key not in (select key from w)`,
-			subject, keys, sizes, hashes, inos, ctimes, versions, ats)
+			subject, keys, sizes, hashes, inos, ctimes, versions, ats, u.Launch)
 		dk, err := pgx.CollectRows(differs, pgx.RowTo[string])
 		if err != nil {
 			return err
@@ -495,8 +502,13 @@ func (s *Store) NewestRecordedSegment(ctx context.Context, subject string, tli i
 	return segment, wrap(err)
 }
 
-// MergeListing merges one page of a rebuild listing, in one transaction.
+// MergeListing merges one page of a rebuild listing, in one transaction. A
+// new row takes page.Launch, the rebuild job's launch number; one that is
+// not above zero is ErrNoLaunch, and nothing is written.
 func (s *Store) MergeListing(ctx context.Context, subject string, page ListingPage, epoch int64) error {
+	if page.Launch <= 0 {
+		return ErrNoLaunch
+	}
 	if len(page.Rows) > bklimit.RebuildPageRows {
 		return fmt.Errorf("store: %d listed rows, at most %d", len(page.Rows), bklimit.RebuildPageRows)
 	}
@@ -536,14 +548,14 @@ func (s *Store) MergeListing(ctx context.Context, subject string, page ListingPa
 		}
 		// A row that has a hash keeps everything but seen_epoch; a row rebuilt
 		// from a listing takes what this listing says.
-		if _, err := tx.Exec(ctx, `insert into offsite_object (subject, key, size, version_id, uploaded_at, seen_epoch)
-				select $1, key, size, nullif(version_id, ''), uploaded_at, $6
+		if _, err := tx.Exec(ctx, `insert into offsite_object (subject, key, size, version_id, uploaded_at, seen_epoch, launch)
+				select $1, key, size, nullif(version_id, ''), uploaded_at, $6, $7
 				from unnest($2::text[], $3::bigint[], $4::text[], $5::timestamptz[]) as t(key, size, version_id, uploaded_at)
 			on conflict (subject, key) do update set seen_epoch = excluded.seen_epoch,
 				size = case when offsite_object.sha256 is null then excluded.size else offsite_object.size end,
 				version_id = case when offsite_object.sha256 is null then excluded.version_id else offsite_object.version_id end,
 				uploaded_at = case when offsite_object.sha256 is null then excluded.uploaded_at else offsite_object.uploaded_at end`,
-			subject, keys, sizes, versions, ats, epoch); err != nil {
+			subject, keys, sizes, versions, ats, epoch, page.Launch); err != nil {
 			return err
 		}
 		if subject != "cp" {
@@ -554,8 +566,8 @@ func (s *Store) MergeListing(ctx context.Context, subject string, page ListingPa
 				}
 			}
 			if len(tlis) > 0 {
-				if _, err := tx.Exec(ctx, `insert into backup_timeline (subject, tli, state)
-					select $1, tli, 'abandoned' from unnest($2::integer[]) as t(tli) on conflict (subject, tli) do nothing`, subject, tlis); err != nil {
+				if _, err := tx.Exec(ctx, `insert into backup_timeline (subject, tli, state, launch)
+					select $1, tli, 'abandoned', 0 from unnest($2::integer[]) as t(tli) on conflict (subject, tli) do nothing`, subject, tlis); err != nil {
 					return err
 				}
 			}
@@ -700,7 +712,7 @@ func (s *Store) BeginRecoveryAttempt(ctx context.Context, ref, stanza string, op
 		}
 		pending = n
 		if _, ok := row[n]; !ok {
-			_, err := tx.Exec(ctx, `insert into backup_timeline (subject, tli, state, op_id) values ($1, $2, 'pending', $3)`, ref, n, opID)
+			_, err := tx.Exec(ctx, `insert into backup_timeline (subject, tli, state, op_id, launch) values ($1, $2, 'pending', $3, 0)`, ref, n, opID)
 			return err
 		}
 		off, err := hasArchive(ctx, tx, ref, stanza, fmt.Sprintf("%08X.history", n))
@@ -718,9 +730,11 @@ func (s *Store) BeginRecoveryAttempt(ctx context.Context, ref, stanza string, op
 
 // ConfirmTimeline makes opID's pending timeline tli recorded and sets the
 // operation's t8_done, in one transaction; anything else is ErrConflict.
+// The recorded timeline draws a launch number: what a restore made is
+// ordered among the jobs.
 func (s *Store) ConfirmTimeline(ctx context.Context, ref string, opID int64, tli int) error {
 	return s.tx(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `update backup_timeline set state = 'recorded'
+		tag, err := tx.Exec(ctx, `update backup_timeline set state = 'recorded', launch = nextval('backup_job_launch')
 			where subject = $1 and tli = $2 and state = 'pending' and op_id = $3`, ref, tli, opID)
 		if err != nil {
 			return err

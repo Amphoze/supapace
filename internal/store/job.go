@@ -29,18 +29,19 @@ type Job struct {
 	Params, Result             json.RawMessage
 	Code, Message              string
 	Runs, DeadlineS            int
+	Launch                     int64 // drawn when the job went running; 0: queued, or launched before the number existed
 	CreatedAt                  time.Time
 	StartedAt, FinishedAt      *time.Time
 }
 
 const jobCols = `id, subject, lane, kind, state, coalesce(op_id, 0), op_step, params, result, coalesce(code, ''),
-	coalesce(message, ''), runs, deadline_s, created_at, started_at, finished_at`
+	coalesce(message, ''), runs, deadline_s, coalesce(launch, 0), created_at, started_at, finished_at`
 
 func scanJob(row pgx.Row) (Job, error) {
 	var j Job
 	var params, result []byte
 	err := row.Scan(&j.ID, &j.Subject, &j.Lane, &j.Kind, &j.State, &j.OpID, &j.OpStep, &params, &result, &j.Code,
-		&j.Message, &j.Runs, &j.DeadlineS, &j.CreatedAt, &j.StartedAt, &j.FinishedAt)
+		&j.Message, &j.Runs, &j.DeadlineS, &j.Launch, &j.CreatedAt, &j.StartedAt, &j.FinishedAt)
 	j.Params, j.Result = params, result
 	return j, err
 }
@@ -114,12 +115,15 @@ func (s *Store) SubmitJobAndPark(ctx context.Context, opID int64, j NewJob) (id 
 // subject whose last job started longest ago (never: first), then the lowest
 // id. Each subject offers only its lowest eligible queued job (f), so two
 // workers of one lane never go for the same subject: the second passes over
-// the job the first holds to another subject.
+// the job the first holds to another subject. The same statement draws the
+// job's launch number, the order in which jobs went running; a pick the slot
+// refuses leaves a gap in the sequence, which no reader of the order minds.
 //
 // ponytail: the last-start order groups every job row of the lane's queued
 // subjects (no index on subject); pruning keeps that to 48 h of jobs. Add an
 // index on (subject, started_at) if a pick shows up in measurements.
-const pickJob = `update backup_job set state = 'running', runs = runs + 1, started_at = now()
+const pickJob = `update backup_job set state = 'running', runs = runs + 1, started_at = now(),
+	launch = nextval('backup_job_launch')
 	where id = (
 		select q.id from backup_job q
 		join (select m.subject, min(m.id) as id from backup_job m left join project mp on mp.ref = m.subject

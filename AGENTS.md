@@ -4182,3 +4182,66 @@ interrupted. dashboard show exits 1 unless in_force. member add always prints th
 hint (a removal does not end a session). A not_in_force removal or revocation says the
 principal is still admitted; a failed rotation step says the old key may still pass. When
 an answer is lost, the commands name where to look (call.look).
+
+### 2026-11-20 — store: schema 4, admission terms, settings, alerts, backup-operation records
+
+- Schema version 4 (migration_4.sql): operation kinds settings and rekey-login; job kinds
+  expire, verify, drop-spool and offsite-expire; sequence backup_job_launch; node.conn_alloc
+  (2128), desc_alloc (2^29), pass_at, clock_hold_until; project.conns (back-filled from the
+  stored max_connections), settings, read_only_since, rekey_pending; schedule columns on
+  backup_state; expired_local_at and offsite_removed_at on backup_set; sent_count and
+  sent_at on backup_notice; tables restore_point, alert and issuance. Additive but for the
+  two kind checks. Migrate runs before any admission; admit's two terms apply from version 4.
+- Launch numbers: NextJob's pick draws one (Job.Launch; 0 while queued or for a job launched
+  before version 4). offsite_object.launch and backup_timeline.launch are NOT NULL with no
+  default, so every insert names the column. RecordUploads takes Uploads.Launch, MergeListing
+  ListingPage.Launch, MergeUnrecorded the launch of the job id it is given; a number that is
+  not above zero is ErrNoLaunch, before any write. An existing row keeps its number.
+  ConfirmTimeline stamps the recorded timeline; a recorded timeline above 1 without a number
+  fails a check constraint. Callers fill Launch from the store.Job whose result they record.
+- Admission: Place refuses with ErrNodeFull (the figures in the message) when the counted
+  projects' conns plus this one's plus poolcfg.ProxyFixedConns exceed node.conn_alloc, or
+  their memory admission times 2^20 / 230 exceeds node.desc_alloc. ProjectShare(cfg) is a
+  configuration's share: max_connections - 48, 72 at the default 120. At the default ceiling
+  a node holds at most 28 default projects, whatever its memory. CheckAdmission(ctx, memMB,
+  share) is the advisory form for the create handler; Place stays the authority. CheckConns
+  and SetConns for a share change; SetNodeAllocs(conn, desc), both above zero, is the
+  daemon's at start (until then the defaults stand). SetAbortSliceHold(d): an aborted
+  create's slice is held for d (0, the default: not held); process-wide, set once.
+- Settings: ProjectSettings with api, pooler, rate, aud and stopped; JSON snake_case
+  (schemas, extra_search_path, max_rows, pool_size, max_clients, allow_list, rps, burst).
+  Validate holds every bound, including the effective pool size (the default 5 when none is
+  given) through poolcfg.Fits, and refuses an allow list while restrictions are not offered,
+  before it reads the node's addresses. SubmitSettings needs an active project, no open
+  operation and the stored document equal to base; StoreSettings writes for an open settings
+  operation. Refusals are ErrConflict; match with errors.Is.
+- Re-keys: SubmitRekey submits rekey-login for a free active project, else queues the login
+  once (at most 16 a project; a 17th is ErrConflict). PendingRekeys lists every project's
+  queue, so filter the free ones yourself; FailedRekeys lists the logins whose newest
+  rekey-login failed. PromoteNextSecret moves name.next into name, takes the login off the
+  queue and, for the read-only login, owes its clean-up again; with no .next it writes
+  nothing.
+- Alerts: RaiseAlert upserts (count + 1; an open page stays page; a lift to page or a
+  re-open is pending at once); at most 64 rows a subject and 16 numeric figures. ClearAlert
+  closes a row. PendingAlerts returns alert rows, cleared ones included, and backup notices
+  whose count moved and whose last delivery is older than repeat. MarkAlertSent never lowers
+  the count sent. OpenAlerts returns open rows only.
+- Backup operations:
+  - Schedule, MarkSchedule, SetFullDue.
+  - ExpireAllowed: the record is rebuilt, and a complete copy was launched after every
+    writer other than the expire itself.
+  - MarkExpiredLocal.
+  - OffsiteExpirePlan reads launch numbers only. It fails with ErrNotRebuilt, or with
+    ErrClock when a job of the subject is dated after now. It returns at most max keys, with
+    More set when there are others. An anchor may come with no key.
+  - RecordPass and ClockHold.
+  - MergeUnrecorded needs a version id on every row.
+  - MarkPurgeSeen, PurgeAllowed ("state" / "wait"), SetPurgeWait (--keep; --now only while
+    the purge flag is set, else ErrConflict), ClearOffsitePurge.
+  - MergeUnrecorded and PruneObjects take at most 2,000 keys.
+  - PruneInfoVersions keeps each name's newest and both fetch candidates of every staying
+    set.
+  - InfoVersionsAsOf, InfoVersionsFor, SetsListedBy, DropsSince.
+- poolcfg.ValidAllowListOn: ValidAllowList, plus a refusal of any prefix holding one of the
+  node's addresses (named by its position, never by its text). An empty address list is an
+  error.
