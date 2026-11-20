@@ -17,9 +17,14 @@
 // with node_full; a restart to a disk quota below the project's usage plus
 // store.QuotaHeadroomMB with quota_below_usage; a restore target outside the
 // backups' window with out_of_window and the window. The backups document is
-// read from the store alone. Projects and keys carry the project's URL and the path of
-// the CA certificate that signed the gateway's (read from node.json and the
-// node's TLS files at each request).
+// read from the store alone. Projects and keys carry the project's URL and the
+// path of the CA certificate that signed the gateway's (read from node.json
+// and the node's TLS files at each request).
+//
+// A dashboard write (members, the sign-in issuer, revocations, a service-key
+// rotation) answers 200 once in force and 503 not_in_force when it is
+// committed and not yet in force (members.go). It is not refused while
+// containment is unverified: a removal is a cut-off.
 package adminapi
 
 import (
@@ -172,6 +177,18 @@ func New(st *store.Store, kek secrets.KEK, ops Ops, domain string, p nodecfg.Pat
 	m.HandleFunc("GET /v1/operations/{id}", read(a.showOperation))
 	m.HandleFunc("POST /v1/operations/{id}/retry", a.mutation(a.retry))
 	m.HandleFunc("GET /v1/node/check", read(a.nodeCheck))
+	// The dashboard's authorization table: writes answer 200 once in force.
+	m.HandleFunc("GET /v1/projects/{ref}/members", read(a.listMembers))
+	m.HandleFunc("POST /v1/projects/{ref}/members", read(a.addMember))
+	m.HandleFunc("POST /v1/projects/{ref}/members/role", read(a.setRole))
+	m.HandleFunc("POST /v1/projects/{ref}/members/remove", read(a.removeMember))
+	m.HandleFunc("POST /v1/projects/{ref}/members/clean-jobs", read(a.cleanJobs))
+	m.HandleFunc("POST /v1/projects/{ref}/service-key/rotate", read(a.rotateKey))
+	m.HandleFunc("GET /v1/projects/{ref}/audit", read(a.audit))
+	m.HandleFunc("GET /v1/dashboard", read(a.dashboard))
+	m.HandleFunc("GET /v1/dashboard/issuer", read(a.showIssuer))
+	m.HandleFunc("PUT /v1/dashboard/issuer", read(a.setIssuer))
+	m.HandleFunc("POST /v1/dashboard/revocations", read(a.revoke))
 	noRoute := read(func(*http.Request) (any, error) { return nil, notFound("no such route") })
 	m.HandleFunc("/", noRoute)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -207,8 +224,11 @@ func conflict(format string, args ...any) error {
 // internal error answers with a fixed message; the error itself is logged.
 func toError(r *http.Request, err error) (int, any) {
 	var ae *apiError
+	var nif *notInForceError
 	var we *store.WindowError
 	switch {
+	case errors.As(err, &nif):
+		return http.StatusServiceUnavailable, nif.body
 	case errors.As(err, &we):
 		var w windowJSON // a bound that is not known is null
 		if !we.From.IsZero() {

@@ -90,7 +90,12 @@ func MarshalJWKS(keys []Key) ([]byte, error) {
 // usable, a usable entry carries a private member, is outside the bounds of
 // KeyFromJWK, or shares its kid with another usable entry (ErrKey); or when a
 // usable entry has no kid (ErrNoKID).
-func ParseJWKS(b []byte, class Class) ([]Key, error) {
+func ParseJWKS(b []byte, class Class) ([]Key, error) { return parseJWKS(b, class, false) }
+
+// parseJWKS is ParseJWKS; with keyOps (the dashboard's sign-in keys) an entry
+// whose key_ops is present and holds no "verify" is skipped too, and a key_ops
+// that is not an array of strings refuses the set.
+func parseJWKS(b []byte, class Class, keyOps bool) ([]Key, error) {
 	if len(b) > maxJWKS {
 		return nil, ErrMalformed
 	}
@@ -133,7 +138,11 @@ func ParseJWKS(b []byte, class Class) ([]Key, error) {
 				return nil, ErrKey
 			}
 		}
-		if _, hasUse := m["use"]; kty != "RSA" || hasUse && use != "sig" {
+		verify, err := verifyOp(m, keyOps)
+		if err != nil {
+			return nil, err
+		}
+		if _, hasUse := m["use"]; kty != "RSA" || hasUse && use != "sig" || !verify {
 			continue
 		}
 		if _, hasAlg := m["alg"]; hasAlg && a != alg {
@@ -156,4 +165,27 @@ func ParseJWKS(b []byte, class Class) ([]Key, error) {
 		return nil, ErrKey
 	}
 	return keys, nil
+}
+
+// verifyOp reports whether an entry may verify signatures by its key_ops:
+// true when it is not read (check false) or absent; else whether it holds
+// "verify". A key_ops that is not an array of strings is ErrMalformed.
+func verifyOp(m map[string]any, check bool) (bool, error) {
+	v, present := m["key_ops"]
+	if !check || !present {
+		return true, nil
+	}
+	ops, ok := v.([]any)
+	if !ok {
+		return false, ErrMalformed
+	}
+	verify := false
+	for _, o := range ops {
+		s, ok := o.(string)
+		if !ok {
+			return false, ErrMalformed
+		}
+		verify = verify || s == "verify"
+	}
+	return verify, nil
 }

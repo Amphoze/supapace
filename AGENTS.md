@@ -4096,3 +4096,89 @@ Known limits
 - Known limits: the stalling fake server is the only hostile-server mode run; the restore-spool
   temporary-name case waits for the serve job's naming; "a link swapped in during a backup" is a
   race whose every outcome is checked; the documents' pointer members decode into values.
+
+### 2026-11-20 — adminapi and CLI: dashboard members, issuer, revocations, rotation, audit
+
+Routes (internal/adminapi/members.go, audit.go; registered in New). Writes answer 200 when in
+force, 503 not_in_force when committed and not yet in force:
+- GET /v1/projects/{ref}/members; POST …/members {issuer?,subject,role}; POST …/members/role
+  {issuer?,subject,role,service_key?}; POST …/members/remove {issuer?,subject,service_key?}.
+  The principal travels in the body only; issuer omitted = the stored dashboard issuer
+  (conflict when none). subject and issuer: 1-255 bytes of printable ASCII. role: owner,
+  developer, read_only. service_key: default (also omitted), keep, rotate.
+- POST …/members/clean-jobs (no body); POST …/service-key/rotate (no body);
+  GET …/audit?tail=N (1-1000, default 100).
+- GET /v1/dashboard (conflict without the pusher capability); GET and PUT
+  /v1/dashboard/issuer; POST /v1/dashboard/revocations.
+- Every route but audit and service-key/rotate answers conflict on a node without a studio
+  domain. The body rules of the API hold (unknown, repeated or upper-case member: bad_request).
+
+Containment: while it is not verified, member add and a raised role (read_only < developer <
+owner) answer 503 containment_failed before any write. Removals, lowered roles, revocations,
+the issuer and rotations are served. A read_only membership that ends is committed and pushed
+but its clean-up is not run in the request (jobs "not run: containment not verified", 503);
+clean-jobs is refused; the round runs the owed record after its containment check.
+
+Member document: ref, issuer, subject, role (null when removed), previous_role, service_key
+("unchanged" | "rotated" | "kept"), rotation ({gateway, rest} or null), still_valid (text when
+an owner's key was kept, else null), jobs ("ran" | "failed: …" | "not run: …" | null),
+dashboard_generation (null when the file is not in force).
+
+Rotation rule: an owner whose membership ends (removed or another role) rotates the project's
+service_role key unless service_key is keep; rotate rotates any change; an owner who stays an
+owner never rotates (service_key rotate is then bad_request: use rotate-key).
+
+Order of a member write: every check and every needed capability first (nothing is written
+when one is missing); the store change (ChangeMemberRotating when rotating, else
+store.ChangeMember with the role read just before: a concurrent change is conflict); the
+dashboard push; then, only if the previous role was read_only and the new one is not, the
+push gave a generation above 0 and containment is verified, DropReadOnlyJobs under 20 s.
+
+503 not_in_force: one JSON object, "code":"not_in_force", "message":"committed; not yet in
+force: <step>: <cause>[; …]" with step "dashboard file", "service-key rotation" or "read-only
+clean-up", then the document's members. A repeated request answers conflict or not_found:
+the change is made. clean-jobs answers 503 with jobs "not run: …" or "failed: …" and a
+message without "committed".
+
+Capabilities, asserted at use on Ops (Ops is unchanged); the daemon implements them:
+- StudioDomain() string; PushDashboard(ctx) (generation, error) and DashboardInForce(ctx)
+  (generation, inForce, error): generation 0 means no file in force, also with a nil error;
+- ChangeMemberRotating(ctx, ref, issuer, subject, fromRole, toRole) (RotationOutcome, error)
+  and RotateServiceKey(ctx, ref) (RotationOutcome, error): a non-nil error means nothing was
+  committed (wrap store.ErrNotFound / store.ErrConflict); a committed rotation whose later
+  step failed returns RotationOutcome.Err;
+- DropReadOnlyJobs(ctx, ref) error.
+Every error text of a capability is shown to the operator, sanitised and capped at 1 KiB:
+it must carry no secret. Keep each call bounded: the whole request must end inside the
+admin server's write timeout.
+
+Issuer (PUT): the key set is parsed with jwtx.ParseDashboardJWKS; only the keys it keeps
+(RSA; use sig or none; alg RS256 or none; key_ops absent or holding "verify") are stored,
+re-encoded by jwtx.MarshalJWKS. A key_ops that is not an array of strings refuses the set;
+the project path (ParseJWKS) does not read key_ops. An encryption-only set is bad_request and
+the stored issuer is unchanged. At most 16 keys; kid 1-255 printable ASCII. authorize_url and
+a non-empty end_session_url: https, a host, no user information, no '#', printable ASCII, at
+most 2048 bytes. session_seconds 300-28800 (default 28800). A key whose modulus equals a
+stored project key is bad_request. Known limit: a project created later with the same public
+key is not refused (it gains no private key).
+
+Revocation: not_before is printed rounded up to the second (the time the file refuses from).
+GET /v1/dashboard: in_force true only with a generation above 0; members counts live
+projects.
+
+Audit: <DataDir>/<ref>/audit.log.1 then audit.log, Studio's files and untrusted: DataDir and
+<ref> opened O_DIRECTORY|O_NOFOLLOW by openat, files O_NOFOLLOW|O_NONBLOCK, fstat regular
+with one link only (a link, hard link, FIFO or directory is conflict naming it; absent is an
+empty list), 16 MiB together newest first, lines walked in place, at most 2 x tail records
+held, lines of at most 4 KiB with exactly the record's members (sql_sha256 optional) and the
+project's ref, each text sanitised; others count in skipped. truncated: bytes left unread or
+records beyond tail.
+
+CLI (cmd/supapace/members.go): member add|set-role|remove|list|clean-jobs, dashboard issuer
+set|show, dashboard revoke ISSUER SUBJECT, dashboard show, project rotate-key REF --service,
+project audit REF [--tail N]. stdout is the one answer document (503 included); notes go to
+stderr, cleaned; exit 0 success, 1 any API error including not_in_force, 2 usage, 130
+interrupted. dashboard show exits 1 unless in_force. member add always prints the revoke
+hint (a removal does not end a session). A not_in_force removal or revocation says the
+principal is still admitted; a failed rotation step says the old key may still pass. When
+an answer is lost, the commands name where to look (call.look).

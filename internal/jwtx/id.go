@@ -171,9 +171,10 @@ func DashboardKeyFromJWK(kid, n, e string) (Key, error) {
 }
 
 // ParseDashboardJWKS is ParseJWKS, with every check of it, for a key set of
-// ClassDashboard.
+// ClassDashboard; an entry whose key_ops is present and holds no "verify" is
+// also skipped (a key_ops that is not an array of strings is ErrMalformed).
 func ParseDashboardJWKS(b []byte) ([]Key, error) {
-	keys, err := ParseJWKS(b, "issuer")
+	keys, err := parseJWKS(b, "issuer", true)
 	if err != nil {
 		return nil, err
 	}

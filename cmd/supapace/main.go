@@ -144,6 +144,99 @@ Projects:
   project delete REF [--no-wait]
   project purge REF [--no-wait]    purge a deleted project now
   project abort REF [--no-wait]    abort a create that has not completed
+  project rotate-key REF --service
+                           replace the project's service_role key; it
+                           cannot be undone. Once the command answers
+                           without an error the gateway refuses the old
+                           key; an answer not_in_force (exit 1) means the
+                           daemon finishes the rotation in its next rounds.
+                           The project's own server-side clients must take
+                           the new key (project keys REF)
+  project audit REF [--tail N]
+                           the newest N records (1 to 1000, default 100) of
+                           the SQL the dashboard ran for the project: when,
+                           who (issuer and subject), with which role and
+                           login, the kind and the SHA-256 of the text
+
+Dashboard members (a node with a studio domain):
+  member add REF --subject SUB --role ROLE [--issuer ISS]
+      --subject SUB        the principal's sub claim at its issuer: 1 to
+                           255 characters of printable ASCII
+      --role ROLE          owner, developer or read_only
+      --issuer ISS         the principal's issuer (default: the dashboard
+                           issuer of 'dashboard issuer set')
+      A removal does not end a session: if the principal was removed in
+      the last eight hours and kept its session cookie, the cookie is
+      valid again once it is added back. 'supapace dashboard revoke
+      ISSUER SUBJECT' ends every session of a principal.
+      While the node's containment is not verified (see 'supapace node
+      check'), member add and a role change that raises a role are
+      refused (containment_failed); removals, lowered roles, revocations,
+      the dashboard issuer and rotations are served.
+  member set-role REF --subject SUB --role ROLE [--issuer ISS]
+                  [--keep-service-key | --rotate-service-key]
+      What a role change that ends an owner's or a read_only membership
+      does is what a removal does: see 'supapace member remove --help'.
+      Raising a role is refused while the node's containment is not
+      verified; lowering one is served (see 'supapace member add --help').
+  member remove REF --subject SUB [--issuer ISS]
+                [--keep-service-key | --rotate-service-key]
+      The gateway refuses the member's requests from its next reading of
+      the dashboard file, which the command writes before it answers.
+      An answer not_in_force (exit 1) means the change is stored but the
+      gateway still admits the member until the daemon writes the file;
+      'supapace dashboard show' exits 0 once it does.
+      An owner who stops being one (removed, or given another role):
+      the project's service_role key is rotated, which cannot be undone;
+      the project's own server-side clients must take the new key
+      (project keys REF). --keep-service-key leaves the key valid, so
+      that member add undoes the change; the answer's still_valid says
+      what the former owner may still use. --rotate-service-key rotates
+      it whatever the role; an owner who stays an owner keeps it.
+      A read_only member who stops being one: the read-only role's
+      database sessions are ended and its scheduled jobs deleted, the
+      other read-only members' included (their sessions reconnect; their
+      jobs must be scheduled again). The daemon runs this clean-up before
+      the command answers (while the node's containment is not verified,
+      only once it is) and once more shortly after; a session can outlive
+      the first run. Nothing skips it.
+      A developer's removal rotates nothing by default
+      (--rotate-service-key does). A removal ends dashboard access only: a
+      statement the member already started runs to its end, and what an
+      owner or developer did in the database as postgres stays.
+  member list REF          the project's members: issuer, subject, role and
+                           when each was added (also listed on stderr)
+  member clean-jobs REF    run the read-only role's clean-up now: its
+                           sessions are ended and its scheduled jobs
+                           deleted; no member changes. Refused while the
+                           dashboard file is not in force
+
+Dashboard (a node with a studio domain):
+  dashboard issuer set --issuer ISS --client-id ID --authorize-url URL
+                       --jwks FILE [--end-session-url URL]
+                       [--session-hours N]
+      --issuer ISS         the iss claim of the issuer's ID tokens, exactly
+      --client-id ID       the dashboard's client id at the issuer
+      --authorize-url URL  the issuer's authorization endpoint: https, no
+                           fragment
+      --jwks FILE          the issuer's public JSON Web Key Set. Its RSA
+                           signing keys (RS256, 2048 to 4096 bits) are
+                           used, at most 16; keys of other types or for
+                           encryption are left out. A key of a project is
+                           refused
+      --end-session-url URL
+                           where signing out sends the browser (https)
+      --session-hours N    how long a session lasts: 1 to 8 (default 8)
+  dashboard issuer show
+  dashboard revoke ISSUER SUBJECT
+                           end every session of the principal on every
+                           project of this node; it can sign in again
+                           where it is still a member
+  dashboard show           the studio domain, the number of members and
+                           revocations, and in_force: whether the gateway
+                           applies the latest member, issuer and
+                           revocation changes. It exits 0 only when
+                           the gateway reads the file the store renders
 
 Operations:
   op list [REF]
@@ -161,7 +254,9 @@ Exit status:
   0    success
   1    an API error; an operation that ended failed, aborted or superseded
        (for project abort, aborted is the success); a check with "ok":
-       false; the daemon could not be reached
+       false; the daemon could not be reached; a dashboard change that is
+       committed but not yet in force (not_in_force: the daemon retries,
+       and 'supapace dashboard show' tells when it is)
   2    usage, or an argument that cannot be read
   130  interrupted while waiting (the operation continues on the node)
 `
@@ -230,6 +325,11 @@ type call struct {
 	check        bool     // the body's "ok" decides the exit status
 	ref          string   // the project the command is about, when known
 	roles        []string // project create: the user roles asked for
+	look         string   // where to look (quoted commands) after a request whose answer was lost; "": the operations
+	before       string   // printed to stderr before the request
+	// notes prints what the operator must know about the answer to stderr
+	// and returns the exit status; nil: the status alone decides.
+	notes func(stderr io.Writer, status int, body []byte) int
 }
 
 // usageError is a malformed command line: printed with the usage text.
@@ -284,23 +384,42 @@ var arity = map[string][2]int{
 	"project check": {1, 1}, "project restart": {1, 1}, "project delete": {1, 1}, "project purge": {1, 1},
 	"project abort": {1, 1}, "project backups": {1, 1}, "project restore": {1, 1}, "op list": {0, 1},
 	"op show": {1, 1}, "op retry": {1, 1}, "node check": {0, 0},
+	"member add": {1, 1}, "member set-role": {1, 1}, "member remove": {1, 1}, "member list": {1, 1}, "member clean-jobs": {1, 1},
+	"dashboard issuer set": {0, 0}, "dashboard issuer show": {0, 0}, "dashboard revoke": {2, 2}, "dashboard show": {0, 0},
+	"project rotate-key": {1, 1}, "project audit": {1, 1},
 }
 
 func isHelp(s string) bool { return s == "help" || s == "-h" || s == "-help" || s == "--help" }
+
+// verbOf splits the command words from the arguments: two words, or three
+// for "dashboard issuer".
+func verbOf(args []string) (verb string, rest []string) {
+	if len(args) < 2 {
+		return "", nil
+	}
+	verb, rest = args[0]+" "+args[1], args[2:]
+	if verb == "dashboard issuer" && len(rest) > 0 && !strings.HasPrefix(rest[0], "-") && !isHelp(rest[0]) {
+		verb, rest = verb+" "+rest[0], rest[1:]
+	}
+	return verb, rest
+}
 
 func parse(args []string) (c call, err error) {
 	if len(args) > 0 && isHelp(args[0]) {
 		return call{}, errHelp
 	}
-	if len(args) > 1 && isHelp(args[1]) && (args[0] == "project" || args[0] == "op" || args[0] == "node") {
+	if len(args) > 1 && isHelp(args[1]) && slices.Contains([]string{"project", "op", "node", "member", "dashboard"}, args[0]) {
 		return call{}, errHelp
 	}
 	if len(args) < 2 {
 		return call{}, usagef("missing command")
 	}
-	verb, rest := args[0]+" "+args[1], args[2:]
+	verb, rest := verbOf(args)
 	ar, known := arity[verb]
 	if !known {
+		if len(rest) > 0 && isHelp(rest[0]) && commandUsage(verb) != "" {
+			return call{}, errHelp // a group of commands: "dashboard issuer --help"
+		}
 		return call{}, usagef("unknown command %q", verb)
 	}
 	fs := flag.NewFlagSet(verb, flag.ContinueOnError)
@@ -368,6 +487,7 @@ func parse(args []string) (c call, err error) {
 	case "project list":
 		fs.Var(&states, "state", "")
 	}
+	build := dashCall(verb, fs)
 	// Flags may come before, between and after positional arguments; "--"
 	// ends them.
 	var pos []string
@@ -413,6 +533,9 @@ func parse(args []string) (c call, err error) {
 		arg = url.PathEscape(pos[0])
 	}
 	project := "/v1/projects/" + arg
+	if build != nil {
+		return build(pos, project)
+	}
 
 	switch verb {
 	case "project create":
@@ -542,8 +665,8 @@ func run(args []string, c client, stdout, stderr io.Writer) int {
 	cl, err := parse(args)
 	// The command named, when it is one: its usage stands for the whole text.
 	var cmd string
-	if len(args) > 1 {
-		cmd = commandUsage(args[0] + " " + args[1])
+	if v, _ := verbOf(args); v != "" {
+		cmd = commandUsage(v)
 	}
 	var ue usageError
 	switch {
@@ -572,6 +695,9 @@ func run(args []string, c client, stdout, stderr io.Writer) int {
 	}}
 	// A mutation catches SIGINT and SIGTERM from its first request on: the
 	// operator must learn what may already have happened.
+	if cl.before != "" {
+		say(stderr, "%s", cl.before)
+	}
 	ctx := context.Background()
 	if cl.method != "GET" && !cl.check {
 		var stop context.CancelFunc
@@ -580,19 +706,29 @@ func run(args []string, c client, stdout, stderr io.Writer) int {
 	}
 	status, body, err := do(ctx, hc, cl.method, cl.path, cl.body)
 	if err != nil && ctx.Err() != nil {
-		look := "supapace op list"
+		look := "'supapace op list'"
 		if cl.ref != "" {
-			look += " " + cl.ref
+			look = "'supapace op list " + cl.ref + "'"
 		}
-		fmt.Fprintf(stderr, "supapace: interrupted before the answer; the request may already have been accepted; look with '%s'\n", look)
+		if cl.look != "" {
+			look = cl.look
+		}
+		fmt.Fprintf(stderr, "supapace: interrupted before the answer; the request may already have been accepted; look with %s\n", look)
 		return 130
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "supapace: %v\n", reach(c.sock, err))
+		var op *net.OpError
+		if cl.look != "" && !(errors.As(err, &op) && op.Op == "dial") {
+			fmt.Fprintf(stderr, "supapace: the request may already have been accepted; look with %s\n", cl.look)
+		}
 		return 1
 	}
 	if status != http.StatusAccepted || cl.wait == "" {
 		stdout.Write(body)
+		if cl.notes != nil {
+			return cl.notes(stderr, status, body)
+		}
 		if status/100 != 2 {
 			return 1
 		}
