@@ -47,6 +47,13 @@ func TestTable_SliceRemoved_ItsConnectionsCut_OthersKept(t *testing.T) {
 		t.Fatal("slice 3's port still accepts")
 	}
 	query(t, kept)
+	// apply opens slice 9's socket only after the removed slice's sockets
+	// have ended: the cut seen by the client does not mean it listens yet.
+	until(t, "slice 9 listening", func() bool {
+		r.p.mu.Lock()
+		defer r.p.mu.Unlock()
+		return r.p.slots[member{9, "a"}] != nil
+	})
 	r.served(peerA2, "a", 9)
 	if u, _ := r.counts("a"); u != 2 {
 		t.Fatalf("%d units held, want slice 7's and slice 9's", u)
@@ -127,6 +134,12 @@ func TestTable_ShapeChangeIsNotReloaded(t *testing.T) {
 			edit(&tb)
 			r.write(tb)
 			until(t, "the change logged", func() bool { return strings.Contains(r.logs.String(), "shape changed") })
+			// The change is logged before the rest is applied.
+			until(t, "slice 7's new allowance in use", func() bool {
+				r.p.mu.Lock()
+				defer r.p.mu.Unlock()
+				return r.p.slots[member{7, "a"}].allowance == 1
+			})
 			got := r.table()
 			if got.MaxConns != old.MaxConns || len(got.Classes) != 1 || got.Classes[0].PortBase != old.Classes[0].PortBase ||
 				len(got.Classes[0].Peers) != 2 || got.Classes[0].SockBufBytes != old.Classes[0].SockBufBytes ||

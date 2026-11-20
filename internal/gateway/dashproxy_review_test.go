@@ -92,8 +92,7 @@ func TestDashProxy_SlowUploadPastTheReadTimeout_H1AndH2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go srv.ServeTLS(ln, "", "")
-	t.Cleanup(func() { srv.Close() })
+	goServe(t, srv, ln, true)
 	for _, h2 := range []bool{false, true} {
 		req := e.wireReq(t, t.Context(), "POST", "/x", &tricklingBody{5})
 		req.ContentLength = -1

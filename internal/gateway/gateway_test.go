@@ -1220,12 +1220,78 @@ func (e *env) serve(t *testing.T, withTLS bool, mod func(*http.Server)) string {
 	}
 	if withTLS {
 		s.TLSConfig.Certificates = []tls.Certificate{testCert(t)}
+	}
+	goServe(t, s, ln, withTLS)
+	return ln.Addr().String()
+}
+
+// The gateway's handlers read package globals that tests set and restore
+// (dashForward, dashAuth, dashTransport, dashcfg.Limits). Server.Close does
+// not wait for its handlers, so a handler can still be unwinding when a
+// cleanup restores one: every cleanup that restores a global calls
+// stopServers first, whatever the order its helper was called in.
+var liveServers struct {
+	sync.Mutex
+	stops map[testing.TB][]func()
+}
+
+// goServe serves s on ln until the test ends or stopServers(t) runs, which
+// close s and wait for every handler it started to return.
+func goServe(t testing.TB, s *http.Server, ln net.Listener, withTLS bool) {
+	t.Helper()
+	var (
+		mu     sync.Mutex
+		closed bool
+		wg     sync.WaitGroup
+	)
+	h := s.Handler
+	s.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if closed { // a request read before the close: nothing runs for it
+			mu.Unlock()
+			return
+		}
+		wg.Add(1)
+		mu.Unlock()
+		defer wg.Done()
+		h.ServeHTTP(w, r)
+	})
+	if withTLS {
 		go s.ServeTLS(ln, "", "")
 	} else {
 		go s.Serve(ln)
 	}
-	t.Cleanup(func() { s.Close() })
-	return ln.Addr().String()
+	stop := func() {
+		s.Close()
+		mu.Lock()
+		closed = true
+		mu.Unlock()
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+			t.Errorf("a handler still runs 20 s after its server was closed")
+		}
+	}
+	liveServers.Lock()
+	if liveServers.stops == nil {
+		liveServers.stops = map[testing.TB][]func(){}
+	}
+	liveServers.stops[t] = append(liveServers.stops[t], stop)
+	liveServers.Unlock()
+	t.Cleanup(func() { stopServers(t) })
+}
+
+// stopServers closes the servers t runs and waits for their handlers.
+func stopServers(t testing.TB) {
+	liveServers.Lock()
+	stops := liveServers.stops[t]
+	delete(liveServers.stops, t)
+	liveServers.Unlock()
+	for _, stop := range stops {
+		stop()
+	}
 }
 
 // testCert is a self-signed certificate for *.sp.test, made per run.

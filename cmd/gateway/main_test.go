@@ -89,9 +89,22 @@ func TestRun_SignalDrains(t *testing.T) {
 	if !stopped.Load() {
 		t.Error("signal handling not restored while a request is in flight")
 	}
+	// The request is still held, so run must still be waiting for it. A run
+	// that gave up on it returns here; slowness can only hide that, never fail
+	// a correct run.
+	early := false
+	select {
+	case err := <-done:
+		early = true
+		t.Errorf("run returned (%v) %v after the signal, with a request in flight", err, time.Since(start))
+	case <-time.After(time.Second):
+	}
 	close(release)
 	if c := <-got; c != 200 {
 		t.Errorf("in-flight request: %d", c)
+	}
+	if early {
+		return
 	}
 	select {
 	case err := <-done:

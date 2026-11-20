@@ -45,7 +45,7 @@ func newFwdEnv(t *testing.T) *dashEnv {
 func setLimits(t *testing.T, f func(*dashcfg.LimitSet)) {
 	t.Helper()
 	old := dashcfg.Limits
-	t.Cleanup(func() { dashcfg.Limits = old })
+	t.Cleanup(func() { stopServers(t); dashcfg.Limits = old })
 	f(&dashcfg.Limits)
 }
 
@@ -59,7 +59,7 @@ func studioAt(t *testing.T, addr string) *http.Transport {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}
 	dashTransport = tr
-	t.Cleanup(func() { tr.CloseIdleConnections(); dashTransport = old })
+	t.Cleanup(func() { stopServers(t); tr.CloseIdleConnections(); dashTransport = old })
 	return tr
 }
 
@@ -172,8 +172,7 @@ func serveDashTLS(t *testing.T, e *dashEnv) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go srv.ServeTLS(ln, "", "")
-	t.Cleanup(func() { srv.Close() })
+	goServe(t, srv, ln, true)
 	return ln.Addr().String()
 }
 

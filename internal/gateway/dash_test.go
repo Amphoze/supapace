@@ -159,7 +159,7 @@ func newDashEnv(t *testing.T, routesFile *routes.File, table bool) *dashEnv {
 	}
 	e.gw.SetDashboard(e.d)
 	oldF, oldA := dashForward, dashAuth
-	t.Cleanup(func() { dashForward, dashAuth = oldF, oldA })
+	t.Cleanup(func() { stopServers(t); dashForward, dashAuth = oldF, oldA })
 	dashForward = func(w http.ResponseWriter, r *http.Request, dr *dashRequest) {
 		e.mu.Lock()
 		e.fwd = append(e.fwd, dr)

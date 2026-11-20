@@ -61,8 +61,7 @@ func TestDashSession_NotPresented_OnTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go srv.ServeTLS(ln, "", "")
-	t.Cleanup(func() { srv.Close() })
+	goServe(t, srv, ln, true)
 	mark := "https://" + dhostA + "/-/auth/session?at=" + strconv.FormatInt(time.Now().Unix()-5, 10)
 	send := func(referer string) (int, int) {
 		e.resetSeams()

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -228,14 +229,18 @@ func TestNode_ImageFilesAndControlPlaneDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	sock := filepath.Join(a.p.CPDir(), "sock", ".s.PGSQL.5432")
+	// The socket file exists from the bind, before the server listens: wait
+	// for a dial that succeeds.
 	deadline := time.Now().Add(90 * time.Second)
 	for {
-		if fi, err := os.Lstat(sock); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		c, err := net.DialTimeout("unix", sock, time.Second)
+		if err == nil {
+			c.Close()
 			break
 		}
 		if time.Now().After(deadline) {
 			logs, _ := exec.Command("docker", "logs", "--tail", "20", cpName).CombinedOutput()
-			t.Fatalf("no socket at %s: %s", sock, logs)
+			t.Fatalf("nothing listens at %s: %v: %s", sock, err, logs)
 		}
 		time.Sleep(time.Second)
 	}

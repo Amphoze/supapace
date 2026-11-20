@@ -43,8 +43,7 @@ func TestDashHostClasses_PerRequestOnOneConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go srv.ServeTLS(ln, "", "")
-	t.Cleanup(func() { srv.Close() })
+	goServe(t, srv, ln, true)
 	cookie := "__Host-sp-session=" + e.session(t, refA, issuer, subOwnerA, time.Now().Unix()-10, 3600)
 
 	c, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{InsecureSkipVerify: true, ServerName: dhostA,
