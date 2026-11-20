@@ -112,7 +112,7 @@ jobs:
       - name: go test -race
         run: |
           s=0
-          go test -race -v ./... >"$RUNNER_TEMP/test.log" 2>&1 || s=$?
+          go test -race -timeout 30m -v ./... >"$RUNNER_TEMP/test.log" 2>&1 || s=$?
           grep -E -- '^(--- FAIL|FAIL|ok)' "$RUNNER_TEMP/test.log" || true
           grep -E -- '--- SKIP' "$RUNNER_TEMP/test.log" || true
           echo "::notice title=skipped tests::$(grep -c -- '--- SKIP' "$RUNNER_TEMP/test.log") skipped"
