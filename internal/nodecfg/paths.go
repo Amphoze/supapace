@@ -75,3 +75,4 @@ func (p Paths) NftLock() string        { return p.at(etcDir, "nft.lock") }
 func (p Paths) CPStanzaSealed() string { return p.at(etcDir, "cp-stanza.sealed") }
 func (p Paths) EscrowAcked() string    { return p.at(etcDir, "escrow.acked") }
 func (p Paths) OffsiteCheck() string   { return p.at(etcDir, "offsite.check") }
+func (p Paths) AlertSealed() string    { return p.at(etcDir, "alert.sealed") }

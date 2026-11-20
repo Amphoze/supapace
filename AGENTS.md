@@ -4483,3 +4483,39 @@ is the Studio request guard's, a later patch.
   `TestAgent_PurgeDirLayout2RemovesSpools` purges a filled layout-2 directory (files, a nested
   directory, a link out of the project directory) with layout-1 controls with and without spool
   trees. The unit fakes model no subdirectories: only the reach test catches a missed tree.
+
+### 2026-11-21 — alert: the alert transport and supapaced alert
+internal/alert delivers alert rows as JSON documents to one operator-declared HTTPS endpoint
+and pings a dead-man address per stanza.
+- Declaration{URL, CAPEM, DeadmanURL}: prints and marshals with paths and queries cut
+  (Redact: scheme://host[:port]). Load/Save: Paths.AlertSealed() (/etc/supapace/alert.sealed),
+  sealed under the node key with the name "alert", 0600, owned by the caller; no file is
+  (zero, false, nil). Load refuses a link, a non-regular file, more than 1 MiB, a mode wider
+  than 0600 and another owner.
+- Save refuses: not https (http only to 127.0.0.1:<port> on a node whose dev-mode marker is a
+  regular file); over 2,048 bytes; non-printable; user information; fragment; bad port; a
+  dead-man template without {stanza} or outside the same rules; a CA bundle over 512 KiB or
+  without certificates. No refusal quotes an address. Load re-checks against the marker.
+- ReadAddressFile(path): one printable line from a regular file not reached through a link,
+  at most 2,048 bytes and a final newline; the error never quotes the content.
+- MarkTested(p, k, d): records a delivered test only while the file still holds d; Save
+  always clears it. NotReady(): "alert destination not declared" | "dead-man address not
+  declared" | "no test alert delivered to the declared destination" | "".
+- NewSender(st, node, load); Run: a round at once, then every 15 s: PendingAlerts(1 h, 64),
+  one POST each, marked after delivery (at least once). The first failure ends the round.
+  Status(): last success and last failure times. Ping does not touch Status.
+- Send: POST application/json over HTTP/1.1, 10 s, no redirect, no proxy, at most 16 KiB of
+  answer header, body unread, 2xx delivered. Errors name scheme://host and a fixed reason
+  only; ErrUndeclared. Ping(ctx, stanza): GET of the template with {stanza} replaced,
+  stanza [a-z0-9][a-z0-9-]{0,62}; ErrNoDeadman when none is declared.
+- Document members: node, subject (node|cp|ref), code, severity, count, first_at, last_at,
+  figures (at most 16, names [a-z][a-z0-9_]{0,31}; {} when none). Severity(code) is the
+  fixed table; a new notice code needs a row there (a test reads the store's and the
+  runner's raisers). A row whose code or subject no document can carry is logged and sent
+  as code unlisted-code: its subject and severity when valid (else node, page), its count
+  and times, no figures.
+- supapaced alert set --url-file F [--ca-file F] [--deadman-url-file F] (--url and
+  --deadman-url exit 2), show, test (records the test in the sealed file), send --code C
+  (no daemon or database; an unlisted code exits 2). Root only; failures exit 1.
+- Known limits: a destination that refuses one document holds back the others until that
+  row is raised again; alert test does not exercise the dead-man address.
