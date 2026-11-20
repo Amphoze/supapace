@@ -292,7 +292,7 @@ func TestUpstream_IdleConnectionsCloseAfterTheTimeout(t *testing.T) {
 // audiences and wakes. None may hand the upstream transport a hook (a trace,
 // a body whose Read it calls) or write to a response from a goroutine of its
 // own: such code runs beside the server's writer (see forward).
-var gatewayAdditions = []string{"rate.go", "aud.go"}
+var gatewayAdditions = []string{"rate.go", "aud.go", "wake.go"}
 
 func TestGatewayAdditions_UseNoTransportHook(t *testing.T) {
 	for _, f := range gatewayAdditions {

@@ -4519,3 +4519,49 @@ and pings a dead-man address per stanza.
   (no daemon or database; an unlisted code exits 2). Root only; failures exit 1.
 - Known limits: a destination that refuses one document holds back the others until that
   row is raised again; alert test does not exercise the dead-man address.
+
+### 2026-11-21 — Gateway: lazy wake; the wake socket
+
+internal/wakesock: the wake socket, both ends. HTTP/1.1 over one Unix socket.
+- SocketName "wake.sock"; WakeBound 10 s (the gateway's hold and the daemon's bound for one
+  wake); Backoff 60 s (no wake asked for a project after a failed one); MaxIdleRefs 1024.
+- POST /v1/wake/<ref>, no body: 204 woken, 409 busy, 504 failed or not in time.
+  POST /v1/idle {"refs":[...]}: at most MaxIdleRefs refs, 204. Bodies at most 64 KiB of
+  strict JSON (unknown members, trailing data refused). Anything else, a ref not of the
+  20-character form, or a request not of HTTP/1.1 is refused (400/404/405/505) before the
+  handler. The target is matched as sent: no query, escape or other spelling reaches it.
+- NewClient(path) / (*Client).Wake(ctx, ref): nil | ErrBusy | ErrFailed | ErrUnavailable
+  (match with errors.Is; a call that ran out of time is ErrUnavailable joined with
+  context.DeadlineExceeded). (*Client).Idle(ctx, refs). Nothing is dialled without a socket
+  file at the path; one connection per call, none kept; every call returns within WakeBound;
+  answer header 8 KiB, body read 64 KiB at most.
+- Serve(ctx, path, peerUID, h): replaces a stale socket, refuses anything else at the path,
+  sets root:<peerUID> 0660 (the owner only when run as root), closes a peer of another uid
+  unanswered, at most 16 connections, header 8 KiB within 2 s, body within 2 s, idle 2 s.
+  Each Handler call (Wake and Idle) gets a context ending at WakeBound and is answered then
+  (504) whether or not it returned; a handler that ignores its context keeps its goroutine,
+  so it must return within WakeBound. Up to 16 calls may run at once.
+
+Gateway (wake.go; route entries gain their own asleep state, the route file's idle_stop_s
+is at most 86400):
+- An asleep project is woken only by a request that passed the key check, the rate bucket,
+  the route check and the declared body length; a keyless request gets 401 as for an active
+  project. One wake per project in flight, the others wait on it; at most 4 on the node; a
+  source (IPv6 /64) asks at most 6 wakes a minute per project (joining spends none). A
+  project holds at most its in-flight cap (128) of waiting requests, asker included, counted
+  until each is answered: at most 512 on the gateway. A request waits at most WakeBound for
+  the wake and for the table to show the project active, then forwards; every refusal is
+  the draining 503 project_restarting with Retry-After: 5, at once when over a limit.
+- A wake that failed or was not answered within the bound backs the project off for Backoff
+  (its requests answered at once); ErrBusy starts none and is answered at once.
+- (*Gateway).SetWake(*wakesock.Client) before serving; (*Gateway).ReportIdle(ctx) runs the
+  idle report every 30 s: the active projects with no request in flight and none for
+  idle_stop_s since the report at which each was first seen active; sent in pieces of
+  MaxIdleRefs. Activity is a request that passed the checks above; anyone holding a
+  project's public anon key can keep it awake.
+- cmd/gateway dials /run/wake/wake.sock; the gateway's container needs that directory
+  mounted (read-only is enough). Without the socket an asleep project answers 503
+  project_restarting and nothing is sent.
+- Known limits: held requests sit outside the in-flight caps (bounded at 512 above); a tenant
+  owning many projects whose wakes stall can keep the four places busy; the declared body
+  length is checked before the wake, a chunked body over the cap is refused while streaming.

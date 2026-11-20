@@ -19,7 +19,7 @@ type File struct {
 	Generation int64              `json:"generation"`
 	Domain     string             `json:"domain"`
 	Projects   map[string]Project `json:"projects"`
-	IdleStopS  int                `json:"idle_stop_s,omitempty"` // 0: the gateway reports no idle project
+	IdleStopS  int                `json:"idle_stop_s,omitempty"` // 0: the gateway reports no idle project; at most 86400
 }
 
 type Project struct {
@@ -48,12 +48,12 @@ type Key struct {
 var refRE = regexp.MustCompile(`^[a-z0-9]{20}$`)
 
 // Parse decodes a route file strictly: trailing data, unknown fields, a
-// generation below 1, a domain that is not lowercase DNS labels, a negative
-// idle period, a malformed ref, an unknown state, a rest URL other than
-// http://<ipv4>:3000 (every state needs one), more than 8 audiences or one
-// that is not 1-255 printable bytes, a rate outside rps 1-100000 and burst
-// rps to 10 x rps, or a project without both an anon and a service_role key
-// are errors. A table with no projects is valid.
+// generation below 1, a domain that is not lowercase DNS labels, an idle
+// period outside 0-86400 seconds, a malformed ref, an unknown state, a rest
+// URL other than http://<ipv4>:3000 (every state needs one), more than 8
+// audiences or one that is not 1-255 printable bytes, a rate outside rps
+// 1-100000 and burst rps to 10 x rps, or a project without both an anon and
+// a service_role key are errors. A table with no projects is valid.
 func Parse(b []byte) (File, error) {
 	var f File
 	dec := json.NewDecoder(bytes.NewReader(b))
@@ -83,8 +83,8 @@ func (f File) validate() error {
 	if f.Generation < 1 || !nodecfg.ValidDomain(f.Domain) {
 		return fmt.Errorf("routes: generation %d or domain %q: not a valid table", f.Generation, f.Domain)
 	}
-	if f.IdleStopS < 0 {
-		return fmt.Errorf("routes: idle_stop_s %d is negative", f.IdleStopS)
+	if f.IdleStopS < 0 || f.IdleStopS > 86400 {
+		return fmt.Errorf("routes: idle_stop_s %d is not 0-86400", f.IdleStopS)
 	}
 	for ref, p := range f.Projects {
 		if !refRE.MatchString(ref) {

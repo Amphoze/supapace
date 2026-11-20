@@ -17,9 +17,13 @@ import (
 	"time"
 
 	"github.com/Amphoze/supapace/internal/gateway"
+	"github.com/Amphoze/supapace/internal/wakesock"
 )
 
 const dir = "/etc/supapace/gateway"
+
+// wakeSocket is the daemon's wake socket, mounted when the node has one.
+const wakeSocket = "/run/wake/" + wakesock.SocketName
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -53,6 +57,8 @@ func start(ctx context.Context, dir string) (*gateway.Gateway, tls.Certificate, 
 	}
 	go tbl.Watch(ctx, time.Second)
 	g := gateway.New(tbl)
+	g.SetWake(wakesock.NewClient(wakeSocket)) // without the socket file nothing is sent
+	go g.ReportIdle(ctx)
 	if d := gateway.LoadDashboard(dir); d != nil {
 		if err := d.Reload(); err != nil {
 			log.Printf("gateway: no dashboard table yet (503 until one is read): %v", err)

@@ -48,6 +48,7 @@ type Gateway struct {
 	projectCap int
 	byProject  map[string]int // proxied requests in flight per ref; no zero entries
 	rates      rates          // request buckets per ref
+	wake       waker          // wakes of asleep projects, idle reports
 
 	dash *Dashboard // nil without a studio domain
 }
@@ -152,6 +153,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.ContentLength > maxBody {
 		fail(w, http.StatusRequestEntityTooLarge, "body_too_large")
+		return
+	}
+	if p, ok = g.awake(w, r, ref, p); !ok {
 		return
 	}
 	// The project's slot first: a project at its cap takes no global slot.

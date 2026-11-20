@@ -17,6 +17,7 @@ import (
 // project is one route entry, its keys already parsed and bounded.
 type project struct {
 	draining  bool
+	asleep    bool     // served only once woken (wake.go)
 	upstream  *url.URL // http://<platform address>:3000
 	userRoles []string
 	keys      []jwtx.Key
@@ -30,6 +31,7 @@ type table struct {
 	generation int64
 	domain     string
 	projects   map[string]*project
+	idleStop   int // seconds; 0: no project is reported idle
 }
 
 // Table holds the route table read from the route file. Requests read one
@@ -114,13 +116,13 @@ func (t *Table) Watch(ctx context.Context, every time.Duration) {
 // build turns a parsed route file into a snapshot. Keys go through
 // jwtx.KeyFromJWK, so one key outside its bounds refuses the whole file.
 func build(f routes.File) (*table, error) {
-	tb := &table{generation: f.Generation, domain: f.Domain, projects: make(map[string]*project, len(f.Projects))}
+	tb := &table{generation: f.Generation, domain: f.Domain, idleStop: f.IdleStopS, projects: make(map[string]*project, len(f.Projects))}
 	for ref, p := range f.Projects {
 		u, err := url.Parse(p.Rest)
 		if err != nil {
 			return nil, fmt.Errorf("routes: %s: rest: %w", ref, err)
 		}
-		np := &project{draining: p.State == "draining" || p.State == "asleep", upstream: u, userRoles: p.UserRoles,
+		np := &project{draining: p.State == "draining", asleep: p.State == "asleep", upstream: u, userRoles: p.UserRoles,
 			stopped: p.State == "stopped", aud: p.Aud, rate: p.Rate}
 		for _, k := range p.Keys {
 			key, err := jwtx.KeyFromJWK(k.KID, jwtx.Class(k.Class), k.N, k.E)
