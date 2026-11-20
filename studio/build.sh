@@ -270,6 +270,10 @@ cmd_image() {
       echo "peak_bytes $(cat /sys/fs/cgroup/memory.peak)" >>/out/stats
       cp apps/studio/.supapace/resolved-config.json apps/studio/routeTree.gen.ts /out/ 2>/dev/null || true
       [ $rc = 0 ] || exit $rc
+      # the bundler'"'"'s own parser (the rolldown its vite resolves), for gates 50 and 60
+      p=$(cd apps/studio && node -p "require(\"path\").dirname(require(\"module\").createRequire(require.resolve(\"vite/package.json\")).resolve(\"rolldown/package.json\"))")
+      mkdir -p /out/parser/node_modules/@rolldown && cp -aL "$p" /out/parser/node_modules/rolldown
+      cp -aL "$p"/../@rolldown/binding-* /out/parser/node_modules/@rolldown/
       mkdir -p /out/srv/apps/studio && cp -a apps/studio/.output /out/srv/apps/studio/
       find /out/srv -name "*.map" -delete
       # every package of studio and its workspace packages, dev ones included: the bundler
@@ -283,6 +287,7 @@ cmd_image() {
       die "the build failed (log: $W/out/build.log)"
     }
   cp "$W/out/build.log" "$W/out/resolved-config.json" "$G/"
+  cp -a "$W/out/routeTree.gen.ts" "$W/out/parser" "$G/"
   local build_wall=$((SECONDS - tb))
 
   # the runtime image, first with an empty record
@@ -322,6 +327,9 @@ cmd_image() {
   measure
   write_record
 
+  # the tables and a copy of the build output, for gates 50, 60 and 70 and their seeds
+  cp "$HERE/routes.tsv" "$HERE/env.tsv" "$HERE/public.tsv" "$HERE/origins.txt" "$G/"
+  rm -rf "$G/output" && cp -a "$W/ctx/srv/apps/studio/.output" "$G/output"
   bash "$HERE/gates/seeds/gen.sh" "$CACHE/upstream" "$G/seeds-gen"
   local g
   for g in "$HERE"/gates/[0-9][0-9]-*.sh; do

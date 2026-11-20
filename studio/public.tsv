@@ -1,0 +1,38 @@
+# Every value the bundler freezes into the dashboard's bundles, and where upstream's hosted
+# values remain. Gate 70-public holds it. Tab-separated:
+#   NAME  TEXT     a name of the bundler's resolved replacement map (define, in every
+#                  environment) and the replacement text it is given
+#   @upstream:apps/studio/.env:NAME  FILE
+#                  a value of upstream's pinned .env that the build finds in the bundle file
+#                  FILE (a bundler hash written [hash]): named by file and name, never by value
+# No plain row may hold a value of upstream's .env. A patch that changes what is frozen
+# changes these rows in the same commit.
+#
+global	globalThis
+import.meta.env.TSS_DEV_SERVER	"false"
+import.meta.env.TSS_DEV_SSR_STYLES_BASEPATH	"/"
+import.meta.env.TSS_DEV_SSR_STYLES_ENABLED	"true"
+import.meta.env.TSS_DISABLE_CSRF_MIDDLEWARE_WARNING	"false"
+import.meta.env.TSS_INLINE_CSS_ENABLED	"false"
+import.meta.env.TSS_ROUTER_BASEPATH	""
+import.meta.env.TSS_SERVER_FN_BASE	"/_serverFn/"
+process.env.MAINTENANCE_MODE	""
+process.env.NEXT_PUBLIC_SENTRY_DSN	undefined
+process.env.NEXT_PUBLIC_SENTRY_ENVIRONMENT	undefined
+process.env.NEXT_PUBLIC_SENTRY_SAMPLE_RATE_OTHER	undefined
+process.env.NEXT_PUBLIC_SENTRY_SAMPLE_RATE_OWNED	undefined
+process.env.NEXT_PUBLIC_SENTRY_SAMPLE_RATE_USER_FAULT	undefined
+process.env.NEXT_PUBLIC_VERCEL_DEPLOYMENT_ID	undefined
+process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA	undefined
+process.env.NODE_ENV	"production"
+process.env.TSS_DEV_SERVER	"false"
+process.env.TSS_DEV_SSR_STYLES_BASEPATH	"/"
+process.env.TSS_DEV_SSR_STYLES_ENABLED	"true"
+process.env.TSS_DISABLE_CSRF_MIDDLEWARE_WARNING	"false"
+process.env.TSS_INLINE_CSS_ENABLED	"false"
+process.env.TSS_ROUTER_BASEPATH	""
+process.env.TSS_SERVER_FN_BASE	"/_serverFn/"
+#
+@upstream:apps/studio/.env:NEXT_PUBLIC_SUPABASE_URL	server/mcp-server+[...].mjs
+@upstream:apps/studio/.env:SUPABASE_PUBLIC_URL	server/_ssr/router-[hash].mjs
+@upstream:apps/studio/.env:SUPABASE_URL	server/_ssr/router-[hash].mjs

@@ -4434,3 +4434,40 @@ Known limits:
 - A parked operation has no wait bound of its own until its job is picked.
 - Until the daemon wires SetJobs, a layout-2 create fails at 5a and its
   abort at C0, both with code internal.
+
+### 2026-11-21 — The served surface: route, environment, origin and frozen-value tables
+Files of studio/ (tab-separated, # comments). A patch that changes what is served, read or
+frozen changes its rows in the same commit.
+- routes.tsv: KIND ID METHODS CLASS REF PHASE. Every API route, page route and server function
+  of the build; class served | opt-in | deleted; phase P1 | P2 | never, - when served. A
+  deleted route's file is a line of delete.txt. At this pin: api 32 served, 13 opt-in
+  (/api/ai/, /api/mcp), 59 deleted; 223 pages; 1 server function.
+- env.tsv: NAME set | unset, or NAME dynamic FILE. set: the process environment (the agent's
+  fixed names, the image label's names, HOSTNAME, HOME, the image's ENV). unset: read by the
+  server bundle, never set; the code takes its default. dynamic: FILE (hash written [hash])
+  has a read that cannot be resolved; one row per name it can yield, PREFIX_*, * (hands the
+  whole environment on) or - (none). A dynamic row excuses its whole file.
+- public.tsv: the bundler's replacement map as built (NAME TEXT), and
+  @upstream:<file>:<name> FILE rows for upstream's hosted values found in the bundles.
+- origins.txt: DIGEST BUNDLE ROLE. DIGEST: first 16 hex of SHA-256 of the lower-cased
+  scheme://host literal, or @upstream:<file>:<name>; BUNDLE client | server | both; ROLE
+  text | request (a page or the server contacts it on load). Gate 70 prints every built
+  origin with its digest and bundle on every build: review that list.
+Gates (studio/gates/, run in name order by build.sh image):
+- 50-routes: route tree, route registrations, server-function manifest, and the server's own
+  router (one /** route to the renderer, rules only headers, the public-file middleware
+  alone) against routes.tsv, both ways; ref-shaped static segments, public file names and
+  function ids fail.
+- 60-env: syntax-tree walk of every server-bundle file with the bundler's parser.
+- 70-public: the replacement map and hosted values against public.tsv; origins of any case,
+  with escaped slashes, in .js .mjs .cjs .html .css .json .svg .webmanifest.
+- 90-selftest: every seed of every gate but 40 must be refused; writes gates.json,
+  [{gate, seed, result}], result refused | passed | not applied | needs a build. Seeds may
+  add files under DIR/output/.
+Limits: the walks read the bundle as written, one file at a time; a value reaching the
+process object, the environment, a handler table or an origin through an alias plus a
+computed key, a non-literal module name, a reflective call, code compiled at run time, or a
+URL assembled at run time is not seen (the recorded browser session finds contacted origins).
+Public files are held only by their names' shape. A deleted route's path reaches the page
+fallback (404 page, 406 for JSON, 307 for a trailing slash); the hard 404/405 for API paths
+is the Studio request guard's, a later patch.

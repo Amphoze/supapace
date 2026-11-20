@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] surface: no PATCH on the config and pooling routes
+
+The config and pooling routes answer GET only: the PATCH handlers, which changed nothing and
+answered 200, are removed with their entries in the route handlers.
+---
+ .../routes/api/platform/database/$ref/pooling.ts       | 10 ++--------
+ .../routes/api/platform/projects/$ref/config/index.ts  |  9 +--------
+ 2 files changed, 3 insertions(+), 16 deletions(-)
+
+diff --git a/apps/studio/routes/api/platform/database/$ref/pooling.ts b/apps/studio/routes/api/platform/database/$ref/pooling.ts
+index f5aa273d..eac74e57 100644
+--- a/apps/studio/routes/api/platform/database/$ref/pooling.ts
++++ b/apps/studio/routes/api/platform/database/$ref/pooling.ts
+@@ -12,10 +12,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+   switch (method) {
+     case 'GET':
+       return handleGetAll(req, res)
+-    case 'PATCH':
+-      return handlePatch(req, res)
+     default:
+-      res.setHeader('Allow', ['GET', 'PATCH'])
++      res.setHeader('Allow', ['GET'])
+       res.status(405).json({ data: null, error: { message: `Method ${method} Not Allowed` } })
+   }
+ }
+@@ -30,12 +28,8 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+   return res.status(200).json({ project })
+ }
+ 
+-const handlePatch = async (_req: NextApiRequest, res: NextApiResponse) => {
+-  return res.status(200).json({})
+-}
+-
+ const webHandler = toWebHandler(nextHandler)
+ 
+ export const Route = createFileRoute('/api/platform/database/$ref/pooling')({
+-  server: { handlers: { GET: webHandler, PATCH: webHandler } },
++  server: { handlers: { GET: webHandler } },
+ })
+diff --git a/apps/studio/routes/api/platform/projects/$ref/config/index.ts b/apps/studio/routes/api/platform/projects/$ref/config/index.ts
+index 7be64314..14b8bc30 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/config/index.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/config/index.ts
+@@ -12,8 +12,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+   switch (method) {
+     case 'GET':
+       return handleGetAll(req, res)
+-    case 'PATCH':
+-      return handlePatch(req, res)
+     default:
+       res.setHeader('Allow', ['GET'])
+       res.status(405).json({ data: null, error: { message: `Method ${method} Not Allowed` } })
+@@ -33,13 +31,8 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+   })
+ }
+ 
+-const handlePatch = async (_req: NextApiRequest, res: NextApiResponse) => {
+-  // Platform specific endpoint
+-  return res.status(200).json({})
+-}
+-
+ const webHandler = toWebHandler(nextHandler)
+ 
+ export const Route = createFileRoute('/api/platform/projects/$ref/config/')({
+-  server: { handlers: { GET: webHandler, PATCH: webHandler } },
++  server: { handlers: { GET: webHandler } },
+ })
