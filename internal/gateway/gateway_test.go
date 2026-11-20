@@ -949,7 +949,7 @@ func TestServer_StalledBodyNotBlamedOnUpstream(t *testing.T) {
 					h.frame(0, 0, 1, []byte("xxxx"))
 					send = func() error { return h.frame(0, 0, 1, []byte("x")) }
 					go func() {
-						if got := h.wait(t, 1, 5*time.Second); !strings.HasPrefix(got, "reset:") {
+						if got := h.wait(t, 1, 20*time.Second); !strings.HasPrefix(got, "reset:") {
 							result <- got + ", want a reset"
 						}
 						close(result)
@@ -968,7 +968,7 @@ func TestServer_StalledBodyNotBlamedOnUpstream(t *testing.T) {
 					defer c.Close()
 					io.WriteString(c, "POST /rest/v1/t HTTP/1.1\r\nHost: "+hostA+"\r\napikey: "+tok+"\r\nContent-Length: 1048576\r\n\r\nxxxx")
 					send = func() error { _, err := c.Write([]byte("x")); return err }
-					c.SetReadDeadline(time.Now().Add(5 * time.Second))
+					c.SetReadDeadline(time.Now().Add(20 * time.Second))
 					go func() {
 						b, err := io.ReadAll(c)
 						switch {
@@ -992,7 +992,7 @@ func TestServer_StalledBodyNotBlamedOnUpstream(t *testing.T) {
 						send() // fails once the server has given up; the reader reports
 					}
 				}
-				if d := time.Since(start); d < timeout || d > 3*time.Second {
+				if d := time.Since(start); d < timeout || d > 10*time.Second {
 					t.Errorf("cut after %v, want the read timeout", d)
 				}
 				eventually(t, func() bool { return idle(e) }, "slots not returned")
@@ -1318,15 +1318,16 @@ func closedAtAccept(t *testing.T, addr, src string) bool {
 	return !served(c)
 }
 
+// eventually waits for f to hold. Every caller waits for something that
+// happens on its own, so the window only bounds a failure.
 func eventually(t *testing.T, f func() bool, msg string) {
 	t.Helper()
-	for i := 0; i < 100; i++ {
-		if f() {
+	for deadline := time.Now().Add(15 * time.Second); !f(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Error(msg)
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
-	t.Error(msg)
 }
 
 const hostB = refB + ".sp.test"
@@ -1829,9 +1830,9 @@ func TestLimitListener_Accounting(t *testing.T) {
 	// A handshake stall: the server must close it, not wait for the client.
 	c, _ = net.Dial("tcp", addr)
 	start := time.Now()
-	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	c.SetReadDeadline(time.Now().Add(20 * time.Second))
 	_, err = io.ReadAll(c)
-	if err != nil || time.Since(start) > 2*time.Second {
+	if err != nil || time.Since(start) > 10*time.Second { // the header timeout is 300 ms
 		t.Errorf("stalled handshake not closed by the server: %v after %v", err, time.Since(start))
 	}
 	c.Close()
@@ -1988,11 +1989,11 @@ func TestForward_UpstreamResponse(t *testing.T) {
 	addr := e.serve(t, false, nil)
 	c, _ := net.Dial("tcp", addr)
 	io.WriteString(c, "GET /rest/v1/hang HTTP/1.1\r\nHost: "+hostA+"\r\napikey: "+anon+"\r\n\r\n")
-	time.Sleep(200 * time.Millisecond)
+	eventually(t, func() bool { return hits.Load() == 2 }, "the request did not reach the upstream")
 	c.Close()
 	select {
 	case <-cancelled:
-	case <-time.After(2 * time.Second):
+	case <-time.After(4 * time.Second): // the upstream ends the request itself after 5 s
 		t.Error("client disconnect did not cancel the upstream request")
 	}
 }
@@ -2160,7 +2161,7 @@ func within(t *testing.T, e *env, r *http.Request) *httptest.ResponseRecorder {
 	select {
 	case w := <-c:
 		return w
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second): // a request admitted over a cap waits for the test's release
 		t.Fatal("request not answered: admitted over a cap")
 		return nil
 	}
@@ -2366,7 +2367,14 @@ func TestShutdown_DrainsInFlight(t *testing.T) {
 	<-arrived
 	shut := make(chan error, 1)
 	go func() { shut <- Shutdown(5*time.Second, s, other) }()
-	time.Sleep(100 * time.Millisecond)
+	// The listener closes while the in-flight request still holds Shutdown.
+	eventually(t, func() bool {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			c.Close()
+		}
+		return err != nil
+	}, "still accepting during shutdown")
 	if _, err := get(); err == nil {
 		t.Error("new connection accepted during shutdown")
 	}
@@ -2386,7 +2394,7 @@ func TestShutdown_DrainsInFlight(t *testing.T) {
 	go get()
 	<-arrived
 	start := time.Now()
-	if err := Shutdown(200*time.Millisecond, s); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+	if err := Shutdown(200*time.Millisecond, s); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
 		t.Errorf("grace exceeded: %v after %v", err, time.Since(start))
 	}
 	s.Close()
@@ -2427,7 +2435,7 @@ func TestServer_ClientGivesUpDuringBodyRead(t *testing.T) {
 			start := time.Now()
 			giveUp()
 			eventually(t, func() bool { return idle(e) }, "slots not returned")
-			if d := time.Since(start); d > 2*time.Second {
+			if d := time.Since(start); d > 8*time.Second { // below the 10 s read timeout
 				t.Errorf("slots back %v after the client gave up, want at once", d)
 			}
 		})

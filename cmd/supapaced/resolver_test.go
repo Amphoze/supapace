@@ -253,10 +253,20 @@ func TestResolver_PicksUpANewDeclarationWithoutRestart(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() { w.r.run(ctx); close(done) }()
-	ticks <- time.Time{} // received after the first round
-	ticks <- time.Time{} // received after the second
+	defer cancel()
+	for _, after := range []string{"first", "second"} { // each tick is received after a round
+		select {
+		case ticks <- time.Time{}:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the resolver loop took no tick after its %s round", after)
+		}
+	}
 	cancel()
-	<-done
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the resolver loop did not end on cancel")
+	}
 	w.wantInstalls(t, addrs(addrA), addrs(addrB))
 	w.wantHanded(t, addrs(addrA), addrs(addrB))
 }

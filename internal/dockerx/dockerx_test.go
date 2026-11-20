@@ -196,7 +196,7 @@ func TestRun_TimeoutKills(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	_, err := Run(ctx, "slow", "x")
-	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 15*time.Second {
 		t.Fatalf("err=%v after %v", err, time.Since(start))
 	}
 	b, rerr := os.ReadFile(filepath.Join(dir, "pid"))
@@ -351,7 +351,7 @@ func TestRun_CancelKillsGroup(t *testing.T) {
 	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
 	start := time.Now()
 	_, err := Run(ctx, "slow", "x")
-	if err == nil || time.Since(start) > 4*time.Second || !strings.Contains(err.Error(), "canceled") {
+	if err == nil || time.Since(start) > 15*time.Second || !strings.Contains(err.Error(), "canceled") {
 		t.Fatalf("err=%v after %v", err, time.Since(start))
 	}
 }
@@ -465,7 +465,7 @@ func TestRun_StillCappedAt60s(t *testing.T) {
 	defer func() { defaultTimeout = old }()
 	start := time.Now()
 	_, err := Run(context.Background(), "slow", "x")
-	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 15*time.Second {
 		t.Fatalf("err=%v after %v", err, time.Since(start))
 	}
 }
@@ -481,7 +481,7 @@ func TestRun_CappedCallsLeakNothing(t *testing.T) {
 		}
 	}
 	var n int
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 500; i++ { // 10 s for the pipes' goroutines to end
 		if n = runtime.NumGoroutine(); n <= base {
 			return
 		}

@@ -1464,7 +1464,7 @@ func TestDiskUsage_HungToolEndsWithContext(t *testing.T) {
 	if _, err := DiskUsage(ctx, p, 900042); err == nil {
 		t.Fatal("a killed tool gave a usage")
 	}
-	if d := time.Since(start); d > 4*time.Second {
+	if d := time.Since(start); d > 20*time.Second { // the tool alone would run 600 s
 		t.Fatalf("DiskUsage returned after %v", d)
 	}
 	b, err := os.ReadFile(pids)

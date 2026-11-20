@@ -130,7 +130,7 @@ func stalledPeer(t *testing.T, copyBuf, sockBuf int, fromCluster bool) {
 			took := make(chan int, conns)
 			hold := make(chan struct{})
 			var wg sync.WaitGroup
-			defer wg.Wait()
+			defer waitGroup(t, &wg, time.Minute, "relays still running after cancel")
 			defer close(hold)
 			go func() {
 				for {
@@ -313,7 +313,11 @@ func TestRelay_WhatTheCallerHandsOver(t *testing.T) {
 				io.Copy(io.Discard, cl)
 			}()
 		}})
-		<-ch
+		select {
+		case <-ch:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the relay did not reach the cluster")
+		}
 		p.cancel()
 		if err := p.result(t); !errors.Is(err, context.Canceled) {
 			t.Fatalf("relay: %v", err)
@@ -514,6 +518,18 @@ func openFiles(t *testing.T) int {
 	return len(d)
 }
 
+// waitGroup waits for wg, failing the test if it takes longer than d.
+func waitGroup(t *testing.T, wg *sync.WaitGroup, d time.Duration, what string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Errorf("%s after %v", what, d)
+	}
+}
+
 // settle waits until f is at most want.
 func settle(want int, f func() int) int {
 	got := f()
@@ -534,7 +550,10 @@ func TestRelay_EveryEndingLeavesNothingBehind(t *testing.T) {
 	const each, parallel = 300, 48
 	w := m('W', make([]byte, 3))
 	slots := &StreamSlots{}
-	meta, stream := metaClass(), streamClass()
+	// No clock of the class ends a connection but the one a way sets: under load
+	// a connection may wait seconds for its turn, which must not change its ending.
+	patient := func(c Class) Class { c.DialMS, c.AuthMS, c.WallMS = 600_000, 600_000, 0; return c }
+	meta, stream := patient(metaClass()), patient(streamClass())
 	stream.Stream.ConnsPerProject = 1 << 20
 	short := func(c Class, auth, wall int) Class { c.AuthMS, c.WallMS = auth, wall; return c }
 	isBreach := func(err error) bool {
@@ -584,7 +603,7 @@ func TestRelay_EveryEndingLeavesNothingBehind(t *testing.T) {
 			edit: func(c *Conn) { c.To, c.Class.DialMS = silent, 40 }, want: has("dial")},
 		{name: "the authentication deadline", class: short(meta, 60, 0), sends: cat(rSASL, rCont), client: wait,
 			want: func(err error) bool { return err == errAuthDeadline }},
-		{name: "the wall clock", class: short(meta, 10000, 80), sends: login, client: wait,
+		{name: "the wall clock", class: short(meta, meta.AuthMS, 80), sends: login, client: wait,
 			want: func(err error) bool { return err == errWallClock }},
 		{name: "the dial refused", class: meta, client: wait, edit: func(c *Conn) { c.To = refused }, want: has("dial")},
 		{name: "a breach", class: meta, sends: cat(rSASL, authReq(3, "")), reads: len(rSASL), client: wait, want: isBreach},
@@ -632,7 +651,7 @@ func TestRelay_EveryEndingLeavesNothingBehind(t *testing.T) {
 				return
 			}
 			defer s.Close()
-			s.SetDeadline(time.Now().Add(60 * time.Second))
+			s.SetDeadline(time.Now().Add(180 * time.Second))
 			if _, err := io.ReadFull(s, make([]byte, 8)); err != nil {
 				return
 			}
@@ -656,7 +675,7 @@ func TestRelay_EveryEndingLeavesNothingBehind(t *testing.T) {
 			return
 		}
 		defer client.Close()
-		client.SetDeadline(time.Now().Add(60 * time.Second))
+		client.SetDeadline(time.Now().Add(180 * time.Second))
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		conn := Conn{Class: wy.class, First: startupPacket(""), From: netip.MustParseAddr("127.0.0.1"),
@@ -681,7 +700,7 @@ func TestRelay_EveryEndingLeavesNothingBehind(t *testing.T) {
 			if !wy.want(err) {
 				fail("%s: relay returned %v", wy.name, err)
 			}
-		case <-time.After(20 * time.Second): // well before the scripted cluster gives up
+		case <-time.After(60 * time.Second): // the scripted cluster gives up only after both waits
 			fail("%s: the relay did not return", wy.name)
 			return
 		}
@@ -703,7 +722,9 @@ func TestRelay_EveryEndingLeavesNothingBehind(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for wy := range work {
-				one(wy)
+				if failed.Load() < 10 { // past ten failures the rest only add minutes of waits
+					one(wy)
+				}
 			}
 		}()
 	}
@@ -713,7 +734,7 @@ func TestRelay_EveryEndingLeavesNothingBehind(t *testing.T) {
 		}
 	}
 	close(work)
-	wg.Wait()
+	waitGroup(t, &wg, 5*time.Minute, "workers still running")
 	t.Logf("%d connections, %d ways", each*len(ways), len(ways))
 	if n := slots.n.Load(); n != 0 {
 		t.Errorf("%d stream places still held", n)

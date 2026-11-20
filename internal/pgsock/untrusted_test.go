@@ -715,9 +715,15 @@ func TestUntrusted_NoLeaks(t *testing.T) {
 			}
 		}
 	}
-	time.Sleep(500 * time.Millisecond)
-	runtime.GC()
-	fd1, g1 := fdCount(t), runtime.NumGoroutine()
+	// The fakes' handlers end on their own: wait for the counts to settle.
+	var fd1, g1 int
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		runtime.GC()
+		fd1, g1 = fdCount(t), runtime.NumGoroutine()
+		if fd1-fd0 <= 2*len(kinds)+2 && g1-g0 <= 2*len(kinds)+4 || time.Now().After(deadline) {
+			break
+		}
+	}
 	tableRow("leaks: 2000 dials (8 kinds x 250): fds %d → %d, goroutines %d → %d (fakes' listeners still open)", fd0, fd1, g0, g1)
 	// each multiFake keeps its listener: one fd and one goroutine per kind
 	if fd1-fd0 > 2*len(kinds)+2 { // two listeners per multiFake
@@ -870,50 +876,55 @@ func TestUntrusted_ConnCalls(t *testing.T) {
 		time.Sleep(4 * time.Second)
 		return nil
 	}
+	// Every call is ended by the budget (statement 500 ms, session 1.5 s from
+	// the dial), never by the peer, whose script runs 4 s: the ceiling sits well
+	// above the budget and well below the peer's end.
 	b := Budget{Connect: 2 * time.Second, Statement: 500 * time.Millisecond, Session: 1500 * time.Millisecond}
+	const bound = 3 * time.Second
+	big := "select '" + strings.Repeat("x", 16<<20) + "'"
 	cases := []struct {
 		name   string
 		script func(c *fconn) error
 		call   func(c *pgx.Conn) error
-		bound  time.Duration
 	}{
 		{"Exec of 16 MiB to a peer that never reads", noRead, func(c *pgx.Conn) error {
-			_, err := c.Exec(context.Background(), "select '"+strings.Repeat("x", 16<<20)+"'")
+			_, err := c.Exec(context.Background(), big)
 			return err
-		}, time.Second},
-		{"Ping to a silent peer", silent, func(c *pgx.Conn) error { return c.Ping(context.Background()) }, time.Second},
+		}},
+		{"Ping to a silent peer", silent, func(c *pgx.Conn) error { return c.Ping(context.Background()) }},
+		// The context (150 ms) ends the call, not the guard's statement bound
+		// (500 ms): the error is the context's deadline, not ErrBudget.
 		{"Stmt context on a silent peer", silent, func(c *pgx.Conn) error {
-			ctx, cancel := Stmt(context.Background(), Budget{Statement: 300 * time.Millisecond})
+			ctx, cancel := Stmt(context.Background(), Budget{Statement: 100 * time.Millisecond})
 			defer cancel()
 			_, err := c.Exec(ctx, "select 1")
-			if err != nil && !errors.Is(err, ErrBudget) {
-				tableRow("conn: Stmt deadline error %q: errors.Is(ErrBudget)=%v, Is(DeadlineExceeded)=%v, Cause=%v",
-					err, errors.Is(err, ErrBudget), errors.Is(err, context.DeadlineExceeded), context.Cause(ctx))
+			if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrBudget) {
+				return fmt.Errorf("want the Stmt context's deadline, got %v", err)
 			}
 			return err
-		}, 450 * time.Millisecond},
+		}},
 		{"WaitForNotification on a silent peer", noRead, func(c *pgx.Conn) error {
 			_, err := c.WaitForNotification(context.Background())
 			return err
-		}, 2 * time.Second},
+		}},
 		{"CopyFrom", afterQuery(func(c *fconn) error {
 			c.send('G', []byte{0, 0, 1, 0, 0})
-			time.Sleep(time.Second)
+			time.Sleep(4 * time.Second)
 			return nil
 		}), func(c *pgx.Conn) error {
 			_, err := c.CopyFrom(context.Background(), pgx.Identifier{"t"}, []string{"x"}, pgx.CopyFromRows([][]any{{1}}))
 			return err
-		}, time.Second},
+		}},
 		{"SendBatch to a silent peer", silent, func(c *pgx.Conn) error {
 			br := c.SendBatch(context.Background(), &pgx.Batch{QueuedQueries: []*pgx.QueuedQuery{{SQL: "select 1"}, {SQL: "select 2"}}})
 			_, err := br.Exec()
 			br.Close()
 			return err
-		}, time.Second},
+		}},
 		{"Prepare to a silent peer", silent, func(c *pgx.Conn) error {
 			_, err := c.Prepare(context.Background(), "s", "select 1")
 			return err
-		}, time.Second},
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -931,7 +942,7 @@ func TestUntrusted_ConnCalls(t *testing.T) {
 			c.Close(context.Background())
 			cl := time.Since(cs)
 			tableRow("| %s | %s | %v | Close %v | accepts %d |", tc.name, errClass(err), el.Round(time.Millisecond), cl.Round(time.Millisecond), f.accepts.Load())
-			if err == nil || el > tc.bound || cl > 600*time.Millisecond {
+			if err == nil || el > bound || cl > 600*time.Millisecond {
 				t.Fatalf("err %v after %v, close %v", err, el, cl)
 			}
 			if n := f.accepts.Load(); n != 1 {
@@ -1088,7 +1099,7 @@ func TestUntrusted_PipelineAfterReadyForQuery(t *testing.T) {
 		return nil
 	})
 	tg := f.target(t)
-	tg.Budget = Budget{Connect: 2 * time.Second, Statement: 300 * time.Millisecond, Session: 3 * time.Second}
+	tg.Budget = Budget{Connect: 2 * time.Second, Statement: 300 * time.Millisecond, Session: 10 * time.Second}
 	c, err := dial(t, tg)
 	if err != nil {
 		t.Fatal(err)
@@ -1109,8 +1120,8 @@ func TestUntrusted_PipelineAfterReadyForQuery(t *testing.T) {
 	}
 	el := time.Since(start)
 	p.Close()
-	tableRow("pipeline: second pipelined statement after a ReadyForQuery ended after %v (statement bound 300ms, session 3s): %s", el.Round(time.Millisecond), errClass(err))
-	if el > time.Second {
+	tableRow("pipeline: second pipelined statement after a ReadyForQuery ended after %v (statement bound 300ms, session 10s): %s", el.Round(time.Millisecond), errClass(err))
+	if el > 3*time.Second {
 		t.Errorf("pipelined statement bounded only by the session: %v", el)
 	}
 }
@@ -1204,14 +1215,15 @@ func TestUntrusted_BatchAfterReadyForQuery(t *testing.T) {
 }
 
 // The guard's statement deadline restarts with each statement: a session of
-// several short statements outlasting one statement bound is not cut.
+// several short statements outlasting one statement bound is not cut (each
+// answer comes after 300 ms of a 1 s bound; together they take over 1.5 s).
 func TestUntrusted_StatementDeadlinePerStatement(t *testing.T) {
 	f := newFake(t, func(c *fconn) error {
 		if err := c.login(); err != nil {
 			return err
 		}
 		for i := 0; i < 5; i++ {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 			if err := c.answer(); err != nil {
 				return err
 			}
@@ -1219,7 +1231,7 @@ func TestUntrusted_StatementDeadlinePerStatement(t *testing.T) {
 		return nil
 	})
 	tg := f.target(t)
-	tg.Budget.Statement = 300 * time.Millisecond
+	tg.Budget.Statement = time.Second
 	c, err := dial(t, tg)
 	if err != nil {
 		t.Fatal(err)

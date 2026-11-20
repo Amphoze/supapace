@@ -652,6 +652,7 @@ func TestFlow_LogOut_Chains(t *testing.T) {
 		long = append(long, tA)
 	}
 	now := time.Now().Unix()
+	h.now = func() time.Time { return time.Unix(now, 0) } // the controls below are exact to the second
 	tk := func(refs string) string { return fmt.Sprintf("%d.%s", now, refs) }
 	for _, q := range []string{"t=" + tk(tB), "t=" + tk(tA+",dddddddddddddddddddd"), "t=" + tk(""), "t=" + tk(strings.Join(long, ",")),
 		"t=" + tA, fmt.Sprintf("t=%d.%s", now-61, tA), "t=" + tk(tA) + "&t=" + tk(tA), "t=x." + tA} {

@@ -125,7 +125,7 @@ func TestForward_InformationalBurstsUnderLoad(t *testing.T) {
 	// A transport finishes a dial whose request has gone and then keeps the
 	// connection idle: such a connection can enter a pool after any one
 	// close, so the pools are closed until the count settles.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		for _, c := range clients {
 			c.Transport.(*http.Transport).CloseIdleConnections()

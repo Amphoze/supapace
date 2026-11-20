@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -552,7 +553,16 @@ func interruptAfterFirstPoll(sock string) client {
 	var once sync.Once
 	return client{sock: sock, poll: 5 * time.Millisecond, outage: time.Minute, polled: func() {
 		once.Do(func() {
+			// Wait for the signal to reach this process, then give the CLI's
+			// handler its turn: delivery under load is what used to be slow.
+			seen := make(chan os.Signal, 1)
+			signal.Notify(seen, syscall.SIGINT)
+			defer signal.Stop(seen)
 			syscall.Kill(os.Getpid(), syscall.SIGINT)
+			select {
+			case <-seen:
+			case <-time.After(10 * time.Second):
+			}
 			time.Sleep(200 * time.Millisecond)
 		})
 	}}

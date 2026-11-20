@@ -1276,30 +1276,48 @@ func TestRun_AttemptDeadlineFailsAttempt(t *testing.T) {
 	<-e.run(e.runner())
 	var slow atomic.Bool
 	slow.Store(true)
+	var mu sync.Mutex
+	var seen []time.Time // the deadline each step of the slow attempt ran under
 	e.ag.setHook(func(ctx context.Context, c call) {
 		switch c.Method {
 		case "EnsureDir", "EnsureCluster", "EnsurePostgREST":
-			if slow.Load() {
-				select {
-				case <-time.After(250 * time.Millisecond):
+			if !slow.Load() {
+				return
+			}
+			dl, _ := ctx.Deadline()
+			mu.Lock()
+			seen = append(seen, dl)
+			mu.Unlock()
+			if c.Method == "EnsurePostgREST" {
+				select { // until the attempt ends; the cap only stops a leak
 				case <-ctx.Done():
+				case <-time.After(time.Minute):
 				}
 			}
 		}
 	})
 	r := e.runner()
-	r.stepDeadline = 300 * time.Millisecond
-	r.attemptDeadline = 900 * time.Millisecond
+	r.stepDeadline = time.Hour // only the attempt's deadline can end a step
+	r.attemptDeadline = 3 * time.Second
 	r.backoff = []time.Duration{time.Hour}
 	e.start(r)
-	// Steps 3, 4a and 4 each succeed in 250 ms; step 9 hits the attempt deadline.
+	// Steps 3 to 7 succeed; step 9 outlives the attempt and is ended by it.
 	op := e.wait(id, "backed off", func(op store.Operation) bool { return op.State == "pending" && op.Attempts == 2 })
 	if !strings.HasPrefix(op.LastError, "timeout: ") || op.Step != "7" {
 		t.Fatalf("op = %+v", op)
 	}
+	// One deadline for the whole attempt, not one per step.
+	mu.Lock()
+	if len(seen) < 4 || slices.ContainsFunc(seen, func(d time.Time) bool { return !d.Equal(seen[0]) }) {
+		t.Fatalf("steps ran under deadlines %v, want the attempt's one", seen)
+	}
+	mu.Unlock()
 	slow.Store(false)
 	sql(t, "update operation set not_before = now() where id = $1", id)
-	e.waitState(id, "done")
+	// An attempt within its deadline finishes and is counted once.
+	if op := e.waitState(id, "done"); op.Attempts != 3 {
+		t.Fatalf("op = %+v", op)
+	}
 	if n := len(e.ag.callsOf(ref, "EnsureDir")); n != 1 {
 		t.Fatalf("%d EnsureDir calls", n)
 	}

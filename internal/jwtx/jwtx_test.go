@@ -756,7 +756,7 @@ func TestVerify_NoGoroutineBoundedAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if runtime.NumGoroutine() != before {
+	if runtime.NumGoroutine() > before { // one ending elsewhere meanwhile is no failure
 		t.Fatalf("goroutines %d -> %d", before, runtime.NumGoroutine())
 	}
 	if allocs > 400 {

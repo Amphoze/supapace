@@ -884,7 +884,7 @@ func TestQuotaUsage_HungToolEndsWithContext(t *testing.T) {
 	if _, _, err := QuotaUsage(ctx, "/srv/repo", nodecfg.ReplicatorUID); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want the context's error", err)
 	}
-	if d := time.Since(start); d > 4*time.Second {
+	if d := time.Since(start); d > 20*time.Second { // the tool alone would run 600 s
 		t.Fatalf("QuotaUsage returned after %v", d)
 	}
 	b, err := os.ReadFile(pids)

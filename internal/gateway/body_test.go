@@ -46,12 +46,12 @@ func TestServer_UpstreamRefusedExpectContinue(t *testing.T) {
 func TestServer_AbortLeavesNoGoroutines(t *testing.T) {
 	before := runtime.NumGoroutine()
 	TestServer_StalledBodyNotBlamedOnUpstream(t)
+	// Closed servers' goroutines end on their own: wait for them.
 	n := 0
-	for range 200 {
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 		if n = runtime.NumGoroutine(); n <= before+2 {
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
 	buf := make([]byte, 1<<20)
 	t.Errorf("goroutines: %d before, %d after\n%s", before, n, buf[:runtime.Stack(buf, true)])

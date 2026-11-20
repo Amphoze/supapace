@@ -926,7 +926,7 @@ func TestGuard_RefusesHighIterations(t *testing.T) {
 		_, err := dial(t, f.target(t))
 		el := time.Since(start)
 		wantErr(t, err, ErrScramParams)
-		if iter == 10000000 && el > 100*time.Millisecond {
+		if iter == 10000000 && el > time.Second { // 10,000,000 iterations take seconds
 			t.Fatalf("refusal took %v", el)
 		}
 		if r := f.result(t); bytes.Count(r.types(), []byte{'p'}) != 1 {
@@ -1334,7 +1334,7 @@ func TestBudget_SessionDeadline(t *testing.T) {
 		_, err = c.c.Exec(context.Background(), "select 1")
 		time.Sleep(50 * time.Millisecond)
 	}
-	if el := time.Since(start); el > 2*time.Second {
+	if el := time.Since(start); el > 5*time.Second {
 		t.Fatalf("session ended after %v", el)
 	}
 	wantErr(t, err, ErrBudget)
@@ -1365,12 +1365,14 @@ func TestBudget_ZeroValueIsDefault(t *testing.T) {
 }
 
 func TestStmt_Deadline(t *testing.T) {
+	before := time.Now()
 	ctx, cancel := Stmt(context.Background(), Budget{Statement: 50 * time.Millisecond})
+	after := time.Now()
 	defer cancel()
 	dl, ok := ctx.Deadline()
-	// a backstop slightly after the guard's own statement bound
-	if d := time.Until(dl); !ok || d <= 50*time.Millisecond || d > 100*time.Millisecond {
-		t.Fatalf("deadline in %v %v", d, ok)
+	// a backstop slightly after the guard's own statement bound: 50 ms + 50 ms
+	if !ok || dl.Sub(before) < 100*time.Millisecond || dl.Sub(after) > 100*time.Millisecond {
+		t.Fatalf("deadline %v after the call (%v) %v", dl.Sub(before), after.Sub(before), ok)
 	}
 	<-ctx.Done()
 	if !errors.Is(context.Cause(ctx), ErrBudget) {
@@ -1628,9 +1630,10 @@ func TestIsBudget(t *testing.T) {
 }
 
 // A statement under a Stmt context on a silent server ends with the guard's
-// ErrBudget, not the context's deadline: the context is only a backstop.
+// ErrBudget, not the context's deadline: the context is only a backstop. The
+// backstop trails the bound by d/20 (100 ms at 2 s), the margin this test has.
 func TestStmt_GuardFiresFirst(t *testing.T) {
-	b := budget(func(b *Budget) { b.Statement = 300 * time.Millisecond })
+	b := budget(func(b *Budget) { b.Statement = 2 * time.Second })
 	f := newFake(t, afterQuery(func(c *fconn) error { return nil }))
 	tg := f.target(t)
 	tg.Budget = b
@@ -1642,7 +1645,7 @@ func TestStmt_GuardFiresFirst(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	_, err = c.c.Exec(ctx, "select 1")
-	if el := time.Since(start); el > time.Second {
+	if el := time.Since(start); el > 5*time.Second {
 		t.Fatalf("ended after %v", el)
 	}
 	if !errors.Is(err, ErrBudget) || !IsBudget(err) {

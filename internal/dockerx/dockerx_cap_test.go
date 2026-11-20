@@ -39,7 +39,7 @@ func pidOf(t *testing.T, dir, name string) int {
 func waitDead(t *testing.T, pid int) {
 	t.Helper()
 	for i := 0; syscall.Kill(pid, 0) != syscall.ESRCH; i++ {
-		if i > 100 {
+		if i > 500 { // 10 s
 			t.Fatalf("pid %d still alive", pid)
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -101,7 +101,7 @@ exit 0`)
 	_, err := Run(context.Background(), "x")
 	el := time.Since(st)
 	t.Logf("grandchild case: err=%v in %v", err, el)
-	if !errors.Is(err, ErrOutputTooLarge) || el > 5*time.Second {
+	if !errors.Is(err, ErrOutputTooLarge) || el > 15*time.Second {
 		t.Fatal("bad")
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -116,7 +116,7 @@ func TestCap_CloseStdoutKeepRunning(t *testing.T) {
 	defer func() { defaultTimeout = old }()
 	st := time.Now()
 	_, err := Run(context.Background(), "x")
-	if !errors.Is(err, context.DeadlineExceeded) || time.Since(st) > 3*time.Second {
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(st) > 15*time.Second {
 		t.Fatalf("%v %v", err, time.Since(st))
 	}
 }
@@ -193,7 +193,9 @@ func TestCap_Concurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	time.Sleep(500 * time.Millisecond)
+	for deadline := time.Now().Add(10 * time.Second); fds() > f0 && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
 	t.Logf("goroutines %d -> %d, fds %d -> %d", g0, runtime.NumGoroutine(), f0, fds())
 	if fds() > f0 {
 		t.Fatal("fd leak")

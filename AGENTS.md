@@ -4350,3 +4350,17 @@ not reuse their names. The proof with the real client
 (`TestRelay_RealClientLibrary`, tag `reach`) runs as root on a bare test node with the
 proxy's and the client's images loaded. `sp-probe fakepg` gained the modes `scram-low`,
 `copy-both` and `param-flood`.
+
+### 2026-11-20 — tests: rules for time-dependent tests
+- A ceiling on elapsed time must sit well above the bound under test and well below the time the
+  defect would take (the script's own end, the next timer); never just above the timeout tested.
+- Replace a sleep before an assertion by a positive wait for the state needed: a received event,
+  a hit counter, a refused or accepted dial. A socket file existing is not the server listening.
+- Counts of goroutines and descriptors are polled until they settle (up to 10-20 s), and compared
+  with `>` against the start, not `!=`.
+- Every wait (receive, WaitGroup, poll) has a deadline that fails by assertion, shorter than the
+  binary's timeout; a defect must end a test with a message, never with a hung binary.
+- Give a test its own clock where it can: pin the model clock, give non-clock cases timeouts they
+  cannot reach, and derive deadlines from the one under test.
+- When two real timers decide an outcome, widen their gap or assert a property that does not
+  depend on the order; add a clock seam only if neither works.

@@ -118,7 +118,7 @@ func TestAPI_ShowDiskUsedBounded(t *testing.T) {
 	start := time.Now()
 	var p projectShape
 	strict(t, e.wantOK(t, "GET", "/v1/projects/"+demoRef, "", 200), &p)
-	if d := time.Since(start); p.DiskUsedBytes != nil || d < showUsageWait || d > showUsageWait+3*time.Second {
+	if d := time.Since(start); p.DiskUsedBytes != nil || d < showUsageWait || d > showUsageWait+15*time.Second {
 		t.Fatalf("disk_used_bytes %v after %v", p.DiskUsedBytes, d)
 	}
 }

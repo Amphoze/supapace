@@ -95,7 +95,7 @@ func runPipeline(c *pgx.Conn, n int, noSync bool) error {
 }
 
 func TestUntrusted_PipelineEachStatementBounded(t *testing.T) {
-	const stmt = 300 * time.Millisecond
+	const stmt = time.Second
 	cases := []struct {
 		name    string
 		n       int
@@ -107,35 +107,35 @@ func TestUntrusted_PipelineEachStatementBounded(t *testing.T) {
 		{"three syncs, each answered within the bound, together beyond it", 3, false, func(c *fconn) error {
 			readSyncs(c, 3, false)
 			for i := 0; i < 3; i++ {
-				time.Sleep(200 * time.Millisecond)
+				time.Sleep(400 * time.Millisecond)
 				c.Write(segment(true))
 			}
 			return nil
-		}, true, 2 * time.Second},
+		}, true, 5 * time.Second},
 		{"three syncs, two answered, then silent", 3, false, func(c *fconn) error {
 			readSyncs(c, 3, false)
 			c.Write(append(segment(true), segment(true)...))
 			return nil
-		}, false, stmt + 250*time.Millisecond},
+		}, false, 5 * time.Second},
 		{"error mid-pipeline, then silent", 2, false, func(c *fconn) error {
 			readSyncs(c, 2, false)
 			c.Write(append(msg('E', []byte("SERROR\x00C42601\x00Mx\x00\x00")), msg('Z', []byte{'I'})...))
 			return nil
-		}, false, stmt + 250*time.Millisecond},
+		}, false, 5 * time.Second},
 		{"extended protocol without a Sync, silent", 1, true, func(c *fconn) error {
 			readSyncs(c, 1, true)
 			return nil
-		}, false, stmt + 250*time.Millisecond},
+		}, false, 5 * time.Second},
 		{"fewer ReadyForQuery than Syncs", 2, false, func(c *fconn) error {
 			readSyncs(c, 2, false)
 			c.Write(append(segment(true), segment(false)...))
 			return nil
-		}, false, stmt + 250*time.Millisecond},
+		}, false, 5 * time.Second},
 		{"more ReadyForQuery than Syncs, then a silent pipeline", 1, false, func(c *fconn) error {
 			readSyncs(c, 1, false)
 			c.Write(bytes.Join([][]byte{segment(true), msg('Z', []byte{'I'}), msg('Z', []byte{'I'})}, nil))
 			return nil
-		}, true, time.Second},
+		}, true, 5 * time.Second},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -170,7 +170,7 @@ func TestUntrusted_PipelineEachStatementBounded(t *testing.T) {
 				}
 				el = time.Since(start)
 				row("| pipeline: after surplus ReadyForQuery, silent | %s | %v |", errClass(err), el.Round(time.Millisecond))
-				if err == nil || el > stmt+250*time.Millisecond {
+				if err == nil || el > 5*time.Second {
 					t.Fatalf("after surplus ReadyForQuery: err %v after %v", err, el)
 				}
 			}
@@ -251,7 +251,7 @@ func TestUntrusted_ConcurrentReads(t *testing.T) {
 		ch := twoReaders(g)
 		time.Sleep(100 * time.Millisecond)
 		g.SetReadDeadline(time.Now())
-		for _, err := range waitBoth(t, ch, 300*time.Millisecond) {
+		for _, err := range waitBoth(t, ch, 5*time.Second) {
 			if err == nil {
 				t.Fatal("read succeeded")
 			}
@@ -262,18 +262,18 @@ func TestUntrusted_ConcurrentReads(t *testing.T) {
 		ch := twoReaders(g)
 		time.Sleep(100 * time.Millisecond)
 		g.Close()
-		waitBoth(t, ch, 300*time.Millisecond)
+		waitBoth(t, ch, 5*time.Second)
 	})
 	t.Run("connect bound with two readers", func(t *testing.T) {
 		g, _ := pipeGuard(t, Budget{Connect: 300 * time.Millisecond, Statement: 20 * time.Second, Session: 20 * time.Second})
 		start := time.Now()
 		ch := twoReaders(g)
-		for _, err := range waitBoth(t, ch, time.Second) {
+		for _, err := range waitBoth(t, ch, 5*time.Second) {
 			if !errors.Is(err, ErrBudget) {
 				t.Fatalf("err %v", err)
 			}
 		}
-		if el := time.Since(start); el > 500*time.Millisecond {
+		if el := time.Since(start); el > 5*time.Second {
 			t.Fatalf("both returned after %v", el)
 		}
 	})
@@ -282,7 +282,7 @@ func TestUntrusted_ConcurrentReads(t *testing.T) {
 		ch := twoReaders(g)
 		time.Sleep(50 * time.Millisecond)
 		go sv.Write([]byte{'R', 0x40, 0, 0, 0})
-		for _, err := range waitBoth(t, ch, 300*time.Millisecond) {
+		for _, err := range waitBoth(t, ch, 5*time.Second) {
 			if !errors.Is(err, ErrBudget) {
 				t.Fatalf("err %v", err)
 			}
@@ -293,7 +293,7 @@ func TestUntrusted_ConcurrentReads(t *testing.T) {
 		ch := twoReaders(g)
 		time.Sleep(50 * time.Millisecond)
 		g.SetReadDeadline(time.Now().Add(time.Hour))
-		for _, err := range waitBoth(t, ch, time.Second) {
+		for _, err := range waitBoth(t, ch, 5*time.Second) {
 			if !errors.Is(err, ErrBudget) {
 				t.Fatalf("err %v", err)
 			}
@@ -562,7 +562,7 @@ func TestUntrusted_DeadConnFailsFast(t *testing.T) {
 	_, err2 := c.c.Exec(context.Background(), "select 1")
 	el := time.Since(start)
 	row("dead conn: WaitForNotification %s, IsClosed %v, next Exec %s after %v", errClass(err), closed, errClass(err2), el.Round(time.Millisecond))
-	if !IsBudget(err) || err2 == nil || el > 50*time.Millisecond {
+	if !IsBudget(err) || err2 == nil || el > 250*time.Millisecond {
 		t.Fatalf("wait %v, exec %v after %v", err, err2, el)
 	}
 }

@@ -1365,14 +1365,21 @@ func TestServe_ShutdownCutsStalledRequests(t *testing.T) {
 		return be, err
 	}
 	stop := w.start()
-	eventually(t, 5*time.Second, "socket", func() bool { _, err := os.Lstat(w.d.p.AdminSock()); return err == nil })
-	c, err := net.Dial("unix", w.d.p.AdminSock()) // a client that never gives up
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The socket file exists from bind, before listen: only a dial that
+	// succeeds shows the server accepting.
+	var c net.Conn // a client that never gives up
+	eventually(t, 10*time.Second, "admin socket accepting", func() bool {
+		var err error
+		c, err = net.Dial("unix", w.d.p.AdminSock())
+		return err == nil
+	})
 	defer c.Close()
 	fmt.Fprint(c, "GET /v1/node/check HTTP/1.1\r\nHost: admin\r\n\r\n")
-	<-started
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
 	stop()
 	select {
 	case <-cut:

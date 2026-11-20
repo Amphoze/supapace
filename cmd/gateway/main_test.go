@@ -58,7 +58,7 @@ func TestRun_SignalDrains(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var stopped atomic.Bool
-	const grace = 5 * time.Second
+	const grace = 30 * time.Second
 	done := make(chan error, 1)
 	go func() { done <- run(ctx, func() { stopped.Store(true) }, grace, h, selfSigned(t), tlsLn, plainLn) }()
 
@@ -77,7 +77,7 @@ func TestRun_SignalDrains(t *testing.T) {
 	start := time.Now()
 	cancel()
 	refused := false
-	for deadline := time.Now().Add(time.Second); !refused && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(10 * time.Second); !refused && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		c, err := net.Dial("tcp", addr)
 		if refused = err != nil; !refused {
 			c.Close()
@@ -98,7 +98,7 @@ func TestRun_SignalDrains(t *testing.T) {
 		if err != nil {
 			t.Errorf("run: %v", err)
 		}
-		if d := time.Since(start); d > grace {
+		if d := time.Since(start); d > 15*time.Second { // well inside the grace: it returned when the request ended
 			t.Errorf("run returned after %v", d)
 		}
 	case <-time.After(grace + time.Second):
