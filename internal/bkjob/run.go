@@ -23,27 +23,35 @@ const outputMax = 64 << 10
 // result line alone. A tool that exits is an exit code and no error; err is a
 // tool that could not be started or was stopped by a signal.
 func Run(ctx context.Context, args ...string) (exit int, output string, err error) {
-	var out tail
+	return run(ctx, outputMax, args...)
+}
+
+// run is Run keeping the last max bytes of the output.
+func run(ctx context.Context, max int, args ...string) (exit int, output string, err error) {
+	out := tail{max: max}
 	cmd := exec.CommandContext(ctx, Tool, args...)
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err = cmd.Run()
 	var ee *exec.ExitError
 	switch {
 	case err == nil:
-		return 0, string(out), nil
+		return 0, string(out.b), nil
 	case errors.As(err, &ee) && ee.Exited():
-		return ee.ExitCode(), string(out), nil
+		return ee.ExitCode(), string(out.b), nil
 	}
-	return -1, string(out), fmt.Errorf("bkjob: running %s: %w", Tool, err)
+	return -1, string(out.b), fmt.Errorf("bkjob: running %s: %w", Tool, err)
 }
 
-// tail keeps the last outputMax bytes written to it.
-type tail []byte
+// tail keeps the last max bytes written to it.
+type tail struct {
+	b   []byte
+	max int
+}
 
 func (t *tail) Write(p []byte) (int, error) {
-	*t = append(*t, p...)
-	if n := len(*t) - outputMax; n > 0 {
-		*t = append((*t)[:0], (*t)[n:]...)
+	t.b = append(t.b, p...)
+	if n := len(t.b) - t.max; n > 0 {
+		t.b = append(t.b[:0], t.b[n:]...)
 	}
 	return len(p), nil
 }
@@ -66,7 +74,10 @@ func fail(code, format string, a ...any) error {
 // the program and the runner's recorder share. A kind is listed here once its
 // program exists.
 var codes = map[string][]string{
-	"push": {CodeRepositoryQuota, CodeRepository, CodeSpool, CodeStopped},
+	"push":          {CodeRepositoryQuota, CodeRepository, CodeSpool, CodeStopped},
+	"stanza-create": {CodeLogin, CodeArchiveTimeout, CodePgbackrest, CodeTablespace, CodeSymlink},
+	"backup":        {CodeLogin, CodeArchiveTimeout, CodePgbackrest, CodeTablespace, CodeSymlink},
+	"check":         {CodeLogin, CodeArchiveTimeout, CodePgbackrest, CodeTablespace, CodeSymlink},
 }
 
 // Codes returns the failure codes kind's program can end with, and whether

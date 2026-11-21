@@ -262,8 +262,18 @@ func TestRecord_PushFailureCodesAreItsProgramsOnly(t *testing.T) {
 			t.Errorf("a push claiming %q was recorded %+v", code, got)
 		}
 	}
-	if got := e.runWith("check", agent.JobResult{ExitCode: 1, Result: failLine("made-up", "x")}, nil); got.Code != "made-up" {
-		t.Errorf("a kind without a listed program (check): %+v", got)
+	// check lists its program's codes now: its own pass, a push's or a made-up one does not.
+	if got := e.runWith("check", agent.JobResult{ExitCode: 1, Result: failLine("login", "x")}, nil); got.Code != "login" {
+		t.Errorf("check's own login: %+v", got)
+	}
+	for _, code := range []string{"made-up", "repository_quota"} {
+		if got := e.runWith("check", agent.JobResult{ExitCode: 1, Result: failLine(code, "x")}, nil); got.Code != "crashed" {
+			t.Errorf("a check claiming %q: %+v", code, got)
+		}
+	}
+	// A kind whose program lists no codes keeps the deny-list of the runner's own.
+	if _, listed := bkjob.Codes("no-such-kind"); listed || repl.Codes("no-such-kind") != nil || !jobCode("no-such-kind", "made-up") || jobCode("no-such-kind", "cancelled") {
+		t.Error("a kind without a listed program (no-such-kind) does not keep the deny-list")
 	}
 }
 

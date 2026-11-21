@@ -25,7 +25,10 @@ var (
 // jobKinds are the job programs this binary runs. A kind is added here with
 // its program; any other is a usage error.
 var jobKinds = map[string]func(ctx context.Context, in jobio.Input) (any, error){
-	"push": func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Push(ctx, in, jobSpool) },
+	"push":          func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Push(ctx, in, jobSpool) },
+	"stanza-create": func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.StanzaCreate(ctx, in) },
+	"backup":        func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Backup(ctx, in) },
+	"check":         func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Check(ctx, in) },
 }
 
 // jobCmd runs one job program inside its job container: supapaced job KIND.

@@ -5124,3 +5124,37 @@ replication worker is allowed there (and a backup holds no replication slot). Ev
 platform session is answered
 by the cluster and can log itself; none carries a secret. Password verifiers are written
 to WAL and to the role catalogue, as at first boot.
+
+### 2026-11-21 — bkjob: stanza-create, backup and check; the data-directory pre-check
+internal/bkjob, inside a job container (data directory read-only at /var/lib/postgresql/data,
+socket, /spool, /repo). Dispatched by `supapaced job stanza-create|backup|check`.
+- StanzaCreate(ctx, in) / Check(ctx, in) (jobio.CheckJobResult) and Backup(ctx, in)
+  (jobio.BackupResult): pre-check, the tool, then a final Push whose result is the `push`
+  member (never nil on success). check and backup run a push loop beside the tool (a pass,
+  then 0.5 s): the tool waits for its WAL in the repository. The loop is stopped by a flag
+  between passes and waited for before the final push, so two pushes never overlap.
+  stanza-create has no loop (no stanza yet): one push after it.
+- Backup refuses any in.Type but "full". The set is read from `info --output=json` (its own
+  read bound of 8 MiB, about 650 bytes a set): exactly one stanza of in.Stanza, the newest
+  label; label ^[0-9]{8}-[0-9]{6}F$, type full, segments of 24 hex digits on one timeline
+  1..2^31-1, LSNs, times from the tool's unix seconds in UTC with stop >= start > 0.
+- Codes (bkjob.Codes, the same five for the three kinds): login (exit 56 or 27 with the tool's
+  "unable to check pg1: [DbConnectError]" warning line), archive_timeout (exit 82; the message
+  names the loop's last push failure, else a late lane), pgbackrest (any other tool failure,
+  a failure of the final push with the push's code in the message, a backup type other than
+  full, an info answer out of shape), tablespace, symlink. A push's own codes never pass out.
+- Messages: the passphrase replaced, cleaned with pgsock.Sanitize, at most 256 bytes.
+- precheck(root): walks from directory descriptors, opening only directories with
+  O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK from the parent's descriptor; any link is symlink, any
+  entry of pg_tblspc is tablespace; a directory replaced by a link or a non-directory before
+  its open is symlink; an entry gone is skipped; FIFOs, sockets, devices and files are passed
+  over (the tool skips special files itself). Bounds: depth 64, 2^24 entries; past either,
+  or a directory that cannot be listed, is symlink ("not walked whole").
+- Known limits: the pre-check is a best effort — a link made after the walk is stored by the
+  tool; the controls are the job's mounts and absent network, and the restore job, which
+  refuses a set whose manifest holds a link. Entries a loop pass set aside are listed only
+  when the job succeeds (the failure document has no push; the message counts them). An entry
+  whose type the listing does not give is symlink ("not walked whole"), never looked up by
+  a path. An info answer at its bound fails the backup (pgbackrest: too many sets). check takes
+  no lock in pgBackRest
+  2.58; stanza-create and backup exit 50 on an unwritable lock path (pgbackrest).
