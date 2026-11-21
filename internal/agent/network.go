@@ -48,3 +48,38 @@ func (a *Agent) RemoveNetwork(ctx context.Context, ref string) error {
 	}
 	return nil
 }
+
+// EnsureBackupNetwork creates `backup`, the network of the jobs that reach
+// the object store: a bridge spb0 on the node's backup subnet with IPv6
+// off and no other option. Leaving it is the node ruleset's (only the
+// declared store addresses, nothing between members). A network of that
+// name with anything else is never adopted, re-created or removed:
+// ErrContainment.
+func (a *Agent) EnsureBackupNetwork(ctx context.Context) error {
+	n, err := dockerInspectNetwork(ctx, nodecfg.BackupNetwork)
+	if err != nil {
+		return err
+	}
+	if n == nil {
+		_, err := dockerRun(ctx, "network", "create", "--driver", "bridge", "--subnet", a.cfg.BackupSubnet, "--ipv6=false",
+			"-o", optBridgeName+"="+nodecfg.BackupBridge, "--", nodecfg.BackupNetwork)
+		if err == nil {
+			return nil
+		}
+		// Another launch may have made it meanwhile: then it is checked like any.
+		if n, _ = dockerInspectNetwork(ctx, nodecfg.BackupNetwork); n == nil {
+			return err
+		}
+	}
+	switch {
+	case n.Internal:
+		return refuse(nil, "%s exists: internal", nodecfg.BackupNetwork)
+	case n.BridgeName != nodecfg.BackupBridge:
+		return refuse(nil, "%s exists: bridge %q, want %q", nodecfg.BackupNetwork, n.BridgeName, nodecfg.BackupBridge)
+	case !samePrefix(n.Subnet, netPrefix(a.cfg.BackupSubnet)):
+		return refuse(nil, "%s exists: subnet %q, want %s", nodecfg.BackupNetwork, n.Subnet, a.cfg.BackupSubnet)
+	case len(n.Options) != 1 || n.Options[optBridgeName] != nodecfg.BackupBridge:
+		return refuse(nil, "%s exists with other options", nodecfg.BackupNetwork)
+	}
+	return refuseIPv6(ctx, nodecfg.BackupNetwork)
+}

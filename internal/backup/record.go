@@ -33,18 +33,8 @@ func failed(code, msg string) outcome { return outcome{state: "failed", code: co
 // one the store refuses.
 func crashed(err error) outcome { return failed("crashed", "result refused: "+err.Error()) }
 
-// hostStateText is agent.ErrHostState's text, matched along the chain:
-// a mount source the launcher refused, recorded as host_state.
-const hostStateText = "agent: a job's mount source is not as the platform made it"
-
-func isHostState(err error) bool {
-	for ; err != nil; err = errors.Unwrap(err) {
-		if err.Error() == hostStateText {
-			return true
-		}
-	}
-	return false
-}
+// isHostState: a mount source the launcher refused, recorded as host_state.
+func isHostState(err error) bool { return errors.Is(err, agent.ErrHostState) }
 
 // runnerCodes are the codes the runner or the store assigns, and the codes of
 // an operation's step: a job's own failure document never carries one. Some

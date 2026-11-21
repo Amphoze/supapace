@@ -1140,3 +1140,145 @@ func TestMemberIDs_StaggeredEndpointsResolve(t *testing.T) {
 		t.Fatalf("mutations %q", m)
 	}
 }
+
+// ───────── node check: the repository filesystem, hard links, the backup network ─────────
+
+// statDevSame puts the repository root on the projects filesystem.
+var statDevSame bool
+
+// repoMount adds the repository filesystem to goodNode's mount table.
+func repoMount(t *testing.T, a *Agent, line string) {
+	t.Helper()
+	// The repository root on a device of its own.
+	t.Cleanup(swap(&statDev, func(path string) (uint64, error) {
+		if path == a.p.RepoRoot() && !statDevSame {
+			return 2, nil
+		}
+		return 1, nil
+	}))
+	p := filepath.Join(a.p.Root, "proc/mounts")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, append(b, line+"\n"...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNodeCheck_RepoFilesystemRowBlocks(t *testing.T) {
+	statDevSame = false
+	t.Cleanup(func() { statDevSame = false })
+	good := func(a *Agent) string {
+		return "/dev/loop4 " + a.p.RepoRoot() + " xfs rw,nosuid,nodev,noexec,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota 0 0"
+	}
+	a, _ := goodNode(t)
+	repoMount(t, a, good(a))
+	if r := rows(t, a)["repo-filesystem"]; !r.OK {
+		t.Fatalf("control: %+v", r)
+	}
+	for name, c := range map[string]struct {
+		line func(a *Agent) string
+		hint string
+	}{
+		"absent": {func(a *Agent) string { return "" }, "not a mount point: mount an XFS filesystem there"},
+		"not xfs": {func(a *Agent) string {
+			return "/dev/sdb1 " + a.p.RepoRoot() + " ext4 rw,nosuid,nodev,noexec,usrquota 0 0"
+		}, "is ext4, not XFS: mount an XFS filesystem there"},
+		"quota accounting": {func(a *Agent) string { return strings.Replace(good(a), "usrquota", "uqnoenforce", 1) }, "without usrquota"},
+		"no quota":         {func(a *Agent) string { return strings.Replace(good(a), ",usrquota", "", 1) }, "without usrquota"},
+		"suid":             {func(a *Agent) string { return strings.Replace(good(a), "nosuid,", "", 1) }, "without nosuid"},
+		"dev":              {func(a *Agent) string { return strings.Replace(good(a), "nodev,", "", 1) }, "without nodev"},
+		"exec":             {func(a *Agent) string { return strings.Replace(good(a), "noexec,", "", 1) }, "without noexec"},
+		"shadowed": {func(a *Agent) string {
+			return good(a) + "\ntmpfs " + a.p.RepoRoot() + " tmpfs rw,nosuid,nodev,noexec 0 0"
+		}, "is tmpfs, not XFS"},
+		"the projects filesystem": {func(a *Agent) string {
+			statDevSame = true
+			return good(a)
+		}, "is the projects filesystem: mount an XFS filesystem there"},
+		"hostile type": {func(a *Agent) string {
+			return "x " + a.p.RepoRoot() + " \x1b[2J" + strings.Repeat("y", 300) + " rw 0 0"
+		}, "not XFS"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, dev := range []bool{false, true} {
+				a, _ := goodNode(t)
+				if dev {
+					os.WriteFile(filepath.Join(filepath.Dir(a.p.NodeJSON()), "dev-mode"), nil, 0o600)
+				}
+				statDevSame = false
+				if l := c.line(a); l != "" {
+					repoMount(t, a, l)
+				}
+				r := rows(t, a)["repo-filesystem"]
+				if r.OK || !Blocking(r) || !strings.Contains(r.Detail, c.hint) {
+					t.Fatalf("dev %v: %+v, want blocking with %q", dev, r, c.hint)
+				}
+				if strings.ContainsAny(r.Detail, "\x1b\n") || len(r.Detail) > 400 {
+					t.Fatalf("detail not bounded or not sanitised: %q", r.Detail)
+				}
+				if !strings.Contains(r.Detail, "usrquota,nosuid,nodev,noexec") {
+					t.Fatalf("detail names no remedy: %q", r.Detail)
+				}
+			}
+		})
+	}
+	// The projects filesystem's rows read their own mount point only.
+	a, _ = goodNode(t)
+	if r := rows(t, a); !r["quota-enforcement"].OK || r["repo-filesystem"].OK {
+		t.Fatalf("rows read each other's mount: %+v %+v", r["quota-enforcement"], r["repo-filesystem"])
+	}
+}
+
+func TestNodeCheck_ProtectedHardlinks_InformationalOnDevelopmentNode(t *testing.T) {
+	put := func(a *Agent, v string) {
+		os.WriteFile(filepath.Join(a.p.Root, "proc/sys/fs/protected_hardlinks"), []byte(v), 0o644)
+	}
+	a, _ := goodNode(t)
+	put(a, "1\n")
+	if r := rows(t, a)["protected-hardlinks"]; !r.OK || r.Detail != "" {
+		t.Fatalf("control: %+v", r)
+	}
+	for v, hint := range map[string]string{"0\n": "fs.protected_hardlinks is 0, want 1", "": "unreadable", "\x1b[2J" + strings.Repeat("9", 500): "unreadable"} {
+		a, _ := goodNode(t)
+		put(a, v)
+		r := rows(t, a)["protected-hardlinks"]
+		if r.OK || !Blocking(r) || !strings.Contains(r.Detail, hint) || !strings.Contains(r.Detail, "sysctl") ||
+			strings.ContainsAny(r.Detail, "\x1b\n") || len(r.Detail) > 400 {
+			t.Fatalf("%q: %+v", v, r)
+		}
+		os.WriteFile(filepath.Join(filepath.Dir(a.p.NodeJSON()), "dev-mode"), nil, 0o600)
+		r = rows(t, a)["protected-hardlinks"]
+		if !r.OK || !strings.HasPrefix(r.Detail, "informational (dev-mode): ") || !strings.Contains(r.Detail, hint) {
+			t.Fatalf("%q, dev mode: %+v", v, r)
+		}
+	}
+	a, _ = goodNode(t)
+	os.Remove(filepath.Join(a.p.Root, "proc/sys/fs/protected_hardlinks"))
+	if r := rows(t, a)["protected-hardlinks"]; r.OK {
+		t.Fatalf("absent: %+v", r)
+	}
+}
+
+func TestNodeCheck_BackupNetworkAllowed(t *testing.T) {
+	a, f := goodNode(t)
+	if r := rows(t, a)["docker-networks"]; !r.OK {
+		t.Fatalf("control: %+v", r)
+	}
+	if err := a.EnsureBackupNetwork(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r := rows(t, a)["docker-networks"]; !r.OK {
+		t.Fatalf("with the backup network: %+v", r)
+	}
+	f.net(fakeNet{Network: dockerx.Network{Name: "backup2"}})
+	if r := rows(t, a)["docker-networks"]; r.OK || !strings.Contains(r.Detail, "backup2") {
+		t.Fatalf("another network: %+v", r)
+	}
+	delete(f.nets, "backup2")
+	f.nets["backup"].Driver = "macvlan"
+	if r := rows(t, a)["docker-networks"]; r.OK {
+		t.Fatalf("backup with another driver: %+v", r)
+	}
+}

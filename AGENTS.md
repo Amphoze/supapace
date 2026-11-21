@@ -5200,3 +5200,87 @@ The restore, serve and seed programs of internal/bkjob, dispatched by supapaced 
   same rules; two manifests with different keys are set_invalid. Serve's listing returns
   after the current batch once its context ends.
 - Known limits: Serve's per-name counts reset past 65,536 names.
+
+### 2026-11-21 — agent: job containers, the backup network, two node-check rows
+- `RunJob(ctx, JobSpec) (JobResult, error)` runs one job of a subject (a project ref or `cp`)
+  in the worker image and returns its exit code, its result line and the tail of its standard
+  error. Kinds: push, stanza-create, backup, check, restore, serve, seed (no network, the
+  subject's ids) and replicate, fetch, probe (the backup network, 65530:65530, for replicate
+  and fetch with the subject's group). Every kind: no capability, no new privileges, the
+  platform's seccomp profile, read-only root, a private /tmp, `--ipc none` (no /dev/shm),
+  memory = swap, a pids limit, one CPU, `GOMEMLIMIT` 32 MiB under the memory limit (it does
+  not cover a tool the program starts); entrypoint `/supapaced`, command `job <kind>` or
+  `replicate <mode>` (copy or rebuild from the input, fetch, probe).
+- Mounts per kind, nothing else: push spool, repo; stanza-create, backup, check data (ro),
+  sock, spool, repo; restore data, repo (ro); serve data (ro), rspool, repo (ro); seed repo,
+  fetch (ro); replicate repo (ro), the index file (ro), /cred (ro); fetch fetch, /cred (ro);
+  probe /cred (ro). Always the daemon's executable at /supapaced (ro) and the job's directory
+  at /job (ro: input.json and the spec's files, 0444 in a 0755 directory).
+- Limits: 512m/256 pids/128m tmpfs for the six worker kinds, 128m/64/16m for seed, 256m/64/64m
+  for fetch and probe, `MemMB` (default 256, at least 128) for replicate.
+- Name `job-<subject>-<kind>`, labels supapace.role=job, supapace.ref, supapace.job,
+  supapace.kind. A probe: `Subject` is the bucket role (`projects` or `cp`), name
+  `job-probe-<role>`, ref label and files `probe-<role>`, id may be 0, ids unused.
+- Refused before anything is created: an unknown kind and `recover`; a subject that is no ref,
+  ids outside the project range (`cp`: 70:70); no id or deadline; an input whose kind, subject
+  or job differ from the spec's; a replicate input without mode copy or rebuild; a passphrase
+  for another kind than the six, any other secret name; a credential for a worker, none for a
+  networked kind, or one that is not exactly 2 lines (probe 4) without a final newline or an
+  empty field; `MemMB` on another kind; an `Env` name outside `^SUPAPACE_[A-Z0-9_]{1,100}$`
+  (and, for a networked kind, one holding PASS, SECRET, KEY or TOKEN) or a value that is not
+  one printable line; a file name outside `[a-z0-9][a-z0-9._-]{0,63}` or `input.json`. A
+  networked job is refused with ErrContainment while containment has failed or the `backup`
+  network is not the platform's. `JobSpec.Addrs` is not read: a program's address list is its
+  `SUPAPACE_S3_ADDRS`, and what a job can reach is the node ruleset's set.
+- Source check (`ErrHostState`, match with errors.Is; nothing launched or made): every mount
+  source must exist, not be a link, be a directory (the index file and the executable: a
+  regular file) and be owned uid and gid by the subject (data, sock, spool, rspool, repo), by
+  65530:<gid> (fetch, made by root when absent, after the other sources passed), by root
+  (index, executable, job directory) or by 65530:65530 (the credential file). The daemon's
+  executable must be root's: a daemon run from a binary of another owner starts no job.
+- Secrets: `Env` and `SecretEnv` go through `<jobs>/<id>.env` (root 0600), removed as soon as
+  `docker run -d` returns; from then the passphrase is in Docker's record of the container
+  (root and the socket's group) until the container is removed. `Cred` is written to
+  `<jobs>/<id>.cred` (65530:65530 0400, jobs directory root 0700) and mounted at /cred; it and
+  the job's directory are removed with the container. The index file must be readable by
+  65530 (0444).
+- Lifecycle: every job container of the subject is removed first, whatever its kind and
+  state — if one stays, nothing is started; the container runs detached and is polled every
+  second; at `Deadline` it is killed and removed (`TimedOut`); when ctx ends it is stopped
+  (`docker stop -t 10`) and its result read as after any exit — ctx's error is returned only
+  when no line was read. The calls after a job (stop, output, removal) have 60 s from the
+  job's end. A removal that fails after the job ended is logged and the result returned; the
+  leftover goes before the subject's next job or at the next daemon start. Callers must not
+  run two jobs of one subject at once: the launcher has no lock.
+- Result: the last newline-terminated line of the whole standard output, at most 1 MiB; more
+  than 4 MiB of output, no terminated line or a longer line give an empty result. `Stderr` is
+  the last 4 KiB of the first 64 KiB, sanitised.
+- `KillJobs(ctx, subject)`: the subject's job containers and files (`probe-projects` and
+  `probe-cp` name the probes); "" removes every job container, every container labelled
+  supapace.phase=R and everything under the jobs directory. Each removal has its own 60 s.
+- `SetReplicatorQuota(ctx, mb)`: uid 65530's quota on the repository filesystem; 0 clears it.
+- `EnsureBackupNetwork(ctx)`: bridge `spb0` on the node's backup subnet, IPv6 off, no other
+  option; a network `backup` with anything else is refused, never changed; a create that
+  loses a race checks the network the other made. Leaving it is the node ruleset's: the
+  declared store addresses only, nothing between members, nothing to or from the node. A
+  job's resolver is 192.0.2.1: no lookup leaves the node.
+- Node check: `repo-filesystem` (blocking everywhere): the repository root is the topmost mount
+  at its path, XFS, mounted usrquota,nosuid,nodev,noexec, and on another device than the
+  projects directory; `protected-hardlinks` (informational on a development node):
+  fs.protected_hardlinks is 1; `docker-networks` accepts `backup`.
+- internal/backup: a mount-source refusal is matched with errors.Is(err, agent.ErrHostState).
+- Test node: the host's build is mounted read-only at /opt/supapace/build; node-init.sh
+  installs root-owned 0755 copies into /opt/supapace/bin at boot and on
+  `docker exec <node> /usr/local/bin/node-init.sh install-bins`. `make reach`, `reach-dash`,
+  `reach-reboot` and `harness-test` install first; after any other rebuild on a running node
+  (a test binary built into bin/, an experiment script) run install-bins before using it. A
+  binary that did not change keeps its file, so a running daemon's /proc/<pid>/exe still names
+  it; one that changed is replaced by rename — the daemon then runs its old program, its jobs
+  the new one, and the suite, which finds the daemon by that link, needs the daemon restarted.
+- Known limits: a job at a project's uid runs beside that project's cluster with shared
+  directories but separate pid, mount and IPC namespaces; a daemon killed mid-job leaves the
+  container and its files until its next start; the environment file is synced to the
+  platform filesystem before it is removed.
+- Node tests (reach tag, bare node with the object-store stand-in, as root):
+  `go test -c -tags reach ./internal/agent`, run `-test.run '^TestJobReach_'`; the test
+  binary is the job's program there, and the node's installed daemon binary for one test.

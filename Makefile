@@ -7,6 +7,9 @@ BIN := bin
 NODE ?= sp-node
 NODE_IMAGE := supapace-node:local
 NODE_BIN := /opt/supapace/bin
+# Where the node sees $(BIN) (read-only); its init installs root-owned copies into
+# $(NODE_BIN), at boot and again before each suite run (`node-init.sh install-bins`).
+NODE_BUILD := /opt/supapace/build
 GATEWAY_IMAGE := supapace-gateway:local
 # The local tag of the backup worker image; whatever it is, the archive names
 # the image supapace-worker:local, as the node refers to it (likewise the gateway).
@@ -82,7 +85,8 @@ reset = s=0; rm -f /run/supapace/failpoint || s=1; $(1) nft load || exit 1; \
 # Bracketed run on the node: reset, test binary $(3) (default reach.test) with $(1)
 # as extra flags and $(2) as extra docker exec options (environment), reset. A
 # failed reset fails the target, also after a passing run.
-node_reach = docker exec $(NODE) sh -c '$(call reset,$(NODE_BIN)/supapaced)' || exit 1; \
+node_reach = docker exec $(NODE) /usr/local/bin/node-init.sh install-bins || exit 1; \
+	docker exec $(NODE) sh -c '$(call reset,$(NODE_BIN)/supapaced)' || exit 1; \
 	docker exec $(2) $(NODE) $(NODE_BIN)/$(or $(3),reach.test) $(REACH_FLAGS) $(1); s=$$?; \
 	docker exec $(NODE) sh -c '$(call reset,$(NODE_BIN)/supapaced)' || exit 1; exit $$s
 
@@ -172,7 +176,7 @@ node-up node-bare:
 	docker run -d --privileged --cgroupns private --memory $(NODE_MEM)g --stop-timeout 60 --name $(NODE) -e SP_NODE_MODE=$(MODE)$(if $(DASH), -e SP_STUDIO_DOMAIN=$(STUDIO_DOMAIN)) \
 		$(if $(filter 0,$(SP_OFFSITE)),,--add-host $(S3_NAME):$(S3_ADDR1)) \
 		-v $(NODE)-docker:/var/lib/docker -v $(NODE)-state:/var/lib/sp \
-		-v "$(CURDIR)/$(BIN)":$(NODE_BIN):ro -v "$(IMAGE_CACHE)":/images:ro $(NODE_IMAGE)
+		-v "$(CURDIR)/$(BIN)":$(NODE_BUILD):ro -v "$(IMAGE_CACHE)":/images:ro $(NODE_IMAGE)
 	@for i in $$(seq 300); do \
 		docker exec $(NODE) sh -c 'test -e /run/sp-node-ready && docker info' >/dev/null 2>&1 && exit 0; \
 		if [ "$$(docker inspect -f '{{.State.Running}}' $(NODE))" != true ]; then \
@@ -217,6 +221,7 @@ node-proof: build
 	@# a Studio variant (supapace-studio-NAME.tar) is never loaded by itself.
 	@for f in "$(IMAGE_CACHE)"/dash/*.tar; do case $$f in */supapace-studio-*.tar) continue ;; esac; \
 		[ ! -e "$$f" ] || { $(call load_tar,$$f); } || exit 1; done
+	docker exec $(NODE) /usr/local/bin/node-init.sh install-bins
 	docker exec $(NODE) $(NODE_BIN)/proof.test -test.v -test.timeout 60m -test.run '$(or $(RUN),^TestNode_)'
 
 # The browser harness's own tests (test/browser), in a node started bare, with the
@@ -224,6 +229,7 @@ node-proof: build
 browser-test: build
 	CGO_ENABLED=0 $(GO) test -c -tags browser -o $(BIN)/browser.test ./test/browser
 	@$(load_browsers)
+	docker exec $(NODE) /usr/local/bin/node-init.sh install-bins
 	docker exec $(NODE) $(NODE_BIN)/browser.test -test.v -test.timeout 60m $(if $(RUN),-test.run '$(RUN)')
 
 reach-reboot: build
@@ -251,6 +257,7 @@ public-check:
 
 # Checks of the harness itself against the running node $(NODE) (test/harness/harness-test.sh).
 harness-test: build
+	docker exec $(NODE) /usr/local/bin/node-init.sh install-bins
 	NODE=$(NODE) NODE_IMAGE=$(NODE_IMAGE) IMAGE_CACHE="$(IMAGE_CACHE)" BIN=$(BIN) LOCK=$(LOCK) test/harness/harness-test.sh
 
 # The lab slot and the addresses derived from it, one KEY=value per line (for the harness).

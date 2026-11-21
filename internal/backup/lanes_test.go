@@ -2,7 +2,6 @@ package backup
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -287,7 +286,7 @@ func TestRun_ExitCodeMustMatchTheResult(t *testing.T) {
 
 func TestRun_HostStateRefusalRecorded(t *testing.T) {
 	e := newEnv(t)
-	hs := errors.New("agent: a job's mount source is not as the platform made it")
+	hs := agent.ErrHostState
 	if got := e.runWith("check", agent.JobResult{}, fmt.Errorf("job 3: %w", hs)); got.Code != "host_state" {
 		t.Fatalf("job = %+v", got)
 	}

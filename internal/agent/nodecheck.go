@@ -18,13 +18,14 @@ import (
 	"time"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/pgsock"
 )
 
 // NodeCheck reports one row per node-wide condition containment rests on.
 // Every row is blocking (OK false makes the caller set containment_failed)
 // except docker-firewall-backend and drift-hold, which are always OK; on a
 // development node (the dev-mode marker) the host-global rows core_pattern,
-// br_netfilter and file-max are informational too. The rows gateway and
+// br_netfilter, file-max and protected-hardlinks are informational too. The rows gateway and
 // control-plane-db report the platform services (running, with this
 // daemon's configuration): they fail but do not block (Blocking). Only
 // host-side facts are read.
@@ -64,12 +65,14 @@ func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	acct, enf := a.checkQuota()
 	add("quota-accounting", acct)
 	add("quota-enforcement", enf)
+	add("repo-filesystem", a.checkRepoFS())
 	add("ptrace_scope", a.checkPtrace())
 	add("kek", a.checkKEK())
 	add("platform-members", a.checkPlatformMembers(ctx))
 	hostGlobal("core_pattern", a.checkCorePattern())
 	hostGlobal("br_netfilter", a.checkBrNetfilter())
 	hostGlobal("file-max", a.checkFileMax())
+	hostGlobal("protected-hardlinks", a.checkProtectedHardlinks())
 
 	fw := "not reported"
 	if infoErr != nil {
@@ -409,14 +412,15 @@ func (a *Agent) links(ctx context.Context) (map[string]string, error) {
 	return m, nil
 }
 
-// checkNetworks: only the platform's networks and Docker's defaults exist,
+// checkNetworks: only the platform's networks (the backup network among them)
+// and Docker's defaults exist,
 // all with the bridge, host or null driver, and no macvlan or ipvlan
 // interface besides the uplinks.
 func (a *Agent) checkNetworks(nets []dockerNet, links map[string]string) error {
 	for _, n := range nets {
 		ref, isProject := strings.CutPrefix(n.name, "proj-")
 		known := n.name == "bridge" || n.name == "host" || n.name == "none" || n.name == platformNet ||
-			n.name == ingressNet || (isProject && refRE.MatchString(ref))
+			n.name == ingressNet || n.name == nodecfg.BackupNetwork || (isProject && refRE.MatchString(ref))
 		if !known {
 			return fmt.Errorf("network %s is not the platform's", n.name)
 		}
@@ -466,18 +470,9 @@ func (a *Agent) checkUplinks(ctx context.Context, links map[string]string) error
 // checkQuota reads the topmost mount of the projects directory: user and
 // project quota accounting on (accounting), user quota enforced (enforcement).
 func (a *Agent) checkQuota() (accounting, enforcement error) {
-	b, err := os.ReadFile(a.host("/proc/mounts"))
+	fstype, opts, err := a.topMount(a.p.ProjectsDir())
 	if err != nil {
 		return err, err
-	}
-	var fstype string
-	var opts []string
-	sc := bufio.NewScanner(bytes.NewReader(b))
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) >= 4 && unescapeMount(f[1]) == a.p.ProjectsDir() {
-			fstype, opts = f[2], strings.Split(f[3], ",")
-		}
 	}
 	if fstype == "" {
 		err := fmt.Errorf("%s is not a mount point", a.p.ProjectsDir())
@@ -496,6 +491,88 @@ func (a *Agent) checkQuota() (accounting, enforcement error) {
 		enforcement = fmt.Errorf("%s: user quota not enforced", a.p.ProjectsDir())
 	}
 	return accounting, enforcement
+}
+
+// topMount reads /proc/mounts for the topmost mount at dir: its type and
+// options; "" when dir is not a mount point.
+func (a *Agent) topMount(dir string) (fstype string, opts []string, err error) {
+	b, err := os.ReadFile(a.host("/proc/mounts"))
+	if err != nil {
+		return "", nil, err
+	}
+	sc := bufio.NewScanner(bytes.NewReader(b))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) >= 4 && unescapeMount(f[1]) == dir {
+			fstype, opts = f[2], strings.Split(f[3], ",")
+		}
+	}
+	return fstype, opts, sc.Err()
+}
+
+// statDev is the device number of the filesystem holding path (a seam).
+var statDev = func(path string) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return 0, err
+	}
+	return uint64(st.Dev), nil
+}
+
+// repoMountOpts are what the repository filesystem must be mounted with.
+var repoMountOpts = []string{"usrquota", "nosuid", "nodev", "noexec"}
+
+// checkRepoFS: the repository root is the topmost mount at its path, XFS,
+// with user quotas enforced and mounted nosuid, nodev and noexec. Every
+// failure says how to make it so.
+func (a *Agent) checkRepoFS() error {
+	root := a.p.RepoRoot()
+	fix := "mount an XFS filesystem there with the options " + strings.Join(repoMountOpts, ",")
+	fstype, opts, err := a.topMount(root)
+	switch {
+	case err != nil:
+		return fmt.Errorf("the mount table is unreadable (%s): %s", pgsock.Sanitize(err.Error(), 128), fix)
+	case fstype == "":
+		return fmt.Errorf("%s is not a mount point: %s", root, fix)
+	case fstype != "xfs":
+		return fmt.Errorf("%s is %s, not XFS: %s", root, pgsock.Sanitize(fstype, 32), fix)
+	}
+	var missing []string
+	for _, o := range repoMountOpts {
+		if !slices.Contains(opts, o) {
+			missing = append(missing, o)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s is mounted without %s: remount it with %s (user quotas are enforced only with usrquota, set at mount time)",
+			root, strings.Join(missing, ","), strings.Join(repoMountOpts, ","))
+	}
+	// By device, not by mount source: one device can be mounted under two names.
+	rd, err := statDev(root)
+	if err == nil {
+		var pd uint64
+		if pd, err = statDev(a.p.ProjectsDir()); err == nil && pd == rd {
+			return fmt.Errorf("%s is the projects filesystem: %s, a filesystem of its own", root, fix)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("the device of %s is unreadable (%s): %s", root, pgsock.Sanitize(err.Error(), 128), fix)
+	}
+	return nil
+}
+
+// checkProtectedHardlinks: fs.protected_hardlinks is 1, so no process can
+// link a file it does not own into a directory it can write.
+func (a *Agent) checkProtectedHardlinks() error {
+	const fix = "set fs.protected_hardlinks = 1 in /etc/sysctl.d/90-supapace.conf and run sysctl --system"
+	v, err := a.readInt("/proc/sys/fs/protected_hardlinks")
+	if err != nil {
+		return fmt.Errorf("fs.protected_hardlinks unreadable (%s): %s", pgsock.Sanitize(err.Error(), 128), fix)
+	}
+	if v != 1 {
+		return fmt.Errorf("fs.protected_hardlinks is %d, want 1: %s", v, fix)
+	}
+	return nil
 }
 
 // unescapeMount undoes the octal escapes of /proc/mounts (\040 for a space).

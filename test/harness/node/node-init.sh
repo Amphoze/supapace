@@ -16,6 +16,10 @@
 set -eu
 
 BIN=/opt/supapace/bin
+# The host's build directory, mounted read-only. Nothing runs from it: the
+# binaries are installed into $BIN, root-owned (the daemon's job launcher
+# mounts its own executable into job containers only when it is root's).
+BUILD=/opt/supapace/build
 STATE=/var/lib/sp
 PROJECTS=/var/lib/supapace/projects
 REPO=/var/lib/supapace/repo
@@ -66,6 +70,29 @@ declare_offsite() {
 		--projects-write-keys "$S3/projects-write.keys" --projects-read-keys "$S3/projects-read.keys" \
 		--cp-write-keys "$S3/cp-write.keys" --cp-read-keys "$S3/cp-read.keys" >&2
 }
+
+# install_bins copies every regular file of $BUILD into $BIN, root 0755, each by
+# rename (a running binary is never written in place). `node-init.sh install-bins`
+# (docker exec) does it again after a rebuild.
+install_bins() {
+	mkdir -p "$BIN" && chown 0:0 "$BIN" && chmod 0755 "$BIN" || return 1
+	for f in "$BUILD"/*; do
+		[ -f "$f" ] || continue
+		n=${f##*/}
+		# An unchanged binary keeps its file, so that a running program's executable
+		# link (/proc/<pid>/exe) still names it.
+		if cmp -s "$f" "$BIN/$n" && [ "$(stat -c '%u:%g %a' "$BIN/$n")" = "0:0 755" ]; then
+			continue
+		fi
+		cp "$f" "$BIN/.$n.tmp" && chown 0:0 "$BIN/.$n.tmp" && chmod 0755 "$BIN/.$n.tmp" &&
+			mv -f "$BIN/.$n.tmp" "$BIN/$n" || return 1
+	done
+}
+if [ "${1:-}" = install-bins ]; then
+	install_bins
+	exit
+fi
+install_bins || { log "installing the binaries from $BUILD failed"; exit 1; }
 
 mode=${SP_NODE_MODE:-full}
 if [ "$mode" = full ] && [ ! -x "$BIN/supapaced" ]; then
