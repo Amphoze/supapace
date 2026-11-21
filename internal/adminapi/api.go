@@ -177,6 +177,8 @@ func New(st *store.Store, kek secrets.KEK, ops Ops, domain string, p nodecfg.Pat
 	m.HandleFunc("GET /v1/operations/{id}", read(a.showOperation))
 	m.HandleFunc("POST /v1/operations/{id}/retry", a.mutation(a.retry))
 	m.HandleFunc("GET /v1/node/check", read(a.nodeCheck))
+	m.HandleFunc("GET /v1/projects/{ref}/logs", read(a.projectLogs))
+	m.HandleFunc("GET /v1/node/logs", read(a.nodeLogs))
 	// The dashboard's authorization table: writes answer 200 once in force.
 	m.HandleFunc("GET /v1/projects/{ref}/members", read(a.listMembers))
 	m.HandleFunc("POST /v1/projects/{ref}/members", read(a.addMember))

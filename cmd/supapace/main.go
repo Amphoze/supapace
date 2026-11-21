@@ -157,6 +157,18 @@ Projects:
                            the SQL the dashboard ran for the project: when,
                            who (issuer and subject), with which role and
                            login, the kind and the SHA-256 of the text
+  project logs REF [--container C] [--tail N]
+                           the newest N lines (1 to 1000, default 100) of
+                           the project's own containers, oldest first; C is
+                           cluster or rest (default: both). Each line is
+                           marked with the container it came from, and what
+                           a project wrote is shown without control
+                           characters. At most 1 MiB of text and 16 KiB a
+                           line; the notes say what was left out and why.
+                           stderr lists the lines as CONTAINER TIME | TEXT
+                           (>/dev/null keeps only that listing). A shared
+                           container's lines are under node logs only, even
+                           those that name the project
 
 Dashboard members (a node with a studio domain):
   member add REF --subject SUB --role ROLE [--issuer ISS]
@@ -245,6 +257,11 @@ Operations:
 
 Node:
   node check
+  node logs --container C [--tail N]
+                           the newest N lines (1 to 1000, default 100) of a
+                           shared container of the node; C is one of
+                           gateway, pooler, proxy or platform-db. Bounded and
+                           listed as project logs is
 
   --no-wait          print the mutation's answer at once instead of waiting
                      for its operation to end
@@ -387,6 +404,7 @@ var arity = map[string][2]int{
 	"member add": {1, 1}, "member set-role": {1, 1}, "member remove": {1, 1}, "member list": {1, 1}, "member clean-jobs": {1, 1},
 	"dashboard issuer set": {0, 0}, "dashboard issuer show": {0, 0}, "dashboard revoke": {2, 2}, "dashboard show": {0, 0},
 	"project rotate-key": {1, 1}, "project audit": {1, 1},
+	"project logs": {1, 1}, "node logs": {0, 0},
 }
 
 func isHelp(s string) bool { return s == "help" || s == "-h" || s == "-help" || s == "--help" }
@@ -488,6 +506,9 @@ func parse(args []string) (c call, err error) {
 		fs.Var(&states, "state", "")
 	}
 	build := dashCall(verb, fs)
+	if build == nil {
+		build = logsCall(verb, fs)
+	}
 	// Flags may come before, between and after positional arguments; "--"
 	// ends them.
 	var pos []string

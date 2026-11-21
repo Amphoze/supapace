@@ -4978,3 +4978,59 @@ pair in /cred, the plan at /job/plan, a regular file; the destination /fetch).
 - Trust: a holder of the write credential can offer older info files or deny the fetch, never
   other content under a write-once name; whoever controls the listings can offer an older state
   unseen.
+
+### 2026-11-21 — Logs by container: a project's and the node's
+
+What it provides
+- GET /v1/projects/{ref}/logs?container=cluster|rest&tail=N and
+  GET /v1/node/logs?container=gateway|pooler|proxy|platform-db&tail=N answer
+  {"lines":[{"container","at","text"}],"notes":["..."]}. A project's container is optional (both,
+  merged by time); the node's is required. tail is 1 to 1000, default 100. Any other query key, a
+  repeated key or a value outside the lists is 400 before the daemon is asked.
+- adminapi: LogLine, Logs (the answer and what the daemon returns), LogsMaxTail (1000),
+  LogsMaxBytes (1 MiB of text), LogLineMax (16 KiB), LogAtLayout
+  ("2006-01-02T15:04:05.000000000Z": UTC, nanoseconds, fixed width, so string order is time order;
+  the API's other times are in seconds), ProjectLogContainers, NodeLogContainers.
+- The daemon's capabilities, asserted at use: Logs(ctx, ref, container, tail) (container "" = both)
+  and NodeLogs(ctx, container, tail); each returns at most tail+1 lines a container, so a cut is
+  known. supapaced's projectLogs and nodeLogs implement them; until ops offers them both routes
+  answer 409 conflict "logs are not available on this node: ..." (after 400 and 404).
+- supapace project logs REF [--container C] [--tail N]; supapace node logs --container C [--tail N].
+  stdout is the body; stderr lists "CONTAINER TIME | TEXT", then the notes. Exit 0 on 200, 1
+  otherwise, 2 on a usage error.
+
+Contracts
+- A project's lines come only from containers labelled with its ref and the role cluster or
+  postgrest, read by id; task and job containers are not included. The node's come from a closed
+  map: gateway sp-gateway, pooler sp-pooler, proxy sp-pgcap, platform-db sp-platform-db; an absent
+  one is a conflict naming it. A shared container's lines are never under a project, whatever
+  they say.
+- container is set by the daemon from the container it read; at is Docker's own time prefix. The
+  API fails the whole answer (500) on a line of a container the route does not serve or with a
+  time outside LogAtLayout, and neither answers nor logs its text.
+- Text and notes lose invalid UTF-8, C0 and C1 controls (CR, LF, ESC included; a TAB becomes one
+  space) and Unicode
+  Cf, Zl and Zp (bidi overrides among them); the CLI cleans again. JSON consumers get valid UTF-8.
+
+Bounds
+- The answer: the newest tail lines, at most 1 MiB of text (newest kept), no line over 16 KiB;
+  each cut is a note, and there is no note without a cut. At most 16 daemon notes of 1 KiB.
+- One read: at most two at once; a third waits at most 15 s for a slot (then a conflict saying two
+  reads are running), and a read that has its slot runs its Docker calls within its own 15 s.
+  A call over the Docker client's
+  output caps (4 MiB of stdout, 64 KiB of stderr) is asked again for half the lines, down to one;
+  the note says how many were read. The lines are always the newest. A container that writes its
+  log to stderr (the database, PostgREST, the gateway) thus yields at most 64 KiB a read.
+
+Errors
+- Daemon refusals wrap store.ErrConflict (match with errors.Is) and are answered 409 with the
+  reason: no slot, past the deadline, an absent node container, a newest line over the cap, a
+  read that failed before its deadline (a container replaced mid-read: "try again"; the daemon
+  logs one fixed line with the container's role and the exit status, nothing Docker printed).
+- While the routes answer 409 the CLI prints, per container, the command to run on the node:
+  docker logs --timestamps --tail N NAME 2>&1 | cat -v (both streams filtered).
+
+Known limits
+- On a terminal narrower than a long line, a wrapped row can look like a line of its own; use the
+  JSON on stdout or less -S. Docker splits a long line into 16 KiB chunks: their time stamps can
+  appear inside the text, and a tail may begin with a line's last chunk.
