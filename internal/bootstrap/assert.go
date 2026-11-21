@@ -680,6 +680,26 @@ func assertSourceFiles(ctx context.Context, c *pgx.Conn, want Baseline, cmdline 
 		}
 	}
 	for _, name := range cmdline {
+		// A name the platform's superuser session sets at startup reads
+		// source "client" in this session, whatever the command line holds.
+		// The server shows nothing else from inside the session: pg_settings'
+		// reset_val is the session's own value and pg_file_settings lists the
+		// files only. Its pin is covered by the container's command line,
+		// under the configuration label. A value set for every role of a
+		// database reaches each session that does not set the name: such a
+		// row of the settings catalogue is reported instead.
+		if _, own := pgsock.StartupParams(true)[name]; own {
+			n := 0
+			if err := querySQL(ctx, c, sqlDatabaseWideSetting, []any{name}, func(rows pgx.Rows) error {
+				return rows.Scan(&n)
+			}); err != nil {
+				return err
+			}
+			if n > 0 {
+				r.add(checkSourceFile, "%s is set for every role of a database, not only on the command line", name)
+			}
+			continue
+		}
 		if !slices.Contains(cl, name) {
 			r.add(checkSourceFile, "%s is not set on the command line", name)
 		}
@@ -795,3 +815,8 @@ func renderedRule(f []string) string {
 	}
 	return rule(typ, db, user, addr, mask, method, strings.Join(rest, ","))
 }
+
+// sqlDatabaseWideSetting counts the rows of the settings catalogue for every
+// role (of one database or of all) that set the name $1.
+const sqlDatabaseWideSetting = `select count(*)::int from pg_catalog.pg_db_role_setting s, pg_catalog.unnest(s.setconfig) c(kv)
+  where s.setrole = 0 and pg_catalog.lower(pg_catalog.split_part(c.kv, '=', 1)) = pg_catalog.lower($1)`

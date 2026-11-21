@@ -1153,3 +1153,45 @@ func TestRekey_EmptyPoolerPasswordSendsExactlyTheEarlierList(t *testing.T) {
 		t.Fatalf("control, with a manager password: sent\n%q", got)
 	}
 }
+
+// TestAssertPins_SessionSetNameNotReportedFromCommandLine: a pinned name the
+// platform's superuser session itself sets at startup reads source "client"
+// in that session; it is not reported as missing from the command line.
+func TestAssertPins_SessionSetNameNotReportedFromCommandLine(t *testing.T) {
+	c := newCluster(t, 2)
+	c.run()
+	adm := c.dial("supabase_admin")
+	if err := Run(context.Background(), adm, c.secrets); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.str(adm, "select source from pg_catalog.pg_settings where name = 'session_preload_libraries'"); got != "client" {
+		t.Fatalf("control: session_preload_libraries from %s in the platform session", got)
+	}
+	r, err := AssertPins(context.Background(), adm, c.baseline, c.conf, pgconf.PinnedNames(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.wantFindings(r)
+}
+
+// TestAssertPins_NameNotInTheStartupListStillReported: a pinned name the
+// session does not set itself and the command line lacks is reported.
+func TestAssertPins_NameNotInTheStartupListStillReported(t *testing.T) {
+	c := newCluster(t, 2)
+	c.run()
+	adm := c.dial("supabase_admin")
+	if err := Run(context.Background(), adm, c.secrets); err != nil {
+		t.Fatal(err)
+	}
+	if _, own := pgsock.StartupParams(true)["work_mem"]; own {
+		t.Fatal("work_mem is in the startup list")
+	}
+	r, err := AssertPins(context.Background(), adm, c.baseline, c.conf, append(pgconf.PinnedNames(2), "work_mem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.wantFindings(r, "source-file")
+	if len(r) != 1 || !hasDetail(r, "source-file", "work_mem is not set on the command line") {
+		t.Fatalf("findings %+v", r)
+	}
+}

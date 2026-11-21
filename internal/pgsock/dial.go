@@ -63,7 +63,7 @@ type Target struct {
 	Password      string
 	ScramSalt     []byte // the role's ScramSalt; required unless AllowTrust
 	AllowTrust    bool   // accept a login without authentication; SASL is then refused
-	Superuser     bool   // also send event_triggers=off
+	Superuser     bool   // also send the superuser parameters (superuserParams)
 	Budget        Budget // zero value: DefaultBudget
 }
 
@@ -225,26 +225,64 @@ func StartupParams(superuser bool) map[string]string {
 		"default_transaction_deferrable":      "off",
 		"standard_conforming_strings":         "on",
 		"backslash_quote":                     "safe_encoding",
-		"synchronous_commit":                  "on",
-		"client_encoding":                     "UTF8",
-		"DateStyle":                           "ISO, MDY",
-		"TimeZone":                            "UTC",
-		"IntervalStyle":                       "postgres",
-		"bytea_output":                        "hex",
-		"extra_float_digits":                  "1",
-		"quote_all_identifiers":               "off",
-		"transform_null_equals":               "off",
-		"row_security":                        "on",
-		"check_function_bodies":               "on",
-		"default_tablespace":                  "",
-		"temp_tablespaces":                    "",
-		"client_min_messages":                 "notice",
-		"application_name":                    "supapace-agent",
+		// A platform write is made durable on this server alone: a synchronous
+		// standby named in the system file would hold every commit until the
+		// statement budget, and the cluster has no standby of the platform's.
+		"synchronous_commit": "local",
+		// A delay after authentication in the system file would hold every
+		// session past its connect budget.
+		"post_auth_delay":       "0",
+		"client_encoding":       "UTF8",
+		"DateStyle":             "ISO, MDY",
+		"TimeZone":              "UTC",
+		"IntervalStyle":         "postgres",
+		"bytea_output":          "hex",
+		"extra_float_digits":    "1",
+		"quote_all_identifiers": "off",
+		"transform_null_equals": "off",
+		"row_security":          "on",
+		"check_function_bodies": "on",
+		"default_tablespace":    "",
+		"temp_tablespaces":      "",
+		"client_min_messages":   "notice",
+		"application_name":      "supapace-agent",
 	}
 	if superuser {
-		m["event_triggers"] = "off" // a non-superuser session is refused with it
+		// A non-superuser session is refused with any of the sixteen the
+		// server reserves to superusers; the three debug_print_* are settable
+		// by any role. A setting of
+		// the login role, of the database or of the system file reaches the
+		// session unless overridden here; each line names what it keeps out.
+		for k, v := range superuserParams {
+			m[k] = v
+		}
 	}
 	return m
+}
+
+// superuserParams are the startup parameters only a superuser session sends.
+// The image decides which of them exist: an image bump re-runs the session
+// experiments before the bootstrap baseline is regenerated.
+var superuserParams = map[string]string{
+	"event_triggers":                   "off",     // a login trigger held the session until its connect deadline
+	"session_preload_libraries":        "",        // a role or database setting loads a library into the session
+	"log_statement":                    "none",    // the session's statement texts in the server log
+	"log_min_duration_statement":       "-1",      // the same, logged by duration
+	"log_min_duration_sample":          "-1",      // the same, sampled
+	"log_transaction_sample_rate":      "0",       // every statement of a sampled transaction, password statements among them
+	"log_duration":                     "off",     // a duration line for each statement
+	"log_min_messages":                 "warning", // debug-level messages that carry statement texts
+	"log_min_error_statement":          "panic",   // the STATEMENT line after a logged message: a failed password statement logged its text
+	"debug_print_parse":                "off",     // the parse tree, with the statement's literal in it
+	"debug_print_rewritten":            "off",     // the same after rewriting
+	"debug_print_plan":                 "off",     // the plans of the session's reads
+	"track_activities":                 "off",     // the running statement shown to other sessions in pg_stat_activity, and the postmaster's "failed process was running" line for a killed session
+	"pgaudit.log":                      "none",    // session audit lines
+	"pgaudit.role":                     "",        // object audit lines for the session's reads
+	"auto_explain.log_min_duration":    "-1",      // plans with their statement text; the image preloads the library
+	"pg_stat_statements.track":         "none",    // the session's statements kept in the statement statistics
+	"pg_stat_statements.track_utility": "off",     // utility statements kept there (the image's default is on)
+	"plan_filter.statement_cost_limit": "0",       // a role setting refused every statement that has a plan
 }
 
 // dialError names the project and the step; its text carries the cause only

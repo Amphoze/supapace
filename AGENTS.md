@@ -5034,3 +5034,93 @@ Known limits
 - On a terminal narrower than a long line, a wrapped row can look like a line of its own; use the
   JSON on stdout or less -S. Docker splits a long line into 16 KiB chunks: their time stamps can
   appear inside the text, and a tail may begin with a line's last chunk.
+
+### 2026-11-21 — agent: recovery start and re-key; pgsock: startup parameters of platform sessions
+internal/agent/recovery.go starts a restored data directory, reports its promotion and gives
+it the platform's passwords. Layout 2 only.
+- EnsureRecovery(ctx, Spec, pgconf.RecoveryTarget) error. Order: spec check; layout 2 (else an
+  error naming the layout); pgconf.RecoveryPins (a refusal wraps pgconf.ErrGUCValue and
+  touches nothing); state.json compared (ErrEpochDivergence, ErrStaleGeneration); any
+  pg-<ref> removed — a failed removal ends the call, so one directory never has two
+  servers; platform files rendered (override file by OverridesPinned, archive binary);
+  create, start gate, start; state.json written with phase R, the init's pid and start time.
+- Its argv is the first boot's (every hardening flag, no network, no access-file mounts: the
+  image's own files stand at the pinned paths) without the password variable, with label
+  supapace.phase=R and no configuration or image label. Command line: the image's pins,
+  pgconf.Pins, pgconf.RecoveryExtensionPins(), recoveryStartPins, then
+  pgconf.RecoveryPins(t) — nothing after it, the chosen target last. A line of the restored
+  system file does not override a pin.
+- recoveryStartPins, for the recovery start only: pre_auth_delay=0; pg_net.database_name and
+  cron.database_name empty (no database has an empty name: the HTTP extension's worker and
+  the scheduler's launcher cannot connect, so neither runs anything the restored database
+  defines); autovacuum=off; max_logical_replication_workers=0 (a restored subscription gets
+  no apply worker). The two workers are started again every second after the
+  promotion, two log lines each, until the container is stopped; none starts during replay.
+  The normal start after it carries none of these.
+- It never wipes and never bootstraps. Without the password variable the image initialises
+  nothing: an empty data directory ends as a failed start ("is not running after docker
+  start") or an exited container, never as a fresh cluster.
+- A failed start leaves state.json as it was and keeps the container for its logs; the next
+  EnsureRecovery, EnsureCluster or StopCluster removes it. A phase-R container is never
+  adopted: EnsureCluster removes it and makes a normal start.
+- RecoveryState(ctx, Spec) (promoted, exited bool, err error): needs state.json at phase R of
+  the spec's epoch (else an error and no session). exited comes from Docker's record alone
+  (absent or not running). promoted comes from one bounded session without a password to
+  the recorded process (bootstrap.InRecovery). Not promoted and no error: pgsock.ErrConnect,
+  pgsock.ErrNotSocket, a budget error of the dial or of the statement, SQLSTATE 57P03. Any
+  other failure: exited when the container stopped meanwhile (a session cut by the server's
+  own exit), else an error — pgsock.ErrPeer for another process than the recorded one, a
+  refused login, a malformed answer. The answer is the restored cluster's word about itself.
+- Caller rule: RecoveryState never ends a wait. A server that neither exits nor promotes
+  reads "not promoted" for ever; the caller polls under its own deadline and stops the
+  container when it passes. A start that exits at once can fail EnsureRecovery instead.
+  Stop the recovery start soon after the re-key: it logs until it is stopped.
+- Rekey(ctx, Spec) (timeline int, err error): one session without a password to the recorded
+  recovery start: bootstrap.Rekey (the password statements first), bootstrap.ReadTimeline,
+  bootstrap.ResetStatementStats (best effort: logged with the ref, 256 sanitised bytes,
+  never returned). It does not ask whether the server is in recovery. Errors are cleaned
+  and keep *pgsock.ServerError (25006 on a server still in recovery) and the budget
+  sentinel. It can be repeated after a cut at any statement: no password is needed.
+- Stopping a recovery start is StopCluster. Pass RecoveryState and Rekey the spec given to
+  EnsureRecovery.
+
+pgsock.StartupParams. The common list (every platform session; internal/bkjob sends it as
+the jobs' PGOPTIONS) now has synchronous_commit=local — a platform write is durable on this
+server alone and never waits for a standby named in the system file — and post_auth_delay=0.
+StartupParams(true) adds nineteen parameters only a superuser session sends
+(superuserParams, each with its reason): event_triggers=off, session_preload_libraries
+(empty), log_statement=none, log_min_duration_statement=-1, log_min_duration_sample=-1,
+log_transaction_sample_rate=0, log_duration=off, log_min_messages=warning,
+log_min_error_statement=panic, debug_print_parse=off, debug_print_rewritten=off,
+debug_print_plan=off, track_activities=off, pgaudit.log=none, pgaudit.role (empty),
+auto_explain.log_min_duration=-1, pg_stat_statements.track=none,
+pg_stat_statements.track_utility=off, plan_filter.statement_cost_limit=0.
+- They are in force from the startup packet in every start kind, above any setting of the
+  login role, the database or the system file. A platform session therefore does not load
+  the image's session-preloaded library, shows no statement in pg_stat_activity, keeps none
+  in the statement statistics, and a failed or killed statement is logged without its text.
+- A role that is not a superuser is refused (42501) when it sends one of the sixteen the
+  server reserves to superusers; the three debug_print_* are settable by any role.
+- The lists are pinned by TestConfig_StartupParameters,
+  TestStartupParams_SuperuserListIsTheReviewedNineteen and the LIST and SUPER lists of
+  test/harness/experiments/e15.sh; each parameter has a case against the pinned image that
+  fails without it (session_cluster_test.go, session_system_test.go). An image bump re-runs
+  them before the bootstrap baseline is regenerated.
+
+bootstrap: the drift check does not report a pinned name as missing from the command line
+when the platform session sets that name itself (it reads source "client" there); the pin
+is the container's command line, covered by the configuration label. For such a name it
+reads the settings catalogue's rows for every role and reports "… is set for every role of
+a database, not only on the command line". Lines of the system file are still reported for
+such names (pg_file_settings).
+
+Known limits. Settings of the system file that the command line does not pin are the
+project's own: one that stops the server, moves its socket or names a start-time script
+fails the platform's sessions, and with them a restore, for that project only; in a normal
+start so does pre_auth_delay, for that project's own sessions. The same holds when the
+platform's login role lost its login right or its superuser attribute, or the database is
+closed to connections. A restored subscription runs nothing in a recovery start: no logical
+replication worker is allowed there (and a backup holds no replication slot). Every read in a
+platform session is answered
+by the cluster and can log itself; none carries a secret. Password verifiers are written
+to WAL and to the role catalogue, as at first boot.

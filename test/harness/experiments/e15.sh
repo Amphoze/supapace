@@ -90,7 +90,7 @@ start() { # supautils file
 start "$REND/supautils.conf"
 
 # The startup-packet parameters a platform session sends, one name=value per line;
-# superuser sessions add event_triggers=off. The definition is pgsock.StartupParams
+# superuser sessions add the SUPER list below. The definition is pgsock.StartupParams
 # (a test keeps this copy equal to it): the raw sessions get them as startup keys,
 # the psql bookkeeping sessions as PGOPTIONS.
 LIST='search_path=pg_catalog,pg_temp
@@ -107,7 +107,8 @@ default_transaction_isolation=read committed
 default_transaction_deferrable=off
 standard_conforming_strings=on
 backslash_quote=safe_encoding
-synchronous_commit=on
+synchronous_commit=local
+post_auth_delay=0
 client_encoding=UTF8
 DateStyle=ISO, MDY
 TimeZone=UTC
@@ -121,11 +122,34 @@ check_function_bodies=on
 default_tablespace=
 temp_tablespaces=
 client_min_messages=notice'
-NLIST=$(printf '%s\n' "$LIST" | grep -c .)
+# What a superuser session sends besides LIST (pgsock.StartupParams; a test keeps it equal).
+SUPER='event_triggers=off
+session_preload_libraries=
+log_statement=none
+log_min_duration_statement=-1
+log_min_duration_sample=-1
+log_transaction_sample_rate=0
+log_duration=off
+log_min_messages=warning
+log_min_error_statement=panic
+debug_print_parse=off
+debug_print_rewritten=off
+debug_print_plan=off
+track_activities=off
+pgaudit.log=none
+pgaudit.role=
+auto_explain.log_min_duration=-1
+pg_stat_statements.track=none
+pg_stat_statements.track_utility=off
+plan_filter.statement_cost_limit=0'
+# Entries no database-level setting can carry (connection-start context): sent, not swept.
+NODB='post_auth_delay'
+NLIST=$(printf '%s\n' "$LIST" | grep -vc "^$NODB=")
 OPTS=$(printf '%s\n' "$LIST" | sed 's/ /\\ /g;s/^/-c /' | tr '\n' ' ')
+SOPTS=$(printf '%s\n' "$SUPER" | sed 's/^/-c /' | tr '\n' ' ')
 # Bookkeeping sessions carry the list, so settings under test never reach them; they
 # are not counted (their application_name is bookkeeping).
-asql() { docker exec -e PGOPTIONS="$OPTS -c event_triggers=off" -e PGAPPNAME=bookkeeping "$PG" \
+asql() { docker exec -e PGOPTIONS="$OPTS $SOPTS" -e PGAPPNAME=bookkeeping "$PG" \
 	psql -X -At -v ON_ERROR_STOP=1 -h /var/run/postgresql -U supabase_admin -d postgres -c "$1"; }
 tsql() { docker exec -e PGOPTIONS="$OPTS" -e PGAPPNAME=bookkeeping "$PG" psql -X -At -h /var/run/postgresql -U postgres -d postgres -c "$1" 2>&1 |
 	grep -E '^(ERROR|DETAIL|[A-Z]+( [A-Z]+)*$)' | tr '\n' ' ' | sed 's/ *$//'; }
@@ -280,14 +304,19 @@ sess() { # user, expression, startup parameters...
 	conn "$u" e15p2 "$@"
 	Q=
 }
-# sess_list user expression [super]: a session with every entry of LIST as a startup key.
+# sess_list user expression [super]: a session with every entry of LIST (and with super
+# of SUPER) as a startup key.
 sess_list() {
 	lu=$1 le=$2 lsup=${3:-}
 	set --
 	while IFS= read -r kv; do set -- "$@" "${kv%%=*}" "${kv#*=}"; done <<EOF
 $LIST
 EOF
-	[ -z "$lsup" ] || set -- "$@" event_triggers off
+	if [ -n "$lsup" ]; then
+		while IFS= read -r kv; do set -- "$@" "${kv%%=*}" "${kv#*=}"; done <<EOF
+$SUPER
+EOF
+	fi
 	sess "$lu" "$le" "$@"
 }
 shadowed() { asql "select count(*) from public.e15_shadow where usr = '$1'"; }

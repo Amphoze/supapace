@@ -657,11 +657,11 @@ func TestAssert_ReportsSettingFromChangedFile(t *testing.T) {
 
 func TestAssert_ReportsAnyAutoConfSetting(t *testing.T) {
 	c := startCluster(t)
-	c.appendAutoConf("log_min_duration_statement = 1000\n")
+	c.appendAutoConf("deadlock_timeout = 3s\n") // a setting the platform session does not set itself
 	c.restart()
 	conn := c.dial("supabase_admin")
-	if got := c.str(conn, "select setting from pg_catalog.pg_settings where name = 'log_min_duration_statement'"); got != "1000" {
-		t.Fatalf("control: log_min_duration_statement %q", got)
+	if got := c.str(conn, "select setting from pg_catalog.pg_settings where name = 'deadlock_timeout'"); got != "3000" {
+		t.Fatalf("control: deadlock_timeout %q", got)
 	}
 	c.wantFindings(c.assert(conn), "source-file")
 }
@@ -669,7 +669,7 @@ func TestAssert_ReportsAnyAutoConfSetting(t *testing.T) {
 func TestAssert_ReportsIncludeFromAutoConf(t *testing.T) {
 	c := startCluster(t)
 	extra := filepath.Join(c.data, "extra.conf")
-	if err := os.WriteFile(extra, []byte("log_min_duration_statement = 2000\n"), 0o600); err != nil {
+	if err := os.WriteFile(extra, []byte("deadlock_timeout = 4s\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chown(extra, c.uid, c.gid); err != nil { // as root, the server runs at the project uid
@@ -678,7 +678,7 @@ func TestAssert_ReportsIncludeFromAutoConf(t *testing.T) {
 	c.appendAutoConf("include '/var/lib/postgresql/data/extra.conf'\n")
 	c.restart()
 	conn := c.dial("supabase_admin")
-	if got := c.str(conn, "select setting from pg_catalog.pg_settings where name = 'log_min_duration_statement'"); got != "2000" {
+	if got := c.str(conn, "select setting from pg_catalog.pg_settings where name = 'deadlock_timeout'"); got != "4000" {
 		t.Fatalf("control: the included file applies: %q", got)
 	}
 	r := c.assert(conn)

@@ -1056,13 +1056,13 @@ func TestConfig_NoFallbacksNoEnv(t *testing.T) {
 	f.noConnection(t)
 }
 
-var want28 = map[string]string{
+var wantCommon = map[string]string{
 	"search_path": "pg_catalog,pg_temp", "role": "none", "default_transaction_read_only": "off",
 	"statement_timeout": "0", "lock_timeout": "0", "idle_in_transaction_session_timeout": "0",
 	"idle_session_timeout": "0", "transaction_timeout": "0", "local_preload_libraries": "",
 	"exit_on_error": "off", "default_transaction_isolation": "read committed",
 	"default_transaction_deferrable": "off", "standard_conforming_strings": "on",
-	"backslash_quote": "safe_encoding", "synchronous_commit": "on", "client_encoding": "UTF8",
+	"backslash_quote": "safe_encoding", "synchronous_commit": "local", "post_auth_delay": "0", "client_encoding": "UTF8",
 	"DateStyle": "ISO, MDY", "TimeZone": "UTC", "IntervalStyle": "postgres", "bytea_output": "hex",
 	"extra_float_digits": "1", "quote_all_identifiers": "off", "transform_null_equals": "off",
 	"row_security": "on", "check_function_bodies": "on", "default_tablespace": "",
@@ -1070,10 +1070,11 @@ var want28 = map[string]string{
 }
 
 func TestConfig_StartupParameters(t *testing.T) {
-	if len(want28) != 28 {
-		t.Fatalf("test list has %d entries", len(want28))
+	if len(wantCommon) != 29 {
+		t.Fatalf("test list has %d entries", len(wantCommon))
 	}
-	for _, super := range []bool{false, true} {
+	// The superuser half: TestStartupParams_SuperuserListIsTheReviewedNineteen.
+	for _, super := range []bool{false} {
 		f := newFake(t, func(c *fconn) error { return c.login() })
 		tg := f.target(t)
 		tg.Superuser = super
@@ -1089,41 +1090,116 @@ func TestConfig_StartupParameters(t *testing.T) {
 		}
 		delete(got, "user")
 		delete(got, "database")
-		want := maps.Clone(want28)
+		want := maps.Clone(wantCommon)
 		want["application_name"] = "supapace-agent"
-		if super {
-			want["event_triggers"] = "off"
-		}
 		if !maps.Equal(got, want) {
 			t.Fatalf("superuser=%v: startup parameters\n got %v\nwant %v", super, got, want)
 		}
 	}
 }
 
-func TestConfig_StartupParamsMatchE15(t *testing.T) {
+// e15List parses the shell list NAME='…' of e15.sh, one name=value a line.
+func e15List(t *testing.T, name string) map[string]string {
+	t.Helper()
 	b, err := os.ReadFile("../../test/harness/experiments/e15.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := string(b)
-	i := strings.Index(s, "\nLIST='")
+	i := strings.Index(s, "\n"+name+"='")
 	if i < 0 {
-		t.Fatal("LIST not found in e15.sh")
+		t.Fatalf("%s not found in e15.sh", name)
 	}
-	s = s[i+len("\nLIST='"):]
+	s = s[i+len("\n"+name+"='"):]
 	s = s[:strings.IndexByte(s, '\'')]
 	got := map[string]string{}
 	for _, line := range strings.Split(s, "\n") {
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
-			t.Fatalf("bad LIST line %q", line)
+			t.Fatalf("bad %s line %q", name, line)
 		}
 		got[k] = v
 	}
+	return got
+}
+
+func TestConfig_StartupParamsMatchE15(t *testing.T) {
 	want := StartupParams(false)
 	delete(want, "application_name")
-	if !maps.Equal(got, want) {
+	if got := e15List(t, "LIST"); !maps.Equal(got, want) {
 		t.Fatalf("e15.sh LIST\n got %v\nwant %v", got, want)
+	}
+	if got := e15List(t, "SUPER"); !maps.Equal(got, want19) {
+		t.Fatalf("e15.sh SUPER\n got %v\nwant %v", got, want19)
+	}
+}
+
+// want19 is the reviewed list of the superuser sessions' additional
+// parameters: names and values, nothing more, nothing less.
+var want19 = map[string]string{
+	"event_triggers": "off", "session_preload_libraries": "", "log_statement": "none",
+	"log_min_duration_statement": "-1", "log_min_duration_sample": "-1", "log_transaction_sample_rate": "0",
+	"log_duration": "off", "log_min_messages": "warning", "log_min_error_statement": "panic",
+	"debug_print_parse": "off", "debug_print_rewritten": "off", "debug_print_plan": "off",
+	"track_activities": "off", "pgaudit.log": "none", "pgaudit.role": "", "auto_explain.log_min_duration": "-1",
+	"pg_stat_statements.track": "none", "pg_stat_statements.track_utility": "off",
+	"plan_filter.statement_cost_limit": "0",
+}
+
+// TestStartupParams_SuperuserListIsTheReviewedNineteen: a superuser session
+// sends the common list and exactly the nineteen, in its startup packet.
+func TestStartupParams_SuperuserListIsTheReviewedNineteen(t *testing.T) {
+	if len(want19) != 19 {
+		t.Fatalf("test list has %d entries", len(want19))
+	}
+	want := maps.Clone(wantCommon)
+	want["application_name"] = "supapace-agent"
+	maps.Copy(want, want19)
+	if got := StartupParams(true); !maps.Equal(got, want) {
+		t.Fatalf("StartupParams(true)\n got %v\nwant %v", got, want)
+	}
+	f := newFake(t, func(c *fconn) error { return c.login() })
+	tg := f.target(t)
+	tg.Superuser = true
+	c, err := dial(t, tg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.close()
+	got := maps.Clone(f.result(t).params)
+	if got["user"] != testUser || got["database"] != "postgres" {
+		t.Fatalf("user/database %v", got)
+	}
+	delete(got, "user")
+	delete(got, "database")
+	if !maps.Equal(got, want) {
+		t.Fatalf("startup packet\n got %v\nwant %v", got, want)
+	}
+}
+
+// TestStartupParams_NonSuperuserUnchanged: a non-superuser session sends the
+// list as built and none of the nineteen (the server refuses a session that
+// sends one).
+func TestStartupParams_NonSuperuserUnchanged(t *testing.T) {
+	want := maps.Clone(wantCommon)
+	want["application_name"] = "supapace-agent"
+	got := StartupParams(false)
+	if !maps.Equal(got, want) {
+		t.Fatalf("StartupParams(false)\n got %v\nwant %v", got, want)
+	}
+	for k := range want19 {
+		if _, ok := got[k]; ok {
+			t.Errorf("non-superuser list carries %s", k)
+		}
+	}
+	// Each call builds a fresh map: a caller's change reaches no other session.
+	got["log_statement"] = "all"
+	if _, ok := StartupParams(false)["log_statement"]; ok {
+		t.Fatal("StartupParams(false) returns a shared map")
+	}
+	StartupParams(true)["log_statement"] = "all"
+	if StartupParams(true)["log_statement"] != "none" {
+		t.Fatal("StartupParams(true) returns a shared map")
 	}
 }
 
