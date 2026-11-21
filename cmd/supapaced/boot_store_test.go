@@ -81,7 +81,7 @@ func startCPDB() (name, root string, err error) {
 		"--tmpfs", "/tmp", "--tmpfs", "/var/lib/postgresql/data:uid=70,gid=70,mode=0700",
 		"-v", sock+":/var/run/postgresql",
 		"-e", "POSTGRES_USER=supapaced", "-e", "POSTGRES_DB=supapaced", "-e", "POSTGRES_PASSWORD="+hex.EncodeToString(pw),
-		"--entrypoint", "timeout", im.ControlPlane, "-s", "INT", "1800",
+		"--entrypoint", "timeout", im.ControlPlane, "-s", "INT", "14400",
 		"docker-entrypoint.sh", "postgres", "-c", "listen_addresses=", "-c", "fsync=off").CombinedOutput()
 	if err != nil {
 		return name, root, fmt.Errorf("docker run: %v: %s", err, bytes.TrimSpace(out))

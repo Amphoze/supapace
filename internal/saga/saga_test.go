@@ -109,7 +109,9 @@ func startDB() (name, dir string, err error) {
 		"-v", dir+":/var/run/postgresql",
 		"-e", "POSTGRES_USER=supapaced", "-e", "POSTGRES_DB=supapaced",
 		"-e", "POSTGRES_PASSWORD="+hex.EncodeToString(pw),
-		"--entrypoint", "timeout", im.ControlPlane, "-s", "INT", "1800",
+		// A backstop only (the watchdog removes it when this process ends): it
+		// must outlive the binary, which a -count run keeps going for hours.
+		"--entrypoint", "timeout", im.ControlPlane, "-s", "INT", "14400",
 		"docker-entrypoint.sh", "postgres", "-c", "listen_addresses=", "-c", "fsync=off").CombinedOutput()
 	if err != nil {
 		return name, dir, fmt.Errorf("docker run: %v: %s", err, bytes.TrimSpace(out))
@@ -1389,8 +1391,10 @@ func TestContainmentErrorWhileFlagSet_Requeued(t *testing.T) {
 		}
 		switch k := n.Add(1); {
 		case k <= 6:
-			e.ag.failed.Store(true) // the node lost containment under the step
-			time.AfterFunc(30*time.Millisecond, func() { e.ag.failed.Store(false) })
+			// The node lost containment under the step; the test clears the
+			// flag once it has seen the requeue, so the flag is still set
+			// whenever the runner judges the error, however slow it is.
+			e.ag.failed.Store(true)
 			return fmt.Errorf("start gate: %w", agent.ErrContainment)
 		case k == 7:
 			return errBoom // an ordinary failure: the requeues did not use up the attempts
@@ -1398,13 +1402,22 @@ func TestContainmentErrorWhileFlagSet_Requeued(t *testing.T) {
 		return nil
 	})
 	r := e.runner()
+	r.containmentRetry = 500 * time.Millisecond // far from the 1 ms backoff
 	e.start(r)
-	op := e.wait(id, "requeued", func(op store.Operation) bool { return op.State == "pending" && op.Attempts == 1 })
-	if !strings.HasPrefix(op.LastError, "containment_failed: ") ||
-		(op.NotBefore.Sub(op.UpdatedAt)-r.containmentRetry).Abs() > 15*time.Millisecond {
-		t.Fatalf("op = %+v", op)
+	for i := 1; i <= 6; i++ {
+		// While the flag is set the runner takes nothing: the requeue stays
+		// in view until the flag is cleared.
+		op := e.wait(id, fmt.Sprintf("requeued (%d)", i), func(op store.Operation) bool {
+			return op.State == "pending" && op.Attempts == i && strings.HasPrefix(op.LastError, "containment_failed: ")
+		})
+		// not_before is the runner's clock plus the delay, updated_at the
+		// database's a moment later: within the delay, well above the backoff.
+		if d := op.NotBefore.Sub(op.UpdatedAt); i == 1 && (d < r.containmentRetry/2 || d > r.containmentRetry+50*time.Millisecond) {
+			t.Fatalf("requeued %v ahead, want %v: %+v", d, r.containmentRetry, op)
+		}
+		e.ag.failed.Store(false)
 	}
-	op = e.waitState(id, "done")
+	op := e.waitState(id, "done")
 	if op.Attempts != 8 || n.Load() != 9 { // six requeues, one failure, then steps 4a and 4
 		t.Fatalf("op = %+v, %d EnsureCluster calls", op, n.Load())
 	}

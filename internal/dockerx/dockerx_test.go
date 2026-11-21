@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -210,12 +209,7 @@ func TestRun_TimeoutKills(t *testing.T) {
 	}
 	gpid, _ := strconv.Atoi(strings.TrimSpace(string(g)))
 	for _, p := range []int{pid, gpid} {
-		for i := 0; syscall.Kill(p, 0) != syscall.ESRCH; i++ {
-			if i > 50 {
-				t.Fatalf("process %d still alive", p)
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
+		waitDead(t, p)
 	}
 }
 
@@ -424,12 +418,7 @@ func TestRun_StdoutCapKillsEndlessWriter(t *testing.T) {
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "pid"))
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-	for i := 0; syscall.Kill(pid, 0) != syscall.ESRCH; i++ {
-		if i > 50 {
-			t.Fatalf("process %d still alive", pid)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitDead(t, pid)
 }
 
 func TestRun_StdoutAtCapPasses(t *testing.T) {

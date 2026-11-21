@@ -5284,3 +5284,21 @@ The restore, serve and seed programs of internal/bkjob, dispatched by supapaced 
 - Node tests (reach tag, bare node with the object-store stand-in, as root):
   `go test -c -tags reach ./internal/agent`, run `-test.run '^TestJobReach_'`; the test
   binary is the job's program there, and the node's installed daemon binary for one test.
+
+### 2026-11-21 — test hardening, second part
+- Gateway tests: serve a test server with goServe, never a bare go Serve. It counts the running
+  handlers. A cleanup that restores a package global (a seam, the limits) calls stopServers(t)
+  first: it closes the test's own servers and waits (20 s at most) for the handlers of those and
+  of its parent tests' servers. A handler may still read the global until it returns.
+- Bootstrap static tests read the package source embedded at build time (the source variable,
+  go:embed *.go), not the working directory: a checkout under a running binary changes nothing.
+  Use parseSource and fs.Glob(source, "*.go"), never parser.ParseFile on a path.
+- A control session in bootstrap tests sends only the startup parameters it needs (rawDial);
+  to leave a role's statement_timeout out of its own query, set only that one to 0.
+- The shared test database of a package lives 4 h as a backstop (the watchdog removes it when the
+  test process ends); a -count run outlives 30 min. Use 14400 in a new package's startDB.
+- A process killed with its group counts as ended when it is gone or a zombie: its new parent
+  (init or a subreaper) may reap it late. Wait with waitDead (10 s), not a short loop.
+- Search a stored key set for the quoted member name ("x5u"), not bare letters: a random key's
+  base64 may contain them.
+- A helper that repeats is stopped after N runs have ended, bounded at 30 s, not after a sleep.

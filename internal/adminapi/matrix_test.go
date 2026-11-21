@@ -317,7 +317,9 @@ func TestAPI_CreateStoresNormalisedKeySet(t *testing.T) {
 	var m mutation
 	strict(t, e.wantOK(t, "POST", "/v1/projects", `{"name":"demo","issuer_jwks":`+set+`}`, 202), &m)
 	params := string(e.op(t, m.OperationID).Params)
-	if strings.Contains(params, `"EC"`) || strings.Contains(params, "x5u") {
+	// Both quoted: a JSON member name or whole value, never a part of the
+	// random key's base64, which may hold the letters x5u.
+	if strings.Contains(params, `"EC"`) || strings.Contains(params, `"x5u"`) {
 		t.Fatalf("params carry the raw key set: %s", params)
 	}
 }

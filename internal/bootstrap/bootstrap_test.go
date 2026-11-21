@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +30,22 @@ import (
 	"github.com/Amphoze/supapace/internal/pgsock"
 	"github.com/jackc/pgx/v5"
 )
+
+// source is the package's source as this binary was built from it. The
+// static tests read it, not the directory, which a checkout may change
+// while they run.
+//
+//go:embed *.go
+var source embed.FS
+
+// parseSource parses the named file of source.
+func parseSource(fset *token.FileSet, name string) (*ast.File, error) {
+	b, err := source.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	return parser.ParseFile(fset, name, b, 0)
+}
 
 // frozenNames is the closed set of check names a report may carry.
 var frozenNames = []string{"presence", "superuser", "attributes", "memberships-reserved",
@@ -123,7 +141,7 @@ func TestAssert_NamesAreFrozen(t *testing.T) {
 	// report goes through one of them.
 	fset := token.NewFileSet()
 	for _, f := range []string{"assert.go", "pooler.go"} {
-		file, err := parser.ParseFile(fset, f, nil, 0)
+		file, err := parseSource(fset, f)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,12 +206,12 @@ func TestStatements_AreConstants(t *testing.T) {
 	fset := token.NewFileSet()
 	consts := map[string]bool{}
 	var files []*ast.File
-	ents, _ := filepath.Glob("*.go")
+	ents, _ := fs.Glob(source, "*.go")
 	for _, f := range ents {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
-		file, err := parser.ParseFile(fset, f, nil, 0)
+		file, err := parseSource(fset, f)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1100,12 +1118,12 @@ func TestStatements_AreConstantsStrict(t *testing.T) {
 	fset := token.NewFileSet()
 	consts := map[string]bool{}
 	var files []*ast.File
-	ents, _ := filepath.Glob("*.go")
+	ents, _ := fs.Glob(source, "*.go")
 	for _, f := range ents {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
-		file, err := parser.ParseFile(fset, f, nil, 0)
+		file, err := parseSource(fset, f)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -35,7 +35,10 @@ func TestSessionCalls_UnderSettingsOfTheRoleAndTheDatabase(t *testing.T) {
 	} {
 		c.exec(adm, s)
 	}
-	raw := c.rawDial("supabase_admin", nil)
+	// The control's own statement may not get the role's 1 ms bound: on a
+	// busy machine it is cancelled before it answers. Its startup list sets
+	// only that one setting; the others still come from the role.
+	raw := c.rawDial("supabase_admin", map[string]string{"statement_timeout": "0"})
 	if got := c.str(raw, "select pg_catalog.current_setting('search_path') || ' ' || current_user::pg_catalog.text"); got != "t_first, pg_temp, pg_catalog postgres" {
 		t.Fatalf("control: a session without the platform's startup list has %s", got)
 	}

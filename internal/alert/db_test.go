@@ -83,7 +83,7 @@ func startDB() (name, dir string, err error) {
 		"-v", dir+":/var/run/postgresql",
 		"-e", "POSTGRES_USER=supapaced", "-e", "POSTGRES_DB=supapaced",
 		"-e", "POSTGRES_PASSWORD="+hex.EncodeToString(pw),
-		"--entrypoint", "timeout", im.ControlPlane, "-s", "INT", "1800",
+		"--entrypoint", "timeout", im.ControlPlane, "-s", "INT", "14400",
 		"docker-entrypoint.sh", "postgres", "-c", "listen_addresses=", "-c", "fsync=off").CombinedOutput()
 	if err != nil {
 		return name, dir, fmt.Errorf("docker run: %v: %s", err, bytes.TrimSpace(out))

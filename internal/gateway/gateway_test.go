@@ -1232,28 +1232,34 @@ func (e *env) serve(t *testing.T, withTLS bool, mod func(*http.Server)) string {
 // stopServers first, whatever the order its helper was called in.
 var liveServers struct {
 	sync.Mutex
-	stops map[testing.TB][]func()
+	m map[testing.TB][]*liveServer
+}
+
+// liveServer is a test's server and the count of its handlers running.
+type liveServer struct {
+	t      testing.TB
+	name   string // t.Name(), to find the servers of a test's parents
+	s      *http.Server
+	mu     sync.Mutex
+	closed bool
+	active int
 }
 
 // goServe serves s on ln until the test ends or stopServers(t) runs, which
 // close s and wait for every handler it started to return.
 func goServe(t testing.TB, s *http.Server, ln net.Listener, withTLS bool) {
 	t.Helper()
-	var (
-		mu     sync.Mutex
-		closed bool
-		wg     sync.WaitGroup
-	)
+	l := &liveServer{t: t, name: t.Name(), s: s}
 	h := s.Handler
 	s.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		if closed { // a request read before the close: nothing runs for it
-			mu.Unlock()
+		l.mu.Lock()
+		if l.closed { // a request read before the close: nothing runs for it
+			l.mu.Unlock()
 			return
 		}
-		wg.Add(1)
-		mu.Unlock()
-		defer wg.Done()
+		l.active++
+		l.mu.Unlock()
+		defer func() { l.mu.Lock(); l.active--; l.mu.Unlock() }()
 		h.ServeHTTP(w, r)
 	})
 	if withTLS {
@@ -1261,36 +1267,57 @@ func goServe(t testing.TB, s *http.Server, ln net.Listener, withTLS bool) {
 	} else {
 		go s.Serve(ln)
 	}
-	stop := func() {
-		s.Close()
-		mu.Lock()
-		closed = true
-		mu.Unlock()
-		done := make(chan struct{})
-		go func() { wg.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(20 * time.Second):
-			t.Errorf("a handler still runs 20 s after its server was closed")
-		}
-	}
 	liveServers.Lock()
-	if liveServers.stops == nil {
-		liveServers.stops = map[testing.TB][]func(){}
+	if liveServers.m == nil {
+		liveServers.m = map[testing.TB][]*liveServer{}
 	}
-	liveServers.stops[t] = append(liveServers.stops[t], stop)
+	liveServers.m[t] = append(liveServers.m[t], l)
 	liveServers.Unlock()
 	t.Cleanup(func() { stopServers(t) })
 }
 
-// stopServers closes the servers t runs and waits for their handlers.
+// idle waits until no handler of l runs, for at most 20 s.
+func (l *liveServer) idle(t testing.TB) {
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(time.Millisecond) {
+		l.mu.Lock()
+		n := l.active
+		l.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("%d handlers still run after 20 s", n)
+			return
+		}
+	}
+}
+
+// stopServers closes the servers t runs and waits for their handlers. A
+// subtest may restore a global while a server of its parent goes on serving
+// the parent: those servers stay open, and their handlers still running (the
+// subtest's requests unwinding) are waited for.
 func stopServers(t testing.TB) {
 	liveServers.Lock()
-	stops := liveServers.stops[t]
-	delete(liveServers.stops, t)
+	own := liveServers.m[t]
+	delete(liveServers.m, t)
+	var parents []*liveServer
+	for _, ls := range liveServers.m {
+		for _, l := range ls {
+			if strings.HasPrefix(t.Name(), l.name+"/") {
+				parents = append(parents, l)
+			}
+		}
+	}
 	liveServers.Unlock()
-	for _, stop := range stops {
-		stop()
+	for _, l := range own {
+		l.s.Close()
+		l.mu.Lock()
+		l.closed = true
+		l.mu.Unlock()
+		l.idle(t)
+	}
+	for _, l := range parents {
+		l.idle(t)
 	}
 }
 

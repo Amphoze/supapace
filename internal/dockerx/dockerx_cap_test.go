@@ -36,9 +36,17 @@ func pidOf(t *testing.T, dir, name string) int {
 	return p
 }
 
+// waitDead waits up to 10 s until pid has ended: gone, or a zombie that its
+// new parent (init or a subreaper, for an orphaned grandchild) has not yet
+// reaped.
 func waitDead(t *testing.T, pid int) {
 	t.Helper()
-	for i := 0; syscall.Kill(pid, 0) != syscall.ESRCH; i++ {
+	zombie := func() bool {
+		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		_, rest, ok := strings.Cut(string(b), ") ")
+		return err == nil && ok && strings.HasPrefix(rest, "Z")
+	}
+	for i := 0; syscall.Kill(pid, 0) != syscall.ESRCH && !zombie(); i++ {
 		if i > 500 { // 10 s
 			t.Fatalf("pid %d still alive", pid)
 		}

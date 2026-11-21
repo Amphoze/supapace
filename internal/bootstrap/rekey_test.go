@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -252,7 +252,7 @@ func TestRekey_Idempotent(t *testing.T) {
 // package function it calls — are the three verifier statements and the
 // backup role's read, creation and two grants.
 func TestRekey_OnlyAllowedStatements(t *testing.T) {
-	files, _ := filepath.Glob("*.go")
+	files, _ := fs.Glob(source, "*.go")
 	if !slices.Contains(files, "rekey.go") {
 		t.Fatal("rekey.go is not among the files the static test reads")
 	}
@@ -263,7 +263,7 @@ func TestRekey_OnlyAllowedStatements(t *testing.T) {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
-		file, err := parser.ParseFile(fset, f, nil, 0)
+		file, err := parseSource(fset, f)
 		if err != nil {
 			t.Fatal(err)
 		}

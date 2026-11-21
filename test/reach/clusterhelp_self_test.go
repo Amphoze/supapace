@@ -14,8 +14,17 @@ import (
 // helpers_self_test.go, built without the reach tag).
 func TestClusterhelp_RepeatWhile(t *testing.T) {
 	if fails(func(tb testing.TB) {
-		stop := repeatWhile(tb, "true", 10*time.Millisecond, commandOK(nil, "true"))
-		time.Sleep(100 * time.Millisecond)
+		// Stopped once three runs have ended, not after a fixed time: on a
+		// busy machine three runs of a command can take longer than any
+		// sleep chosen here.
+		var runs atomic.Int32
+		ok := commandOK(nil, "true")
+		stop := repeatWhile(tb, "true", 10*time.Millisecond, func() error { defer runs.Add(1); return ok() })
+		for deadline := time.Now().Add(30 * time.Second); runs.Load() < 3; time.Sleep(5 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				tb.Fatalf("%d runs in 30 s", runs.Load())
+			}
+		}
 		stop()
 	}) {
 		t.Fatal("a command that always succeeds failed the test")
