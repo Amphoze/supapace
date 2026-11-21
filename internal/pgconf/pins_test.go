@@ -231,6 +231,10 @@ func TestRecoveryPins_LSN(t *testing.T) {
 
 func TestRecoveryPins_Latest(t *testing.T) {
 	recoveryCase(t, rt(time.Time{}, "", "latest"), "latest", "")
+	// The end of one timeline's archive: a decimal id with no target.
+	for _, tl := range []string{"1", "2", "4294967295"} {
+		recoveryCase(t, rt(time.Time{}, "", tl), tl, "")
+	}
 }
 
 func TestRecoveryPins_Timeline(t *testing.T) {
@@ -245,8 +249,7 @@ func TestRecoveryPins_Refusals(t *testing.T) {
 		rt(tenAM, "0/1", "current"),           // both targets
 		rt(tenAM, "", "latest"),               // latest with a target
 		rt(time.Time{}, "0/1", "latest"),      // latest with a target
-		rt(time.Time{}, "", "current"),        // a zero time and no position: no target, so only latest
-		rt(time.Time{}, "", "1"),              // the same
+		rt(time.Time{}, "", "current"),        // a zero time and no position: no target, so latest or a decimal id
 		rt(time.Time{}, "", ""),               //
 		rt(tenAM, "", "0"),                    // timeline 0
 		rt(tenAM, "", "00"),                   //

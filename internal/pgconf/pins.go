@@ -93,8 +93,8 @@ func PinnedNames(layout int) []string {
 
 // RecoveryTarget is where a restore stops: at Time, at the position LSN
 // ("hex/hex"), or — both unset — at the end of the archive. Timeline is
-// "latest" for the end of the archive, "current" or a decimal timeline id
-// otherwise.
+// "latest" or a decimal timeline id for the end of the archive (the end of
+// that timeline's archive), "current" or a decimal timeline id otherwise.
 type RecoveryTarget struct {
 	Time     time.Time
 	LSN      string
@@ -120,8 +120,8 @@ func RecoveryPins(t RecoveryTarget) ([]string, error) {
 		return bad("a time and a position")
 	case hasTime && (t.Time.UTC().Year() < 1 || t.Time.UTC().Year() > 9999):
 		return bad("want a year 1 to 9999")
-	case !hasTime && !hasLSN && t.Timeline != "latest":
-		return bad("no target needs timeline latest")
+	case !hasTime && !hasLSN && t.Timeline != "latest" && !timelineID(t.Timeline):
+		return bad("no target needs timeline latest or a decimal id 1–4294967295")
 	case (hasTime || hasLSN) && t.Timeline != "current" && !timelineID(t.Timeline):
 		return bad("want timeline current or a decimal id 1–4294967295")
 	case hasLSN && !lsn(t.LSN):

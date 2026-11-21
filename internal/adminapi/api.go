@@ -255,6 +255,12 @@ func toError(r *http.Request, err error) (int, any) {
 			return http.StatusNotFound, errorJSON{"not_found", "no such operation"}
 		}
 		return http.StatusNotFound, errorJSON{"not_found", "no such project"}
+	case errors.Is(err, pgconf.ErrGUCValue): // a restore target the recovery start would refuse
+		msg := err.Error()
+		if i := strings.LastIndex(msg, pgconf.ErrGUCValue.Error()+": "); i >= 0 {
+			msg = msg[i+len(pgconf.ErrGUCValue.Error())+2:]
+		}
+		return http.StatusBadRequest, errorJSON{"bad_request", clean(msg, maxMessage, "the restore target is not valid")}
 	case errors.Is(err, store.ErrConflict):
 		msg := strings.TrimPrefix(err.Error(), store.ErrConflict.Error())
 		msg = strings.TrimSpace(strings.TrimPrefix(msg, ":"))

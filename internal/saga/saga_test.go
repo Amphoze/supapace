@@ -177,6 +177,7 @@ type fakeAgent struct {
 	effects      map[string]int
 	dir, network map[string]bool
 	cluster      map[string]int64
+	state        map[string]bool // a state file: written by the first start, kept across a stop
 	pgrest       map[string]int64
 	render       map[string]bool
 	repo         map[string]bool
@@ -198,7 +199,7 @@ type fakeAgent struct {
 
 func newFake() *fakeAgent {
 	return &fakeAgent{effects: map[string]int{}, dir: map[string]bool{}, network: map[string]bool{},
-		cluster: map[string]int64{}, pgrest: map[string]int64{}, render: map[string]bool{}, repo: map[string]bool{}, route: map[string]routes.Project{}}
+		cluster: map[string]int64{}, state: map[string]bool{}, pgrest: map[string]int64{}, render: map[string]bool{}, repo: map[string]bool{}, route: map[string]routes.Project{}}
 }
 
 func (f *fakeAgent) enter(ctx context.Context, c call, s *agent.Spec) error {
@@ -290,6 +291,7 @@ func (f *fakeAgent) EnsureCluster(ctx context.Context, s agent.Spec) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.render[s.Ref] = true
+	f.state[s.Ref] = true
 	if f.cluster[s.Ref] != s.Generation {
 		f.cluster[s.Ref] = s.Generation
 		f.effects[fmt.Sprintf("cluster %s %d", s.Ref, s.Generation)]++
@@ -426,6 +428,7 @@ func (f *fakeAgent) PurgeDir(ctx context.Context, s agent.Spec) error {
 	defer f.mu.Unlock()
 	if f.dir[s.Ref] {
 		delete(f.dir, s.Ref)
+		delete(f.state, s.Ref)
 		f.effects["purgedir "+s.Ref]++
 	}
 	return nil
@@ -477,7 +480,7 @@ func (f *fakeAgent) HostState(ctx context.Context, s agent.Spec) (agent.HostStat
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return agent.HostState{ProjectDir: f.dir[s.Ref], StateFile: f.cluster[s.Ref] != 0, ClusterRunning: f.cluster[s.Ref] != 0}, nil
+	return agent.HostState{ProjectDir: f.dir[s.Ref], StateFile: f.state[s.Ref], ClusterRunning: f.cluster[s.Ref] != 0}, nil
 }
 
 func (f *fakeAgent) setErr(fn func(c call) error) {
@@ -1014,7 +1017,7 @@ func TestStepIDs_Fixed(t *testing.T) {
 	wantSeq(t, ids(tables["delete"]), []string{"D1", "D2", "Db", "D3", "Dp", "Dr", "D4", "D5"})
 	wantSeq(t, ids(tables["purge"]), []string{"P1", "P2", "P3", "P4", "P5"})
 	wantSeq(t, ids(compensation), []string{"C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7"})
-	wantSeq(t, ids(tables["restore"]), nil)
+	wantSeq(t, ids(tables["restore"]), restoreIDs)
 	if len(tables) != 5 {
 		t.Fatalf("tables %v", tables)
 	}

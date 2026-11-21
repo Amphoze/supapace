@@ -5302,3 +5302,119 @@ The restore, serve and seed programs of internal/bkjob, dispatched by supapaced 
 - Search a stored key set for the quoted member name ("x5u"), not bare letters: a random key's
   base64 may contain them.
 - A helper that repeats is stopped after N runs have ended, bounded at 30 s, not after a sleep.
+
+### 2026-11-21 — saga: the restore operation
+
+internal/saga/restore.go, restore_submit.go. A restore replaces a project's data in place with a
+backup set and the archive after it: to a time, a WAL position, or the end of the archive; from
+the project's repository or from the off-site store.
+
+Submit
+- Runner.Submit(ctx, "restore", ref, params): params are exactly {"to","timeline","from"}.
+  to: "latest", an RFC 3339 time, or "lsn:<hex>/<hex>". timeline: 0 = the newest recorded one.
+  from: "" = the default (local), "local", "offsite".
+- The timeline followed is the one named, else the newest recorded; it is rendered as its decimal
+  for every target, the end of the archive included ("latest" is never rendered: the server
+  would follow the newest history the archive holds, a branch no restore finished included).
+- Rules run before the store is touched, in this order: target (pgconf.RecoveryPins), window,
+  source, disk quota, repository quota, replication pause. Nothing is written on a refusal.
+- Errors: a target outside the backups' window is a *store.WindowError (errors.As); a target the
+  recovery pins refuse wraps pgconf.ErrGUCValue and store.ErrConflict (the admin API answers 400
+  bad_request); every other refusal wraps store.ErrConflict with its reason (409 conflict).
+- The set is chosen from the recorded sets, never from repository files: the newest that stopped
+  at or before the target on the lineage of the timeline followed. Lineage of timeline k: the
+  sets on k, plus — when the restore that recorded k is known (the timeline row names its
+  operation, whose parameters name its set L) — the lineage of L's timeline up to L's stop, down
+  the chain. A timeline whose restore is not known contributes its own sets only.
+- The source becomes off-site without being asked on a node that has no state file of the
+  project, and for a set that stopped before the repository's seed time; off-site needs the store
+  declared and a set recorded as replicated and listed.
+- Also refused: the repository quota full by the last push's quota report or by the newest push
+  job's code (not on a node without a state file, where the figure is stale); with the store
+  declared, a replication paused for its budget (a restore replicates before it wipes).
+
+Steps (operation.step), in order
+- T1 target rendered again (refusal: final, invalid_target, nothing changed); on a node without a
+  state file of the project: directories, network and rendered files, no first boot.
+- T2 project restoring, route draining, PostgREST stopped. T3 cluster stopped and removed.
+- T4p slot taken; push jobs until one reports the spool empty (bound: bklimit.PushLoopMax, then
+  final push_incomplete). T4r replication, then what the repository holds is recorded and compared
+  with the timeline rows; a difference sends the restore off-site.
+- T5a (off-site): only after a copy job of T4r in the same pass ended complete (mode copy, not
+  stopped, not skipped) — else back to T4p; then the fetch directory emptied and the fetch job.
+- T5b (off-site): the seed time is recorded, then the seed job, which empties the repository
+  and copies the fetched range in; the held histories are then the fetch plan's.
+- T5 "wiped" recorded, then the data directory wiped: the first step that changes it.
+- T6 restore job, mode none; after a history_mismatch one standby retry with the timeline
+  followed when the set lies on it, else the off-site store. tablespace is final. The job's
+  reported mode must be the one asked.
+- T7 the timeline this recovery will create is chosen, then the recover job. T8 re-key with the
+  spec the recovery start was given, the new timeline confirmed (t8_done in the same
+  transaction); the recovery start is stopped on every outcome.
+- T9 normal start and check. T10p, T10r, T10c, T10b, T10s: push, replicate, check, full backup,
+  replicate; a check or backup that ends tablespace or symlink is final.
+- T11 PostgREST, route active, fetch directory removed, done and slot freed in one transaction.
+
+Re-entry and attempts
+- A step reads only jobs above the operation's job floor; every rewind and every op retry raises
+  it, so the steps passed again submit fresh jobs. A step that needs an earlier step's job of the
+  same pass and finds none goes back to that step (T4r to T4p, T5a to T4p, T5b to T5a, T6 with an
+  unseeded off-site source to T5a).
+- Failed or interrupted job at T6: back to T5 (wipe first). At T7, and any failure of T8 before
+  t8_done: back to T3. A seed that finds no fetch directory: back to T5a.
+- A rewind costs an attempt unless a job that was already counted caused it; cancelled and
+  interrupted jobs are not counted at their end, so their rewind is. Five attempts, then failed
+  with the cause's code.
+- T8 with t8_done set only stops the cluster: no second re-key.
+- A failed restore leaves the project restoring, its route draining; op retry continues it, a
+  new restore or a delete supersedes it. Its last_error ends with the state it leaves — data
+  directory unchanged or replaced, or nothing on the node yet — the commands that leave it, the
+  way back to the state before ("--to latest --timeline n") once the directory was wiped, and
+  the first reason the source became the off-site store.
+
+Shortfall (end-of-archive restores only)
+- Compared by segment number: the highest segment the serve job handed out against the newest
+  segment of the timeline followed as the last T4p push reported it (the off-site record's on a
+  node that held nothing). Below it: the result's shortfall object and notice restore-shortfall;
+  the restore still completes. A missing figure, or no serve result: "not checked" and the notice.
+- The figure is what was handed to the recovering server, not what it replayed.
+
+Result document (operation.result of a done restore)
+- to, from, set, mode, reached_segment, new_timeline, previous_timeline,
+  previous_newest_segment, seeded, shortfall (null, an object, or "not checked"), steps
+  (seconds per step, parked waits included). A failed restore has none.
+
+Parameters the steps add (operation.params; written member by member, others kept)
+- set, set_start_segment, replaced, n, n_newest_segment, reached_segment, histories, newest,
+  t7_started, t8_done, standby_tried, fetch_extra, seeded, shortfall, mode, times, clock, decided,
+  wiped, switched.
+
+Job parameters written
+- recover: {"target":{"timeline", "time"?, "lsn"?}}, timeline a decimal;
+  restore: {"set","mode","target_timeline"}; fetch: {"set","to","timeline","extra"}.
+
+Codes of its own
+- Final: invalid_target, push_incomplete, fetch_too_large, set_not_offsite,
+  offsite_not_declared, tablespace, symlink, and internal for a stored job result out of shape.
+  Counted: timeline_conflict, timeline_mismatch (notice timeline-mismatch).
+
+Touches outside the package
+- pgconf.RecoveryPins: with no target the timeline is "latest" or a decimal id (the end of that
+  timeline's archive); with a time or a position, "current" or a decimal id, as before.
+- adminapi: an error wrapping pgconf.ErrGUCValue answers 400 bad_request.
+
+Caller rules
+- SetJobs and SetRecoverer before Run: without them a restore fails with code internal.
+- Every stored job result is checked for shape and bounds before use.
+
+Known limits
+- Nothing lifts a replication pause before its time; the refusal says when the pause ends.
+- The stop after the re-key runs within what is left of the step's deadline (5 s at least); the
+  step's own parameter writes have a bound of their own, so a re-key out of time rewinds.
+- symlink at T10c/T10b is final also when the data directory could not be walked whole.
+- Without a named timeline a restore follows the newest recorded one — also the timeline of a
+  restore that failed after its re-key. After a control-plane recovery that lost a recorded
+  timeline's row, that timeline is abandoned and is not followed.
+- A restore job's refusal of a set (tablespace, link) comes after the wipe.
+- A restore to a time after the last commit fails target_not_reached, five passes.
+- Nothing here has run on a node yet.

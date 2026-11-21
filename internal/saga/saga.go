@@ -266,7 +266,7 @@ func (x *job) finishFailedMsg(ctx context.Context, msg string) {
 	if x.record(ctx) != nil {
 		return
 	}
-	msg = x.stranded(ctx, msg)
+	msg = x.restoreNote(ctx, x.stranded(ctx, msg))
 	if err := x.r.st.FinishOperation(ctx, x.op.ID, "failed", msg); err != nil {
 		x.r.log.Error("recording a failed operation", "op", x.op.ID, "ref", x.op.Ref, "err", x.r.text(err))
 		return
@@ -510,7 +510,7 @@ func (x *job) afterError(ctx context.Context, err error) {
 		}
 	case errors.Is(err, agent.ErrContainment) && !errors.Is(err, agent.ErrCheckIncomplete), errors.Is(err, bootstrap.ErrAssertion), errors.Is(err, agent.ErrEpochDivergence),
 		errors.As(err, &f) && f.final, cur.Attempts-requeued >= maxAttempts:
-		msg = x.stranded(ctx, msg)
+		msg = x.restoreNote(ctx, x.stranded(ctx, msg))
 		if werr = r.st.FinishOperation(ctx, op.ID, "failed", msg); werr == nil {
 			r.log.Warn("step failed", "op", op.ID, "ref", op.Ref, "kind", op.Kind, "after", cur.Step,
 				"attempt", cur.Attempts, "final", true, "err", msg)
