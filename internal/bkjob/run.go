@@ -78,6 +78,9 @@ var codes = map[string][]string{
 	"stanza-create": {CodeLogin, CodeArchiveTimeout, CodePgbackrest, CodeTablespace, CodeSymlink},
 	"backup":        {CodeLogin, CodeArchiveTimeout, CodePgbackrest, CodeTablespace, CodeSymlink},
 	"check":         {CodeLogin, CodeArchiveTimeout, CodePgbackrest, CodeTablespace, CodeSymlink},
+	"restore":       {restoreTablespace, restoreHistory, restoreSetInvalid, restoreTool},
+	"serve":         {serveRspool},
+	"seed":          {seedFailed},
 }
 
 // Codes returns the failure codes kind's program can end with, and whether

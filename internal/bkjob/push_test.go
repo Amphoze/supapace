@@ -672,7 +672,7 @@ func TestPush_FailureCodesAreItsKinds(t *testing.T) {
 	if failCode(err) != CodeSpool {
 		t.Errorf("an absent spool: %v", err)
 	}
-	for _, k := range []string{"seed", "replicate", "fetch", "recover"} {
+	for _, k := range []string{"replicate", "fetch", "recover"} {
 		if _, ok := Codes(k); ok {
 			t.Errorf("Codes(%s) is known before its program exists", k)
 		}

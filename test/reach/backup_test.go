@@ -722,20 +722,32 @@ func tenantTrees(t *testing.T, bCanary string, bNeedle needle) {
 		if out := get("--config=/job/input.json"); !strings.Contains(out, "exit 201") || strings.Contains(out, "config") {
 			t.Errorf("an option-shaped restore request: %q, want exit 201 and no request", brief(out))
 		}
-		mustUID(t, S, `cd `+rspoolInPG+` && printf x > 'req/--config=x' && ln -s /repo req/.tmp-reach && rm -rf out && ln -s /job out`)
+		// req/ replaced by a link to a decoy holding an option-shaped request
+		// (the serve job would remove it, were the link followed), and a link
+		// at the serve job's temporary pattern in out/ pointing into the
+		// job's own writable mount.
+		const tmpName = ".tmp-" + wal + "-0123456789abcdef"
+		mustUID(t, S, `cd `+rspoolInPG+` && mkdir decoy && printf x > 'decoy/--config=x' && rm -rf req && ln -s decoy req && ln -s /rspool/reach-through "out/`+tmpName+`"`)
 		op, code := restore(t, S.Ref, "--to", "latest")
 		if code != 0 || op.State != "done" {
 			t.Fatalf("restore with links in the restore spool: exit %d, %s at step %q: %s", code, op.State, op.Step, op.LastError)
 		}
-		// The worker may remove the planted link; it must never write through it.
-		p := filepath.Join(paths.ProjectDir(S.Ref), "rspool", "req", ".tmp-reach")
-		if fi, err := os.Lstat(p); err == nil {
-			if l, _ := os.Readlink(p); fi.Mode()&os.ModeSymlink == 0 || l != "/repo" {
-				t.Errorf("the planted link in the restore spool was replaced (%v, %q)", fi.Mode(), l)
+		rs := filepath.Join(paths.ProjectDir(S.Ref), "rspool")
+		for _, d := range []string{"req", "out"} {
+			if fi, err := os.Lstat(filepath.Join(rs, d)); err != nil || !fi.IsDir() {
+				t.Errorf("%s/ of the restore spool is not a directory after the restore (%v)", d, err)
 			}
 		}
-		if fi, err := os.Lstat(filepath.Join(paths.ProjectDir(S.Ref), "rspool", "out")); err != nil || !fi.IsDir() {
-			t.Errorf("out/ of the restore spool is not a directory again after the restore (%v)", err)
+		if b, err := os.ReadFile(filepath.Join(rs, "decoy", "--config=x")); err != nil || string(b) != "x" {
+			t.Errorf("the decoy behind the req/ link was touched (%q, %v): the link was followed", b, err)
+		}
+		// The serve job removes old temporaries by name, unfollowed, when it
+		// starts: the planted link is gone and nothing was written through it.
+		if _, err := os.Lstat(filepath.Join(rs, "out", tmpName)); err == nil {
+			t.Error("the link planted at a temporary name in out/ is still there: the serve job did not clear it at its start")
+		}
+		if _, err := os.Lstat(filepath.Join(rs, "reach-through")); err == nil {
+			t.Error("something was written through the link at a temporary name in out/")
 		}
 	})
 

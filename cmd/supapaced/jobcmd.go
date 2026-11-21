@@ -29,6 +29,9 @@ var jobKinds = map[string]func(ctx context.Context, in jobio.Input) (any, error)
 	"stanza-create": func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.StanzaCreate(ctx, in) },
 	"backup":        func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Backup(ctx, in) },
 	"check":         func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Check(ctx, in) },
+	"restore":       func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Restore(ctx, in) },
+	"serve":         func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Serve(ctx, in, "/rspool") },
+	"seed":          func(ctx context.Context, in jobio.Input) (any, error) { return bkjob.Seed(ctx, "/repo", "/fetch") },
 }
 
 // jobCmd runs one job program inside its job container: supapaced job KIND.
@@ -40,7 +43,7 @@ var jobKinds = map[string]func(ctx context.Context, in jobio.Input) (any, error)
 // (no result line: the runner records the job crashed).
 func jobCmd(args []string) int {
 	if len(args) != 1 || jobKinds[args[0]] == nil {
-		fmt.Fprintln(stderr, "usage: supapaced job push")
+		fmt.Fprintln(stderr, "usage: supapaced job KIND")
 		return 2
 	}
 	b, err := os.ReadFile(jobInput)

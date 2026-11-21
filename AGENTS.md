@@ -5158,3 +5158,45 @@ socket, /spool, /repo). Dispatched by `supapaced job stanza-create|backup|check`
   a path. An info answer at its bound fails the backup (pgbackrest: too many sets). check takes
   no lock in pgBackRest
   2.58; stanza-create and backup exit 50 on an unwritable lock path (pgbackrest).
+
+### 2026-11-21 — bkjob: restore, serve and seed jobs
+The restore, serve and seed programs of internal/bkjob, dispatched by supapaced job KIND.
+- Restore(ctx, in): restores set in.Set into the empty data directory. First it reads the
+  set's manifest with the tool's repo-get backup/<stanza>/<label>/backup.manifest (only that
+  path, the job's environment, never --raw), streamed: at most bklimit.SetFileMax bytes and
+  1 MiB a line, the tool stopped at the verdict. Refused before anything is written:
+  any pg_tblspc entry or link (code tablespace); a [backup:target] entry other than pg_data
+  of type path, a [target:file]/[target:path] key outside walname's set-file form, a
+  malformed or oversized manifest, any repo-get failure (code set_invalid).
+  Then restore --set=<label> --type=none, or --type=standby --target-timeline=<n>.
+  On success: none writes recovery.signal (O_EXCL|O_NOFOLLOW); standby renames the tool's
+  standby.signal (a regular file) to recovery.signal. Result {"ok","mode"}.
+  Codes: tablespace; history_mismatch (exit 58); set_invalid (75, a signal, a manifest
+  refusal); pgbackrest (anything else, a data directory that is not empty). A failed job
+  leaves the tool's files and no recovery.signal; the caller wipes before the next restore.
+  Messages never hold the passphrase or the set's key (also a key cut at 256 bytes).
+- Serve(ctx, in, rspool): answers the archive binary's requests until ctx ends (SIGTERM),
+  then exit 0 with {"ok","served","none","refused","last","last_none","last_segment"}.
+  req/ and out/ are opened once without following links; a non-directory there is
+  replaced; failure code rspool. A request must be a regular file of in.UID named as
+  walname.Request; anything else is unlinked unread (directories stay). Each pass answers
+  at most 8 requests without a waiting answer, newest ctime first. A name answered
+  in.MaxAnswers times (cap bklimit.ServeMaxAnswers) is removed unanswered, so the server
+  times out and stops instead of promoting. An unadmitted timeline is answered <name>.none
+  without the tool; archive-get exit 1 is <name>.none; other failures retry. A file answer
+  is checked against SegmentMax/SmallMax and copied to out/.tmp-<name>-<16 hex> (exclusive,
+  no link), fsynced and renamed. Old .tmp- entries in out/ are removed at start.
+  last_segment: highest segment number answered with a file. none: last 64 names.
+  A kill (deadline) leaves no result line.
+- Seed(ctx, repo, fetch): checks all of fetch/ first (directories and regular files only,
+  names [A-Za-z0-9_.+-]{1,255}, at most 32 levels; failure leaves repo/ untouched), then
+  empties repo/ (rmtree.Remove per directory, unlink otherwise; repo/ is a mount) and copies
+  by descriptor: directories 0750, files 0640, exclusive and unfollowed; each file is synced
+  before it is closed, each directory after its walk, repo/ last. Result
+  {"ok","files","bytes"}; failure code seed. A failed copy leaves repo/ partial; running
+  the job again over the same fetch/ is correct. A fetch/ carrying pgBackRest's latest
+  link is refused.
+- The manifest check also reads backup.manifest.copy when the repository holds one, by the
+  same rules; two manifests with different keys are set_invalid. Serve's listing returns
+  after the current batch once its context ends.
+- Known limits: Serve's per-name counts reset past 65,536 names.
