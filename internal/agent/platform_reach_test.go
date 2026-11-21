@@ -187,6 +187,8 @@ func TestNode_ImageFilesAndControlPlaneDB(t *testing.T) {
 	t.Cleanup(func() {
 		nodeDockerQuiet("rm", "-f", cpName)
 		os.RemoveAll(a.p.CPDir())
+		os.RemoveAll(a.p.CPProjectDir())
+		os.RemoveAll(a.p.RepoDir(nodecfg.ControlPlaneSubject))
 		os.RemoveAll(a.p.PlatformDir())
 	})
 

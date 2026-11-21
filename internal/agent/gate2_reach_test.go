@@ -79,6 +79,8 @@ func TestNode_ControlPlaneDataSurvivesRecreation(t *testing.T) {
 	t.Cleanup(func() {
 		nodeDockerQuiet("rm", "-f", cpName)
 		os.RemoveAll(a.p.CPDir())
+		os.RemoveAll(a.p.CPProjectDir())
+		os.RemoveAll(a.p.RepoDir("cp"))
 		os.RemoveAll(a.p.PlatformDir())
 	})
 	if err := a.EnsureImageFiles(ctx); err != nil {
@@ -103,10 +105,14 @@ func TestNode_ControlPlaneDataSurvivesRecreation(t *testing.T) {
 		t.Fatalf("%v %s", err, out)
 	}
 	id1 := g2Run(t, "container", "inspect", "--format", "{{.Id}}", "--", cpName)
-	// An older build's container on the same directories: other arguments, no label.
+	// An older build's container on its own data path: other arguments, no
+	// label. The ensure below moves the data to the projects filesystem.
 	cp := a.p.CPDir()
 	g2Run(t, "stop", "-t", "30", cpName)
 	g2Run(t, "rm", cpName)
+	if out, err := exec.Command("mv", filepath.Join(a.p.CPProjectDir(), "data"), filepath.Join(cp, "data")).CombinedOutput(); err != nil {
+		t.Fatalf("back to the older path: %v %s", err, out)
+	}
 	g2Run(t, "run", "-d", "--name", cpName, "--network", "none", "--user", "70:70", "--memory", "300m",
 		"-v", filepath.Join(cp, "data")+":/var/lib/postgresql/data", "-v", filepath.Join(cp, "sock")+":/var/run/postgresql",
 		"-v", filepath.Join(cp, "etc")+":/etc/sp:ro", a.cfg.Images.ControlPlane,
@@ -121,6 +127,11 @@ func TestNode_ControlPlaneDataSurvivesRecreation(t *testing.T) {
 	t.Logf("before %s; after %s", id1[:12], id2)
 	if out, err := psql("select v from keep"); err != nil || out != "kept" {
 		t.Fatalf("row after re-creation: %v %q", err, out)
+	}
+	for _, p := range []string{filepath.Join(cp, "data.moved", "PG_VERSION"), filepath.Join(a.p.CPProjectDir(), "data", "PG_VERSION")} {
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("not moved: %v", err)
+		}
 	}
 	logs, _ := exec.Command("docker", "logs", "--tail", "5", cpName).CombinedOutput()
 	t.Logf("logs after re-creation: %s", logs)

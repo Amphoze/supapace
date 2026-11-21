@@ -5418,3 +5418,100 @@ Known limits
 - A restore job's refusal of a set (tablespace, link) comes after the wipe.
 - A restore to a time after the last commit fails target_not_reached, five passes.
 - Nothing here has run on a node yet.
+
+### 2026-11-21 — Control-plane database: archiving, its move, the recovery start
+
+internal/agent/platform.go. The control-plane database (container sp-cp-db, uid and gid
+nodecfg.ControlPlaneUID = 70, no network, peer authentication over its socket only) archives
+like a project's cluster, lives on the projects filesystem under quotas, and can be restored.
+
+Where things are
+- CPProjectDir()/{data,spool,rspool/{req,out}}: 70:70 0700; CPProjectDir() itself root 0700.
+- CPDir()/sock (70:70) and CPDir()/etc (pg_hba.conf, pg_ident.conf, root 0444): unchanged.
+- RepoDir("cp")/repo: 70:70 0750; RepoDir("cp")/fetch: 65530:70 2750, only during a restore.
+- ToolsDir()/supapace-arch: root 0555, copied from beside the daemon's executable; its
+  digest is part of the container's configuration label.
+- CPDir()/initialised: the stamp, root 0444, empty. CPDir()/restoring: the restore marker,
+  root 0600, empty. CPDir()/data.moved: the old tree after a move; this package never
+  removes it.
+
+Exported
+- EnsureControlPlaneDB(ctx) error: refuses while the marker exists; sets uid 70's two
+  quotas (nodecfg.CPQuotas) first and at every call, so a filesystem without enforced
+  quotas stops it before anything is written; moves a database from an older build's
+  CPDir()/data; stamps the node; starts or adopts sp-cp-db, re-creating it when its label
+  differs. Command line adds archive_mode=on, archive_command=pgconf.ArchiveCommand (with
+  its marker word, without which a backup is refused), restore_command=
+  pgconf.RestoreCommand, archive_timeout=300; environment adds
+  POSTGRES_INITDB_ARGS=--data-checksums (acts on an empty data directory only).
+- EnsureControlPlaneRecovery(ctx, pgconf.RecoveryTarget) error: sp-cp-recovery, the same
+  arguments without a restart policy and without the initialisation variable, role label
+  cp-recovery, the recovery settings last. Only while the marker exists and sp-cp-db does
+  not; an earlier sp-cp-recovery is removed first. On an empty data directory it exits 1.
+- StopControlPlaneRecovery(ctx) error: stops (30 s grace) and removes it; absent is done.
+- PrepareControlPlaneRestore(ctx) error: starts nothing. Refuses while sp-cp-db exists and
+  while CPDir()/data exists. A first call (no marker) also refuses a non-empty data
+  directory or repository, then writes the marker, makes the trees with their quotas and
+  empties spool and rspool. A call that finds the marker also empties data and repo/ and
+  removes fetch/. A removal task that fails is an error.
+- ControlPlaneRecoveryState(ctx) (promoted, exited bool, systemID string, err error):
+  exited is true for an absent or stopped container, and then no session is opened; a
+  server that does not accept a session yet is promoted=false with no error; systemID is
+  the database system identifier as an unsigned decimal, set once promoted.
+- FinishControlPlaneRestore(ctx) error: stops the recovery start, removes fetch/, and
+  last the marker.
+
+The move (once, at the first ensure that finds CPDir()/data)
+- Order: the old tree is checked (directories and regular files only), sp-cp-db is stopped
+  and removed, the tree is copied to data.part with owners and modes, the projects
+  filesystem is synced (syncfs on a descriptor opened before the copy; its error stops the
+  move), CPDir()/data is renamed to data.moved, data.part is renamed to data.
+- Resume by names alone: data.moved + data.part finishes with one rename; data.moved +
+  data is done; the old tree alone (with or without data.part) copies again.
+- Refused: data.moved alone; the old and the new data without data.moved.
+- The copy does not watch the context: a deadline that passes during it fails the call
+  after the move is complete, and the next call starts the container.
+
+The stamp
+- Written once the data directory holds PG_VERSION. A stamped node whose data directory
+  holds no database is refused with a message naming the path, the stamp and the mount to
+  check: no new database is ever created over an empty or wrong projects filesystem.
+- Anything at the stamp's path counts as the stamp (it is not opened). It is part of the
+  container's configuration label.
+- Only a start on an unstamped node carries the image's initialisation variable; without
+  it the image refuses to initialise an empty directory.
+- A fresh node's first ensure therefore starts the database twice: once to initialise it,
+  then — when it answers and the node is stamped — again without the variable; it returns
+  when the second answers. An ensure waits for an answer (3 min at most; a stopped
+  container or another session error ends it at once) only when it stamps the node in that
+  call; on a stamped node it never waits.
+
+Caller rules
+- The archive binary must lie beside the daemon's executable at every ensure.
+- EnsureImageFiles before EnsureControlPlaneRecovery and before a second
+  PrepareControlPlaneRestore (the removal tasks need the seccomp profile).
+- No job container of subject "cp" may run during PrepareControlPlaneRestore or
+  FinishControlPlaneRestore; no daemon may run during a restore (the recovery start
+  listens on the daemon's socket path).
+- repo/ and fetch/ are emptied only by tasks at their owners' ids (70:70, 65530:70) on the
+  control-plane image; root empties data, spool and rspool.
+
+Errors
+- All refusals are plain errors with fixed wording; none is exported for matching. The
+  marker refusal contains "a control-plane restore is marked".
+
+Known limits
+- The quotas are set from the configuration at every ensure: a quota changed by hand is
+  put back within a repair round. Change cp_disk_quota_mb or cp_repo_quota_mb instead.
+- At uid 70's quota a write that needs WAL space stops the server; while recovery cannot
+  write, Docker restarts it at its back-off. Committed rows are kept. Nothing reports the
+  state in the node check yet.
+- Nothing pushes the control plane's spool yet: it grows by one 16 MiB segment every five
+  minutes at least.
+- A daemon that dies during a fresh node's first start stamps the node when it comes back,
+  before that start has answered; the start is then stopped with Docker's 30 s grace.
+- A build older than this one must never run on a moved node; docs/operations.md has the
+  four steps back.
+- A database moved from an older build has no page checksums; a new one has.
+- internal/agent/sys_linux_amd64.go and sys_linux_arm64.go hold the syncfs call number;
+  another architecture needs its own file.

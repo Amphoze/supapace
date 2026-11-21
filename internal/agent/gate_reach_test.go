@@ -227,7 +227,7 @@ func TestNode_PlatformContainersWithOtherArgumentsRecreated(t *testing.T) {
 	img := a.cfg.Images.ControlPlane
 	t.Cleanup(func() {
 		nodeDockerQuiet("rm", "-f", cpName)
-		exec.Command("rm", "-rf", "/var/lib/supapace/cp", "/var/lib/supapace/platform").Run()
+		exec.Command("rm", "-rf", "/var/lib/supapace/cp", "/var/lib/supapace/projects/cp", "/var/lib/supapace/repo/cp", "/var/lib/supapace/platform").Run()
 	})
 	if out, err := exec.Command("docker", "run", "-d", "--name", cpName, "--label", "supapace.test=1", "--network", "bridge",
 		"--entrypoint", "sleep", img, "300").CombinedOutput(); err != nil {

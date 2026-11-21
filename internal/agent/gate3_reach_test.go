@@ -32,6 +32,8 @@ func TestNode_ProfileChangeRecreatesBothCleanly(t *testing.T) {
 		}
 		os.RemoveAll("/etc/supapace")
 		os.RemoveAll(a.p.CPDir())
+		os.RemoveAll(a.p.CPProjectDir())
+		os.RemoveAll(a.p.RepoDir("cp"))
 		os.RemoveAll(a.p.PlatformDir())
 	})
 	if err := a.EnsurePlatformNetworks(ctx); err != nil {

@@ -1583,12 +1583,15 @@ func TestEnsurePlatformNetworks_Args(t *testing.T) {
 
 func TestEnsureControlPlaneDB_Args(t *testing.T) {
 	a, f, _ := newTestAgent(t)
+	cpSeams(t, a, f)
 	writeSeccomp(t, a)
 	if err := a.EnsureControlPlaneDB(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	// A fresh node: the first start (with the initdb password), then, once
+	// stamped, the same arguments again without it.
 	runs := f.argv("run")
-	if len(runs) != 1 {
+	if len(runs) != 2 {
 		t.Fatalf("docker run calls: %q", runs)
 	}
 	argv := strings.Join(runs[0], " ")
@@ -1598,8 +1601,8 @@ func TestEnsureControlPlaneDB_Args(t *testing.T) {
 		"--security-opt seccomp=" + filepath.Join(a.p.PlatformDir(), "seccomp.json"), "--read-only", "--tmpfs /tmp",
 		"--memory 256m", "--pids-limit 128", "--ulimit core=0", "--restart unless-stopped", "--label supapace.role=cp-db",
 		"-e POSTGRES_USER=supapaced", "-e POSTGRES_DB=supapaced",
-		"-v " + cp + "/data:/var/lib/postgresql/data", "-v " + cp + "/sock:/var/run/postgresql", "-v " + cp + "/etc:/etc/sp:ro",
-		"-- " + a.cfg.Images.ControlPlane + " postgres -c listen_addresses= -c hba_file=/etc/sp/pg_hba.conf -c ident_file=/etc/sp/pg_ident.conf",
+		"-v " + a.p.CPProjectDir() + "/data:/var/lib/postgresql/data", "-v " + cp + "/sock:/var/run/postgresql", "-v " + cp + "/etc:/etc/sp:ro",
+		"-- " + a.cfg.Images.ControlPlane + " postgres -c listen_addresses= -c hba_file=/etc/sp/pg_hba.conf -c ident_file=/etc/sp/pg_ident.conf -c archive_mode=on",
 	} {
 		if !strings.Contains(argv, want) {
 			t.Errorf("argv lacks %q:\n%s", want, argv)
@@ -1614,13 +1617,13 @@ func TestEnsureControlPlaneDB_Args(t *testing.T) {
 		}
 	}
 	// Directories, owners and the two files.
-	for path, mode := range map[string]os.FileMode{filepath.Dir(cp): 0o700, cp: 0o700, cp + "/data": 0o700, cp + "/sock": 0o700, cp + "/etc": 0o755} {
+	for path, mode := range map[string]os.FileMode{filepath.Dir(cp): 0o700, cp: 0o700, a.p.CPProjectDir() + "/data": 0o700, cp + "/sock": 0o700, cp + "/etc": 0o755} {
 		if fi, err := os.Lstat(path); err != nil || !fi.IsDir() || fi.Mode().Perm() != mode {
 			t.Errorf("%s: %v %v, want directory %o", path, fi, err, mode)
 		}
 	}
 	log := strings.Join(f.calls(), "\n")
-	for _, want := range []string{"chown " + cp + "/data 70:70", "chown " + cp + "/sock 70:70"} {
+	for _, want := range []string{"chown " + a.p.CPProjectDir() + "/data 70:70", "chown " + cp + "/sock 70:70"} {
 		if !strings.Contains(log, want) {
 			t.Errorf("no %q", want)
 		}
@@ -2239,6 +2242,7 @@ func TestNodeCheck_DevModeHostGlobalRowsInformational(t *testing.T) {
 // with another configuration.
 func TestNodeCheck_PlatformServiceRows(t *testing.T) {
 	a, f := goodNode(t)
+	cpSeams(t, a, f)
 	delete(f.ctrs, "sp-gateway")
 	writeTLS(t, a)
 	ctx := context.Background()
@@ -2370,6 +2374,8 @@ func TestEnsurePlatform_RecreationLogged(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 	t.Cleanup(func() { slog.SetDefault(old) })
 	a, f, s := newTestAgent(t)
+	cpSeams(t, a, f)
+	cpStamped(t, a)
 	healthy(a, f, s)
 	delete(f.ctrs, "sp-gateway")
 	writeTLS(t, a)

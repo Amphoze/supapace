@@ -48,6 +48,11 @@ func (o taskOutput) String() string { return "stdout: " + o.stdout + "; stderr: 
 // runTask runs one task container to its end and returns its exit code and
 // its output. flags are added to the common ones; cmd follows the image.
 func (a *Agent) runTask(ctx context.Context, s Spec, kind string, flags []string, entrypoint string, cmd ...string) (int, taskOutput, error) {
+	return a.runTaskImage(ctx, s, a.cfg.Images.Postgres, kind, flags, entrypoint, cmd...)
+}
+
+// runTaskImage is runTask on another image.
+func (a *Agent) runTaskImage(ctx context.Context, s Spec, image, kind string, flags []string, entrypoint string, cmd ...string) (int, taskOutput, error) {
 	ctx, cancel := context.WithTimeout(ctx, taskTimeout)
 	defer cancel()
 	name := "task-" + s.Ref + "-" + kind
@@ -63,7 +68,7 @@ func (a *Agent) runTask(ctx context.Context, s Spec, kind string, flags []string
 		"--read-only", "--memory", "128m", "--memory-swap", "128m", "--pids-limit", "64", "--ulimit", "core=0", "--ulimit", "nofile=65536:65536",
 		"--no-healthcheck", "--label", labelRole + "=task", "--label", "supapace.ref=" + s.Ref,
 		"--label", "supapace.generation=" + strconv.FormatInt(s.Generation, 10), "--label", "supapace.epoch=" + strconv.FormatInt(s.Epoch, 10)}
-	args = append(append(args, flags...), "--entrypoint", entrypoint, "--", a.cfg.Images.Postgres)
+	args = append(append(args, flags...), "--entrypoint", entrypoint, "--", image)
 	if _, err := dockerRun(ctx, append(args, cmd...)...); err != nil {
 		return 0, taskOutput{}, errors.Join(err, kill())
 	}

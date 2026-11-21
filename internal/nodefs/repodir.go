@@ -32,6 +32,16 @@ func openSubject(p nodecfg.Paths, subject string, create bool) (rootFd, subjFd i
 		return -1, -1, err
 	}
 	if create {
+		// Nothing is made on a filesystem other than the repository's (an
+		// unmounted one would hide it under the later mount).
+		var sfs syscall.Statfs_t
+		if err := syscall.Fstatfs(rfd, &sfs); err != nil || sfs.Type != xfsSuperMagic {
+			syscall.Close(rfd)
+			if err == nil {
+				err = fmt.Errorf("nodefs: %s is not XFS", p.RepoRoot())
+			}
+			return -1, -1, err
+		}
 		if err := syscall.Mkdirat(rfd, subject, 0o755); err != nil && !errors.Is(err, syscall.EEXIST) {
 			syscall.Close(rfd)
 			return -1, -1, fmt.Errorf("nodefs: mkdir %s/%s: %w", p.RepoRoot(), subject, err)

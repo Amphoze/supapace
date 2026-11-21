@@ -443,6 +443,32 @@ container once, cleanly. In a test, `kill -TERM` of the daemon left the cluster'
 unchanged; the new daemon served after about 2 s and logged `adopted ref=… generation=4`.
 Operations in progress resume after the restart.
 
+### The control-plane database's move, and going back to an older build
+
+The first start of a build that archives the control-plane database moves that database from
+`/var/lib/supapace/cp/data` to the projects filesystem, `/var/lib/supapace/projects/cp/data`;
+the old tree is kept as `/var/lib/supapace/cp/data.moved` and the node is stamped
+(`/var/lib/supapace/cp/initialised`). The socket and the access files stay in
+`/var/lib/supapace/cp`. From then on the daemon refuses to start the database when the stamp
+exists and the data directory holds none: it never creates an empty database over a projects
+filesystem that is not mounted, not the one the database was on, or empty. Check the mount;
+if the data is lost, recover the control plane.
+
+**Never run a build older than this one on a node whose control-plane data has been moved:** it
+knows only the old path and would create a new, empty control-plane database there, without
+the node's projects. To go back to an older build, with the daemon stopped (`systemctl stop
+supapaced`):
+
+1. `docker stop -t 30 sp-cp-db && docker rm sp-cp-db`;
+2. as root, copy the current database back: `cp -a /var/lib/supapace/projects/cp/data
+   /var/lib/supapace/cp/data` (not `data.moved`, which is the state at the move and lacks every
+   change since);
+3. move `/var/lib/supapace/projects/cp/data` and `/var/lib/supapace/cp/data.moved` out of the
+   way (keep them until the older build serves), and remove `/var/lib/supapace/cp/initialised`;
+4. install and start the older build.
+
+A later upgrade then moves the database again.
+
 ### `containment_failed`
 
 Meaning: the node could not show that its containment holds — the firewall tables are wrong

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,8 @@ func TestEnsureGateway_RecreatesContainerWithOtherArguments(t *testing.T) {
 // adopted.
 func TestEnsureControlPlaneDB_RecreatesContainerWithOtherArguments(t *testing.T) {
 	a, f, _ := newTestAgent(t)
+	cpSeams(t, a, f)
+	cpStamped(t, a)
 	writeSeccomp(t, a)
 	f.ctr(fakeCtr{Name: "sp-cp-db", Running: true, Labels: map[string]string{"supapace.role": "cp-db"},
 		Nets: map[string]string{"bridge": "198.51.100.7"}, Argv: []string{"run", "-d", "--name", "sp-cp-db", "--", "postgres"}})
@@ -371,6 +374,7 @@ func TestPlatformContainers_ConfigLabel(t *testing.T) {
 		return ""
 	}
 	a, f, _ := newTestAgent(t)
+	cpSeams(t, a, f)
 	writeTLS(t, a)
 	healthy(a, f, Spec{Ref: testRef, SubnetIndex: 14})
 	delete(f.ctrs, "sp-gateway")
@@ -381,17 +385,23 @@ func TestPlatformContainers_ConfigLabel(t *testing.T) {
 		}
 	}
 	var pws []string
-	password := func(c *fakeCtr) {
-		for _, e := range flagValues(c.Argv, "-e") {
+	password := func(argv []string) {
+		for _, e := range flagValues(argv, "-e") {
 			if v, ok := strings.CutPrefix(e, "POSTGRES_PASSWORD="); ok {
-				if strings.Contains(label(c.Argv), v) {
+				if strings.Contains(label(argv), v) {
 					t.Fatal("the password is in the label")
 				}
 				pws = append(pws, v)
 			}
 		}
 	}
-	password(f.ctrs["sp-cp-db"])
+	// A fresh node: the first start carries the password, the start after
+	// the stamp none.
+	for _, r := range f.argv("run") {
+		if flagValue(r, "--name") == cpName {
+			password(r)
+		}
+	}
 	for _, name := range []string{"sp-cp-db", "sp-gateway"} {
 		c := f.ctrs[name]
 		conf := label(c.Argv)
@@ -426,15 +436,16 @@ func TestPlatformContainers_ConfigLabel(t *testing.T) {
 				t.Fatalf("%s label %q: %q", name, l, m)
 			}
 			c = f.ctrs[name]
-			password(c)
+			password(c.Argv)
 			if label(c.Argv) != conf {
 				t.Fatalf("%s re-created with label %q, want %q", name, label(c.Argv), conf)
 			}
 		}
 	}
-	// The password is random per run and stays out of the hash.
-	if len(pws) < 3 || pws[0] == pws[1] || pws[1] == pws[2] {
-		t.Fatalf("passwords %q: want distinct random values over the re-creations", pws)
+	// The password: random, out of the hash, and only in the start before
+	// the node is stamped — none of the re-creations carries one.
+	if len(pws) != 1 || len(pws[0]) != 64 || strings.Trim(pws[0], "0123456789abcdef") != "" {
+		t.Fatalf("passwords %q: want one random value, in the first start only", pws)
 	}
 	if h := configHash([]string{"a", "b"}, []string{"c"}); h == configHash([]string{"a"}, []string{"b", "c"}) || h == configHash([]string{"ab"}, []string{"c"}) {
 		t.Fatal("the hash does not separate arguments")
@@ -550,6 +561,7 @@ func TestCheckContainment_MemberNamedLikeAnID(t *testing.T) {
 // configuration: a different profile on disk (a re-pin) re-creates it.
 func TestPlatformContainers_SeccompProfileInLabel(t *testing.T) {
 	a, f, s := newTestAgent(t)
+	cpSeams(t, a, f)
 	healthy(a, f, s)
 	delete(f.ctrs, "sp-gateway")
 	writeTLS(t, a)
@@ -601,6 +613,7 @@ func TestConfFormat_ReadsEveryJudgedField(t *testing.T) {
 // A different argument gives a different label: here the image.
 func TestEnsureControlPlaneDB_OtherArgumentOtherLabel(t *testing.T) {
 	a, f, _ := newTestAgent(t)
+	cpSeams(t, a, f)
 	writeSeccomp(t, a)
 	ctx := context.Background()
 	if err := a.EnsureControlPlaneDB(ctx); err != nil {
@@ -620,6 +633,7 @@ func TestEnsureControlPlaneDB_OtherArgumentOtherLabel(t *testing.T) {
 // When the old control-plane container cannot be removed, nothing is run.
 func TestEnsureControlPlaneDB_RemoveFailureRunsNothing(t *testing.T) {
 	a, f, _ := newTestAgent(t)
+	cpSeams(t, a, f)
 	writeSeccomp(t, a)
 	f.ctr(fakeCtr{Name: "sp-cp-db", Running: true, Labels: map[string]string{"supapace.role": "cp-db"}})
 	f.failVerb["rm"] = errors.New("daemon busy")
@@ -635,6 +649,7 @@ func TestEnsureControlPlaneDB_RemoveFailureRunsNothing(t *testing.T) {
 // password value and the label itself left out.
 func TestPlatformContainers_LabelCoversEveryArgument(t *testing.T) {
 	a, f, s := newTestAgent(t)
+	cpSeams(t, a, f)
 	healthy(a, f, s)
 	delete(f.ctrs, "sp-gateway")
 	writeTLS(t, a)
@@ -672,11 +687,13 @@ func firstRemoval(name string) string {
 // cpExtra is what the control-plane label covers besides the arguments.
 func cpExtra(t *testing.T, a *Agent) []string {
 	etc := filepath.Join(a.p.CPDir(), "etc")
-	extra, err := fileDigests(a.seccompFile(), filepath.Join(etc, "pg_hba.conf"), filepath.Join(etc, "pg_ident.conf"))
+	extra, err := fileDigests(a.seccompFile(), filepath.Join(etc, "pg_hba.conf"), filepath.Join(etc, "pg_ident.conf"),
+		filepath.Join(a.p.ToolsDir(), archBinary))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return extra
+	_, serr := os.Lstat(a.cpStampPath())
+	return append(extra, "stamped="+strconv.FormatBool(serr == nil))
 }
 
 // Members are read by their endpoint ids; every way that read can fail is a
@@ -757,6 +774,8 @@ func TestEnsureGateway_ImageIDInLabel(t *testing.T) {
 func TestEnsureControlPlaneDB_RecreationStopsGracefully(t *testing.T) {
 	setup := func(t *testing.T, running bool) (*Agent, *fakeHost) {
 		a, f, _ := newTestAgent(t)
+		cpSeams(t, a, f)
+		cpStamped(t, a)
 		writeSeccomp(t, a)
 		f.ctr(fakeCtr{Name: "sp-cp-db", Running: running, Labels: map[string]string{"supapace.role": "cp-db"}})
 		f.resetLog()
@@ -827,6 +846,7 @@ func TestEnsureControlPlaneDB_RecreationStopsGracefully(t *testing.T) {
 // adopted: what its label would describe cannot be read.
 func TestPlatformContainers_MissingProfileIsAnError(t *testing.T) {
 	a, f, s := newTestAgent(t)
+	cpSeams(t, a, f)
 	healthy(a, f, s)
 	delete(f.ctrs, "sp-gateway")
 	writeTLS(t, a)
@@ -846,6 +866,7 @@ func TestPlatformContainers_MissingProfileIsAnError(t *testing.T) {
 // removed or run.
 func TestEnsureControlPlaneDB_StopFailureUnreadable(t *testing.T) {
 	a, f, _ := newTestAgent(t)
+	cpSeams(t, a, f)
 	writeSeccomp(t, a)
 	f.ctr(fakeCtr{Name: "sp-cp-db", Running: true, Labels: map[string]string{"supapace.role": "cp-db"}})
 	boom := errors.New("daemon busy")
