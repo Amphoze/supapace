@@ -8,10 +8,10 @@
 #            only under /api/ai/ and /api/mcp); deleted (its file is in delete.txt)
 #   ref      y when a segment of the path is $ref, else n
 #   phase    the phase a deleted or opt-in row returns in: P1, P2 or never; - when served
-# A deleted route is not in the build: its path reaches the framework's page fallback (a 404
-# page, 406 for a JSON request, 307 first for a trailing slash); no handler of it runs. A served
-# route asked for a method it does not list gets the same fallback. The hard 404/405 for API
-# paths is the Studio request guard's, a later patch.
+# A deleted route is not in the build and no handler of it runs: its path is answered by the
+# request guard, 404 for every method, with or without a trailing slash. A served route asked
+# for a method it does not list is answered 405 with Allow, by the guard too; without a valid
+# assertion every path is answered 401.
 # A patch that adds, removes or changes an entry changes its row in the same commit.
 # The server function lib/cli-favicon.ts getCLIFaviconRoute:
 function	13355c4bebdb166d8b90dd1232f8a7ed9810ba1819821acf01f1db6947e845ee	GET	served	n	-

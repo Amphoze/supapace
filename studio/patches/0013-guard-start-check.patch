@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] guard: a node's settings checked when the server starts
+
+A plugin of the server reads and checks every setting of a node once, when the process
+starts and before it listens: the bounds, the control plane's socket, the data and key
+directories, the wire proxy's address, the cache key, the node's id and the assertion key.
+A server without one of them stops at once instead of at the first request that needs it.
+---
+ apps/studio/lib/api/self-hosted/start-check.ts | 10 ++++++++++
+ apps/studio/vite.config.ts                     |  2 ++
+ 2 files changed, 12 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/start-check.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/start-check.ts b/apps/studio/lib/api/self-hosted/start-check.ts
+new file mode 100644
+index 00000000..bf03bead
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/start-check.ts
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: Apache-2.0
++// A plugin of the server: it runs once when the process starts, before the server listens.
++// A node's settings are read and checked then, so that a server without them stops at once
++// and not at the first request that needs one.
++
++import { checkStart } from './request-guard'
++
++export default function startCheck() {
++  checkStart()
++}
+diff --git a/apps/studio/vite.config.ts b/apps/studio/vite.config.ts
+index 4e947810..0bcd6acf 100644
+--- a/apps/studio/vite.config.ts
++++ b/apps/studio/vite.config.ts
+@@ -821,6 +821,8 @@ export default defineConfig(({ command, mode }) => {
+         // `server.ts` is TanStack Start's SSR entry, not a Nitro entry;
+         // without this Nitro's scan picks it up as both and warns.
+         serverEntry: false,
++        // supapace: a node's settings are checked when the process starts, before it listens.
++        plugins: [path.resolve(rootDir, 'lib/api/self-hosted/start-check.ts')],
+         // Nitro bundles dependencies. libpg-query's emscripten glue reads
+         // `__dirname` and loads its `.wasm` from disk, so keep it external
+         // and fully copied (`*`).

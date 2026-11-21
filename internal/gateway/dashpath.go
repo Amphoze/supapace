@@ -16,9 +16,11 @@ import (
 // with "/", has an empty segment (a doubled slash, a trailing one on anything
 // but "/"), a "." or ".." segment, a backslash, a byte below 0x20 or above
 // 0x7e, or a "%" without two hexadecimal digits, or when the readings differ
-// (an encoded slash). What passes has one reading
-// that a URL parser resolves no further, and is ASCII, so lower-casing it
-// means the same everywhere.
+// (an encoded slash), or when the path ends in a space, whatever the query: a
+// server that parses the decoded path as a URL once more drops it, and
+// resolves a dot segment it hid. What passes has one reading that a URL parser
+// resolves no further, and is ASCII, so lower-casing it means the same
+// everywhere.
 func readPath(target string) (segs []string, ok bool) {
 	if strings.ContainsAny(target, "# ") {
 		return nil, false
@@ -53,6 +55,9 @@ func readPath(target string) (segs []string, ok bool) {
 				return nil, false
 			}
 		}
+	}
+	if strings.HasSuffix(segs[len(segs)-1], " ") {
+		return nil, false // a URL parser drops a space that ends the path
 	}
 	return segs, true
 }

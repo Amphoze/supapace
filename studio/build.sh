@@ -329,6 +329,7 @@ cmd_image() {
 
   # the tables and a copy of the build output, for gates 50, 60 and 70 and their seeds
   cp "$HERE/routes.tsv" "$HERE/env.tsv" "$HERE/public.tsv" "$HERE/origins.txt" "$G/"
+  cp "$HERE/prove/paths.in" "$HERE/prove/paths.json" "$G/"
   rm -rf "$G/output" && cp -a "$W/ctx/srv/apps/studio/.output" "$G/output"
   bash "$HERE/gates/seeds/gen.sh" "$CACHE/upstream" "$G/seeds-gen"
   local g
@@ -393,12 +394,19 @@ bundle_packages() {
 # measure — the facts of the record, from containers of the candidate image (no network).
 measure() {
   local srv=$W/ctx/srv/apps/studio/.output m=$W/measure c=supapace-studio-measure-$$
-  rm -rf "$m" && mkdir -p "$m"
+  rm -rf "$m" && mkdir -p "$m/keys"
   CONTAINERS+=("$c")
+  # A node's settings: the server stops at start without them. The assertion key is the
+  # vectors' public test key; nothing here signs, so every request is answered 401.
+  sed -n 's/^ *"public_file": "\(.*\)",$/\1/p' "$W/vectors/tokens.json" >"$m/keys/assert.pub"
+  head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' >"$m/keys/cache.key"
+  local node=(-v "$m:/data:ro" -e SUPAPACE_NODE_ID=build -e SUPAPACE_DASH_SOCKET=/run/dash/dash.sock
+    -e SUPAPACE_DASH_KEYS=/data/keys -e SUPAPACE_DASH_DATA=/tmp/dash -e SUPAPACE_PGCAP=10.212.0.6:20000:21023
+    -e "SUPAPACE_LIMITS=$(cat "$W/vectors/limits.json")")
   start() { # start [docker args] — the candidate as $c, until it answers
     docker rm -f "$c" >/dev/null 2>&1 || true
     docker run -d --name "$c" "${LABELS[@]}" --network none --memory 2g --memory-swap 2g \
-      -v "$HERE/image:/m:ro" -v "$m:/data:ro" "$@" "$CANDIDATE" >/dev/null
+      -v "$HERE/image:/m:ro" "${node[@]}" "$@" "$CANDIDATE" >/dev/null
     docker exec "$c" node /m/measure.mjs wait 120 || die "the built server did not answer within 120 s"
   }
 
@@ -422,26 +430,11 @@ measure() {
     case $n in *PORT) v=3999 ;; *) v=127.0.0.2 ;; esac
     docker rm -f "$c" >/dev/null
     docker run -d --name "$c" "${LABELS[@]}" --network none --memory 2g --memory-swap 2g \
-      -v "$HERE/image:/m:ro" -e "$n=$v" "$CANDIDATE" >/dev/null
+      -v "$HERE/image:/m:ro" "${node[@]}" -e "$n=$v" "$CANDIDATE" >/dev/null
     got=$(docker exec "$c" node /m/measure.mjs listen 60) || die "no listener with $n set"
     [ "$got" != "$base" ] || die "the listener path reads $n, but setting it does not move the listener"
   done
   M_LISTENER=$(jarr <"$m/listener.txt")
-
-  say "measure: pages"
-  sed -n '/^export interface FileRoutesByFullPath {/,/^}/p' "$W/out/routeTree.gen.ts" |
-    sed -n "s/^  '\([^']*\)':.*/\1/p" | grep -v '^/api/' |
-    awk '{ p = $0; gsub(/\$ref/, "default", p); gsub(/\$[A-Za-z_]*/, "sp1", p); print $0 "\t" p }' >"$m/pages.txt"
-  [ -s "$m/pages.txt" ] || die "no page routes in the regenerated route tree"
-  start -e DEFAULT_PROJECT_NAME=spmarkProjectName -e DEFAULT_ORGANIZATION_NAME=spmarkOrgName \
-    -e SUPABASE_PUBLIC_URL=http://spmarkpublic -e SUPABASE_URL=http://spmarkurl \
-    -e SUPABASE_ANON_KEY=spmarkAnonKey -e SUPABASE_SERVICE_KEY=spmarkServiceKey \
-    -e AUTH_JWT_SECRET=spmarkJwtSecret -e POSTGRES_PASSWORD=spmarkPassword \
-    -e POSTGRES_HOST=spmarkpghost -e POSTGRES_DB=spmarkdb -e STUDIO_PG_META_URL=http://spmarkmeta
-  docker exec "$c" node /m/measure.mjs pages /data/pages.txt >"$m/pages.out"
-  M_PAGES_FETCHED=$(sed -n 's/^fetched //p' "$m/pages.out")
-  [ "$M_PAGES_FETCHED" = "$(wc -l <"$m/pages.txt")" ] || die "not every page was fetched"
-  M_PAGES=$( (grep -v '^fetched ' "$m/pages.out" || true) | sort | jarr)
 
   say "measure: what bypasses the middleware chain"
   local fn file
@@ -468,6 +461,8 @@ measure() {
     printf 'server function\tPOST\t/_serverFn/%s\tx-tsr-serverfn:true\n' "$fn"
     printf 'not found\tGET\t/sp-no-such-path\n'
     printf 'not found\tGET\t/api/sp-no-such-route\n'
+    printf 'function without id\tGET\t/_serverFn/\n'
+    printf 'doubled slash\tGET\t//sp-no-such-path\n'
   } >"$m/matrix.txt"
   start -v "$m/server:/app/apps/studio/.output/server:ro"
   docker exec "$c" node /m/measure.mjs matrix /data/matrix.txt >"$m/matrix.out"
@@ -523,8 +518,6 @@ write_record() {
     echo " \"bypass\": $M_BYPASS,"
     echo " \"frozen\": $M_FROZEN,"
     echo " \"mcp_chunk_importers\": $M_MCP,"
-    echo " \"pages_with_project_data\": $M_PAGES,"
-    echo " \"pages_fetched\": $M_PAGES_FETCHED,"
     echo " \"output_sha256\": $(jstr "$M_OUTPUT"),"
     echo " \"total_seconds\": null,"
     echo " \"gates\": null,"
@@ -591,8 +584,8 @@ cmd_paths() {
   [ -d "$W/ctx/srv/apps/studio/.output" ] || die "no build output; run build.sh image first"
   docker run --rm -i "${LABELS[@]}" --network none --memory 2g \
     -v "$HERE/prove:/prove:ro" -v "$W/ctx/srv/apps/studio/.output:/srv:ro" "$NODE_BASE" \
-    node /prove/paths.mjs /srv <"$HERE/prove/paths.in" >"$HERE/prove/paths.json.tmp" ||
-    { rm -f "$HERE/prove/paths.json.tmp"; die "paths.mjs failed"; }
+    timeout 600 node /prove/paths.mjs /srv <"$HERE/prove/paths.in" >"$HERE/prove/paths.json.tmp" ||
+    { rm -f "$HERE/prove/paths.json.tmp"; die "paths.mjs failed, or did not end within 600 s"; }
   mv "$HERE/prove/paths.json.tmp" "$HERE/prove/paths.json"
 }
 

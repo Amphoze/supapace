@@ -143,6 +143,10 @@ const (
 	// the member "more" is required.
 	oldTicket = "v1.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwicmVmcyI6WyJhYmNkZWZnaGlqMDEyMzQ1Njc4OSIsImJjZGVmZ2hpajAxMjM0NTY3ODlhIl0sImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDYwfQ.QEl0ba6GAYbQ6effdDziYy-qPSMm2P6o01VS19DNzM5k8dfMMud0WhosA9U4ZdNkmRQtLn7Kk1bKMW4Lb728Ag"
 
+	// A further assertion whose name holds <, >, &, a quote, a backslash and
+	// non-ASCII text: another implementation must re-serialise it to these bytes.
+	wantAssertionName = "v1.eyJub2RlIjoibG9jYWwiLCJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwibmFtZSI6Ilpvw6sgPGI-JlwiXFwg5pel5pys6KqeIiwicmVmIjoiYWJjZGVmZ2hpajAxMjM0NTY3ODkiLCJyb2xlIjoib3duZXIiLCJwdXJwb3NlIjoiIiwiaWF0IjoxODAwMDAwMDAwLCJleHAiOjE4MDAwMDAwMzB9.spXtOlH9pOEDwgDiaXnc0UcxQS0XgesrpXG3xjn1_PadMSamXqPZCv2P5AeI-9ECcN-UJE9ZhUlTXVPl9feZDw"
+
 	wantNonce = "6oZqdX5MOLq_qBJ8vppAnT4fk6AP8UiP9zX8-Rev_9A"
 )
 
@@ -156,9 +160,10 @@ func TestVectors_SignGivesExactlyTheVector(t *testing.T) {
 	if !bytes.Equal(priv.Seed(), seed) || !bytes.Equal(priv.Public().(ed25519.PublicKey), pub) {
 		t.Fatal("private file, public file and seed disagree")
 	}
-	// In file order: the ticket twice, "more" false and then true.
-	want := []string{wantAssertion, wantSession, wantTicket, wantTicketMore}
-	kinds := []string{"assertion", "session", "ticket", "ticket"}
+	// In file order: the ticket twice, "more" false and then true; then the
+	// assertion with the name of many characters.
+	want := []string{wantAssertion, wantSession, wantTicket, wantTicketMore, wantAssertionName}
+	kinds := []string{"assertion", "session", "ticket", "ticket", "assertion"}
 	labels := map[string]string{"assertion": "supapace-assertion-v1.", "session": "supapace-session-v1.", "ticket": "supapace-logout-v1."}
 	if len(v.Tokens) != len(want) {
 		t.Fatalf("%d tokens, want %d", len(v.Tokens), len(want))
@@ -265,7 +270,7 @@ func TestVerify_NoKindPassesAsAnother(t *testing.T) {
 			}
 		}
 	}
-	if n != 8 {
+	if n != 10 { // two other kinds for each of the five tokens
 		t.Fatalf("%d cross checks", n)
 	}
 }

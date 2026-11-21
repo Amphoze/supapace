@@ -1,6 +1,7 @@
 // measure.mjs MODE ... — run by studio/build.sh inside a container of the built image
 // (node only, no network) to measure the server. Modes:
-//   wait SECONDS              until GET /api/platform/profile answers 200 (exit 1 at the deadline)
+//   wait SECONDS              until GET /api/platform/profile is answered by the server: 401, as the
+//                             request carries no assertion (exit 1 at the deadline)
 //   listen SECONDS            the first listening TCP socket, as "address:port" (exit 1 at the deadline)
 //   encoding PATH             the content-encoding answered to a request accepting br, gzip and zstd
 //   matrix FILE               one request per line "kind<TAB>method<TAB>path[<TAB>header:value]";
@@ -11,8 +12,6 @@
 //   listener DIR              the environment names the built listener path reads (the node-server
 //                             preset's module, srvx's port, host and TLS resolution), sorted; fails on
 //                             a missing anchor or an environment access of another shape
-//   pages FILE                one line per page "route<TAB>path": GET of the path; prints the routes
-//                             whose HTML holds "spmark" (a marker of the project's settings), then "fetched N"
 import fs from 'node:fs'
 import http from 'node:http'
 
@@ -54,7 +53,7 @@ switch (mode) {
     const end = Date.now() + Number(arg) * 1000
     for (;;) {
       try {
-        if ((await req('GET', '/api/platform/profile')).status === 200) process.exit(0)
+        if ((await req('GET', '/api/platform/profile')).status === 401) process.exit(0)
       } catch {}
       if (Date.now() > end) process.exit(1)
       await sleep(500)
@@ -94,17 +93,6 @@ switch (mode) {
       console.log(`${kind}\t${method}\t${path}\t${status}`)
     }
     break
-  case 'pages': {
-    let n = 0
-    for (const l of lines(arg)) {
-      const [route, path] = l.split('\t')
-      const r = await req('GET', path, { accept: 'text/html' })
-      n++
-      if (/spmark/i.test(r.body.toString('latin1'))) console.log(route)
-    }
-    console.log(`fetched ${n}`)
-    break
-  }
   case 'mark': {
     // in a copy of the server bundle (DIR): put a request middleware first in the start
     // instance's chain that logs "[sp-marker] METHOD PATH" for every request entering it

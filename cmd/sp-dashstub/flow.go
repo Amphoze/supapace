@@ -412,7 +412,8 @@ func returnPath(s string) string {
 
 // ruleZero is the gateway's rule 0 for a path: no empty segment (but the
 // root), no "." or ".." segment after decoding, no backslash, control byte or
-// byte above 0x7e raw or decoded, no malformed "%", no encoded "/".
+// byte above 0x7e raw or decoded, no malformed "%", no encoded "/", no space
+// ending the path.
 func ruleZero(path string) bool {
 	if path == "/" {
 		return true
@@ -420,13 +421,15 @@ func ruleZero(path string) bool {
 	bad := func(s string) bool {
 		return strings.ContainsFunc(s, func(c rune) bool { return c < 0x20 || c > 0x7e || c == '\\' })
 	}
+	last := ""
 	for _, seg := range strings.Split(path[1:], "/") {
 		d, err := url.PathUnescape(seg)
 		if seg == "" || err != nil || d == "." || d == ".." || strings.Contains(d, "/") || bad(d) {
 			return false
 		}
+		last = d
 	}
-	return true
+	return !strings.HasSuffix(last, " ")
 }
 
 func nonceOf(r string) string {

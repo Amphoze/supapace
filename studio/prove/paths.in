@@ -1,0 +1,77 @@
+# Raw request paths whose reading by the dashboard's server is recorded in paths.json — by
+# paths.mjs, which runs the built server itself — and compared with the gateway's reading of
+# the same paths (internal/gateway/dash_paths_test.go). One path per line, sent as written; a
+# line beginning with # is a comment (a request path begins with /).
+#
+# This file holds the fixed lines. paths.mjs adds, for every route of the built route tree,
+# the route's plain form and its mechanical forms: a dot-dot segment before it, plain and
+# percent-encoded; static segments in capitals; a doubled slash; a backslash, an encoded
+# backslash and an encoded slash for a slash; a control character; another project's ref in
+# each position, in both letter cases; double encoding; a letter that only folds to ASCII
+# when lower-cased; an overlong encoding; a # after each segment, at the end and before a
+# dot-dot; a trailing slash; a trailing encoded space (alone, doubled, before an empty and a
+# non-empty query, as a segment of its own, behind a dot segment); a percent-encoded letter;
+# and, under /api, an encoded space beside the first segment and a first segment that only
+# decodes twice. So a route the build gains has its vectors without an edit here, and
+# paths.json changes with the route tree.
+# It also adds every octet, percent-encoded, at the edges of three paths it chooses from the
+# route tree: the end of the path, a segment of its own, each side of the first segment,
+# behind a dot segment, with and without an empty query. A parser that strips, resolves or
+# cuts at an octet there is seen, whatever the octet.
+#
+# Two refs stand in the vectors: aaaaaaaaaaaaaaaaaaa1 is the project of the request,
+# bbbbbbbbbbbbbbbbbbb2 another project's.
+/
+/api
+/api/ai
+/api/mcp
+/Api
+/API
+/api/Ai
+/api/AI
+/api/Mcp
+/API/MCP
+/api/mcp#
+/api/ai#
+/api/mcp#/x
+/project/bbbbbbbbbbbbbbbbbbb2#
+/x#/../api/mcp
+/x#/../api/ai
+/-%20/auth/login
+/-/auth/login
+/api/mcp/
+/api/mcp/x
+/api/mcp/.
+/api/mcp/%2e
+/api/mcp%23x
+/api/mcp%3Fx
+/api/mcp%3fx=1
+/api/mcp;x=1
+/api/mcp%00
+/api/mcp%20
+/api/mcp%20%20
+/api/mcp/%20
+/api/mcp%20/
+/api/mcp%20?x=1
+/api/parse-query%20
+/project/bbbbbbbbbbbbbbbbbbb2%20
+/project/bbbbbbbbbbbbbbbbbbb2%20?x=1
+/api/mcp%09
+/api/m%63p
+/%61pi/mcp
+/%41PI/%4dcp
+/api/ai/sql/../../mcp
+/api/ai/%2e%2e/mcp
+/api/x/..%2fmcp
+/api/mcp?x=/../y#z
+/api/mcp?x=%23
+/project/bbbbbbbbbbbbbbbbbbb2
+/project/BBBBBBBBBBBBBBBBBBB2
+/project/%62bbbbbbbbbbbbbbbbbb2
+/project/%2562bbbbbbbbbbbbbbbbbb2
+/project/aaaaaaaaaaaaaaaaaaa1/bbbbbbbbbbbbbbbbbbb2
+/x/bbbbbbbbbbbbbbbbbbb2
+/_serverFn/x
+/_serverFn/bbbbbbbbbbbbbbbbbbb2
+/_serverfn/x
+/%5fserverFn/x

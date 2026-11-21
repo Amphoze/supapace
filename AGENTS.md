@@ -5515,3 +5515,117 @@ Known limits
 - A database moved from an older build has no page checksums; a new one has.
 - internal/agent/sys_linux_amd64.go and sys_linux_arm64.go hold the syncfs call number;
   another architecture needs its own file.
+
+### 2026-11-21 — Studio: the request guard; how the server reads a path; a path ending in a space
+Patches 0011-0013 (topic guard). The first request middleware of the dashboard's server
+(start.ts), ahead of every other and listed once; it covers route handlers, server functions
+and pages.
+- lib/api/self-hosted/assertion.ts: verifyAssertion(text, now?) - the header
+  X-Supapace-Assertion, checked as internal/dashtok checks it, on the same vectors: size,
+  envelope (strict unpadded base64url), Ed25519 with <SUPAPACE_DASH_KEYS>/assert.pub (43
+  base64url characters, at most one line end), a fatal UTF-8 decode, types and domains, the
+  payload's bytes against their re-serialisation, times, SUPAPACE_NODE_ID. Every refusal is
+  401 bad_assertion with one message. checkAssertionSettings() reads the two settings now.
+- lib/api/self-hosted/request-guard.ts: guardRequest(ctx, getRouter), readPath(router,
+  pathname) -> {segments, route, methods}, checkStart(). Order: assertion (401); the path it
+  is handed - never the request's own URL - read with the router's decoder and matcher: first
+  two segments api + ai|mcp: 404; a segment with the shape of a ref that is not the
+  assertion's, any letter case: 404; under /api, no exact route with handlers: 404, no handler
+  for the method: 405 with Allow (HEAD follows GET); then resolve, and the rest of the request
+  inside the project's context. A ProjectError from any of it, or thrown further down, is
+  answered {code, message}.
+- lib/api/apiWrapper.ts rethrows an error named ProjectError (the module is shared with the
+  browser's bundle: it must import nothing of self-hosted/).
+- lib/api/self-hosted/start-check.ts: a server plugin (vite.config.ts, nitro plugins); at
+  process start it calls checkStart(): limits, the control-plane client's settings, the
+  assertion's. A server without one exits 1 before it listens, with one log line and no
+  other: "supapace: <reason>; the server stops". The plugin is bundled into the server entry
+  with its own copies of those modules: module state exists twice; a start hook proves
+  settings and warms nothing for requests.
+What the assertion binds: node, principal, project, role, purpose - not the request. Accepted:
+exp > now, iat <= now + 5 s, 0 < exp - iat <= 60 s, whole seconds, no leeway. One assertion is
+accepted again within its life, for any route of its project.
+Answered before the guard, never by a handler: a GET or HEAD of an existing public file; a
+path beginning // (308 to the same path with one slash); a path under /_serverFn/ without a
+function id, and what normalises to one (the framework's 500 with its fixed body, no detail);
+the HTTP parser's 400 and 431; 400 for an invalid percent sequence.
+The build's prerender starts the server with TSS_PRERENDERING=true and no setting of a node,
+and asks for the shell (GET, header X-TSS_SHELL: true). In that mode only a page passes: GET,
+that header with the value true, no assertion, no path under /_serverFn/, first segment not
+api in any case, no server handler on the matched route - all judged on the handed path.
+Everything else is 401 and no setting is read. A process with the switch and any of
+SUPAPACE_NODE_ID, _DASH_SOCKET, _DASH_KEYS, _DASH_DATA, _PGCAP, _PGMETA, _LIMITS exits 1 (the
+test of _PGMETA is of its presence; the guard never reads its value). No request and no node
+can choose the mode.
+Caller rules:
+- Every request to a built image needs an assertion; a container needs the node's settings
+  and both key files or it exits at start (studio/build.sh gives its measured containers
+  test settings and waits for a 401).
+- The project comes from the context alone: never from a path parameter (the framework
+  decodes parameter values once more than the path), a query, a body or a function's payload.
+- Code that catches every error under the guard must rethrow a ProjectError. No secret,
+  connection string or path in an Error message: upstream's 500 bodies and a server
+  function's error answer carry the message.
+- A setting added later is read by checkSettings() or checkAssertionSettings() - or it is
+  checked at first use only - and joins the prerender stop's list and env.tsv.
+- A route whose handlers are not an object of methods is answered 405 for every method.
+studio/prove (run by build.sh prove; each `bash F IMAGE`; hosts need openssl 3 and curl):
+- stand-ins.bash (sourced): the image as a node runs it, sp-dashstub socket and pgmeta, three
+  projects, a key pair of the run; tok REF SUB ROLE [PURPOSE [IAT_OFFSET [LIFETIME]]];
+  PROVE_PREFIX names what it starts. Answer times come from the clock.
+- context.sh (72 rows): each request answered for its assertion's project (single,
+  interleaved, one kept-alive connection, pipelined); refusals; the chain's order; start-up
+  without settings; the prerender mode.
+- manifest.sh (2,045 rows at this pin): from the image's own route tree (paths.mjs --routes,
+  which must equal the non-deleted rows of routes.tsv): 401 without an assertion for every
+  route, page and server function; 404 for another project's ref in every $ref position; 404
+  for the routes not served; the guard's 404 for every deleted row, every method, with and
+  without a slash; 405 with Allow; then the controls, the last on a server whose own project
+  settings are marked: no page's HTML holds a marked value of the control plane or of the
+  process, and a route that still answers a process value shows that the search finds one.
+  It fails when a started row left no line. A release checks the build record's proofs member.
+- paths.mjs SRV <paths.in >paths.json: reads its input first, starts the built server
+  in-process, replaces the request-middleware chain by an observer, and records for each raw
+  path {raw, href, segments, route}: the URL as the server's parser left it (null: answered
+  400 unread), the segments the router matched on (null: no router asked), the route's full
+  path. paths.in holds the fixed lines. Derived from the built route tree: for every route its
+  mechanical forms (dot segments, capitals, slashes, another project's ref, encodings, a
+  trailing space alone, doubled, before an empty and a non-empty query, as a segment, behind
+  a dot segment), and every octet %00-%ff at eight places of three routes chosen from the
+  tree. 15,846 vectors at this pin. It fails when the guard's readPath disagrees with the
+  router, when a /_serverFn/ path reaches the route tree, or when a route's plain, dot-dot or
+  capitals form does not match.
+- Gate 45-paths: the generator's output, given 600 s, must be studio/prove/paths.json byte
+  for byte. After a change of the pin or of a route: build.sh paths, commit, run
+  TestDashPaths_ServerVectors.
+- The build record has no pages_with_project_data and no pages_fetched; gate 55-record holds
+  bypass, mcp_chunk_importers and listener.
+internal/gateway TestDashPaths_ServerVectors: seven assertions over every vector, no
+exception; among them that what the gateway forwards, the router matched on the segments the
+gateway read, and that a path ending in an encoded space is answered 400.
+Gateway, the first path rule (internal/gateway/dashpath.go; the sign-in model's ruleZero): a
+path whose last segment, percent-decoded, ends in a space is refused, 400 bad_request,
+whatever the query - counted with that rule's refusals, not forwarded, on project hosts and
+the sign-in host. The server parses the decoded path as a URL a second time; a URL parser
+drops a space that ends it and then resolves a dot segment it hid, so /project/<ref>%20,
+/api/mcp%20? and /api/parse-query/x/..%20 were routed without the space. A return path of
+the sign-in follows the same rule (it becomes /). A space elsewhere in a segment, or in the
+query, is an ordinary character.
+How the server reads a path (pin: router-core 1.171, start-server-core 1.169, Nitro 3 beta,
+Node 24): the HTTP parser refuses a raw space, control and byte above 0x7e and accepts a raw
+#; the request URL is parsed once (dot segments, backslash); the path is decoded once -
+%25, %5C and the URL delimiters ; / ? : @ & = + $ , # stay encoded, controls are re-encoded -
+and parsed as a URL again; the router decodes the same way again (no change), trims trailing
+slashes and matches without regard to case. Path segments are never decoded twice.
+Known limits:
+- A route parameter value that ends in a space cannot be addressed: the gateway refuses the
+  path (with an empty query the server dropped the space itself).
+- Server functions are dispatched by the prefix /_serverFn/, not through the route tree; the
+  vectors do not cover their handlers, the guard and manifest.sh do.
+- A page's body streams after the guard's next() returned; a read of the context from a
+  callback the response's consumer drives may find none (500, fail closed). No page reads the
+  context yet.
+- The assertion is not bound to a method or a path; it lives 30 s as minted.
+- Studio has no request-body bound of its own; the gateway's caps are the only ones.
+- manifest.sh's control for process values needs a route that still answers one.
+- paths.mjs depends on the bundle exporting getRouter, startInstance and readPath by name.

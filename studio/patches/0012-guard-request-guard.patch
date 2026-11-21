@@ -1,0 +1,1225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] guard: no route without a verified assertion and a project
+ context
+
+The first request middleware, ahead of every other: it covers route handlers, server
+functions and pages. A request whose assertion does not verify is answered 401. The path is
+read with the router's own decoder and matcher, and it is the path the server hands a
+middleware, not the request's URL: a route that is not served (under /api/ai, at /api/mcp)
+and a segment with the shape of a ref that is not the assertion's project are answered 404,
+in any letter case; a path under /api that matches no route with a handler is answered 404,
+and 405 with Allow when the route has no handler for the method. What passes runs inside
+the context of the assertion's project, as the control plane answers for it; a refusal of
+the control plane, or one thrown further down, is the answer {code, message}.
+
+The build's prerender starts the server once without a node's settings and asks for the
+application shell. In that mode, which is the process's environment and nothing a request
+carries, one kind of request passes: a GET with the shell's header and no assertion for a
+page - no API path, no server function, no route with a server handler. A process that has
+the switch and any setting of a node stops.
+---
+ apps/studio/lib/api/apiWrapper.ts             |   4 +
+ .../api/self-hosted/refusal-answer.test.ts    |  53 ++
+ .../lib/api/self-hosted/request-guard.test.ts | 897 ++++++++++++++++++
+ .../lib/api/self-hosted/request-guard.ts      | 171 ++++
+ apps/studio/start.ts                          |  22 +-
+ 5 files changed, 1146 insertions(+), 1 deletion(-)
+ create mode 100644 apps/studio/lib/api/self-hosted/refusal-answer.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/request-guard.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/request-guard.ts
+
+diff --git a/apps/studio/lib/api/apiWrapper.ts b/apps/studio/lib/api/apiWrapper.ts
+index 958186e2..b5c9679e 100644
+--- a/apps/studio/lib/api/apiWrapper.ts
++++ b/apps/studio/lib/api/apiWrapper.ts
+@@ -54,6 +54,10 @@ export async function apiWrapper(
+ 
+     return await handler(req, res, claims)
+   } catch (error) {
++    // supapace: a refusal of the server itself is not an internal error; the request guard
++    // answers it. Told by its name: this module is shared with the browser's bundle, which
++    // must not load the server's project context.
++    if (error instanceof Error && error.name === 'ProjectError') throw error
+     Sentry.captureException(error)
+     return res.status(500).json({ error })
+   }
+diff --git a/apps/studio/lib/api/self-hosted/refusal-answer.test.ts b/apps/studio/lib/api/self-hosted/refusal-answer.test.ts
+new file mode 100644
+index 00000000..0900e5aa
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/refusal-answer.test.ts
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: Apache-2.0
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++import type { NextApiRequest, NextApiResponse } from 'next'
++import { describe, expect, it, vi } from 'vitest'
++
++import { apiWrapper } from '../apiWrapper'
++import { ProjectError } from './project-context'
++
++vi.mock('@sentry/react', () => ({ captureException: vi.fn() }))
++
++function response() {
++  const res = { status: vi.fn(), json: vi.fn() }
++  res.status.mockReturnValue(res)
++  res.json.mockReturnValue(res)
++  return res
++}
++
++describe('a route handler that throws', () => {
++  it('passes a refusal of the server on to the request guard, unanswered', async () => {
++    const res = response()
++    const refusal = new ProjectError(
++      403,
++      'no_read_only_login',
++      'The project has no read-only login'
++    )
++    const wrapped = apiWrapper(
++      {} as NextApiRequest,
++      res as unknown as NextApiResponse,
++      async () => {
++        throw refusal
++      }
++    )
++    await expect(wrapped).rejects.toBe(refusal)
++    expect(res.status).not.toHaveBeenCalled()
++    expect(res.json).not.toHaveBeenCalled()
++  })
++
++  it('answers any other error as before', async () => {
++    const res = response()
++    const error = new TypeError('broken')
++    await apiWrapper({} as NextApiRequest, res as unknown as NextApiResponse, async () => {
++      throw error
++    })
++    expect(res.status).toHaveBeenCalledWith(500)
++    expect(res.json).toHaveBeenCalledWith({ error })
++  })
++
++  it('does not load the project context into a module the browser’s bundle shares', () => {
++    const source = readFileSync(join(import.meta.dirname, '../apiWrapper.ts'), 'utf8')
++    expect(source).not.toMatch(/from ['"][^'"]*self-hosted/)
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/request-guard.test.ts b/apps/studio/lib/api/self-hosted/request-guard.test.ts
+new file mode 100644
+index 00000000..571f26cb
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/request-guard.test.ts
+@@ -0,0 +1,897 @@
++// SPDX-License-Identifier: Apache-2.0
++import { createPrivateKey, sign as signBytes } from 'node:crypto'
++import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { createServer, type Server } from 'node:http'
++import { tmpdir } from 'node:os'
++import { join, resolve as resolvePath } from 'node:path'
++import { setTimeout as sleep } from 'node:timers/promises'
++import { createRootRoute, createRoute, createRouter } from '@tanstack/react-router'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const VECTOR_DIR = resolvePath(import.meta.dirname, '../../../../../vectors')
++const VECTORS = JSON.parse(readFileSync(join(VECTOR_DIR, 'tokens.json'), 'utf8'))
++const LIMITS = readFileSync(join(VECTOR_DIR, 'limits.json'), 'utf8').trim()
++const HEADER = 'X-Supapace-Assertion'
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++const ISS = 'https://issuer.test'
++
++// The routes the build refuses though it holds them: under /api/ai/ and at /api/mcp.
++const OPT_IN = [
++  '/api/ai/code/complete',
++  '/api/ai/docs',
++  '/api/ai/feedback/classify',
++  '/api/ai/feedback/rate',
++  '/api/ai/onboarding/design',
++  '/api/ai/sql/check-api-key',
++  '/api/ai/sql/cron-v2',
++  '/api/ai/sql/filter-v1',
++  '/api/ai/sql/generate-v4',
++  '/api/ai/sql/parse-client-code',
++  '/api/ai/sql/policy',
++  '/api/ai/sql/title-v2',
++  '/api/mcp',
++]
++
++// A route tree of the shapes the application has, matched by the router package itself.
++const handler = vi.fn(() => new Response('handled'))
++function testRouter() {
++  const root = createRootRoute()
++  const route = (path: string, methods?: string[]) =>
++    createRoute({
++      getParentRoute: () => root,
++      path,
++      ...(methods && {
++        server: {
++          handlers: Object.fromEntries(methods.map((m) => [m, handler])),
++        },
++      }),
++    } as any)
++  const routeTree = root.addChildren([
++    route('/'),
++    route('/project/$ref'),
++    route('/project/$ref/editor'),
++    route('/org/$slug'),
++    route('/api/get-utc-time', ['GET']),
++    route('/api/platform/profile', ['GET']),
++    route('/api/platform/pg-meta/$ref/query', ['POST']),
++    route('/api/platform/projects/$ref/content', ['DELETE', 'GET', 'PUT']),
++    route('/api/any', ['ANY']),
++    route('/api/platform/projects/$ref/content/folders/$id', ['GET', 'PATCH']),
++    route('/api/no-handlers'),
++    // a route outside /api with a server handler: the application has none, the guard does
++    // not rely on it
++    route('/hooks/ping', ['GET']),
++    ...OPT_IN.map((path) => route(path, [path.endsWith('check-api-key') ? 'GET' : 'POST'])),
++  ])
++  return createRouter({ routeTree }) as any
++}
++
++const privateKey = createPrivateKey({
++  key: {
++    kty: 'OKP',
++    crv: 'Ed25519',
++    d: VECTORS.private_file,
++    x: VECTORS.public_file,
++  },
++  format: 'jwk',
++})
++function assertion(
++  ref: string,
++  sub = 'user-1',
++  role = 'owner',
++  over: Record<string, unknown> = {}
++) {
++  const iat = Math.floor(Date.now() / 1000)
++  const claims = {
++    node: VECTORS.node,
++    iss: ISS,
++    sub,
++    name: `N ${sub}`,
++    ref,
++    role,
++    purpose: '',
++    iat,
++    exp: iat + 30,
++    ...over,
++  }
++  const p = Buffer.from(JSON.stringify(claims)).toString('base64url')
++  const s = signBytes(null, Buffer.from('supapace-assertion-v1.' + p), privateKey)
++  return `v1.${p}.${s.toString('base64url')}`
++}
++
++function answer(ref: string, role: string) {
++  const port = ref === REF_A ? 20001 : 20002
++  return {
++    ref,
++    name: `project ${port}`,
++    state: 'active',
++    db_version: '17.6.1',
++    pg_meta: port % 2,
++    ...(role !== 'read_only' && {
++      dsn_rw: `postgresql://postgres:rw${port}@10.212.0.6:${port}/postgres?sslmode=disable`,
++    }),
++    dsn_ro: `postgresql://supabase_read_only_user:ro${port}@10.212.0.6:${port}/postgres?sslmode=disable`,
++    api_url: `https://${ref}.example.test`,
++    data_api: {
++      schemas: ['public'],
++      extra_search_path: ['public', 'extensions'],
++      max_rows: null,
++    },
++    generation: 4,
++    at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
++  }
++}
++
++describe('api/self-hosted/request-guard', () => {
++  let dir: string
++  let socket: Server
++  let asked: string[]
++  let refusal: { status: number; code: string } | undefined
++  let exit: ReturnType<typeof vi.spyOn>
++  let said: ReturnType<typeof vi.spyOn>
++  let guard: typeof import('./request-guard')
++  let context: typeof import('./project-context')
++  let router: any
++
++  /** One request through the guard; `seen` is what the rest of the chain saw. */
++  async function send(
++    path: string,
++    init: {
++      method?: string
++      assertion?: string | null
++      headers?: Record<string, string>
++      next?: () => unknown
++      // the path the server framework hands a middleware; the URL's own when not given
++      pathname?: string
++    } = {}
++  ) {
++    const headers = new Headers(init.headers)
++    if (init.assertion) headers.set(HEADER, init.assertion)
++    const request = new Request(`http://studio.test${path}`, {
++      method: init.method ?? 'GET',
++      headers,
++    })
++    const seen: { called: boolean; context?: unknown; noContext?: unknown } = {
++      called: false,
++    }
++    const next = async () => {
++      seen.called = true
++      try {
++        seen.context = context.getProjectContext()
++      } catch (error) {
++        seen.noContext = error
++      }
++      return init.next ? init.next() : new Response('next')
++    }
++    const response = (await guard.guardRequest(
++      { request, pathname: init.pathname ?? new URL(request.url).pathname, next },
++      () => router
++    )) as Response
++    return {
++      response,
++      seen,
++      body:
++        response.status === 200
++          ? undefined
++          : await response
++              .clone()
++              .json()
++              .catch(() => undefined),
++    }
++  }
++  const expectRefused = async (sent: ReturnType<typeof send>, status: number, code: string) => {
++    const { response, seen, body } = await sent
++    expect([response.status, body?.code]).toEqual([status, code])
++    expect(Object.keys(body)).toEqual(['code', 'message'])
++    expect(seen.called).toBe(false)
++    return response
++  }
++
++  beforeEach(async () => {
++    vi.resetModules()
++    handler.mockClear()
++    dir = mkdtempSync(join(tmpdir(), 'guard-'))
++    writeFileSync(join(dir, 'assert.pub'), VECTORS.public_file + '\n')
++    writeFileSync(join(dir, 'cache.key'), Buffer.alloc(32, 7).toString('base64url') + '\n')
++    asked = []
++    refusal = undefined
++    socket = createServer((req, res) => {
++      const text = String(req.headers[HEADER.toLowerCase()])
++      const claims = JSON.parse(Buffer.from(text.split('.')[1], 'base64url').toString('utf8'))
++      asked.push(`${req.url} ${claims.ref} ${claims.sub}`)
++      res.setHeader('content-type', 'application/json')
++      if (refusal) {
++        res.statusCode = refusal.status
++        res.end(JSON.stringify({ code: refusal.code }))
++      } else res.end(JSON.stringify(answer(claims.ref, claims.role)))
++    })
++    await new Promise<void>((done) => socket.listen(join(dir, 'dash.sock'), done))
++    vi.stubEnv('SUPAPACE_LIMITS', LIMITS)
++    vi.stubEnv('SUPAPACE_DASH_SOCKET', join(dir, 'dash.sock'))
++    vi.stubEnv('SUPAPACE_DASH_DATA', join(dir, 'data'))
++    vi.stubEnv('SUPAPACE_DASH_KEYS', dir)
++    vi.stubEnv('SUPAPACE_PGCAP', '10.212.0.6:20000:21023')
++    vi.stubEnv('SUPAPACE_PGMETA', 'http://10.212.0.4:8080,http://10.212.0.5:8080')
++    vi.stubEnv('SUPAPACE_NODE_ID', VECTORS.node)
++    vi.stubEnv('TSS_PRERENDERING', '')
++    delete process.env.TSS_PRERENDERING
++    exit = vi.spyOn(process, 'exit').mockImplementation(() => {
++      throw new Error('the process exited')
++    })
++    said = vi.spyOn(console, 'error').mockImplementation(() => {})
++    guard = await import('./request-guard')
++    context = await import('./project-context')
++    router = testRouter()
++  })
++  afterEach(async () => {
++    vi.useRealTimers()
++    vi.unstubAllEnvs()
++    vi.restoreAllMocks()
++    await new Promise((done) => socket.close(done))
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  describe('the assertion', () => {
++    it.each([
++      ['an API route', '/api/platform/profile', 'GET'],
++      ['a route that writes', `/api/platform/pg-meta/${REF_A}/query`, 'POST'],
++      ['a page', `/project/${REF_A}/editor`, 'GET'],
++      ['the root', '/', 'GET'],
++      [
++        'a server function',
++        '/_serverFn/13355c4bebdb166d8b90dd1232f8a7ed9810ba1819821acf01f1db6947e845ee',
++        'GET',
++      ],
++      ['a path no route has', '/nothing/here', 'GET'],
++      ['an API path no route has', '/api/nothing', 'GET'],
++      ['a refused route', '/api/mcp', 'POST'],
++    ])('answers 401 without one: %s', async (_, path, method) => {
++      await expectRefused(send(path, { method }), 401, 'bad_assertion')
++      expect(asked).toEqual([])
++    })
++
++    it('answers 401 for every refused case of the vector file, at the case’s own time', async () => {
++      vi.useFakeTimers({ toFake: ['Date'] })
++      let own = 0
++      for (const c of VECTORS.refused) {
++        // a line end cannot be in a header's value: that case is the verifier's own test
++        if (/[\r\n]/.test(c.token)) {
++          expect(c.case).toBe('signature-line-end')
++          continue
++        }
++        vi.setSystemTime(c.now * 1000)
++        await expectRefused(
++          send('/api/platform/profile', { assertion: c.token }),
++          401,
++          'bad_assertion'
++        )
++        if (c.kind === 'assertion') own++
++      }
++      expect(own).toBeGreaterThanOrEqual(24)
++      expect(VECTORS.refused.map((c: any) => `${c.kind}/${c.case}`)).toContain(
++        'assertion/signature-s-plus-l'
++      )
++      expect(asked).toEqual([])
++      // the control: the accepted assertions pass at theirs
++      for (const t of VECTORS.tokens.filter((t: any) => t.kind === 'assertion')) {
++        vi.setSystemTime(t.now * 1000)
++        const { response, seen } = await send('/api/platform/profile', {
++          assertion: t.token,
++        })
++        expect(response.status).toBe(200)
++        expect((seen.context as any).principal.name).toBe(JSON.parse(t.payload).name)
++      }
++    })
++
++    it('answers 401 for two assertion headers', async () => {
++      const headers = new Headers()
++      headers.append(HEADER, assertion(REF_A))
++      headers.append(HEADER, assertion(REF_A))
++      const request = new Request('http://studio.test/api/platform/profile', {
++        headers,
++      })
++      const next = vi.fn()
++      const response = (await guard.guardRequest(
++        { request, pathname: '/api/platform/profile', next },
++        () => router
++      )) as Response
++      expect(response.status).toBe(401)
++      expect(next).not.toHaveBeenCalled()
++    })
++
++    it('takes no assertion from a query, a cookie or another header', async () => {
++      const a = assertion(REF_A)
++      await expectRefused(
++        send(`/api/platform/profile?${HEADER}=${a}&${HEADER.toLowerCase()}=${a}&assertion=${a}`, {
++          headers: {
++            cookie: `${HEADER}=${a}`,
++            authorization: `Bearer ${a}`,
++            'x-assertion': a,
++          },
++        }),
++        401,
++        'bad_assertion'
++      )
++    })
++  })
++
++  describe('the routes that are not served', () => {
++    const forms = (path: string) => [
++      path,
++      path.toUpperCase(),
++      path.replace('/api/', '/Api/'),
++      // percent-encoded: a letter of each of the first two segments
++      path
++        .replace('/api/', '/%61pi/')
++        .replace(/^(\/[^/]+\/)(.)/, (_, head, c) => `${head}%${c.charCodeAt(0).toString(16)}`),
++      path.replace('/api/', '/%41PI/'),
++      `${path}/`,
++    ]
++
++    it.each(OPT_IN)(
++      'answers 404 for %s as written, encoded, in capitals and with a slash',
++      async (path) => {
++        const method = path.endsWith('check-api-key') ? 'GET' : 'POST'
++        for (const form of forms(path)) {
++          await expectRefused(send(form, { method, assertion: assertion(REF_A) }), 404, 'not_found')
++        }
++        expect(handler).not.toHaveBeenCalled()
++        expect(asked).toEqual([])
++      }
++    )
++
++    it.each([
++      '/api/ai',
++      '/api/mcp',
++      '/API/AI',
++      '/api/Mcp',
++      '/api/ai/',
++      '/api/mcp/x',
++      '/api/ai/sql/anything/else',
++      '/api/%6dcp',
++    ])('answers 404 for the bare path %s, whatever the method', async (path) => {
++      for (const method of ['GET', 'POST', 'OPTIONS', 'DELETE']) {
++        await expectRefused(send(path, { method, assertion: assertion(REF_A) }), 404, 'not_found')
++      }
++      expect(asked).toEqual([])
++    })
++
++    it('has thirteen such routes in this test’s tree, each matched by the router', () => {
++      expect(OPT_IN).toHaveLength(13)
++      for (const path of OPT_IN) expect(guard.readPath(router, path.toUpperCase()).route).toBe(path)
++    })
++  })
++
++  describe('a ref in the path', () => {
++    it.each([
++      ['a page', `/project/${REF_B}/editor`, 'GET'],
++      ['a page, in capitals', `/project/${REF_B.toUpperCase()}/editor`, 'GET'],
++      ['a page, in mixed case', `/project/${REF_B.replace('b', 'B')}`, 'GET'],
++      ['an API route', `/api/platform/pg-meta/${REF_B}/query`, 'POST'],
++      ['an API route, in capitals', `/API/PLATFORM/PG-META/${REF_B.toUpperCase()}/QUERY`, 'POST'],
++      ['a position that is no parameter', `/api/platform/profile/${REF_B}`, 'GET'],
++      ['a path no route has', `/x/${REF_B}/y`, 'GET'],
++      ['a server function’s path', `/_serverFn/${REF_B}`, 'GET'],
++      ['a percent-encoded letter', `/project/%62${REF_B.slice(1)}/editor`, 'GET'],
++      ['beside the project’s own ref', `/project/${REF_A}/${REF_B}`, 'GET'],
++      ['the last segment, before a slash', `/project/${REF_B}/`, 'GET'],
++    ])('answers 404 for another project’s ref in %s', async (_, path, method) => {
++      await expectRefused(send(path, { method, assertion: assertion(REF_A) }), 404, 'not_found')
++      expect(asked).toEqual([])
++      expect(handler).not.toHaveBeenCalled()
++    })
++
++    it.each([
++      `/project/${REF_A}/editor`,
++      `/project/${REF_A.toUpperCase()}/editor`,
++      `/project/${REF_A}`,
++      // not the shape of a ref: 19 and 21 characters, and a character outside it
++      `/project/${REF_B.slice(1)}/editor`,
++      `/project/${REF_B}0/editor`,
++      `/project/${REF_B.slice(1)}_/editor`,
++      `/org/${REF_A}`,
++    ])('passes %s for the assertion’s project', async (path) => {
++      const { response, seen } = await send(path, {
++        assertion: assertion(REF_A),
++      })
++      expect(response.status).toBe(200)
++      expect(seen.called).toBe(true)
++    })
++
++    it('reads no ref from the query, the body or a header', async () => {
++      const { response, seen } = await send(
++        `/api/platform/pg-meta/${REF_A}/query?ref=${REF_B}&project=${REF_B}`,
++        {
++          method: 'POST',
++          assertion: assertion(REF_A),
++          headers: {
++            'x-project-ref': REF_B,
++            'x-forwarded-host': `${REF_B}.studio.test`,
++            host: `${REF_B}.studio.test`,
++          },
++        }
++      )
++      expect(response.status).toBe(200)
++      expect((seen.context as any).ref).toBe(REF_A)
++    })
++  })
++
++  describe('an API path', () => {
++    it.each([
++      ['a route that is not in the build', '/api/platform/storage/x/buckets'],
++      ['the same with a slash', '/api/platform/storage/x/buckets/'],
++      ['the same in capitals', '/API/platform/storage/x/buckets'],
++      ['/api itself', '/api'],
++      ['/api/', '/api/'],
++      ['a path below a route', '/api/platform/profile/more'],
++      ['a route without handlers', '/api/no-handlers'],
++      ['a segment that only decodes twice', '/%2561pi/platform/profile/..%252f'],
++    ])('answers 404 for %s, whatever the method', async (_, path) => {
++      for (const method of ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
++        if (!path.toLowerCase().startsWith('/api')) continue
++        const response = await expectRefused(
++          send(path, { method, assertion: assertion(REF_A) }),
++          404,
++          'not_found'
++        )
++        expect(response.headers.get('allow')).toBeNull()
++      }
++      expect(asked).toEqual([])
++    })
++
++    it.each([
++      ['/api/platform/profile', 'POST', 'GET, HEAD'],
++      ['/api/platform/profile', 'OPTIONS', 'GET, HEAD'],
++      ['/api/platform/profile/', 'DELETE', 'GET, HEAD'],
++      ['/API/Platform/Profile', 'PUT', 'GET, HEAD'],
++      [`/api/platform/pg-meta/${REF_A}/query`, 'GET', 'POST'],
++      [`/api/platform/pg-meta/${REF_A}/query`, 'HEAD', 'POST'],
++      [`/api/platform/projects/${REF_A}/content`, 'POST', 'DELETE, GET, HEAD, PUT'],
++      [`/api/platform/projects/${REF_A}/content`, 'PATCH', 'DELETE, GET, HEAD, PUT'],
++    ])('answers 405 with Allow for %s asked by %s', async (path, method, allow) => {
++      const response = await expectRefused(
++        send(path, { method, assertion: assertion(REF_A) }),
++        405,
++        'method_not_allowed'
++      )
++      expect(response.headers.get('allow')).toBe(allow)
++      expect(asked).toEqual([])
++      expect(handler).not.toHaveBeenCalled()
++    })
++
++    it.each([
++      ['/api/platform/profile', 'GET'],
++      ['/api/platform/profile', 'HEAD'],
++      ['/api/platform/profile/', 'GET'],
++      ['/API/PLATFORM/PROFILE', 'GET'],
++      ['/api/platform/%70rofile', 'GET'],
++      [`/api/platform/pg-meta/${REF_A}/query`, 'POST'],
++      [`/api/platform/projects/${REF_A}/content`, 'DELETE'],
++      [`/api/platform/projects/${REF_A}/content`, 'HEAD'],
++      ['/api/any', 'PATCH'],
++      ['/api/any', 'HEAD'],
++      // a method is matched as the server matches it: in capitals
++      [`/api/platform/projects/${REF_A}/content/folders/7`, 'patch'],
++    ])('passes %s asked by %s', async (path, method) => {
++      const { response, seen } = await send(path, {
++        method,
++        assertion: assertion(REF_A),
++      })
++      expect(response.status).toBe(200)
++      expect(seen.called).toBe(true)
++    })
++
++    it('leaves a path that is no API path to the pages, whatever the method', async () => {
++      for (const path of [
++        '/nothing/here',
++        '/apis',
++        '/api-keys',
++        '/x/api/mcp',
++        '/docs/mcp',
++        '/x/ai/sql',
++        `/project/${REF_A}/api`,
++      ]) {
++        const { response } = await send(path, {
++          method: 'POST',
++          assertion: assertion(REF_A),
++        })
++        expect(response.status).toBe(200)
++      }
++    })
++  })
++
++  describe('the context', () => {
++    it('runs the request with exactly the answer, the principal, the role and the purpose', async () => {
++      const text = assertion(REF_A, 'user-7', 'developer')
++      const { response, seen } = await send(`/api/platform/pg-meta/${REF_A}/query`, {
++        method: 'POST',
++        assertion: text,
++      })
++      expect(response.status).toBe(200)
++      expect(await response.text()).toBe('next')
++      expect(seen.context).toEqual({
++        ...answer(REF_A, 'developer'),
++        at: (seen.context as any).at,
++        principal: { iss: ISS, sub: 'user-7', name: 'N user-7' },
++        role: 'developer',
++        purpose: '',
++        assertion: text,
++      })
++      expect(asked).toEqual([`/v1/resolve ${REF_A} user-7`])
++    })
++
++    it('carries the purpose and the read-only role as asserted', async () => {
++      const reveal = await send('/api/platform/profile', {
++        assertion: assertion(REF_A, 'user-1', 'owner', { purpose: 'reveal' }),
++      })
++      expect(reveal.seen.context).toMatchObject({
++        role: 'owner',
++        purpose: 'reveal',
++      })
++      const ro = await send('/api/platform/profile', {
++        assertion: assertion(REF_B, 'user-2', 'read_only'),
++      })
++      expect(ro.seen.context).toMatchObject({
++        ref: REF_B,
++        role: 'read_only',
++        purpose: '',
++      })
++      expect((ro.seen.context as any).dsn_rw).toBeUndefined()
++    })
++
++    it('gives a page and a server function their context too', async () => {
++      for (const path of [`/project/${REF_A}/editor`, '/_serverFn/abc', '/nothing/here']) {
++        const { seen } = await send(path, { assertion: assertion(REF_A) })
++        expect((seen.context as any).ref).toBe(REF_A)
++      }
++    })
++
++    it('keeps interleaved requests of two projects apart, and leaves nothing behind', async () => {
++      const one = (ref: string, i: number) =>
++        send(`/api/platform/pg-meta/${ref}/query`, {
++          method: 'POST',
++          assertion: assertion(ref, `user-${i}`),
++          next: async () => {
++            const before = context.getProjectContext()
++            await sleep((i * 7) % 13)
++            const after = context.getProjectContext()
++            return Response.json({
++              before: [before.ref, before.principal.sub],
++              after: [after.ref, after.principal.sub],
++            })
++          },
++        })
++      const all = await Promise.all(
++        Array.from({ length: 40 }, (_, i) => one(i % 2 ? REF_A : REF_B, i))
++      )
++      for (const [i, r] of all.entries()) {
++        const mine = [i % 2 ? REF_A : REF_B, `user-${i}`]
++        expect(await r.response.json()).toEqual({ before: mine, after: mine })
++      }
++      expect(() => context.getProjectContext()).toThrow('No project context')
++    })
++
++    it.each([
++      [403, 'not_a_member'],
++      [404, 'not_here'],
++      [401, 'bad_assertion'],
++      [429, 'rate_limited'],
++      [503, 'unavailable'],
++    ])('answers the control plane’s refusal %s %s and runs nothing', async (status, code) => {
++      refusal = { status, code }
++      await expectRefused(
++        send('/api/platform/profile', { assertion: assertion(REF_A) }),
++        status,
++        code
++      )
++      expect(asked).toHaveLength(1)
++    })
++
++    it('answers 503 when the control plane’s answer names another project', async () => {
++      const original = socket.listeners('request')[0] as any
++      socket.removeAllListeners('request')
++      socket.on('request', (_req, res) => res.end(JSON.stringify(answer(REF_B, 'owner'))))
++      await expectRefused(
++        send('/api/platform/profile', { assertion: assertion(REF_A) }),
++        503,
++        'project_unavailable'
++      )
++      socket.removeAllListeners('request')
++      socket.on('request', original)
++    })
++
++    it('answers a refusal thrown further down the chain as its status, code and message', async () => {
++      const { response, body } = await send('/api/platform/profile', {
++        assertion: assertion(REF_A),
++        next: () => {
++          throw new context.ProjectError(
++            403,
++            'no_read_only_login',
++            'The project has no read-only login'
++          )
++        },
++      })
++      expect(response.status).toBe(403)
++      expect(body).toEqual({
++        code: 'no_read_only_login',
++        message: 'The project has no read-only login',
++      })
++    })
++
++    it('passes any other error on', async () => {
++      const sent = send('/api/platform/profile', {
++        assertion: assertion(REF_A),
++        next: async () => {
++          throw new TypeError('broken')
++        },
++      })
++      await expect(sent).rejects.toThrow('broken')
++    })
++  })
++
++  describe('the build’s prerender', () => {
++    const SHELL = { 'x-tss_shell': 'true' }
++    const NODE_NAMES = [
++      'SUPAPACE_NODE_ID',
++      'SUPAPACE_DASH_SOCKET',
++      'SUPAPACE_DASH_KEYS',
++      'SUPAPACE_DASH_DATA',
++      'SUPAPACE_PGCAP',
++      'SUPAPACE_PGMETA',
++      'SUPAPACE_LIMITS',
++    ]
++    async function prerender(value: string, keep: string[] = []) {
++      vi.resetModules()
++      for (const name of NODE_NAMES) if (!keep.includes(name)) delete process.env[name]
++      vi.stubEnv('TSS_PRERENDERING', value)
++      guard = await import('./request-guard')
++      context = await import('./project-context')
++    }
++
++    it('passes the request for the shell, without an assertion, a setting or a context', async () => {
++      await prerender('true')
++      const { response, seen } = await send('/', { headers: SHELL })
++      expect(response.status).toBe(200)
++      expect(seen.called).toBe(true)
++      expect(String(seen.noContext)).toContain('No project context')
++      expect(exit).not.toHaveBeenCalled()
++      expect(asked).toEqual([])
++    })
++
++    it.each([
++      ['a request without the shell’s header', '/', 'GET', {}],
++      ['another value of the header', '/', 'GET', { 'x-tss_shell': '1' }],
++      ['another method', '/', 'POST', SHELL],
++      ['a HEAD', '/', 'HEAD', SHELL],
++      ['a request that carries an assertion', '/', 'GET', { ...SHELL, [HEADER]: 'v1.x.y' }],
++      ['an API route without the header', '/api/platform/profile', 'GET', {}],
++    ])('answers 401 for %s, and reads no setting for it', async (_, path, method, headers) => {
++      await prerender('true')
++      await expectRefused(send(path, { method, headers }), 401, 'bad_assertion')
++      expect(exit).not.toHaveBeenCalled()
++    })
++
++    it.each(NODE_NAMES)('stops a server that has %s and the prerender switch', async (name) => {
++      await prerender('true', [name])
++      await expect(send('/', { headers: SHELL })).rejects.toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(said).toHaveBeenCalledTimes(1)
++      expect(String(said.mock.calls[0][0])).toContain('TSS_PRERENDERING')
++      // and at start, before any request
++      await prerender('true', [name])
++      expect(() => guard.checkStart()).toThrow('the process exited')
++    })
++
++    it.each(['TRUE', '1', 'yes', ' true', 'true ', ''])(
++      'serves as a node when the switch is "%s"',
++      async (value) => {
++        await prerender(value, NODE_NAMES)
++        await expectRefused(send('/', { headers: SHELL }), 401, 'bad_assertion')
++        const { response } = await send('/', {
++          headers: SHELL,
++          assertion: assertion(REF_A),
++        })
++        expect(response.status).toBe(200)
++      }
++    )
++
++    it('is not entered by anything a request carries', async () => {
++      await expectRefused(
++        send('/?TSS_PRERENDERING=true&x-tss_shell=true', {
++          headers: {
++            ...SHELL,
++            'x-tss-shell': 'true',
++            tss_prerendering: 'true',
++            cookie: 'TSS_PRERENDERING=true',
++          },
++        }),
++        401,
++        'bad_assertion'
++      )
++      expect(process.env.TSS_PRERENDERING).toBeUndefined()
++    })
++
++    it.each([
++      ['an API route', '/api/platform/profile'],
++      ['an API route of a project', `/api/platform/pg-meta/${REF_A}/query`],
++      ['a route that is not served', '/api/ai/sql/check-api-key'],
++      ['a route that is not served, in capitals', '/API/AI/SQL/CHECK-API-KEY'],
++      ['an API path no route has', '/api/nothing'],
++      ['an API path no route has, in capitals', '/API/nothing'],
++      ['an API path, its first segment percent-encoded', '/%61pi/platform/profile'],
++      [
++        'a server function',
++        '/_serverFn/13355c4bebdb166d8b90dd1232f8a7ed9810ba1819821acf01f1db6947e845ee',
++      ],
++      ['the prefix of the server functions alone', '/_serverFn/'],
++      ['a route outside /api that has a server handler', '/hooks/ping'],
++    ])('passes the shell’s request for a page only: %s is answered 401', async (_, path) => {
++      await prerender('true')
++      await expectRefused(send(path, { headers: SHELL }), 401, 'bad_assertion')
++      expect(handler).not.toHaveBeenCalled()
++      expect(exit).not.toHaveBeenCalled()
++    })
++
++    it.each(['/', `/project/${REF_A}`, '/project/default/editor', '/org/x', '/nothing/here'])(
++      'passes the shell’s request for the page %s',
++      async (path) => {
++        await prerender('true')
++        const { response, seen } = await send(path, { headers: SHELL })
++        expect(response.status).toBe(200)
++        expect(seen.called).toBe(true)
++        expect(exit).not.toHaveBeenCalled()
++      }
++    )
++
++    it('judges the path it is handed, not the request’s URL, here too', async () => {
++      await prerender('true')
++      await expectRefused(
++        send('/project/x', { headers: SHELL, pathname: '/api/platform/profile' }),
++        401,
++        'bad_assertion'
++      )
++      const { response } = await send('/api/platform/profile', {
++        headers: SHELL,
++        pathname: '/project/x',
++      })
++      expect(response.status).toBe(200)
++    })
++
++    it('takes a server function’s path from what it is handed: the prefix percent-encoded in the URL', async () => {
++      // the server decodes the prefix and dispatches the function; the URL's own path does
++      // not begin with it
++      const id = '13355c4bebdb166d8b90dd1232f8a7ed9810ba1819821acf01f1db6947e845ee'
++      await prerender('true')
++      for (const encoded of ['/%5FserverFn/', '/%5fserverFn/']) {
++        await expectRefused(
++          send(encoded + id, { headers: SHELL, pathname: '/_serverFn/' + id }),
++          401,
++          'bad_assertion'
++        )
++      }
++      expect(exit).not.toHaveBeenCalled()
++    })
++  })
++
++  describe('the path that is judged', () => {
++    it('is the path the guard is handed, not the request’s URL', async () => {
++      // the server hands a middleware the path it will route: here without the space that
++      // ends the URL's own
++      const handed = { assertion: assertion(REF_A), pathname: `/project/${REF_B}` }
++      await expectRefused(send(`/project/${REF_B}%20`, handed), 404, 'not_found')
++      await expectRefused(
++        send('/project/x%20', { assertion: assertion(REF_A), pathname: '/api/mcp' }),
++        404,
++        'not_found'
++      )
++      // and the other way round: what the URL alone names refuses nothing
++      const { response } = await send(`/project/${REF_B}`, {
++        assertion: assertion(REF_A),
++        pathname: `/project/${REF_A}`,
++      })
++      expect(response.status).toBe(200)
++    })
++
++    it('is judged first of all: the guard heads the chain of request middlewares', () => {
++      const source = readFileSync(resolvePath(import.meta.dirname, '../../../start.ts'), 'utf8')
++      const chains = [...source.matchAll(/requestMiddleware: \[([^\]]*)\]/g)]
++      expect(chains).toHaveLength(1)
++      const names = chains[0][1]
++        .split(',')
++        .map((name) => name.trim())
++        .filter(Boolean)
++      expect(names[0]).toBe('requestGuard')
++      expect(names.length).toBeGreaterThan(1)
++      expect(names.filter((name) => name === 'requestGuard')).toHaveLength(1)
++    })
++  })
++
++  describe('the check at start', () => {
++    it('reads every setting, and stops nothing when they are good', () => {
++      guard.checkStart()
++      expect(exit).not.toHaveBeenCalled()
++      expect(said).not.toHaveBeenCalled()
++    })
++
++    it.each([
++      ['SUPAPACE_LIMITS', 'SUPAPACE_LIMITS'],
++      ['SUPAPACE_PGCAP', 'SUPAPACE_PGCAP'],
++      ['SUPAPACE_DASH_SOCKET', 'SUPAPACE_DASH_SOCKET'],
++      ['SUPAPACE_DASH_DATA', 'SUPAPACE_DASH_DATA'],
++      ['SUPAPACE_NODE_ID', 'SUPAPACE_NODE_ID'],
++    ])('stops the server without %s, with no request', async (name, said_) => {
++      vi.resetModules()
++      delete process.env[name]
++      guard = await import('./request-guard')
++      expect(() => guard.checkStart()).toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(String(said.mock.calls[0][0])).toContain(said_)
++    })
++
++    it.each(['assert.pub', 'cache.key'])(
++      'stops the server without the key file %s',
++      async (file) => {
++        vi.resetModules()
++        rmSync(join(dir, file))
++        guard = await import('./request-guard')
++        expect(() => guard.checkStart()).toThrow('the process exited')
++        expect(exit).toHaveBeenCalledWith(1)
++      }
++    )
++
++    it('does nothing in the build’s prerender, which has no setting', async () => {
++      vi.resetModules()
++      for (const name of Object.keys(process.env))
++        if (name.startsWith('SUPAPACE_')) delete process.env[name]
++      vi.stubEnv('TSS_PRERENDERING', 'true')
++      guard = await import('./request-guard')
++      guard.checkStart()
++      expect(exit).not.toHaveBeenCalled()
++    })
++  })
++
++  describe('readPath', () => {
++    it('gives the segments the router matches on, the route and its methods', () => {
++      expect(guard.readPath(router, '/api/platform/profile')).toEqual({
++        segments: ['api', 'platform', 'profile'],
++        route: '/api/platform/profile',
++        methods: ['GET'],
++      })
++      expect(guard.readPath(router, `/Project/${REF_A.toUpperCase()}/Editor/`)).toEqual({
++        segments: ['Project', REF_A.toUpperCase(), 'Editor'],
++        route: '/project/$ref/editor',
++        methods: null,
++      })
++      expect(guard.readPath(router, '/')).toEqual({
++        segments: [],
++        route: '/',
++        methods: null,
++      })
++      expect(guard.readPath(router, '/api/platform/profile/more')).toMatchObject({
++        route: null,
++        methods: null,
++      })
++      expect(guard.readPath(router, '/nothing')).toEqual({
++        segments: ['nothing'],
++        route: null,
++        methods: null,
++      })
++    })
++
++    it('decodes a segment once, as the router does, and keeps an encoded slash, backslash and percent', () => {
++      expect(guard.readPath(router, '/%61pi/platform/%70rofile').route).toBe(
++        '/api/platform/profile'
++      )
++      expect(guard.readPath(router, '/api%20/platform/profile')).toMatchObject({
++        segments: ['api ', 'platform', 'profile'],
++        route: null,
++      })
++      expect(guard.readPath(router, '/%2561pi/a%2Fb/c%5Cd').segments).toEqual([
++        '%2561pi',
++        'a%2Fb',
++        'c%5Cd',
++      ])
++    })
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/request-guard.ts b/apps/studio/lib/api/self-hosted/request-guard.ts
+new file mode 100644
+index 00000000..e0975ac2
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/request-guard.ts
+@@ -0,0 +1,171 @@
++// SPDX-License-Identifier: Apache-2.0
++// The request guard: the first thing every request to this server meets, whatever it is for —
++// a route handler, a server function or a page. In order:
++//
++//   1. the gateway's assertion must verify, or the answer is 401;
++//   2. the path, read as the router reads it, must name no route that is not served and no
++//      project but the assertion's, or the answer is 404; a path under /api must match a route
++//      with a handler for the method, or the answer is 404 or 405;
++//   3. the control plane is asked for the assertion's project, and the rest of the request
++//      runs inside that project's context; its refusal is the answer.
++//
++// A refusal's body is {code, message}. The project is never taken from the path, the query, a
++// body or a header: the path can only disagree with the assertion, and then it is refused.
++
++import { checkAssertionSettings, verifyAssertion } from './assertion'
++import { checkSettings, resolve } from './dash-socket'
++import { orStop } from './limits'
++import { projectContext, ProjectError, runWithProject } from './project-context'
++
++const HEADER = 'x-supapace-assertion'
++// The header of the build's request for the application shell.
++const SHELL_HEADER = 'x-tss_shell'
++const REF_SHAPE = /^[a-z0-9]{20}$/
++
++/** What this module uses of the application's router: its own reading and matching of a path. */
++export type PathRouter = {
++  parseLocation: (location: any) => { pathname: string }
++  getMatchedRoutes: (pathname: string) => [unknown, Record<string, unknown>, any?]
++}
++
++export type PathReading = {
++  /** the path's segments as the router matches on them: decoded once, a trailing slash dropped */
++  segments: string[]
++  /** the full path of the route the path matches exactly, or null */
++  route: string | null
++  /** the methods that route's server handlers answer, or null when it has none */
++  methods: string[] | null
++}
++
++/** Reads a request path with the router's own decoder and matcher. */
++export function readPath(router: PathRouter, pathname: string): PathReading {
++  const path = router.parseLocation({
++    href: pathname,
++    pathname,
++    search: '',
++    hash: '',
++    state: {},
++  }).pathname
++  const [, params, found] = router.getMatchedRoutes(path)
++  // a match with a rest of the path left over is no match for a handler
++  const route = found && params['**'] === undefined ? found : undefined
++  // the handlers as the build registers them: an object, one member per method
++  const handlers = route?.options?.server?.handlers
++  return {
++    segments: path.replace(/\/+$/, '').split('/').slice(1),
++    route: route ? (route.fullPath as string) : null,
++    methods: handlers ? Object.keys(handlers).sort() : null,
++  }
++}
++
++/** Whether a route's handlers answer the method, as the server picks one: HEAD follows GET. */
++function answers(methods: string[], method: string): boolean {
++  const m = method.toUpperCase()
++  return methods.includes(m) || methods.includes('ANY') || (m === 'HEAD' && methods.includes('GET'))
++}
++
++function refusal(error: ProjectError, headers?: Record<string, string>): Response {
++  return Response.json(
++    { code: error.code, message: error.message },
++    { status: error.status, headers }
++  )
++}
++const notFound = () => refusal(new ProjectError(404, 'not_found', 'Not found'))
++
++// The server framework takes every path with this prefix for a server function, before any
++// route is matched.
++const SERVER_FUNCTIONS = '/_serverFn/'
++/** A path that is no API path and whose route, if it has one, has no server handler. */
++const isPage = ({ segments, methods }: PathReading) =>
++  segments[0]?.toLowerCase() !== 'api' && methods === null
++
++// --- the build's prerender -------------------------------------------------------------------
++
++let prerender: boolean | undefined
++
++/**
++ * True only in the build's prerender: the build starts this server once, without a node's
++ * settings, and asks for the application shell. The switch is the process's environment and
++ * nothing a request carries. A process that has the switch together with any setting of a
++ * node stops: a node never serves in this mode.
++ */
++function buildPrerender(): boolean {
++  return (prerender ??= orStop(() => {
++    if (process.env.TSS_PRERENDERING !== 'true') return false
++    if (
++      process.env.SUPAPACE_NODE_ID !== undefined ||
++      process.env.SUPAPACE_DASH_SOCKET !== undefined ||
++      process.env.SUPAPACE_DASH_KEYS !== undefined ||
++      process.env.SUPAPACE_DASH_DATA !== undefined ||
++      process.env.SUPAPACE_PGCAP !== undefined ||
++      process.env.SUPAPACE_PGMETA !== undefined ||
++      process.env.SUPAPACE_LIMITS !== undefined
++    ) {
++      throw new Error('TSS_PRERENDERING is set on a node: the build’s prerender is never served')
++    }
++    return true
++  }))
++}
++
++/**
++ * Run once when the process starts: every setting of a node is read and checked now, and a
++ * missing or malformed one stops the process before it serves. The build's prerender has none.
++ */
++export function checkStart() {
++  if (buildPrerender()) return
++  checkSettings()
++  checkAssertionSettings()
++}
++
++// --- the guard -------------------------------------------------------------------------------
++
++type GuardContext = { request: Request; pathname: string; next: () => unknown }
++let router: PathRouter | undefined
++
++/**
++ * The first request middleware. `pathname` is the request's path as the server framework hands
++ * it to a middleware; `getRouter` makes the application's router, once.
++ */
++export async function guardRequest(
++  { request, pathname, next }: GuardContext,
++  getRouter: () => PathRouter
++): Promise<unknown> {
++  if (buildPrerender()) {
++    // Only the page the build asks for passes: a GET with the shell's header and no
++    // assertion, for a path that is no server function and no API path and whose route has
++    // no server handler. Everything else is refused, and no setting is read for it.
++    const shell =
++      request.method === 'GET' &&
++      request.headers.get(SHELL_HEADER) === 'true' &&
++      !request.headers.has(HEADER) &&
++      !pathname.startsWith(SERVER_FUNCTIONS) &&
++      isPage(readPath((router ??= getRouter()), pathname))
++    return shell
++      ? next()
++      : refusal(new ProjectError(401, 'bad_assertion', 'The request carries no valid assertion'))
++  }
++  try {
++    const assertion = verifyAssertion(request.headers.get(HEADER))
++
++    const { segments, methods } = readPath((router ??= getRouter()), pathname)
++    const lower = segments.map((s) => s.toLowerCase())
++    const api = lower[0] === 'api'
++    if (api && (lower[1] === 'ai' || lower[1] === 'mcp')) return notFound()
++    if (lower.some((s) => REF_SHAPE.test(s) && s !== assertion.ref)) return notFound()
++    if (api) {
++      if (!methods) return notFound()
++      if (!answers(methods, request.method)) {
++        const allow = [...new Set(methods.includes('GET') ? [...methods, 'HEAD'] : methods)].sort()
++        return refusal(new ProjectError(405, 'method_not_allowed', 'Method not allowed'), {
++          allow: allow.join(', '),
++        })
++      }
++    }
++
++    const context = projectContext(assertion, await resolve(assertion))
++    return await runWithProject(context, () => next())
++  } catch (error) {
++    if (error instanceof ProjectError) return refusal(error)
++    throw error
++  }
++}
+diff --git a/apps/studio/start.ts b/apps/studio/start.ts
+index 986e1be5..7551227f 100644
+--- a/apps/studio/start.ts
++++ b/apps/studio/start.ts
+@@ -43,6 +43,21 @@ const crossOriginGuard = createMiddleware({ type: 'request' }).server(({ request
+   return next()
+ })
+ 
++// supapace: the request guard. One server process serves many projects behind a gateway that
++// signs, per request, who asks and for which project. Nothing of this server answers a request
++// whose assertion does not verify, a path that names another project or a route that is not
++// served; what passes runs inside its project's context. It stands first, ahead of every
++// other middleware, and covers route handlers, server functions and pages alike. Both modules
++// are loaded when the first request arrives: nothing of them is at this module's scope, which
++// the browser's bundle shares.
++const requestGuard = createMiddleware({ type: 'request' }).server(async (ctx) => {
++  const [{ guardRequest }, { getRouter }] = await Promise.all([
++    import('@/lib/api/self-hosted/request-guard'),
++    import('./router'),
++  ])
++  return guardRequest(ctx, getRouter) as ReturnType<typeof ctx.next>
++})
++
+ // Vercel's standard request pin keeps server functions compatible with the
+ // current tab. Documents and the deployment check stay unpinned, so a reload
+ // gets the latest version. Vite only defines the ID when protection is enabled.
+@@ -58,6 +73,11 @@ const deploymentMiddleware = createMiddleware({ type: 'function' }).client(({ ne
+ // (`autoInstrumentMiddleware: false` in vite.config.ts) and wire them
+ // explicitly so the instrumentation is visible in source.
+ export const startInstance = createStart(() => ({
+-  requestMiddleware: [sentryGlobalRequestMiddleware, platformApiGuard, crossOriginGuard],
++  requestMiddleware: [
++    requestGuard,
++    sentryGlobalRequestMiddleware,
++    platformApiGuard,
++    crossOriginGuard,
++  ],
+   functionMiddleware: [sentryGlobalFunctionMiddleware, deploymentMiddleware],
+ }))

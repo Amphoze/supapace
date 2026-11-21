@@ -28,13 +28,15 @@ func TestDashPath_RuleZero(t *testing.T) {
 		"/x#y", "/a/b#", "/api/mcp#x", "/api/ai#/x", "/api/platform/pg-meta/" + refB + "#y", "/x#/../api/mcp", "/#",
 		// ... and in the query: a URL parser ends the query there too
 		"/x?a#b", "/x?reveal=true#", "/x?#",
+		// a space that ends the path: a URL parser drops it, with or without a query
+		"/a%20", "/a/b%20", "/a%20?x=1", "/a%20?", "/a/%20", "/a%20%20", "/a/..%20", "/a/.%20", "/api/mcp%20", "/project/" + refB + "%20",
 	} {
 		e.dexpect(t, "dashboard "+raw, e.as(t, rawReq("GET", dhostA, raw), refA, subOwnerA), 400, "bad_request")
 		e.dexpect(t, "sign-in host "+raw, rawReq("GET", signInH, raw), 400, "bad_request")
 		// Rule 0 does not judge the studio domain: anything but "/" is 404.
 		e.dexpect(t, "studio domain "+raw, rawReq("GET", studioDom, raw), 404, "not_found")
 	}
-	for _, raw := range []string{"/", "/a/b", "/a/b?q=%E2%84%AA", "/a?q=\xe2\x84\xaa", "/a%20b", "/a~b", "/a%25b", "/x%23y", "/x?a=%23"} {
+	for _, raw := range []string{"/", "/a/b", "/a/b?q=%E2%84%AA", "/a?q=\xe2\x84\xaa", "/a%20b", "/%20a", "/a%20/b", "/a?x=%20", "/a~b", "/a%25b", "/x%23y", "/x?a=%23"} {
 		e.passes(t, "dashboard "+raw, e.as(t, rawReq("GET", dhostA, raw), refA, subOwnerA))
 		e.resetSeams()
 		if w := e.do(rawReq("GET", signInH, raw)); w.Code != 200 {

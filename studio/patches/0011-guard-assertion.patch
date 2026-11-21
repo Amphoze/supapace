@@ -1,0 +1,686 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:00:00 +0000
+Subject: [PATCH] guard: the gateway's assertion, verified
+
+The gateway signs, for every request, who asks, for which project and in which role. This
+is the verifier: the size and the envelope strictly, the Ed25519 signature with the node's
+public key, the payload's bytes against their own re-serialisation, the members' types and
+domains, the times, the node. One encoding is accepted, the one the gateway's signer
+writes, and both sides run the same vectors. Every refusal is the same 401. The node's id
+and the key file are read at the first use, never when the module loads.
+---
+ .../lib/api/self-hosted/assertion.test.ts     | 484 ++++++++++++++++++
+ apps/studio/lib/api/self-hosted/assertion.ts  | 172 +++++++
+ 2 files changed, 656 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/assertion.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/assertion.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/assertion.test.ts b/apps/studio/lib/api/self-hosted/assertion.test.ts
+new file mode 100644
+index 00000000..6b26ad91
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/assertion.test.ts
+@@ -0,0 +1,484 @@
++// SPDX-License-Identifier: Apache-2.0
++import { createPrivateKey, sign as signBytes } from 'node:crypto'
++import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join, resolve } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// The vectors of the gateway's signer and verifier: this verifier must accept and refuse the
++// same tokens. The build writes the file beside the tree.
++const VECTORS = JSON.parse(
++  readFileSync(resolve(import.meta.dirname, '../../../../../vectors/tokens.json'), 'utf8')
++)
++const LABEL = 'supapace-assertion-v1.'
++const NOW = 1800000010
++const REF = 'abcdefghij0123456789'
++
++type Token = {
++  kind: string
++  label: string
++  payload: string
++  token: string
++  now: number
++}
++type Refused = {
++  kind: string
++  case: string
++  token: string
++  now: number
++  error: string
++}
++
++// The vector key, to sign what the gateway's signer never writes.
++const privateKey = createPrivateKey({
++  key: {
++    kty: 'OKP',
++    crv: 'Ed25519',
++    d: VECTORS.private_file,
++    x: VECTORS.public_file,
++  },
++  format: 'jwk',
++})
++function sign(payload: string | Buffer, label = LABEL): string {
++  const p = Buffer.from(payload).toString('base64url')
++  return `v1.${p}.${signBytes(null, Buffer.from(label + p), privateKey).toString('base64url')}`
++}
++const base = {
++  node: 'local',
++  iss: 'https://issuer.test',
++  sub: 'user-1',
++  name: 'Ada',
++  ref: REF,
++  role: 'owner',
++  purpose: '',
++  iat: 1800000000,
++  exp: 1800000030,
++}
++const payload = (over: Record<string, unknown> = {}) => JSON.stringify({ ...base, ...over })
++/** The canonical payload with one member's JSON text replaced. */
++const withText = (member: string, text: string) => {
++  const out = payload().replace(new RegExp(`"${member}":("[^"]*"|\\d+)`), `"${member}":${text}`)
++  expect(out).not.toBe(payload())
++  return out
++}
++
++describe('api/self-hosted/assertion', () => {
++  let dir: string
++  let exit: ReturnType<typeof vi.spyOn>
++  let said: ReturnType<typeof vi.spyOn>
++  let verifyAssertion: (text: string | null, now?: number) => Record<string, unknown>
++  let checkAssertionSettings: () => void
++
++  const refused = (text: string | null, now = NOW) => {
++    let error: any
++    try {
++      verifyAssertion(text, now)
++    } catch (e) {
++      error = e
++    }
++    expect(error?.name).toBe('ProjectError')
++    expect([error.status, error.code]).toEqual([401, 'bad_assertion'])
++    // one message whatever the cause, and nothing of the token in it
++    expect(error.message).toBe('The request carries no valid assertion')
++  }
++
++  async function load() {
++    const m = await import('./assertion')
++    verifyAssertion = m.verifyAssertion as any
++    checkAssertionSettings = m.checkAssertionSettings
++  }
++
++  beforeEach(async () => {
++    vi.resetModules()
++    dir = mkdtempSync(join(tmpdir(), 'assertion-'))
++    writeFileSync(join(dir, 'assert.pub'), VECTORS.public_file + '\n')
++    vi.stubEnv('SUPAPACE_DASH_KEYS', dir)
++    vi.stubEnv('SUPAPACE_NODE_ID', VECTORS.node)
++    exit = vi.spyOn(process, 'exit').mockImplementation(() => {
++      throw new Error('the process exited')
++    })
++    said = vi.spyOn(console, 'error').mockImplementation(() => {})
++    await load()
++  })
++  afterEach(() => {
++    vi.unstubAllEnvs()
++    vi.restoreAllMocks()
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  describe('the vector file', () => {
++    it('has the members this reader knows and no other', () => {
++      expect(Object.keys(VECTORS).sort()).toEqual([
++        'comment',
++        'login',
++        'node',
++        'private_file',
++        'public_file',
++        'refused',
++        'seed_hex',
++        'session_max_seconds',
++        'tokens',
++      ])
++      for (const t of VECTORS.tokens) {
++        expect(Object.keys(t).sort()).toEqual(['kind', 'label', 'now', 'payload', 'token'])
++      }
++      for (const r of VECTORS.refused) {
++        expect(Object.keys(r).sort()).toEqual(['case', 'error', 'kind', 'now', 'token'])
++      }
++    })
++
++    // Ed25519 with the raw 32-byte key of the key file, in this runtime.
++    it('accepts every accepted assertion, member for member', () => {
++      const accepted = (VECTORS.tokens as Token[]).filter((t) => t.kind === 'assertion')
++      expect(accepted.length).toBeGreaterThanOrEqual(2)
++      for (const t of accepted) {
++        const want = JSON.parse(t.payload)
++        expect(verifyAssertion(t.token, t.now)).toEqual({
++          text: t.token,
++          ref: want.ref,
++          iss: want.iss,
++          sub: want.sub,
++          name: want.name,
++          role: want.role,
++          purpose: want.purpose,
++        })
++      }
++    })
++
++    it('re-serialises a name of markup, quote, backslash and non-ASCII text to the signer’s bytes', () => {
++      const t = (VECTORS.tokens as Token[]).find(
++        (t) => t.kind === 'assertion' && /[<>&]/.test(t.payload)
++      )!
++      const name = JSON.parse(t.payload).name as string
++      for (const c of ['<', '>', '&', '"', '\\']) expect(name).toContain(c)
++      expect(/[^\x00-\x7f]/.test(name)).toBe(true)
++      // the payload as signed is the vector's text, byte for byte
++      expect(Buffer.from(t.token.split('.')[1], 'base64url').toString('utf8')).toBe(t.payload)
++      expect(verifyAssertion(t.token, t.now).name).toBe(name)
++      // and this side's own signature over its own serialisation is the same token
++      expect(sign(JSON.stringify(JSON.parse(t.payload)))).toBe(t.token)
++    })
++
++    it('refuses every refused case, of every kind', () => {
++      const cases = VECTORS.refused as Refused[]
++      const own = cases.filter((c) => c.kind === 'assertion').map((c) => c.case)
++      expect(own.length).toBeGreaterThanOrEqual(25)
++      // the signature with S + L, the unused bits, the padded segment: none may be missing
++      for (const name of [
++        'signature-s-plus-l',
++        'signature-trailing-bits',
++        'signature-line-end',
++        'standard-alphabet',
++        'padded-segment',
++        'fourth-segment',
++        'size-4097',
++        'size-4096',
++        'white-space',
++        'member-added',
++        'member-removed',
++        'member-duplicated',
++        'members-reordered',
++        'name-line-separator-raw',
++        'name-line-separator-escaped',
++        'node',
++        'label-other-1',
++        'label-other-2',
++        'exp-at-now',
++        'lifetime-plus-one',
++        'iat-six-ahead',
++      ]) {
++        expect(own).toContain(name)
++      }
++      for (const c of cases) refused(c.token, c.now)
++    })
++
++    it('refuses the accepted tokens of the other kinds', () => {
++      const others = (VECTORS.tokens as Token[]).filter((t) => t.kind !== 'assertion')
++      expect(others.length).toBeGreaterThanOrEqual(3)
++      for (const t of others) refused(t.token, t.now)
++    })
++  })
++
++  describe('the envelope', () => {
++    const good = () => sign(payload())
++
++    it('accepts what this test signs, as a control', () => {
++      expect(verifyAssertion(good(), NOW)).toMatchObject({
++        ref: REF,
++        role: 'owner',
++        purpose: '',
++      })
++      expect(verifyAssertion(sign(payload({ purpose: 'reveal' })), NOW).purpose).toBe('reveal')
++    })
++
++    it.each([
++      ['no header', null],
++      ['an empty header', ''],
++      ['two assertions joined by the runtime', `${sign(payload())}, ${sign(payload())}`],
++      ['another version', good().replace(/^v1\./, 'v2.')],
++      ['no version', good().slice(3)],
++      ['a fourth segment', `${good()}.x`],
++      ['an empty payload', `v1..${good().split('.')[2]}`],
++      ['a signature one character short', good().slice(0, -1)],
++      ['a signature one character long', `${good()}A`],
++      ['a padded payload', good().replace(/\.([^.]+)$/, '=.$1')],
++      ['a character outside the alphabet', good().replace(/^v1\.e/, 'v1.+')],
++      ['white space after the token', `${good()} `],
++      ['a line end after the token', `${good()}\n`],
++    ])('refuses %s', (_, text) => {
++      refused(text)
++    })
++
++    it('refuses a payload whose last character sets unused bits', () => {
++      // 3n+1 payload bytes end in a character with four unused bits; setting one decodes the same
++      const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
++      const text = ['Ada', 'Adah', 'Adahh']
++        .map((name) => payload({ name }))
++        .find((t) => t.length % 3 === 1)!
++      const p = Buffer.from(text).toString('base64url')
++      const last = alphabet.indexOf(p.at(-1)!)
++      expect(last % 16).toBe(0)
++      const loose = p.slice(0, -1) + alphabet[last + 1]
++      expect(Buffer.from(loose, 'base64url').equals(Buffer.from(text))).toBe(true)
++      const s = signBytes(null, Buffer.from(LABEL + loose), privateKey).toString('base64url')
++      refused(`v1.${loose}.${s}`)
++      expect(verifyAssertion(sign(text), NOW).name).toMatch(/^Adah*$/)
++    })
++
++    it('refuses a token over 4096 bytes before anything else, and takes one of 4096 for its content', () => {
++      const long = sign(payload()) + 'A'.repeat(5000)
++      refused(long)
++      // a valid signature over a payload that is too long for its members only
++      // 3 + 4006 + 1 + 86 characters: a payload of 3004 bytes
++      const exact = sign(payload({ sub: 'x'.repeat(3004 - payload({ sub: '' }).length) }))
++      expect(exact.length).toBe(4096)
++      refused(exact) // sub is longer than 255 bytes
++    })
++
++    it('refuses a signature under another label', () => {
++      refused(sign(payload(), 'supapace-session-v1.'))
++      refused(sign(payload(), ''))
++    })
++  })
++
++  describe('the payload', () => {
++    it.each([
++      ['a list', '[]'],
++      ['null', 'null'],
++      ['a string', '"x"'],
++      ['a number', '7'],
++      ['text that is not JSON', '{"node":'],
++      ['a member too many', payload({ admin: true })],
++      ['a member too few', payload().replace('"purpose":"",', '')],
++      ['a member twice', payload().replace('"sub":"user-1"', '"sub":"user-2","sub":"user-1"')],
++      ['members in another order', JSON.stringify({ ...base, iat: undefined, node: 'local' })],
++      ['a space after a colon', payload().replace('"node":', '"node": ')],
++      ['a line end at the end', payload() + '\n'],
++      [
++        'a byte-order mark first',
++        Buffer.concat([Buffer.from('efbbbf', 'hex'), Buffer.from(payload())]),
++      ],
++    ])('refuses %s', (_, text) => {
++      refused(sign(text as string | Buffer))
++    })
++
++    it.each([
++      ['a name that is an object', withText('name', '{"a":1}')],
++      ['a name that is a list', withText('name', '["Ada"]')],
++      ['a name that is a number', withText('name', '7')],
++      ['a name that is null', withText('name', 'null')],
++      ['a name that is true', withText('name', 'true')],
++      ['a ref that is a list of one ref', withText('ref', `["${REF}"]`)],
++      ['a role that is an object', withText('role', '{"toString":"owner"}')],
++      ['an iat that is a string', withText('iat', '"1800000000"')],
++      ['an exp with a fraction', withText('exp', '1800000030.5')],
++      ['an iat with a fraction', withText('iat', '1800000000.5')],
++      ['an exp written with a zero fraction', withText('exp', '1800000030.0')],
++      ['an iat written with an exponent', withText('iat', '18e8')],
++      ['an iat of minus zero', withText('iat', '-0')],
++      ['an iat with a leading zero', withText('iat', '01800000000')],
++      ['an exp past the safe integers', withText('exp', '9007199254740993')],
++      ['an exp that is null', withText('exp', 'null')],
++    ])('refuses %s', (_, text) => {
++      refused(sign(text))
++    })
++
++    it.each([
++      ['an escape the signer does not write', withText('name', '"\\u0041da"')],
++      ['an escaped solidus', withText('name', '"A\\/da"')],
++      ['half of a surrogate pair, escaped', withText('name', '"A\\ud800da"')],
++      ['a tab, escaped', withText('name', '"A\\tda"')],
++      ['a line end, escaped', withText('name', '"A\\nda"')],
++      ['the delete character', withText('name', '"A\u007fda"')],
++      ['a control character above ASCII', withText('name', '"A\u0085da"')],
++      ['a line separator in the node’s id', withText('node', '"lo\u2028cal"')],
++      ['a name of 129 bytes', withText('name', `"${'日'.repeat(43)}"`)],
++      ['an issuer with a character above ASCII', withText('iss', '"https://issüer.test"')],
++      ['an empty issuer', withText('iss', '""')],
++      ['an empty subject', withText('sub', '""')],
++      ['a subject of 256 bytes', withText('sub', `"${'s'.repeat(256)}"`)],
++      ['a subject with a control character', withText('sub', '"user\\u00011"')],
++      ['an empty node', withText('node', '""')],
++      ['a ref in capitals', withText('ref', `"${REF.toUpperCase()}"`)],
++      ['a ref of 19 characters', withText('ref', `"${REF.slice(1)}"`)],
++      ['a ref of 21 characters', withText('ref', `"${REF}0"`)],
++      ['a role outside the three', withText('role', '"admin"')],
++      ['a role in capitals', withText('role', '"Owner"')],
++      ['a purpose outside the two', withText('purpose', '"all"')],
++    ])('refuses %s', (_, text) => {
++      refused(sign(text))
++    })
++
++    it('refuses bytes that are not UTF-8, whatever a lenient decoder would make of them', () => {
++      const bytes = Buffer.from(payload())
++      const at = bytes.indexOf('Ada')
++      bytes[at] = 0xff
++      refused(sign(bytes))
++      // an overlong form of "A"
++      const long = Buffer.concat([
++        bytes.subarray(0, at),
++        Buffer.from('c181', 'hex'),
++        bytes.subarray(at + 1),
++      ])
++      refused(sign(long))
++    })
++
++    it('accepts members at their bounds', () => {
++      const name = '日'.repeat(42) + 'ab' // 128 bytes
++      expect(Buffer.byteLength(name)).toBe(128)
++      const got = verifyAssertion(
++        sign(
++          payload({
++            name,
++            sub: 's'.repeat(255),
++            iss: ' ~'.repeat(127),
++            role: 'read_only',
++          })
++        ),
++        NOW
++      )
++      expect(got).toMatchObject({ name, role: 'read_only' })
++      expect(verifyAssertion(sign(payload({ name: '' })), NOW).name).toBe('')
++      expect(verifyAssertion(sign(payload({ role: 'developer' })), NOW).role).toBe('developer')
++    })
++  })
++
++  describe('the times and the node', () => {
++    const at = (iat: number, exp: number) => sign(payload({ iat, exp }))
++
++    it('refuses an assertion at and after its expiry', () => {
++      expect(verifyAssertion(at(NOW - 10, NOW + 1), NOW)).toBeTruthy()
++      refused(at(NOW - 10, NOW), NOW)
++      refused(at(NOW - 10, NOW - 1), NOW)
++    })
++
++    it('refuses an assertion issued more than five seconds ahead', () => {
++      expect(verifyAssertion(at(NOW + 5, NOW + 35), NOW)).toBeTruthy()
++      refused(at(NOW + 6, NOW + 36), NOW)
++    })
++
++    it('refuses a lifetime above sixty seconds, of zero and below', () => {
++      expect(verifyAssertion(at(NOW - 1, NOW + 59), NOW)).toBeTruthy()
++      refused(at(NOW - 1, NOW + 60), NOW)
++      refused(at(NOW + 2, NOW + 2), NOW)
++      refused(at(NOW + 3, NOW + 2), NOW)
++    })
++
++    it('reads the clock when no time is given', () => {
++      const now = Math.floor(Date.now() / 1000)
++      expect(verifyAssertion(at(now, now + 30))).toBeTruthy()
++      refused(at(now - 40, now - 10), undefined)
++    })
++
++    it('refuses an assertion for another node', () => {
++      refused(sign(payload({ node: 'local2' })))
++      refused(sign(payload({ node: 'Local' })))
++    })
++
++    it('refuses a node id outside its domain though it is the node’s own', async () => {
++      for (const node of ['n'.repeat(256), 'lo\u2028cal', 'lo\u0007cal']) {
++        vi.resetModules()
++        vi.stubEnv('SUPAPACE_NODE_ID', node)
++        await load()
++        refused(sign(payload({ node })))
++      }
++      vi.resetModules()
++      vi.stubEnv('SUPAPACE_NODE_ID', 'n'.repeat(255))
++      await load()
++      expect(verifyAssertion(sign(payload({ node: 'n'.repeat(255) })), NOW)).toBeTruthy()
++    })
++  })
++
++  describe('the settings, at the first use', () => {
++    const token = () => sign(payload())
++
++    it('reads nothing when the module loads, as the build loads it', async () => {
++      vi.resetModules()
++      vi.stubEnv('SUPAPACE_DASH_KEYS', '')
++      delete process.env.SUPAPACE_DASH_KEYS
++      delete process.env.SUPAPACE_NODE_ID
++      await import('./assertion')
++      expect(exit).not.toHaveBeenCalled()
++      expect(said).not.toHaveBeenCalled()
++    })
++
++    it('reads the key file once', () => {
++      expect(verifyAssertion(token(), NOW)).toBeTruthy()
++      rmSync(join(dir, 'assert.pub'))
++      vi.stubEnv('SUPAPACE_NODE_ID', 'another')
++      expect(verifyAssertion(token(), NOW)).toBeTruthy()
++    })
++
++    it('takes the key file without its line end', async () => {
++      vi.resetModules()
++      writeFileSync(join(dir, 'assert.pub'), VECTORS.public_file)
++      await load()
++      expect(verifyAssertion(token(), NOW)).toBeTruthy()
++    })
++
++    it.each([
++      ['is missing', null],
++      ['is empty', ''],
++      ['is a character short', VECTORS.public_file.slice(1) + '\n'],
++      ['is a character long', VECTORS.public_file + 'A\n'],
++      ['is padded', VECTORS.public_file + '=\n'],
++      ['ends in two line ends', VECTORS.public_file + '\n\n'],
++      ['holds a character outside the alphabet', '+' + VECTORS.public_file.slice(1) + '\n'],
++      ['sets unused bits', VECTORS.public_file.slice(0, -1) + 'h\n'],
++      ['is the private key’s file with a space', ' ' + VECTORS.public_file],
++    ])('stops the server when the key file %s', async (_, content) => {
++      vi.resetModules()
++      if (content === null) rmSync(join(dir, 'assert.pub'))
++      else writeFileSync(join(dir, 'assert.pub'), content)
++      await load()
++      expect(() => verifyAssertion(token(), NOW)).toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(said).toHaveBeenCalledTimes(1)
++      expect(String(said.mock.calls[0][0])).toContain('assertion key')
++      expect(String(said.mock.calls[0][0])).not.toContain(VECTORS.public_file.slice(1, 20))
++    })
++
++    it.each([
++      ['SUPAPACE_NODE_ID', undefined],
++      ['SUPAPACE_NODE_ID', ''],
++      ['SUPAPACE_DASH_KEYS', undefined],
++      ['SUPAPACE_DASH_KEYS', 'keys'],
++    ])('stops the server when %s is %s', async (name, value) => {
++      vi.resetModules()
++      vi.stubEnv(name, value ?? '')
++      if (value === undefined) delete process.env[name]
++      await load()
++      expect(() => checkAssertionSettings()).toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++      expect(said).toHaveBeenCalledTimes(1)
++      expect(String(said.mock.calls[0][0])).toContain(name)
++    })
++
++    it('checks the settings without a request, and stops nothing when they are good', () => {
++      checkAssertionSettings()
++      checkAssertionSettings()
++      expect(exit).not.toHaveBeenCalled()
++      expect(said).not.toHaveBeenCalled()
++    })
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/assertion.ts b/apps/studio/lib/api/self-hosted/assertion.ts
+new file mode 100644
+index 00000000..b090ec36
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/assertion.ts
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: Apache-2.0
++// The gateway's assertion: who asks, for which project, in which role. The gateway signs one
++// per request with the node's key; this server holds the public key only and verifies every
++// request's assertion before anything else runs. The format has one encoding, so that this
++// verifier and the gateway's accept exactly the same tokens:
++//
++//   v1.<P>.<S>   P: base64url of the payload, S: base64url of an Ed25519 signature over the
++//                label followed by P; no padding, no unused bits, at most 4096 bytes
++//   payload      {"node","iss","sub","name","ref","role","purpose","iat","exp"}: these members
++//                in this order, no white space, no escape but \" and \\
++//
++// The payload is never rebuilt from a lenient decoder: what was decoded is serialised again
++// and its bytes are compared with the bytes that were signed.
++
++import { createPublicKey, verify, type KeyObject } from 'node:crypto'
++import { readFileSync } from 'node:fs'
++import { isAbsolute, join } from 'node:path'
++
++import { orStop } from './limits'
++import { ProjectError, type Assertion } from './project-context'
++
++const LABEL = 'supapace-assertion-v1.'
++const MAX_TOKEN_BYTES = 4096
++const SIGNATURE_CHARS = 86
++const MAX_LIFETIME_S = 60
++const AHEAD_S = 5
++const BASE64URL = /^[A-Za-z0-9_-]+$/
++const REF = /^[a-z0-9]{20}$/
++const PRINTABLE = /^[\x20-\x7e]{1,255}$/
++// Control characters, and the two separators that JSON encoders do not all write the same way.
++const UNWRITTEN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/
++const ROLES: readonly unknown[] = ['owner', 'developer', 'read_only']
++const PURPOSES: readonly unknown[] = ['', 'reveal']
++
++// One refusal for every cause: the answer says nothing about which check failed.
++const refuse = () =>
++  new ProjectError(401, 'bad_assertion', 'The request carries no valid assertion')
++
++/** Unpadded base64url with no unused bit set, or nothing. */
++function decode(text: string): Buffer | undefined {
++  if (!BASE64URL.test(text)) return undefined
++  const bytes = Buffer.from(text, 'base64url')
++  return bytes.toString('base64url') === text ? bytes : undefined
++}
++
++/** UTF-8 text of `min` to `max` bytes, without a control character or a Unicode separator. */
++function isText(value: unknown, min: number, max: number): value is string {
++  if (typeof value !== 'string' || !value.isWellFormed() || UNWRITTEN.test(value)) return false
++  const bytes = Buffer.byteLength(value)
++  return bytes >= min && bytes <= max
++}
++
++// --- the node's settings, read once, at the first use ----------------------------------------
++
++type Settings = { node: string; key: KeyObject }
++let loaded: Settings | undefined
++
++/** The public key file: 32 bytes as 43 base64url characters and at most one line end. */
++function readKey(file: string): KeyObject {
++  let text: string
++  try {
++    text = readFileSync(file, 'latin1')
++  } catch {
++    throw new Error('the assertion key file cannot be read')
++  }
++  const x = text.endsWith('\n') ? text.slice(0, -1) : text
++  if (x.length !== 43 || decode(x) === undefined) {
++    throw new Error('the assertion key file does not hold 32 bytes in base64url')
++  }
++  return createPublicKey({
++    key: { kty: 'OKP', crv: 'Ed25519', x },
++    format: 'jwk',
++  })
++}
++
++function settings(): Settings {
++  return (loaded ??= orStop(() => {
++    const node = process.env.SUPAPACE_NODE_ID
++    if (!node) throw new Error('SUPAPACE_NODE_ID is not set')
++    const keys = process.env.SUPAPACE_DASH_KEYS
++    if (!keys || !isAbsolute(keys)) {
++      throw new Error('SUPAPACE_DASH_KEYS is not set to an absolute path')
++    }
++    return { node, key: readKey(join(keys, 'assert.pub')) }
++  }))
++}
++
++/**
++ * Reads and checks the node's id and the assertion key now; a missing or malformed one stops
++ * the process, with the line the first request would give. Nothing is read when the module
++ * loads.
++ */
++export function checkAssertionSettings() {
++  settings()
++}
++
++// --- the verifier ----------------------------------------------------------------------------
++
++/**
++ * Verifies the text of a request's assertion header and returns it as verified, or throws the
++ * one refusal, `401 bad_assertion`. In order: the size and the envelope, the signature, the
++ * payload's bytes against their own re-serialisation, the members' types and domains, the
++ * times, the node. `now` is in seconds; the clock when it is not given.
++ */
++export function verifyAssertion(
++  text: string | null,
++  now = Math.floor(Date.now() / 1000)
++): Assertion {
++  const { node, key } = settings()
++  if (text === null || text.length > MAX_TOKEN_BYTES || !text.startsWith('v1.')) throw refuse()
++  const parts = text.slice(3).split('.')
++  if (parts.length !== 2 || parts[1].length !== SIGNATURE_CHARS) throw refuse()
++  const payload = decode(parts[0])
++  const signature = decode(parts[1])
++  if (!payload || !signature) throw refuse()
++  if (!verify(null, Buffer.from(LABEL + parts[0]), key, signature)) throw refuse()
++
++  let value: unknown
++  try {
++    value = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(payload))
++  } catch {
++    throw refuse()
++  }
++  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw refuse()
++  const given: Record<string, unknown> = { ...value }
++  // Only these members, in this order: a missing, added, repeated, reordered or otherwise
++  // spelled member, an escape or a number in another notation does not serialise to the
++  // bytes that were signed.
++  const claims = {
++    node: given.node,
++    iss: given.iss,
++    sub: given.sub,
++    name: given.name,
++    ref: given.ref,
++    role: given.role,
++    purpose: given.purpose,
++    iat: given.iat,
++    exp: given.exp,
++  }
++  const { iss, sub, name, ref, role, purpose, iat, exp } = claims
++  if (
++    !isText(claims.node, 1, 255) ||
++    typeof iss !== 'string' ||
++    !PRINTABLE.test(iss) ||
++    typeof sub !== 'string' ||
++    !PRINTABLE.test(sub) ||
++    !isText(name, 0, 128) ||
++    typeof ref !== 'string' ||
++    !REF.test(ref) ||
++    !ROLES.includes(role) ||
++    !PURPOSES.includes(purpose) ||
++    typeof iat !== 'number' ||
++    !Number.isSafeInteger(iat) ||
++    typeof exp !== 'number' ||
++    !Number.isSafeInteger(exp)
++  ) {
++    throw refuse()
++  }
++  if (!Buffer.from(JSON.stringify(claims), 'utf8').equals(payload)) throw refuse()
++
++  if (exp <= now || iat > now + AHEAD_S || exp <= iat || exp - iat > MAX_LIFETIME_S) throw refuse()
++  if (claims.node !== node) throw refuse()
++  return {
++    text,
++    ref,
++    iss,
++    sub,
++    name,
++    role: role as Assertion['role'],
++    purpose: purpose as Assertion['purpose'],
++  }
++}

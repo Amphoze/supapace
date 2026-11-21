@@ -37,6 +37,13 @@
       "payload": "{\"iss\":\"https://issuer.test\",\"sub\":\"user-1\",\"refs\":[\"abcdefghij0123456789\",\"bcdefghij0123456789a\"],\"more\":true,\"iat\":1800000000,\"exp\":1800000060}",
       "token": "v1.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwicmVmcyI6WyJhYmNkZWZnaGlqMDEyMzQ1Njc4OSIsImJjZGVmZ2hpajAxMjM0NTY3ODlhIl0sIm1vcmUiOnRydWUsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDYwfQ.FzJMQqoZVmU_zNwNyPult2o0eT3fW1Nl7yMkBH0ubs-8y_3CE-iQJyOWK0-kep4nO-DQ6piMnloWKfYMgmVKDA",
       "now": 1800000010
+    },
+    {
+      "kind": "assertion",
+      "label": "supapace-assertion-v1.",
+      "payload": "{\"node\":\"local\",\"iss\":\"https://issuer.test\",\"sub\":\"user-1\",\"name\":\"Zoë <b>&\\\"\\\\ 日本語\",\"ref\":\"abcdefghij0123456789\",\"role\":\"owner\",\"purpose\":\"\",\"iat\":1800000000,\"exp\":1800000030}",
+      "token": "v1.eyJub2RlIjoibG9jYWwiLCJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoidXNlci0xIiwibmFtZSI6Ilpvw6sgPGI-JlwiXFwg5pel5pys6KqeIiwicmVmIjoiYWJjZGVmZ2hpajAxMjM0NTY3ODkiLCJyb2xlIjoib3duZXIiLCJwdXJwb3NlIjoiIiwiaWF0IjoxODAwMDAwMDAwLCJleHAiOjE4MDAwMDAwMzB9.spXtOlH9pOEDwgDiaXnc0UcxQS0XgesrpXG3xjn1_PadMSamXqPZCv2P5AeI-9ECcN-UJE9ZhUlTXVPl9feZDw",
+      "now": 1800000010
     }
   ],
   "refused": [
