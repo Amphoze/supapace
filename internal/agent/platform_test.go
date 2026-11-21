@@ -1089,3 +1089,51 @@ func TestEnsureCP_Move_SyncErrorStopsBeforeTheCommitPoint(t *testing.T) {
 		t.Fatalf("not moved after the sync works: %v", got)
 	}
 }
+
+// The daemon died during a fresh node's first start and comes back while
+// that start still initialises: PG_VERSION is there, the node unstamped,
+// sp-cp-db runs. The ensure adopts it and waits for its answer before it
+// stamps the node; only then is the container made again without the
+// password.
+func TestEnsureCP_ResumedFirstStartStampedOnlyAfterItAnswers(t *testing.T) {
+	a, f, cf := cpSetup(t)
+	ctx := context.Background()
+	if err := a.ensureCPRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ensureCPArchBinary(); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(a.p.CPProjectDir(), "data")
+	mkdirs(t, data)
+	os.WriteFile(filepath.Join(data, "PG_VERSION"), []byte("17\n"), 0o600)
+	_, _, conf, err := a.cpConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := f.ctr(fakeCtr{Name: cpName, Running: true, Restart: "unless-stopped",
+		Labels: map[string]string{labelRole: "cp-db", labelConfig: conf}})
+	answered := false
+	cf.session = func(context.Context, string) (bool, int64, error) {
+		if !answered {
+			if _, err := os.Lstat(cpStamp(a)); err == nil {
+				t.Error("stamped before the first start answered")
+			}
+			if c := f.ctrs[cpName]; c == nil || c.ID != first.ID {
+				t.Error("the initialising container was replaced before it answered")
+			}
+		}
+		answered = true
+		return false, 0, nil
+	}
+	if err := a.EnsureControlPlaneDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c := f.ctrs[cpName]
+	if !answered || c == nil || c.ID == first.ID || cpPassword(c.Argv) {
+		t.Fatalf("answered %v, container %+v", answered, c)
+	}
+	if _, err := os.Lstat(cpStamp(a)); err != nil {
+		t.Fatalf("not stamped: %v", err)
+	}
+}

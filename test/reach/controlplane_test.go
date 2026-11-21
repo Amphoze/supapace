@@ -225,8 +225,15 @@ func setCPDiskQuota(t testing.TB, mb int) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	writeNodeFile(t, append(out, '\n'))
+}
+
+// writeNodeFile writes b as node.json, restarts the daemon on it and waits
+// until uid 70's quota reads what it configures.
+func writeNodeFile(t testing.TB, b []byte) {
+	t.Helper()
 	release := holdDaemon(t)
-	if err := os.WriteFile(paths.NodeJSON(), append(out, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(paths.NodeJSON(), b, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	release()
@@ -251,14 +258,25 @@ func setCPDiskQuota(t testing.TB, mb int) {
 // raise the store answers with every row.
 func TestControlPlane_StopsAtItsDiskQuotaAndComesBackAfterARaise(t *testing.T) {
 	ctx := context.Background()
-	// A run killed before its clean-up left a lowered quota in the node
-	// file: put it back first (test nodes set no cp_disk_quota_mb).
-	if b, err := os.ReadFile(paths.NodeJSON()); err == nil && bytes.Contains(b, []byte(`"cp_disk_quota_mb"`)) {
-		t.Logf("a lowered quota left by an earlier run: removed")
-		setCPDiskQuota(t, 0)
+	// While the quota is lowered the node file's original bytes are kept
+	// beside it. A run killed before its clean-up left that copy: the node
+	// file is put back from it, byte for byte. Without a copy nothing is
+	// touched (a value an operator configured stays).
+	keep := paths.NodeJSON() + ".reach-orig"
+	if b, err := os.ReadFile(keep); err == nil {
+		t.Logf("the node file left lowered by an earlier run: restored from %s", keep)
+		writeNodeFile(t, b)
+		if err := os.Remove(keep); err != nil {
+			t.Fatal(err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
 	}
 	orig, err := os.ReadFile(paths.NodeJSON())
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, orig, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	uid := nodecfg.ControlPlaneUID
@@ -267,6 +285,8 @@ func TestControlPlane_StopsAtItsDiskQuotaAndComesBackAfterARaise(t *testing.T) {
 	t.Cleanup(func() {
 		if err := os.WriteFile(paths.NodeJSON(), orig, 0o600); err != nil {
 			t.Errorf("node.json back: %v", err)
+		} else if err := os.Remove(keep); err != nil {
+			t.Errorf("removing %s: %v", keep, err)
 		}
 		release := holdDaemon(t)
 		release()
@@ -362,8 +382,8 @@ func TestControlPlane_StopsAtItsDiskQuotaAndComesBackAfterARaise(t *testing.T) {
 		}
 	}
 
-	// The raise, through the configuration: every committed row is there.
-	setCPDiskQuota(t, 0)
+	// The raise: the original node file again; every committed row is there.
+	writeNodeFile(t, orig)
 	cpBack(t, 3*repairWait)
 	if out, err := cpPsql("select count(*) from reach_cp_rows"); err != nil || out != strconv.Itoa(rows) {
 		t.Fatalf("rows after the raise: %q %v", out, err)

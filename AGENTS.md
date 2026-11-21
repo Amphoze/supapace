@@ -5508,8 +5508,11 @@ Known limits
   state in the node check yet.
 - Nothing pushes the control plane's spool yet: it grows by one 16 MiB segment every five
   minutes at least.
-- A daemon that dies during a fresh node's first start stamps the node when it comes back,
-  before that start has answered; the start is then stopped with Docker's 30 s grace.
+- A daemon that dies during a fresh node's first start waits, when it comes back, until
+  that start has answered; only then is the node stamped and the container made again
+  without the initialisation variable.
+- The suite's quota test keeps the node file's bytes in node.json.reach-orig while the
+  quota is lowered and restores only from that copy; without a copy it changes nothing.
 - A build older than this one must never run on a moved node; docs/operations.md has the
   four steps back.
 - A database moved from an older build has no page checksums; a new one has.

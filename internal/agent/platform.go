@@ -144,8 +144,19 @@ func (a *Agent) EnsureControlPlaneDB(ctx context.Context) error {
 	// So a fresh node's boot starts the database twice, and no container
 	// keeps the password once a database exists. On a stamped node with its
 	// container in place nothing waits.
-	for range 2 {
-		stamped, wrote, err := a.checkCPStamp()
+	for pass := range 2 {
+		// A running sp-cp-db on an unstamped node may still initialise (a
+		// daemon that died during the first start): the first pass adopts
+		// it and waits for its answer; the second pass stamps.
+		mayStamp := pass > 0
+		if !mayStamp {
+			c, err := dockerInspectContainer(ctx, cpName)
+			if err != nil {
+				return err
+			}
+			mayStamp = c == nil || !c.Running
+		}
+		stamped, wrote, err := a.checkCPStamp(mayStamp)
 		if err != nil {
 			return err
 		}
@@ -1148,7 +1159,8 @@ func (a *Agent) cpStampPath() string { return filepath.Join(a.p.CPDir(), "initia
 // when the node is stamped and the data directory holds none: the projects
 // filesystem is not the one the database was on, or the data is gone, and a
 // new database there would silently replace every project's record.
-func (a *Agent) checkCPStamp() (stamped, wrote bool, err error) {
+// Without mayStamp it does not stamp (a start that may still initialise).
+func (a *Agent) checkCPStamp(mayStamp bool) (stamped, wrote bool, err error) {
 	data := filepath.Join(a.p.CPProjectDir(), "data")
 	hasDB, err := present(filepath.Join(data, "PG_VERSION"))
 	if err != nil {
@@ -1159,7 +1171,7 @@ func (a *Agent) checkCPStamp() (stamped, wrote bool, err error) {
 		return false, false, err
 	}
 	switch {
-	case hasDB && !stamped:
+	case hasDB && !stamped && mayStamp:
 		if err := writeFile(a.p, a.p.CPDir(), filepath.Base(stamp), nil, 0o444, os.Geteuid(), os.Getegid()); err != nil {
 			return false, false, err
 		}
