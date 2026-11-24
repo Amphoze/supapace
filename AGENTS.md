@@ -5740,3 +5740,37 @@ TestReach32_Switch. Written ahead of the daemon's backup and restore wiring: not
   image builds, pgBackRest starts and links the new library. Nothing else in the list moved.
 - A pinned package that Alpine replaces fails the build with "unable to select packages": bump
   that pin (the release keeps one version of a package), rebuild, and let the node suite run.
+
+### 2026-11-24 — The wiped-node recovery drill (TestReach27_WipedNode)
+test/reach/recovery_test.go. Written ahead of `supapaced recover`, `escrow show` and their wiring
+in the daemon; it has not run end to end yet.
+What it covers, in order (each phase's duration is logged as `drill: <phase>: <d>`):
+- the escrow set shown in two parts and kept in the test's temporary directory; the key, stanza,
+  bucket and read-only credential checked against the node;
+- untrusted store content: another control-plane database's objects under another stanza name, a
+  far higher history, an unusable object at the key of a segment not yet uploaded, and 5,000
+  objects of a non-existent set in A's prefix;
+- a deleted project whose purge waits, a finished create, a create held at step 12b with the
+  stand-in paused, and a restore parked on a paused push;
+- recover refused on a node that still has its control-plane database, and refused for a key part
+  of another key before anything is written; a serve job killed mid-recovery: no promotion;
+- the wipe: every container, network and volume of the node's Docker, /etc/supapace, and all of
+  /var/lib/supapace except the two filesystems, which are emptied;
+- recover stops at the shortfall naming the newest fetched segment and the end of replay;
+  --accept-shortfall finishes; init; the daemon released;
+- before `offsite set`: create refused "partly declared", no project path made; after it: a new
+  epoch, open operations failed (a provisioning create aborted) with "recovered", the purge still
+  pending and then done with the keys destroyed; A restored from the store to a time between two
+  markers (a Vault secret decrypts); the finished create and B restored to the end of their
+  archives.
+How it skips and fails: it skips off the test node (no /run/sp-node-ready, or SUPAPACE_HOST=1);
+then needBackups and needStandin as every backup test; then it needs SUPAPACE_WIPE_NODE=1. Without
+the switch it skips, or fails when SUPAPACE_BACKUP=1. A full run therefore passes
+-test.skip '^TestReach27_WipedNode$' and runs it afterwards alone with SUPAPACE_WIPE_NODE=1.
+It destroys the node's state by design. After a failure past the plant or the wipe, recreate the
+node and its stand-in (make node-down, node-up): the planted objects stay locked for a day.
+Needs: the harness's stand-in, the worker image under its default name, dev mode (failpoints) and
+the hold-file supervisor.
+Known limits: images, kernel tables, quota limits and /run survive the wipe (the image archive
+option of recover is not exercised); the epoch check sees two calls in one run, not a call by a
+stopped run.
