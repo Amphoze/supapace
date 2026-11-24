@@ -5691,3 +5691,35 @@ node with the stand-in (make node-up; make reach exports SUPAPACE_STANDIN=1).
 - Helpers local to the file: versionsAt/objectsOf/inStore (sp-probe s3 versions/head), waitKey,
   waitRepl, noticeCount, noticeEntries, waitNotice, archiveDir, plantRepo, segPath, handRestore,
   s3Client, s3Delete (signed DELETE with an optional bypass header), restoreLong.
+
+### 2026-11-24 — test/reach: restore tests and the restore drill
+test/reach/restore_test.go (tag reach): TestReach30_Restore, TestReach31_RestoreDrill,
+TestReach32_Switch. Written ahead of the daemon's backup and restore wiring: not yet run.
+- Reach30: refusals of a restore request (out of the window, an unrecorded timeline, a full
+  disk); the recovery start (no network, phase R, removed by a daemon restart); a daemon killed
+  at restore:T7 and restore:T8; time and position targets; a spool of more than one push job's
+  worth pushed empty before the wipe, and the shortfall; restored settings and restored content
+  (role settings, a login trigger, a password check, a scheduled job) that must not delay, stop
+  or observe the re-key; failed restores: exactly five passes, restart refused, delete, op
+  retry, superseded. Sub-test offsite: the off-site source, a stray history, two off-site
+  fetches at once.
+- Reach31: the restore drill, both sources, with durations logged. Reach32: the switch of a
+  layout-1 project by one restart, and one whose first backup failed.
+- After every restore to a time or a position, archiveClean: pg_stat_archiver.failed_count is 0
+  and pg_wal/ holds no .partial file two minutes on.
+- Each test skips on a node at layout 1 and fails at once naming the layout when
+  SUPAPACE_BACKUP=1. The sub-tests offsite need the object-store stand-in (needStandin).
+- Needs a development node (failpoints, --layout 1), the daemon running backup jobs and
+  restores, and about 3 GiB free on the projects filesystem (one case spools ~1.9 GiB).
+- restoreScratch: the scratch fixture of a test that restores. Its clean-up waits for an open
+  restore and deletes a project left restoring before the scratch clean-up runs.
+- holdQuiet: holds the daemon while no push of the project is queued or running. The spool case
+  repeats a pass (at most 3) whose restore did not stop the project being served within one push
+  interval of the hold's end.
+- hide(): redaction plus password verifiers, for every printed error and statement.
+- concurrent_fetches writes forged rows into the off-site record through the store. They stay
+  until the project's off-site purge.
+- Bounds: a restore 45 minutes, replication 15, a forced full 10. Estimated 5 to 6.5 hours for
+  the file at layout 2; split it over several node jobs.
+- Known limits: a restore still open at 45 minutes leaves its project restoring for the suite's
+  own clean-up. The password check's counterpart for logins (pg_tle clientauth) is not covered.
