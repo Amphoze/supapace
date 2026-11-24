@@ -5658,3 +5658,36 @@ Known limits:
   system unit that logs to the journal and restarts outside the harness's hold, so these two
   tests would read a log file that does not exist and restart the daemon under other tests.
 - The read-only control-plane test (data moved, socket stays) runs on both kinds of run.
+
+### 2026-11-24 — Reach suite: off-site tests (test/reach/offsite_test.go)
+Written ahead of the daemon's backup wiring: on a layout-1 node all three tests skip; with
+SUPAPACE_BACKUP=1 they fail at once naming the layout (needBackups), and without a declared
+object-store stand-in they skip, or fail with SUPAPACE_STANDIN=1 (needStandin). They need a full
+node with the stand-in (make node-up; make reach exports SUPAPACE_STANDIN=1).
+- TestReach24_RepositoryScope: A's push and replication jobs mount nothing of B; the replication
+  job's /repo is A's, read-only; its /cred is the projects' write pair. Planted in A's repository:
+  files under B's stanza name, a top directory named for B's ref, links into B's tree; none reaches
+  the store under any key; every key beginning with A's ref is below "<ref>/" and names a path of
+  A's stanza (control: a forged file at a valid name of A's stanza is uploaded). Known limit,
+  logged: on the stand-in the write pair places delete markers; locked versions stay. A's set
+  restored by hand with B's passphrase fails (control: with A's it restores).
+- TestReach25_ObjectLock: a locked version is not removed by the admin keys, nor with the
+  governance-bypass header (control: the same request without a version places a marker); forged
+  empty overwrites of a segment and the info files become current; a restore --from offsite still
+  completes from the recorded versions and a row written before it is present.
+- TestReach29_Replicator: walk (links out, to the root and into B; a FIFO; a 100 GB sparse file;
+  5,000 names of a timeline never admitted; a file of another uid; 14 levels; a name swapped for a
+  link) — nothing planted is uploaded, the copy's notice detail counts every entry; write_once
+  (history-rewritten, one version kept); copy_order (a set without backup.manifest is not uploaded);
+  history_first (failpoint restore:T10r with the supervisor hold: timeline 2 stays local while its
+  history is unreadable, segment-without-history, no info version; then both go up); budgets
+  (upload_objects_per_day=1 pauses until 00:00 UTC, the notice gives a fill time, pushes and B go
+  on); offsite_outage (the replication jobs' packets dropped in the inet supapace forward chain:
+  pushes continue, last_ok and lag show it, the stand-in still answers the suite, catch-up after);
+  repository_quota_full (1 GiB repository filled: segments stay spooled, B and the control plane
+  push on, a restart with a larger disk_quota_mb recovers).
+- Keys are read as "<ref>/<path>" (the harness declares no bucket prefix). Long bounds: a restore
+  45 min; history_first up to about 105 min. The outage holds the drift tick, refreshed per push.
+- Helpers local to the file: versionsAt/objectsOf/inStore (sp-probe s3 versions/head), waitKey,
+  waitRepl, noticeCount, noticeEntries, waitNotice, archiveDir, plantRepo, segPath, handRestore,
+  s3Client, s3Delete (signed DELETE with an optional bypass header), restoreLong.
