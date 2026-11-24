@@ -5732,3 +5732,11 @@ TestReach32_Switch. Written ahead of the daemon's backup and restore wiring: not
   path that ends in a space.
 - The test's path lists are literals and the binary runs only in a node: after a change of the
   sign-in vectors or of either return-path function, run `make browser-test`, not only a compile.
+
+## 2026-11-24 — worker image: the zstd pin follows Alpine
+
+- Alpine moved zstd from 1.5.7-r2 to 1.6.0-r0 in the pinned release, so `apk add` refused both
+  pins in deploy/worker/Dockerfile and every node build in CI failed. Both pins are bumped; the
+  image builds, pgBackRest starts and links the new library. Nothing else in the list moved.
+- A pinned package that Alpine replaces fails the build with "unable to select packages": bump
+  that pin (the release keeps one version of a package), rebuild, and let the node suite run.
