@@ -5723,3 +5723,12 @@ TestReach32_Switch. Written ahead of the daemon's backup and restore wiring: not
   the file at layout 2; split it over several node jobs.
 - Known limits: a restore still open at 45 minutes leaves its project restoring for the suite's
   own clean-up. The password check's counterpart for logins (pg_tle clientauth) is not covered.
+
+## 2026-11-24 — browser tests: a return path that ends in an encoded space
+
+- The browser test of return paths from another site expects a path ending in an encoded space
+  to land on /, as the gateway and the flow model have answered since the first path rule; a path
+  with an encoded space inside a segment is still kept. It also fails when any request reaches a
+  path that ends in a space.
+- The test's path lists are literals and the binary runs only in a node: after a change of the
+  sign-in vectors or of either return-path function, run `make browser-test`, not only a compile.

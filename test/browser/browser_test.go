@@ -835,17 +835,21 @@ func TestBrowsers_FlowModel_SessionNotPresented(t *testing.T) {
 }
 
 // A link from another site to the login endpoint whose return path is one of
-// the gateway's own endpoints or an API route, plain or by dot segments,
-// lands on / and leaves the session in place.
+// the gateway's own endpoints or an API route, plain or by dot segments, or a
+// path the gateway refuses to serve, lands on / and leaves the session in
+// place.
 func TestBrowsers_FlowModel_ReturnPathFromAnotherSite(t *testing.T) {
 	// Shut out, each landing on /: the gateway's own endpoints and API routes,
 	// plain, by dot segments, and with a raw trailing space (which a browser
-	// would request without it).
+	// would request without it); and a path that ends in an encoded space,
+	// which the gateway's first path rule refuses as a request (the
+	// dashboard's server would route it without the space, as /api and /-).
 	refused := []string{"/-/auth/logout", "/x/../-/auth/logout", "/./-/auth/logout", "/%2e/-/auth/logout",
-		"/x/%2e%2e/api/v1/projects?reveal=true", "/api ", "/- "}
-	// Kept: an encoded space is a byte of the segment, so "api " and "- " are
-	// neither "api" nor "-"; the browser ends on that path, signed in.
-	kept := []string{"/api%20", "/-%20"}
+		"/x/%2e%2e/api/v1/projects?reveal=true", "/api ", "/- ", "/api%20", "/-%20", "/p/x%20?tab=1"}
+	// Kept: an encoded space that does not end the path is a byte of its
+	// segment, so "api " and "- " are neither "api" nor "-"; the browser ends
+	// on that path, signed in.
+	kept := []string{"/api%20/x", "/-%20/auth/login"}
 	each(t, func(t *testing.T, m model, engine string) {
 		host := m.host(refs[0])
 		steps := []step{{"op": "goto", "url": "https://" + host + "/p"}, {"op": "wait", "url": "https://" + host + "/p"}}
@@ -873,7 +877,7 @@ func TestBrowsers_FlowModel_ReturnPathFromAnotherSite(t *testing.T) {
 			u, _ := url.Parse(q.URL)
 			first, _, _ := strings.Cut(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
 			first, _ = url.PathUnescape(first)
-			if u.Path == "/-/auth/logout" || strings.ToLower(first) == "api" || strings.Contains(u.Path, "..") {
+			if u.Path == "/-/auth/logout" || strings.ToLower(first) == "api" || strings.Contains(u.Path, "..") || strings.HasSuffix(u.Path, " ") {
 				t.Errorf("a request reached %s", q.URL)
 			}
 		}
