@@ -5650,3 +5650,11 @@ Known limits:
   int, so a 32-bit build cannot see a negative length or a wrapped count.
 - Known limit: one test of the wire proxy (the largest stated length streams without an
   allocation) cannot hold on a 32-bit int; 64-bit builds only are tested.
+
+## 2026-11-24 — control-plane tests on a host run
+
+- The restore-marker test and the quota test of the control-plane suite skip, as their first
+  statement, when the suite runs against a host (SUPAPACE_HOST=1): on a host the daemon is a
+  system unit that logs to the journal and restarts outside the harness's hold, so these two
+  tests would read a log file that does not exist and restart the daemon under other tests.
+- The read-only control-plane test (data moved, socket stays) runs on both kinds of run.

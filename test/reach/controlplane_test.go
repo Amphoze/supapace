@@ -145,6 +145,12 @@ func logSince(t testing.TB, off int64) string {
 // the directory a restore would be writing is not touched. Without the
 // marker the next round brings it back with every project.
 func TestControlPlane_NotStartedWhileARestoreIsMarked(t *testing.T) {
+	if os.Getenv("SUPAPACE_HOST") == "1" {
+		// It removes the control-plane database and reads the harness's
+		// daemon log; on a host the daemon is a unit that logs to the
+		// journal, and a killed run would leave the host without its store.
+		t.Skip("test node only: on a host the control plane is not taken down")
+	}
 	ctx := context.Background()
 	ag := agent.New(nodeConf(t), paths)
 	marker := paths.CPRestoring()
@@ -257,6 +263,12 @@ func writeNodeFile(t testing.TB, b []byte) {
 // rows are kept. Nothing reports the state in the node check yet. After the
 // raise the store answers with every row.
 func TestControlPlane_StopsAtItsDiskQuotaAndComesBackAfterARaise(t *testing.T) {
+	if os.Getenv("SUPAPACE_HOST") == "1" {
+		// It rewrites the node file, lowers a real quota and restarts the
+		// daemon through the harness's hold, which a system unit does not
+		// honour (it restarts the daemon at once, outside the test).
+		t.Skip("test node only: on a host the node's quota and configuration are not changed")
+	}
 	ctx := context.Background()
 	// While the quota is lowered the node file's original bytes are kept
 	// beside it. A run killed before its clean-up left that copy: the node
