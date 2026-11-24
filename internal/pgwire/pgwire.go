@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 )
 
 // Authentication request subtypes.
@@ -26,7 +27,8 @@ const (
 )
 
 var (
-	// ErrLength is a message length below the four bytes of the length itself.
+	// ErrLength is a message length below the four bytes of the length itself, or a body
+	// longer than an int holds (on a platform with a 32-bit int).
 	ErrLength = errors.New("pgwire: message length below 4")
 	errShort  = errors.New("pgwire: message too short")
 	errScram  = errors.New("pgwire: malformed server-first message")
@@ -36,10 +38,10 @@ var (
 // announced length less the four bytes of the length itself.
 func Header(h [5]byte) (typ byte, bodyLen int, err error) {
 	n := binary.BigEndian.Uint32(h[1:])
-	if n < 4 {
+	if n < 4 || uint64(n-4) > math.MaxInt { // a body length that does not fit an int is refused, not wrapped
 		return h[0], 0, ErrLength
 	}
-	return h[0], int(n) - 4, nil
+	return h[0], int(n - 4), nil
 }
 
 // AuthSubtype returns the subtype of an authentication request's body.
@@ -64,17 +66,17 @@ func ScramIterations(serverFirst []byte) (int, error) {
 	if len(d) == 0 || len(d) > 10 || d[0] == '0' {
 		return 0, errScram
 	}
-	n := 0
+	n := int64(0) // ten digits fit; an int may be 32 bits
 	for _, c := range d {
 		if c < '0' || c > '9' {
 			return 0, errScram
 		}
-		n = n*10 + int(c-'0')
+		n = n*10 + int64(c-'0')
 	}
 	if n > 1<<31-1 {
 		return 0, errScram
 	}
-	return n, nil
+	return int(n), nil
 }
 
 // RowFields returns the field count of a row description: its first two bytes.

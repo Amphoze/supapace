@@ -5632,3 +5632,21 @@ Known limits:
 - Studio has no request-body bound of its own; the gateway's caps are the only ones.
 - manifest.sh's control for process values needs a route that still answers one.
 - paths.mjs depends on the bundle exporting getRouter, startInstance and readPath by name.
+
+### 2026-11-24 — pgsock guard uses the shared wire checks
+- guard.go no longer reads lengths, subtypes or counts itself; it calls internal/pgwire:
+  Header (backend and client message headers), AuthSubtype and the Auth* constants,
+  ScramIterations (shape of the server-first message and its count).
+- The guard keeps: the salt compare (constant time, against the platform's salt), the exact
+  count 4096, the SASL mechanism list split, taking the payload after the subtype (b[4:]),
+  and its own refusal of a negative body length.
+- Refusals are unchanged: ErrScramParams, ErrNotScram, ErrCleartextRequested, ErrBudget keep
+  their meaning; a non-canonical count now reads "malformed server-first message".
+- Caller rule: keep the order in checkServerFirst: ScramIterations first, then the salt is
+  read from field two (safe only after that shape check).
+- guard_test.go: a source test forbids length, subtype and count parsing in guard.go.
+  It reads guard.go only and is a tripwire; the behaviour tests are the proof.
+- pgwire.Header and ScramIterations refuse a stated length or count that does not fit an
+  int, so a 32-bit build cannot see a negative length or a wrapped count.
+- Known limit: one test of the wire proxy (the largest stated length streams without an
+  allocation) cannot hold on a 32-bit int; 64-bit builds only are tested.

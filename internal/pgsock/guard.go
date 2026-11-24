@@ -5,16 +5,16 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/Amphoze/supapace/internal/pgwire"
 )
 
 // Budget bounds one session. A zero field takes its value from DefaultBudget.
@@ -258,25 +258,19 @@ func (g *guard) countRequests(p []byte) {
 			p, g.wskip = p[n:], g.wskip-n
 			continue
 		}
-		hl := 5
-		if !g.wStarted {
-			hl = 4
+		if g.whn == 0 && !g.wStarted {
+			g.whn = 1 // the startup packet has no type byte: its length fills the header's last four
 		}
-		k := copy(g.whdr[g.whn:hl], p)
+		k := copy(g.whdr[g.whn:], p)
 		g.whn, p = g.whn+k, p[k:]
-		if g.whn < hl {
+		if g.whn < len(g.whdr) {
 			return
 		}
-		var l uint32
-		if hl == 4 {
-			l, g.wStarted = binary.BigEndian.Uint32(g.whdr[:4]), true
-		} else {
-			l = binary.BigEndian.Uint32(g.whdr[1:5])
-			if g.whdr[0] == 'Q' || g.whdr[0] == 'S' {
-				g.outstanding++
-			}
+		typ, n, _ := pgwire.Header(g.whdr) // a length below 4 frames an empty body
+		if g.wStarted && (typ == 'Q' || typ == 'S') {
+			g.outstanding++
 		}
-		g.wskip, g.whn = max(int64(l)-4, 0), 0
+		g.wStarted, g.wskip, g.whn = true, int64(n), 0
 	}
 }
 
@@ -325,12 +319,14 @@ func (g *guard) next() error {
 	if err := g.fill(5); err != nil {
 		return err
 	}
-	typ := g.buf[0]
-	n := int64(binary.BigEndian.Uint32(g.buf[1:5])) - 4
-	if err := g.header(typ, n); err != nil {
+	typ, n, err := pgwire.Header([5]byte(g.buf))
+	if err != nil {
+		return g.fail(budgetErr("malformed message length"))
+	}
+	if err := g.header(typ, int64(n)); err != nil {
 		return g.fail(err)
 	}
-	if err := g.fill(5 + int(n)); err != nil {
+	if err := g.fill(5 + n); err != nil {
 		return err
 	}
 	if err := g.body(typ, g.buf[5:]); err != nil {
@@ -344,7 +340,7 @@ func (g *guard) next() error {
 // is read.
 func (g *guard) header(typ byte, n int64) error {
 	switch {
-	case n < 0:
+	case n < 0: // pgwire's body length passes a 32-bit int as negative
 		return budgetErr("malformed message length")
 	case n > int64(g.b.MessageBytes):
 		return budgetErr("message of %d bytes over the cap of %d", n, g.b.MessageBytes)
@@ -392,16 +388,17 @@ func (g *guard) body(typ byte, b []byte) error {
 	if typ != 'R' {
 		return nil
 	}
-	if len(b) < 4 {
+	code, err := pgwire.AuthSubtype(b)
+	if err != nil {
 		return fmt.Errorf("%w: malformed authentication message", ErrNotScram)
 	}
-	code, data := binary.BigEndian.Uint32(b), b[4:]
+	data := b[4:] // what follows the subtype
 	switch {
-	case code == 3 || code == 5:
+	case code == pgwire.AuthCleartext || code == pgwire.AuthMD5:
 		return ErrCleartextRequested
-	case code == 0 && (g.auth == authFinal || g.auth == authStart && g.allowTrust):
+	case code == pgwire.AuthOK && (g.auth == authFinal || g.auth == authStart && g.allowTrust):
 		g.auth = authDone
-	case code == 10 && g.auth == authStart:
+	case code == pgwire.AuthSASL && g.auth == authStart:
 		if g.allowTrust {
 			return fmt.Errorf("%w: SASL requested from a target without a salt", ErrScramParams)
 		}
@@ -414,12 +411,12 @@ func (g *guard) body(typ byte, b []byte) error {
 			return fmt.Errorf("%w: SCRAM-SHA-256 not offered", ErrNotScram)
 		}
 		g.auth = authSASL
-	case code == 11 && g.auth == authSASL:
+	case code == pgwire.AuthSASLContinue && g.auth == authSASL:
 		if err := g.checkServerFirst(data); err != nil {
 			return err
 		}
 		g.auth = authContinue
-	case code == 12 && g.auth == authContinue:
+	case code == pgwire.AuthSASLFinal && g.auth == authContinue:
 		g.auth = authFinal
 	default:
 		return fmt.Errorf("%w: authentication request %d refused", ErrNotScram, code)
@@ -431,15 +428,16 @@ func (g *guard) body(typ byte, b []byte) error {
 // exactly the platform's salt and iteration count, so the client derives keys
 // only for the verifier the platform set.
 func (g *guard) checkServerFirst(data []byte) error {
-	f := bytes.Split(data, []byte(","))
-	if len(f) != 3 || !bytes.HasPrefix(f[0], []byte("r=")) || !bytes.HasPrefix(f[1], []byte("s=")) || !bytes.HasPrefix(f[2], []byte("i=")) {
+	iter, err := pgwire.ScramIterations(data)
+	if err != nil {
 		return fmt.Errorf("%w: malformed server-first message", ErrScramParams)
 	}
-	salt, err := base64.StdEncoding.DecodeString(string(f[1][2:]))
+	// the shape is checked: the second of the three fields is "s=" and the salt
+	salt, err := base64.StdEncoding.DecodeString(string(bytes.Split(data, []byte(","))[1][2:]))
 	if err != nil || subtle.ConstantTimeCompare(salt, g.salt) != 1 {
 		return fmt.Errorf("%w: salt differs from the platform's", ErrScramParams)
 	}
-	if string(f[2][2:]) != strconv.Itoa(scramIterations) {
+	if iter != scramIterations {
 		return fmt.Errorf("%w: iteration count differs from %d", ErrScramParams, scramIterations)
 	}
 	return nil

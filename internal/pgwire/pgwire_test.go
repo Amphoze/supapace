@@ -3,6 +3,7 @@ package pgwire
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -18,18 +19,20 @@ func hdr(typ byte, length uint32) [5]byte {
 func TestHeader_LengthRule(t *testing.T) {
 	for _, c := range []struct {
 		length uint32
-		body   int
+		body   int64
 		err    bool
 	}{
 		{0, 0, true}, {3, 0, true}, {4, 0, false}, {5, 1, false},
-		{1 << 30, 1<<30 - 4, false}, {0xffffffff, 0xffffffff - 4, false},
+		{1 << 30, 1<<30 - 4, false}, {1<<31 - 1 + 4, 1<<31 - 1, false},
+		{1<<31 + 4, 1 << 31, false}, {0xffffffff, 0xffffffff - 4, false},
 	} {
+		c.err = c.err || c.body > math.MaxInt // a 32-bit int cannot hold the body: refused, never negative
 		typ, n, err := Header(hdr('D', c.length))
 		if (err != nil) != c.err || err != nil && !errors.Is(err, ErrLength) {
 			t.Errorf("length %d: err %v", c.length, err)
 			continue
 		}
-		if err == nil && (typ != 'D' || n != c.body) {
+		if err == nil && (typ != 'D' || int64(n) != c.body) {
 			t.Errorf("length %d: %q %d, want D %d", c.length, typ, n, c.body)
 		}
 	}

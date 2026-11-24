@@ -3,6 +3,7 @@ package pgwire
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"strconv"
 	"testing"
 )
@@ -17,7 +18,7 @@ func FuzzHeader(f *testing.F) {
 		}
 		typ, n, err := Header([5]byte(b[:5]))
 		length := binary.BigEndian.Uint32(b[1:5])
-		if typ != b[0] || (err != nil) != (length < 4) || err == nil && (n < 0 || n != int(length)-4) {
+		if typ != b[0] || (err != nil) != (length < 4 || int64(length)-4 > math.MaxInt) || err == nil && (n < 0 || int64(n) != int64(length)-4) {
 			t.Fatalf("%x: %q %d %v", b[:5], typ, n, err)
 		}
 		tls, gss := EncryptionRequest(b)
