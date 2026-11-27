@@ -25,8 +25,10 @@
 //   eval     {tab, expr}              → {value}         an expression in the page
 //   eval     {tab, fetch: {url, init}} → {status, headers}
 //   cookies  {}                       → {cookies: [{name, value, domain, path, expires, httpOnly, secure, sameSite}]}
-//   setCookie {tab, cookie, name}     → {kept}          document.cookie = cookie; kept: a cookie of that name is in the jar
-//                                                      once a mark the page wrote after it is (the mark is removed)
+//   setCookie {tab, cookie, name}     → {kept, page}    document.cookie = cookie; kept: a cookie of that name is in the jar
+//                                                      once a mark the page wrote after it is (the mark is removed),
+//                                                      or, when the page holds no mark, after the page's own read;
+//                                                      page: the names the page reads back after its writes
 //   requests {}                       → {requests: [{tab, method, url, resourceType, initiator, site, referer, cookies}]} since the last call;
 //                                                      site and referer are the Sec-Fetch-Site and Referer headers sent,
 //                                                      cookies the names in the Cookie header sent
@@ -173,15 +175,27 @@ async function main() {
             // page sees it (WebKit stores it in its network process). A page
             // has its writes stored in order, so a host-only mark written
             // after the cookie is waited for in the jar, then removed: when it
-            // is there, so is the cookie, if the engine kept it.
+            // is there, so is the cookie, if the engine kept it. The page
+            // reads its cookies back after both writes (r.page): an engine
+            // that keeps no cookie on the page's host at all (WebKit on a
+            // host that is a listed suffix) refuses the mark too, so the
+            // mark is waited for only when the page holds it, else the
+            // cookie when the page holds that; with neither, the jar is read
+            // once, after the page's own read, which follows its writes.
             const mark = `sp_mark_${out.steps.length}`;
-            await tab(s).evaluate(([c, m]) => { document.cookie = c; document.cookie = `${m}=1; Path=/; Secure`; }, [s.cookie, mark]);
+            const page = await tab(s).evaluate(([c, m]) => {
+              document.cookie = c;
+              document.cookie = `${m}=1; Path=/; Secure`;
+              return document.cookie.split('; ').map((p) => p.split('=')[0]);
+            }, [s.cookie, mark]);
+            r.page = page.filter((n) => n !== mark);
+            const want = page.includes(mark) ? mark : page.includes(s.name) ? s.name : '';
             const end = Date.now() + (sc.timeout_ms || 15000);
             let jar;
             for (;;) {
               jar = await ctx.cookies();
-              if (jar.some((c) => c.name === mark)) break;
-              if (Date.now() > end) throw new Error('setCookie: the mark written after the cookie never reached the jar');
+              if (!want || jar.some((c) => c.name === want)) break;
+              if (Date.now() > end) throw new Error(`setCookie: ${want}, which the page holds, never reached the jar`);
               await new Promise((ok) => setTimeout(ok, 20));
             }
             await ctx.clearCookies({ name: mark });

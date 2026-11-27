@@ -6413,3 +6413,11 @@ Known limits:
   newer versions report it as SC2329. ag/lab.sh's EXIT-trap handler disables both by directive.
 - A lint step must pass under the runner's tool version, not only the workstation's: print the
   version in the step (CI does) and prefer a directive with a reason over a global exclusion.
+
+### 2026-11-27 — Browser harness: a cookie barrier the engine keeps
+
+- run.mjs setCookie: the page reads its cookies back after writing the cookie and a host-only
+  mark; the mark is waited for in the jar when the page holds it, else the cookie, else the jar
+  is read once after the page's read. WebKit keeps no cookie, the mark included, on a host that
+  is itself a listed suffix, so a wait for the mark there can only time out.
+- A barrier cookie must be one the engine keeps on that host; a refused barrier is not a delay.
