@@ -5901,3 +5901,14 @@ Known limits:
 - LOGFLARE_URL (analytics) is still a process value; only opt-in and deleted routes reach it.
 - The UI's edge-function URL for hooks and cron jobs is upstream's fixed internal address.
 - The Data API settings form rejects a null row limit; the pooling route is a fixed stub.
+
+### 2026-11-27 — The worker image pins versions, not Alpine's package revisions
+
+- Alpine replaced two more package revisions inside the pinned release (libxml2 -r3 to -r5, zstd
+  -r0 to -r1) three days after the last bump; every node build failed again at `apk add`.
+- deploy/worker/Dockerfile now pins each package as `name~version` (apk's prefix match): the
+  upstream version stays fixed, the revision Alpine rebuilds in place is taken as it comes.
+- This replaces the earlier rule "bump the pin; do not unpin". Still do not drop a pin: a build
+  that fails with "unable to select packages" now means a version moved. Look at what changed,
+  bump that pin, rebuild, and let the node suite run.
+- The base image stays pinned by digest in internal/nodecfg/images.lock.
