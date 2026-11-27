@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 )
@@ -45,10 +46,15 @@ func refuse(cause error, format string, args ...any) error {
 //  6. no member of proj-<ref>, platform or ingress, nor pg-<ref> or
 //     postgrest-<ref>, nor any container sharing the network namespace of
 //     one of them or of the host, is privileged, runs without --cap-drop
-//     ALL, or adds any capability.
+//     ALL, or adds any capability;
+//  7. proj-<ref> holds at most pg-<ref>, postgrest-<ref> and, on a node
+//     whose dashboard is configured, sp-pgcap, each at its address there,
+//     and nothing else, whatever its capabilities (memberViolation); and
+//     each of the dashboard's addresses on platform is held by its own
+//     container or by none.
 //
-// It takes the spec, not a container name: conditions 3, 4 and 6 cover both
-// tenant containers whenever each exists. Everything is read from Docker's
+// It takes the spec, not a container name: conditions 3, 4, 6 and 7 cover
+// both tenant containers whenever each exists. Everything is read from Docker's
 // record of container configuration and from the host; nothing from a
 // tenant process. Any error on the way is a refusal.
 func (a *Agent) CheckContainment(ctx context.Context, s Spec) error {
@@ -81,7 +87,7 @@ func (a *Agent) CheckAdopted(ctx context.Context, s Spec) error {
 	return a.checkProject(ctx, s)
 }
 
-// checkProject is conditions 2, 3, 4 and 6.
+// checkProject is conditions 2, 3, 4, 6 and 7.
 func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 	i := s.SubnetIndex
 	// 2: the project network, from Docker and from the interface itself.
@@ -153,10 +159,15 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 		return refuse(incomplete{err}, "read container configuration")
 	}
 	addr := a.cfg.PlatformAddr(i).String()
+	fixed := dashMembers(dashcfg.Static(a.cfg))
 	for _, c := range confs {
 		// 6
 		if why := c.capViolation(); why != "" {
 			return refuse(nil, "%s: %s", c.name(), why)
+		}
+		// 7
+		if why := a.memberViolation(c, s.Ref, i); why != "" {
+			return refuse(nil, "%s", why)
 		}
 		// 4
 		if slices.Contains(tenantNames, c.name()) {
@@ -176,6 +187,11 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 			}
 		case attached && held == addr:
 			return refuse(nil, "%s holds %s on %s", c.name(), addr, platformNet)
+		}
+		for _, m := range fixed { // 7
+			if attached && held == m.addr && c.name() != m.name {
+				return refuse(nil, "%s holds %s on %s, the address of %s", c.name(), held, platformNet, m.name)
+			}
 		}
 	}
 	// 6 for the containers that are on no member list: those sharing the
@@ -470,6 +486,7 @@ type ctrConf struct {
 	CapDrop    []string          `json:"cap_drop"`
 	Restart    string            `json:"restart"`
 	NetMode    string            `json:"netmode"`
+	Sysctls    map[string]string `json:"sysctls"`
 	Labels     map[string]string `json:"labels"`
 	Networks   map[string]struct {
 		IPAMConfig *struct {
@@ -481,7 +498,10 @@ type ctrConf struct {
 
 const confFormat = `{"id":{{json .Id}},"name":{{json .Name}},"running":{{json .State.Running}},` +
 	`"privileged":{{json .HostConfig.Privileged}},"cap_add":{{json .HostConfig.CapAdd}},"cap_drop":{{json .HostConfig.CapDrop}},` +
-	`"restart":{{json .HostConfig.RestartPolicy.Name}},"netmode":{{json .HostConfig.NetworkMode}},"labels":{{json .Config.Labels}},"networks":{{json .NetworkSettings.Networks}}}`
+	`"restart":{{json .HostConfig.RestartPolicy.Name}},"netmode":{{json .HostConfig.NetworkMode}},"labels":{{json .Config.Labels}},"networks":{{json .NetworkSettings.Networks}},` +
+	// Docker leaves Sysctls out of a container that has none: index, not a
+	// field, which would fail the whole read.
+	`"sysctls":{{json (index .HostConfig "Sysctls")}}}`
 
 func (c ctrConf) name() string { return strings.TrimPrefix(c.Name, "/") }
 
@@ -557,4 +577,47 @@ func readConfs(ctx context.Context, names []string) ([]ctrConf, error) {
 		return nil, fmt.Errorf("docker container inspect: %d records for %d containers", len(confs), len(names))
 	}
 	return confs, nil
+}
+
+// memberViolation says why container c may not be on the project network of
+// ref (slice i) as Docker records it, or "": that network holds pg-<ref> at
+// the cluster's address, postgrest-<ref> at the REST address and, on a node
+// whose dashboard is configured, sp-pgcap at the proxy's address — at most
+// those, each there, and nothing else. A member's capabilities do not enter
+// into it. The text names the member, its address on this network and what
+// the network may hold, nothing of another network.
+func (a *Agent) memberViolation(c ctrConf, ref string, i int) string {
+	net := networkName(ref)
+	held, on := c.addr(net)
+	if !on {
+		return ""
+	}
+	type slot struct {
+		name string
+		addr netip.Addr
+	}
+	may := []slot{{clusterName(ref), a.cfg.ClusterAddr(i)}, {postgrestName(ref), a.cfg.PostgRESTAddr(i)}}
+	if _, dash, _ := a.dashAddrs(); dash {
+		may = append(may, slot{dashcfg.PgcapName, dashcfg.ProxyAddr(a.cfg, i)})
+	}
+	var list []string
+	for _, m := range may {
+		if c.name() == m.name && held == m.addr.String() {
+			return ""
+		}
+		list = append(list, m.name+" at "+m.addr.String())
+	}
+	return fmt.Sprintf("%s: member rule: %s is on it at %q; it may hold only %s", net, c.name(), held, strings.Join(list, ", "))
+}
+
+// dashMember is one of the dashboard's containers on platform: its role
+// label and the address that it alone may hold there.
+type dashMember struct{ name, role, addr string }
+
+// dashMembers lists the dashboard's containers at the addresses of ad. An
+// address the configuration cannot state (zero in dashcfg.Static) reads
+// "invalid IP" here, which no container holds.
+func dashMembers(ad dashcfg.Addrs) []dashMember {
+	return []dashMember{{dashcfg.StudioName, "studio", ad.Studio.String()}, {dashcfg.PgMeta0Name, "pgmeta", ad.PgMeta0.String()},
+		{dashcfg.PgMeta1Name, "pgmeta", ad.PgMeta1.String()}, {dashcfg.PgcapName, "pgcap", ad.Pgcap.String()}}
 }

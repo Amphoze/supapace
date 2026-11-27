@@ -97,12 +97,19 @@ func PgMetaEnv(l LimitSet) []string {
 }
 
 // NoForwardArgs are the docker arguments that keep a container on two networks
-// from forwarding between them.
+// from forwarding between them. The two conf.default settings are what each
+// interface of the container starts with: for the reverse-path filter the
+// kernel takes the larger of the interface's value and conf.all's, and a new
+// namespace takes its default from the host — where it is often 2, the loose
+// filter, which conf.all=1 alone would leave in force on every interface. The
+// arp_ignore default changes nothing in effect (conf.all=1 already gives 1).
 func NoForwardArgs() []string {
 	return []string{
 		"--sysctl", "net.ipv4.ip_forward=0",
 		"--sysctl", "net.ipv4.conf.all.rp_filter=1",
+		"--sysctl", "net.ipv4.conf.default.rp_filter=1",
 		"--sysctl", "net.ipv4.conf.all.arp_ignore=1",
+		"--sysctl", "net.ipv4.conf.default.arp_ignore=1",
 		"--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
 	}
 }

@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
+	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgsock"
 )
@@ -69,6 +71,8 @@ func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	add("ptrace_scope", a.checkPtrace())
 	add("kek", a.checkKEK())
 	add("platform-members", a.checkPlatformMembers(ctx))
+	add("project-addresses", orErr(netsErr, func() error { return a.checkProjectAddresses(ctx, nets) }))
+	add("forwarding", a.checkForwarding(ctx))
 	hostGlobal("core_pattern", a.checkCorePattern())
 	hostGlobal("br_netfilter", a.checkBrNetfilter())
 	hostGlobal("file-max", a.checkFileMax())
@@ -633,8 +637,10 @@ func (a *Agent) checkKEK() error {
 }
 
 // checkPlatformMembers: every container on platform is sp-gateway at the
-// gateway's address or the PostgREST of a project at PlatformAddr of its
-// project network's slice, and none could hold a capability.
+// gateway's address, the PostgREST of a project at PlatformAddr of its
+// project network's slice or, on a node whose dashboard is configured, one of
+// the dashboard's four with its role label at its address; and none could
+// hold a capability.
 func (a *Agent) checkPlatformMembers(ctx context.Context) error {
 	plat, err := dockerInspectNetwork(ctx, platformNet)
 	if err != nil {
@@ -651,6 +657,10 @@ func (a *Agent) checkPlatformMembers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var dash []dashMember
+	if ad, ok, _ := a.dashAddrs(); ok {
+		dash = dashMembers(ad)
+	}
 	for _, c := range confs {
 		if why := c.capViolation(); why != "" {
 			return fmt.Errorf("%s: %s", c.name(), why)
@@ -659,6 +669,12 @@ func (a *Agent) checkPlatformMembers(ctx context.Context) error {
 		if c.name() == gatewayName {
 			if addr != a.cfg.GatewayIP {
 				return fmt.Errorf("%s at %s, want %s", gatewayName, addr, a.cfg.GatewayIP)
+			}
+			continue
+		}
+		if i := slices.IndexFunc(dash, func(m dashMember) bool { return m.name == c.name() }); i >= 0 {
+			if m := dash[i]; addr != m.addr || c.Labels[labelRole] != m.role {
+				return fmt.Errorf("%s at %s: not at %s with the role label %s", c.name(), addr, m.addr, m.role)
 			}
 			continue
 		}
@@ -741,4 +757,132 @@ func (a *Agent) checkFileMax() error {
 		return fmt.Errorf("fs.file-max is %d, want at least %d", v, 1<<30)
 	}
 	return nil
+}
+
+// sliceOf is the slice index of project network n — the number in its bridge
+// name, when its subnet is that slice — or -1 when it is no slice of this
+// node.
+func (a *Agent) sliceOf(n *dockerx.Network) int {
+	i, err := strconv.Atoi(strings.TrimPrefix(n.BridgeName, "spp"))
+	if err != nil || !samePrefix(n.Subnet, a.cfg.Slice(i)) {
+		return -1
+	}
+	return i
+}
+
+// checkProjectAddresses holds the members of every network named like a
+// project's to the start gate's member rule (memberViolation): an extra or a
+// misplaced member fails the row, a missing one does not. Members are read as
+// the gate reads them (by id; an endpoint key is read again).
+// Cost: three Docker calls per project network; read the networks in one
+// call if a full node's check takes too long.
+func (a *Agent) checkProjectAddresses(ctx context.Context, nets []dockerNet) error {
+	for _, n := range nets {
+		ref, ok := strings.CutPrefix(n.name, "proj-")
+		if !ok {
+			continue
+		}
+		pn, err := dockerInspectNetwork(ctx, n.name)
+		if err != nil {
+			return err
+		}
+		if pn == nil { // removed since the listing
+			continue
+		}
+		ids, err := memberIDs(ctx, n.name)
+		if err != nil {
+			return err
+		}
+		confs, err := inspectConfigs(ctx, ids)
+		if err != nil {
+			return err
+		}
+		i := a.sliceOf(pn)
+		for _, c := range confs {
+			if i < 0 {
+				return fmt.Errorf("%s: member rule: %s is on it, and it is not a slice of this node", n.name, c.name())
+			}
+			if why := a.memberViolation(c, ref, i); why != "" {
+				return errors.New(why)
+			}
+		}
+	}
+	return nil
+}
+
+// checkForwarding: Docker's record of every platform container with
+// interfaces on two networks — sp-gateway, every PostgREST and, where it
+// exists, sp-pgcap — holds the settings of dashcfg.NoForwardArgs, each at
+// its value. The gateway and a PostgREST are judged when they carry the
+// configuration label this daemon gives them now: one with another label
+// (an older daemon's, or of a file that changed since) is never adopted and
+// is made again at its next ensure, and the rows gateway and rest-container
+// report it meanwhile.
+func (a *Agent) checkForwarding(ctx context.Context) error {
+	var ids []string
+	for _, name := range []string{gatewayName, dashcfg.PgcapName} {
+		c, err := dockerInspectContainer(ctx, name)
+		if err != nil {
+			return err
+		}
+		if c != nil {
+			ids = append(ids, c.ID)
+		}
+	}
+	rest, err := dockerListContainers(ctx, labelRole+"=postgrest")
+	if err != nil {
+		return err
+	}
+	for _, c := range rest {
+		ids = append(ids, c.ID)
+	}
+	slices.Sort(ids)
+	confs, err := inspectConfigs(ctx, slices.Compact(ids))
+	if err != nil {
+		return err
+	}
+	for _, c := range confs {
+		switch c.name() {
+		case dashcfg.PgcapName:
+		case gatewayName:
+			if _, _, conf, err := a.gatewayConfig(ctx); err != nil || c.Labels[labelConfig] != conf {
+				continue
+			}
+		default:
+			if !a.ownPostgREST(c) {
+				continue
+			}
+		}
+		for _, kv := range dashcfg.NoForwardArgs() {
+			if k, v, ok := strings.Cut(kv, "="); ok && c.Sysctls[k] != v {
+				return fmt.Errorf("%s was not created with %s", c.name(), kv)
+			}
+		}
+	}
+	return nil
+}
+
+// ownPostgREST reports whether c carries the configuration label this daemon
+// gives the PostgREST of c's own ref, generation and epoch at c's platform
+// address, with postgrest.conf as now rendered.
+func (a *Agent) ownPostgREST(c ctrConf) bool {
+	ref := c.Labels[labelRef]
+	if checkRef(ref) != nil { // a path is built from it
+		return false
+	}
+	// A label that is no number gives arguments, and so a label, of its own.
+	gen, _ := strconv.ParseInt(c.Labels[labelGeneration], 10, 64)
+	epoch, _ := strconv.ParseInt(c.Labels[labelEpoch], 10, 64)
+	addr, _ := c.addr(platformNet)
+	i := 0
+	for i < a.cfg.Slices() && a.cfg.PlatformAddr(i).String() != addr {
+		i++
+	}
+	fileHash, err := renderedHash(a.postgrestDir(ref), postgrestConf)
+	if err != nil {
+		return false
+	}
+	flags, tail := a.postgrestArgs(Spec{Ref: ref, SubnetIndex: i, Generation: gen, Epoch: epoch})
+	label, err := a.configLabel(fileHash, slices.Concat(flags, tail))
+	return err == nil && c.Labels[labelConfig] == label
 }

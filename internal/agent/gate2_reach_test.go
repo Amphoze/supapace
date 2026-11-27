@@ -45,7 +45,7 @@ func TestNode_GateSharerChainsAndHostMode(t *testing.T) {
 			nodeDockerQuiet("rm", "-f", names[i])
 		}
 	})
-	g2Run(t, "run", "-d", "--name", names[0], "--label", "supapace.test=1", "--network", networkName(s.Ref), "--cap-drop", "ALL",
+	g2Run(t, "run", "-d", "--name", names[0], "--label", "supapace.test=1", "--network", platformNet, "--cap-drop", "ALL",
 		"--entrypoint", "sleep", img, "300")
 	g2Run(t, "run", "-d", "--name", names[1], "--label", "supapace.test=1", "--network", "container:"+names[0], "--cap-drop", "ALL",
 		"--entrypoint", "sleep", img, "300")
@@ -74,6 +74,18 @@ func TestNode_GateSharerChainsAndHostMode(t *testing.T) {
 		"--entrypoint", "sleep", img, "300")
 	if err := a.CheckAdopted(ctx, s); err != nil {
 		t.Errorf("hardened host-mode container refused: %v", err)
+	}
+	// The member rule: the hardened member, attached to the project network
+	// while it runs, refuses the start; detached, it passes again.
+	g2Run(t, "network", "connect", networkName(s.Ref), names[0])
+	err := a.CheckAdopted(ctx, s)
+	t.Logf("gate with the hardened member attached to the project network: %v", err)
+	if !errors.Is(err, ErrContainment) || !strings.Contains(err.Error(), "member rule: "+names[0]+" is on it") {
+		t.Errorf("a hardened container attached to the project network: %v", err)
+	}
+	g2Run(t, "network", "disconnect", networkName(s.Ref), names[0])
+	if err := a.CheckAdopted(ctx, s); err != nil {
+		t.Errorf("detached again: %v", err)
 	}
 }
 
@@ -226,7 +238,7 @@ func TestNode_GateNameLikeAnID(t *testing.T) {
 	// x is unrelated (no network); a member is named exactly like x's id.
 	idx := g2Run(t, "create", "--name", names[0], "--label", "supapace.test=1", "--network", "none", "--cap-drop", "ALL",
 		"--entrypoint", "sleep", img, "300")
-	out, err := exec.Command("docker", "run", "-d", "--name", idx, "--label", "supapace.test=1", "--network", networkName(s.Ref),
+	out, err := exec.Command("docker", "run", "-d", "--name", idx, "--label", "supapace.test=1", "--network", platformNet,
 		"--cap-drop", "ALL", "--cap-add", "NET_RAW", "--entrypoint", "sleep", img, "300").CombinedOutput()
 	t.Logf("a container named like an id: %v %s", err, strings.TrimSpace(string(out)))
 	if err == nil {

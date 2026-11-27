@@ -15,11 +15,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 func nodeAgent(t *testing.T) *Agent {
@@ -98,7 +100,7 @@ func TestNode_PlatformNetworks(t *testing.T) {
 		t.Logf("node check: %s ok=%v %s", r.Name, r.OK, r.Detail)
 	}
 	for _, name := range []string{"docker-version", "docker-seccomp", "live-restore", "docker-networks", "uplinks",
-		"quota-accounting", "quota-enforcement", "platform-members", "docker-firewall-backend"} {
+		"quota-accounting", "quota-enforcement", "platform-members", "project-addresses", "forwarding", "docker-firewall-backend"} {
 		if !got[name].OK {
 			t.Errorf("bare node: row %s = %+v", name, got[name])
 		}
@@ -132,20 +134,42 @@ func TestNode_PlatformNetworks(t *testing.T) {
 			t.Fatalf("%s: got %v, want ErrContainment", what, err)
 		}
 	}
-	nodeDocker(t, "run", "-d", "--name", member, "--network", networkName(s.Ref), "--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")
-	adopted(true, "hardened member")
+	// The member rule: a hardened stranger on the project network is not
+	// adopted, and the node check reports it.
+	labelled := func(args ...string) []string { // removed by the watchdog should this process be killed
+		return slices.Concat(args[:1], testdocker.Labels(t), args[1:])
+	}
+	nodeDocker(t, labelled("run", "-d", "--name", member, "--network", networkName(s.Ref), "--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")...)
+	err := a.CheckAdopted(ctx, s)
+	t.Logf("gate with a hardened stranger on the project network: %v", err)
+	if !errors.Is(err, ErrContainment) || errors.Is(err, ErrCheckIncomplete) || !strings.Contains(err.Error(), "member rule: "+member+" is on it") {
+		t.Fatalf("a hardened stranger on the project network: got %v, want the member rule", err)
+	}
+	for _, r := range a.NodeCheck(ctx) {
+		if r.Name == "project-addresses" && (r.OK || !Blocking(r) || !strings.Contains(r.Detail, member)) {
+			t.Fatalf("node check with the stranger: %+v", r)
+		}
+	}
+	nodeDocker(t, "rm", "-f", member)
+	adopted(true, "the stranger removed")
+	nodeDocker(t, labelled("run", "-d", "--name", member, "--network", platformNet, "--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")...)
+	adopted(true, "hardened member of platform")
+	nodeDocker(t, "network", "disconnect", platformNet, member)
 	nodeDocker(t, "network", "connect", "--ip", a.cfg.PlatformAddr(s.SubnetIndex).String(), platformNet, member)
 	adopted(false, "a member holding the project's platform address")
 	nodeDocker(t, "network", "disconnect", platformNet, member)
 	adopted(true, "member disconnected from platform")
-	nodeDocker(t, "run", "-d", "--name", member+"-raw", "--network", networkName(s.Ref), "--cap-drop", "ALL", "--cap-add", "NET_RAW",
-		"--entrypoint", "sleep", img, "300")
-	adopted(false, "a member configured with NET_RAW")
+	nodeDocker(t, labelled("run", "-d", "--name", member+"-raw", "--network", platformNet, "--cap-drop", "ALL", "--cap-add", "NET_RAW",
+		"--entrypoint", "sleep", img, "300")...)
+	err = a.CheckAdopted(ctx, s)
+	if !errors.Is(err, ErrContainment) || !strings.Contains(err.Error(), member+"-raw: adds capabilities") {
+		t.Fatalf("a platform member configured with NET_RAW: got %v, want the capability rule", err)
+	}
 	nodeDocker(t, "rm", "-f", member+"-raw")
 	nodeDocker(t, "create", "--name", pg, "--network", "none", "--cap-drop", "ALL", "--restart", "always", img)
 	adopted(false, "a created cluster with a restart policy")
 	nodeDocker(t, "rm", "-f", pg)
-	nodeDocker(t, "create", "--name", pr, "--network", networkName(s.Ref), "--cap-drop", "ALL", img)
+	nodeDocker(t, "create", "--name", pr, "--network", networkName(s.Ref), "--ip", a.cfg.PostgRESTAddr(s.SubnetIndex).String(), "--cap-drop", "ALL", img)
 	nodeDocker(t, "network", "connect", "--ip", a.cfg.PlatformAddr(s.SubnetIndex+1).String(), platformNet, pr)
 	adopted(false, "a created PostgREST at another project's platform address")
 	nodeDocker(t, "network", "disconnect", platformNet, pr)

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/nodefs"
@@ -125,8 +127,8 @@ func TestCheckContainment_RecheckErrorRefuses(t *testing.T) {
 	a, f, s := newTestAgent(t)
 	healthy(a, f, s)
 	tenants(a, f, s)
-	f.ctr(fakeCtr{Name: "flaky", Running: true, CapDrop: []string{"ALL"}, CapAdd: []string{"NET_RAW"},
-		Nets: map[string]string{"proj-" + s.Ref: "10.213.3.140"}})
+	flaky := f.ctr(fakeCtr{Name: "flaky", Running: true, CapDrop: []string{"ALL"}, CapAdd: []string{"NET_RAW"},
+		Nets: map[string]string{"platform": "10.212.6.20"}})
 	batch := 0
 	f.onRun = func(args []string, _ []byte) (string, error, bool) {
 		if args[0] == "container" && args[1] == "inspect" {
@@ -137,8 +139,12 @@ func TestCheckContainment_RecheckErrorRefuses(t *testing.T) {
 		}
 		return "", nil, false
 	}
-	f.failInspect["flaky"] = errors.New("daemon busy")
-	wantContainment(t, a.CheckContainment(context.Background(), s), "inspect error on re-check")
+	f.failInspect[flaky.ID] = errors.New("re-check refused") // members are read by id
+	err := a.CheckContainment(context.Background(), s)
+	wantContainment(t, err, "inspect error on re-check")
+	if !strings.Contains(err.Error(), "read container configuration: re-check refused") {
+		t.Fatalf("refused for another reason than the failed re-check: %v", err)
+	}
 }
 
 // state.json with trailing data, or a link to a well-formed state file, is
@@ -212,7 +218,7 @@ func TestIPCommand_OutputBounded(t *testing.T) {
 func TestCheckContainment_NetworkNamespaceSharers(t *testing.T) {
 	member := func(a *Agent, f *fakeHost, s Spec) *fakeCtr {
 		return f.ctr(fakeCtr{Name: "member", Running: true, CapDrop: []string{"ALL"},
-			Nets: map[string]string{"proj-" + s.Ref: "10.213.3.140"}})
+			Nets: map[string]string{"platform": "10.212.6.20"}})
 	}
 	for name, fault := range map[string]func(a *Agent, f *fakeHost, s Spec){
 		"sharer by id": func(a *Agent, f *fakeHost, s Spec) {
@@ -254,6 +260,14 @@ func TestCheckContainment_NetworkNamespaceSharers(t *testing.T) {
 	f.ctr(fakeCtr{Name: "sharer-of-other", Running: true, NetMode: "container:" + other.ID})
 	if err := a.CheckAdopted(context.Background(), s); err != nil {
 		t.Fatalf("hardened sharers: %v", err)
+	}
+	// The same hardened container on the project network is refused by the
+	// member rule, whatever its capabilities.
+	f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{"proj-" + s.Ref: "10.213.3.140"}})
+	err := a.CheckAdopted(context.Background(), s)
+	wantContainment(t, err, "a hardened stranger on the project network")
+	if !strings.Contains(err.Error(), memberRule) || !strings.Contains(err.Error(), "stranger") {
+		t.Fatalf("got %v, want the member rule naming the stranger", err)
 	}
 }
 
@@ -553,7 +567,7 @@ func TestCheckContainment_MemberNamedLikeAnID(t *testing.T) {
 	gateRefuses(t, func(a *Agent, f *fakeHost, s Spec) {
 		other := f.ctr(fakeCtr{Name: "hardened", CapDrop: []string{"ALL"}, NetMode: "none"})
 		f.ctr(fakeCtr{Name: other.ID, Running: true, CapDrop: []string{"ALL"}, CapAdd: []string{"NET_RAW"},
-			Nets: map[string]string{"proj-" + s.Ref: "10.213.3.140"}})
+			Nets: map[string]string{"platform": "10.212.6.20"}})
 	}, true)
 }
 
@@ -602,6 +616,11 @@ func TestConfFormat_ReadsEveryJudgedField(t *testing.T) {
 		if !strings.Contains(confFormat, "{{json "+f+"}}") {
 			t.Errorf("confFormat lacks %s", f)
 		}
+	}
+	// Docker leaves Sysctls out of the record of a container that has none; a
+	// field reference would then fail the read of every container.
+	if !strings.Contains(confFormat, `{{json (index .HostConfig "Sysctls")}}`) || strings.Contains(confFormat, ".HostConfig.Sysctls") {
+		t.Error("confFormat does not read the sysctls by index")
 	}
 	for _, f := range []string{".Id", ".Name", ".HostConfig.NetworkMode"} {
 		if !strings.Contains(modeFormat, "{{json "+f+"}}") {
@@ -908,6 +927,11 @@ func TestEnsureGateway_ImageIDStrict(t *testing.T) {
 // it starts or stops, and under its id from then on. It returns the count of
 // platform member reads so far.
 func listedAsEndpoint(f *fakeHost, name string, reads int) (platformReads func() int) {
+	return listedAsEndpointOn(f, platformNet, name, reads)
+}
+
+// listedAsEndpointOn is listedAsEndpoint for the member reads of network net.
+func listedAsEndpointOn(f *fakeHost, net, name string, reads int) (netReads func() int) {
 	f.mu.Lock()
 	c := f.ctrs[name]
 	id := c.ID
@@ -915,7 +939,7 @@ func listedAsEndpoint(f *fakeHost, name string, reads int) (platformReads func()
 	f.mu.Unlock()
 	n := 0
 	f.before = func(args []string) {
-		if flagValue(args, "--format") == "{{json .Containers}}" && args[len(args)-1] == platformNet {
+		if flagValue(args, "--format") == "{{json .Containers}}" && args[len(args)-1] == net {
 			f.mu.Lock()
 			if n++; n > reads {
 				c.ID = id
@@ -1301,5 +1325,718 @@ func TestNodeCheck_BackupNetworkAllowed(t *testing.T) {
 	f.nets["backup"].Driver = "macvlan"
 	if r := rows(t, a)["docker-networks"]; r.OK {
 		t.Fatalf("backup with another driver: %+v", r)
+	}
+}
+
+// ───────── the members of a project network; forwarding ─────────
+
+// memberRule is how a refusal by the member rule names it.
+const memberRule = "member rule"
+
+// noForward is the settings of dashcfg.NoForwardArgs as Docker records them.
+func noForward() map[string]string {
+	m := map[string]string{}
+	for _, kv := range dashcfg.NoForwardArgs() {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+// proxyCtr adds sp-pgcap as the platform runs it: on platform at its address
+// and on s's project network at the proxy's address there.
+func proxyCtr(a *Agent, f *fakeHost, s Spec) *fakeCtr {
+	return f.ctr(fakeCtr{Name: dashcfg.PgcapName, Running: true, Restart: "unless-stopped", CapDrop: []string{"ALL"},
+		Labels: map[string]string{"supapace.role": "pgcap"}, Sysctls: noForward(),
+		Nets: map[string]string{"platform": dashcfg.Static(a.cfg).Pgcap.String(),
+			"proj-" + s.Ref: dashcfg.ProxyAddr(a.cfg, s.SubnetIndex).String()}})
+}
+
+// A project network holds at most the cluster, the PostgREST and, on a node
+// with a studio domain, the wire proxy, each at its address: anything else,
+// and any of the three elsewhere, refuses the start whatever its
+// capabilities. A network with fewer members is not refused.
+func TestGate_ProjectNetworkMembers(t *testing.T) {
+	const domain = "studio.test"
+	proj := "proj-" + testRef
+	at := func(a *Agent, host uint32) string { // an address of slice 14
+		b := a.cfg.Slice(14).Addr().As4()
+		b[3] += byte(host)
+		return fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3])
+	}
+	cases := []struct {
+		name, domain string
+		arrange      func(a *Agent, f *fakeHost, s Spec)
+		refused      string // what the refusal must name; "" for a start that passes
+	}{
+		{"the cluster and the PostgREST", "", func(a *Agent, f *fakeHost, s Spec) {}, ""},
+		{"the cluster alone", "", func(a *Agent, f *fakeHost, s Spec) { delete(f.ctrs, "postgrest-"+s.Ref) }, ""},
+		{"no member", "", func(a *Agent, f *fakeHost, s Spec) {
+			delete(f.ctrs, "postgrest-"+s.Ref)
+			delete(f.ctrs, "pg-"+s.Ref)
+		}, ""},
+		{"no proxy on a node with a studio domain", domain, func(a *Agent, f *fakeHost, s Spec) {}, ""},
+		{"the proxy at its address", domain, func(a *Agent, f *fakeHost, s Spec) { proxyCtr(a, f, s) }, ""},
+		{"the proxy on a node without a studio domain", "", func(a *Agent, f *fakeHost, s Spec) { proxyCtr(a, f, s) }, dashcfg.PgcapName},
+		{"the proxy at another address", domain, func(a *Agent, f *fakeHost, s Spec) {
+			proxyCtr(a, f, s).Nets[proj] = at(a, 12)
+		}, dashcfg.PgcapName},
+		{"the proxy at the reserved address", domain, func(a *Agent, f *fakeHost, s Spec) {
+			proxyCtr(a, f, s).Nets[proj] = at(a, dashcfg.ReservedHost)
+		}, dashcfg.PgcapName},
+		{"a hardened fourth member", domain, func(a *Agent, f *fakeHost, s Spec) {
+			proxyCtr(a, f, s)
+			f.ctr(fakeCtr{Name: "fourth", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{proj: at(a, 12)}})
+		}, "fourth"},
+		{"a hardened stranger", "", func(a *Agent, f *fakeHost, s Spec) {
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{proj: at(a, 12)}})
+		}, "stranger"},
+		{"a stranger at the reserved address", "", func(a *Agent, f *fakeHost, s Spec) {
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"},
+				Nets: map[string]string{proj: at(a, dashcfg.ReservedHost)}})
+		}, "stranger"},
+		{"a stranger at the proxy's address", domain, func(a *Agent, f *fakeHost, s Spec) {
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"},
+				Nets: map[string]string{proj: at(a, dashcfg.ProxyHost)}})
+		}, "stranger"},
+		{"another project's cluster", "", func(a *Agent, f *fakeHost, s Spec) {
+			f.ctr(fakeCtr{Name: "pg-" + prRef(15), Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{proj: at(a, 12)}})
+		}, "pg-" + prRef(15)},
+		{"the cluster at another address", "", func(a *Agent, f *fakeHost, s Spec) { f.ctrs["pg-"+s.Ref].Nets[proj] = at(a, 12) }, "pg-" + testRef},
+		{"the cluster at the reserved address", "", func(a *Agent, f *fakeHost, s Spec) {
+			f.ctrs["pg-"+s.Ref].Nets[proj] = at(a, dashcfg.ReservedHost)
+		}, "pg-" + testRef},
+		{"the PostgREST at another address", "", func(a *Agent, f *fakeHost, s Spec) {
+			f.ctrs["postgrest-"+s.Ref].Nets[proj] = at(a, 12)
+		}, "postgrest-" + testRef},
+		{"the cluster and the PostgREST at each other's address", "", func(a *Agent, f *fakeHost, s Spec) {
+			pg, pr := f.ctrs["pg-"+s.Ref], f.ctrs["postgrest-"+s.Ref]
+			pg.Nets[proj], pr.Nets[proj] = pr.Nets[proj], pg.Nets[proj]
+		}, testRef},
+		{"a created PostgREST without an address", "", func(a *Agent, f *fakeHost, s Spec) {
+			pr := f.ctrs["postgrest-"+s.Ref]
+			pr.Running, pr.Nets[proj] = false, ""
+		}, "postgrest-" + testRef},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a, f, s := newTestAgent(t)
+			a.cfg.StudioDomain = c.domain
+			healthy(a, f, s)
+			tenants(a, f, s)
+			ctx := context.Background()
+			if err := a.CheckContainment(ctx, s); err != nil {
+				t.Fatalf("control: %v", err)
+			}
+			c.arrange(a, f, s)
+			for name, gate := range map[string]func(context.Context, Spec) error{"start": a.CheckContainment, "adoption": a.CheckAdopted} {
+				err := gate(ctx, s)
+				if c.refused == "" {
+					if err != nil {
+						t.Errorf("%s refused: %v", name, err)
+					}
+					continue
+				}
+				wantContainment(t, err, name)
+				if errors.Is(err, ErrCheckIncomplete) {
+					t.Errorf("%s: a finding reads as an incomplete check: %v", name, err)
+				}
+				for _, w := range []string{memberRule, proj, c.refused} {
+					if !strings.Contains(err.Error(), w) {
+						t.Errorf("%s: refusal %q lacks %q", name, err, w)
+					}
+				}
+			}
+		})
+	}
+	// A studio domain on a configuration the dashboard refuses counts as none.
+	a, f, s := newTestAgent(t)
+	a.cfg.StudioDomain, a.cfg.UIDBase, a.cfg.UIDCount = domain, 65000, 700000 // the project uids would hold the dashboard's
+	if _, err := dashcfg.For(a.cfg); err == nil || !dashcfg.Static(a.cfg).Pgcap.IsValid() {
+		t.Fatalf("fixture: a configuration refused for another reason than its addresses: %v", err)
+	}
+	healthy(a, f, s)
+	tenants(a, f, s)
+	proxyCtr(a, f, s)
+	if err := a.CheckAdopted(context.Background(), s); !errors.Is(err, ErrContainment) || !strings.Contains(err.Error(), memberRule) ||
+		!strings.Contains(err.Error(), dashcfg.PgcapName) {
+		t.Fatalf("the proxy on a refused configuration: got %v, want the member rule", err)
+	}
+	// What the refusal says: the member and where it is, and what the network
+	// may hold — nothing of any other network.
+	a, f, s = newTestAgent(t)
+	healthy(a, f, s)
+	tenants(a, f, s)
+	f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"}, Labels: map[string]string{"secret": "label-value"},
+		Nets: map[string]string{proj: at(a, 12), "ingress": "10.212.8.77"}})
+	err := a.CheckAdopted(context.Background(), s)
+	wantContainment(t, err, "stranger")
+	for _, w := range []string{at(a, 12), "pg-" + testRef, at(a, dashcfg.ClusterHost), "postgrest-" + testRef, at(a, dashcfg.RestHost)} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("refusal %q lacks %q", err, w)
+		}
+	}
+	for _, w := range []string{"label-value", "10.212.8.77", dashcfg.PgcapName} {
+		if strings.Contains(err.Error(), w) {
+			t.Errorf("refusal %q carries %q", err, w)
+		}
+	}
+}
+
+// Each of the dashboard's four addresses on platform belongs to one
+// container by name: another member holding one refuses the start. A
+// stranger elsewhere on platform is the node check's to report.
+func TestGate_FixedPlatformAddressUnderAnotherName(t *testing.T) {
+	for _, domain := range []string{"", "studio.test"} {
+		a, f, s := newTestAgent(t)
+		a.cfg.StudioDomain = domain
+		healthy(a, f, s)
+		tenants(a, f, s)
+		ad := dashcfg.Static(a.cfg)
+		owners := map[string]string{ad.Studio.String(): dashcfg.StudioName, ad.PgMeta0.String(): dashcfg.PgMeta0Name,
+			ad.PgMeta1.String(): dashcfg.PgMeta1Name, ad.Pgcap.String(): dashcfg.PgcapName}
+		if len(owners) != 4 {
+			t.Fatalf("the default node has no four dashboard addresses: %+v", ad)
+		}
+		ctx := context.Background()
+		for addr, owner := range owners {
+			f.ctr(fakeCtr{Name: "squatter", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{"platform": addr}})
+			err := a.CheckAdopted(ctx, s)
+			wantContainment(t, err, "another name at "+addr)
+			if errors.Is(err, ErrCheckIncomplete) || !strings.Contains(err.Error(), "squatter holds "+addr) || !strings.Contains(err.Error(), owner) {
+				t.Errorf("domain %q, %s: got %v, want a finding naming the holder, the address and %s", domain, addr, err, owner)
+			}
+			// Created, not started: its configured address counts, as for a
+			// PostgREST address.
+			delete(f.ctrs, "squatter")
+			f.ctr(fakeCtr{Name: "pg-" + s.Ref, Running: false, CapDrop: []string{"ALL"}, Nets: map[string]string{"platform": addr}})
+			wantContainment(t, a.CheckAdopted(ctx, s), "a created tenant container configured at "+addr)
+			tenants(a, f, s)
+			// Control: its owner there passes.
+			f.ctr(fakeCtr{Name: owner, Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{"platform": addr}})
+			if err := a.CheckAdopted(ctx, s); err != nil {
+				t.Errorf("domain %q: %s at %s refused: %v", domain, owner, addr, err)
+			}
+			delete(f.ctrs, owner)
+		}
+		f.ctr(fakeCtr{Name: "squatter", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{"platform": "10.212.6.20"}})
+		if err := a.CheckAdopted(ctx, s); err != nil {
+			t.Errorf("domain %q: a hardened stranger elsewhere on platform refused by the gate: %v", domain, err)
+		}
+	}
+}
+
+// A member of the project network listed under its endpoint key for a
+// moment is read again and then judged by the member rule like any other; a
+// key that stays is refused; a context that ends meanwhile leaves the check
+// incomplete.
+func TestGate_TransientEndpointIsReadAgain(t *testing.T) {
+	fastReread(t)
+	proj := "proj-" + testRef
+	ctx := context.Background()
+	for _, reads := range []int{1, memberRereads} {
+		a, f, s := newTestAgent(t)
+		healthy(a, f, s)
+		tenants(a, f, s)
+		netReads := listedAsEndpointOn(f, proj, "pg-"+s.Ref, reads)
+		if err := a.CheckAdopted(ctx, s); err != nil {
+			t.Fatalf("reads=%d: a starting cluster refused: %v", reads, err)
+		}
+		if n := netReads(); n != reads+1 {
+			t.Fatalf("reads=%d: members of the project network read %d times, want %d", reads, n, reads+1)
+		}
+	}
+	// Resolved, a stranger is the member rule's finding.
+	a, f, s := newTestAgent(t)
+	healthy(a, f, s)
+	tenants(a, f, s)
+	f.ctr(fakeCtr{Name: "starting", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{proj: "10.213.3.140"}})
+	listedAsEndpointOn(f, proj, "starting", 1)
+	err := a.CheckAdopted(ctx, s)
+	wantContainment(t, err, "a resolved stranger")
+	if errors.Is(err, ErrCheckIncomplete) || !strings.Contains(err.Error(), memberRule) {
+		t.Fatalf("got %v, want the member rule", err)
+	}
+	// A key that stays: refused, a completed check.
+	a, f, s = newTestAgent(t)
+	healthy(a, f, s)
+	tenants(a, f, s)
+	netReads := listedAsEndpointOn(f, proj, "pg-"+s.Ref, 1<<30)
+	err = a.CheckAdopted(ctx, s)
+	wantContainment(t, err, "a persistent endpoint key")
+	if errors.Is(err, ErrCheckIncomplete) || !strings.Contains(err.Error(), "endpoint without a container") {
+		t.Fatalf("got %v, want an unidentified member", err)
+	}
+	if n := netReads(); n != 1+memberRereads {
+		t.Fatalf("members read %d times, want %d", n, 1+memberRereads)
+	}
+	// The context ends during the re-reads: incomplete, not a finding.
+	a, f, s = newTestAgent(t)
+	healthy(a, f, s)
+	tenants(a, f, s)
+	listedAsEndpointOn(f, proj, "pg-"+s.Ref, 1<<30)
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := a.CheckAdopted(cctx, s); !errors.Is(err, ErrContainment) || !errors.Is(err, ErrCheckIncomplete) {
+		t.Fatalf("an ended context: got %v, want an incomplete check", err)
+	}
+}
+
+// pairs counts how often flag is directly followed by value before "--".
+func pairs(args []string, flag, value string) int {
+	n := 0
+	for i := 0; i+1 < len(args) && args[i] != "--"; i++ {
+		if args[i] == flag && args[i+1] == value {
+			n++
+		}
+	}
+	return n
+}
+
+// without returns args without each flag-value pair of drop.
+func without(args []string, drop ...string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		if i+1 < len(args) && args[i] == "--sysctl" && slices.Contains(drop, args[i+1]) {
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
+
+// The gateway is on two networks: it is created with the forwarding settings, its
+// label covers them, and a gateway created without them is made again once.
+func TestGatewayArgs_ForwardingSettings(t *testing.T) {
+	a, f, s := newTestAgent(t)
+	healthy(a, f, s)
+	delete(f.ctrs, "sp-gateway")
+	writeTLS(t, a)
+	ctx := context.Background()
+	if err := a.EnsureGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	opts, cmd, conf, err := a.gatewayConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noForward()) != 6 {
+		t.Fatalf("settings: %v", noForward())
+	}
+	for k, v := range noForward() {
+		if n := pairs(opts, "--sysctl", k+"="+v); n != 1 {
+			t.Errorf("--sysctl %s=%s is %d times in the gateway's options", k, v, n)
+		}
+	}
+	// The label of the arguments without the settings, as an older daemon
+	// computed it.
+	extra, err := fileDigests(filepath.Join(a.p.GatewayDir(), "tls", "cert.pem"), a.seccompFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra = append(extra, "image id="+f.images[a.cfg.Images.Gateway])
+	if got := configHash(opts, cmd, extra...); got != conf {
+		t.Fatalf("the label is not the hash of the options: %s, %s", got, conf)
+	}
+	var drop []string
+	for k, v := range noForward() {
+		drop = append(drop, k+"="+v)
+	}
+	older := configHash(without(opts, drop...), cmd, extra...)
+	if older == conf {
+		t.Fatal("the label does not cover the settings")
+	}
+	gw := f.ctrs["sp-gateway"]
+	if !maps.Equal(gw.Sysctls, noForward()) || gw.Labels["supapace.config"] != conf {
+		t.Fatalf("created with %v and label %s", gw.Sysctls, gw.Labels["supapace.config"])
+	}
+	// A gateway of the older arguments: made again once, then left alone.
+	gw.Labels["supapace.config"], gw.Sysctls = older, nil
+	f.resetLog()
+	if err := a.EnsureGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if m := f.mutations(); len(m) != 4 || m[0] != "docker rm -f -- sp-gateway" {
+		t.Fatalf("a gateway created without the settings: %q", m)
+	}
+	if gw := f.ctrs["sp-gateway"]; !maps.Equal(gw.Sysctls, noForward()) || gw.Labels["supapace.config"] != conf {
+		t.Fatalf("made again with %v and label %s", gw.Sysctls, gw.Labels["supapace.config"])
+	}
+	for range 2 {
+		f.resetLog()
+		if err := a.EnsureGateway(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if m := f.mutations(); len(m) != 0 {
+			t.Fatalf("the gateway made again a second time: %q", m)
+		}
+	}
+}
+
+// dashCtrOn adds one of the dashboard's containers on platform.
+func dashCtrOn(f *fakeHost, name, role, addr string) *fakeCtr {
+	return f.ctr(fakeCtr{Name: name, Running: true, Restart: "unless-stopped", CapDrop: []string{"ALL"},
+		Labels: map[string]string{"supapace.role": role}, Nets: map[string]string{"platform": addr}})
+}
+
+// The row platform-members accepts the dashboard's four containers, each
+// with its role label at its address, on a node with a studio domain only.
+func TestNodeCheck_PlatformMembers_AcceptsTheFour_OnlyWithAStudioDomain(t *testing.T) {
+	type member struct{ name, role, addr string }
+	four := func(a *Agent) []member {
+		ad := dashcfg.Static(a.cfg)
+		return []member{{dashcfg.StudioName, "studio", ad.Studio.String()}, {dashcfg.PgMeta0Name, "pgmeta", ad.PgMeta0.String()},
+			{dashcfg.PgMeta1Name, "pgmeta", ad.PgMeta1.String()}, {dashcfg.PgcapName, "pgcap", ad.Pgcap.String()}}
+	}
+	node := func(t *testing.T, domain string) (*Agent, *fakeHost) {
+		a, f := goodNode(t)
+		a.cfg.StudioDomain = domain
+		for _, m := range four(a) {
+			dashCtrOn(f, m.name, m.role, m.addr)
+		}
+		return a, f
+	}
+	a, _ := node(t, "studio.test")
+	if r := rows(t, a)["platform-members"]; !r.OK {
+		t.Fatalf("the four on a node with a studio domain: %+v", r)
+	}
+	fails := func(t *testing.T, a *Agent, name string) {
+		t.Helper()
+		r := rows(t, a)["platform-members"]
+		if r.OK || !Blocking(r) || !strings.Contains(r.Detail, name) {
+			t.Fatalf("row %+v (blocking %v), want a blocking failure naming %s", r, Blocking(r), name)
+		}
+	}
+	for i, m := range four(a) {
+		t.Run(m.name, func(t *testing.T) {
+			// Alone, on a node with a studio domain: accepted.
+			a, f := goodNode(t)
+			a.cfg.StudioDomain = "studio.test"
+			c := dashCtrOn(f, m.name, m.role, m.addr)
+			if r := rows(t, a)["platform-members"]; !r.OK {
+				t.Fatalf("alone: %+v", r)
+			}
+			// Without a studio domain, and on a configuration the dashboard
+			// refuses: a foreign member.
+			a.cfg.StudioDomain = ""
+			fails(t, a, m.name)
+			a.cfg.StudioDomain = "studio.test"
+			a.cfg.UIDBase, a.cfg.UIDCount = 65000, 700000 // the project uids would hold the dashboard's
+			if _, err := dashcfg.For(a.cfg); err == nil || dashcfg.Static(a.cfg).Pgcap.String() != four(a)[3].addr {
+				t.Fatalf("fixture: a configuration refused for another reason than its addresses: %v", err)
+			}
+			fails(t, a, m.name)
+			a.cfg.UIDBase, a.cfg.UIDCount = nodecfg.Default("sp.test").UIDBase, nodecfg.Default("sp.test").UIDCount
+			// Another role label, none, or another address.
+			c.Labels["supapace.role"] = "postgrest"
+			fails(t, a, m.name)
+			delete(c.Labels, "supapace.role")
+			fails(t, a, m.name)
+			c.Labels["supapace.role"] = m.role
+			c.Nets["platform"] = four(a)[(i+1)%4].addr
+			fails(t, a, m.name)
+			c.Nets["platform"] = "10.212.6.20"
+			fails(t, a, m.name)
+			c.Nets["platform"] = m.addr
+			// A capability.
+			c.CapAdd = []string{"NET_RAW"}
+			fails(t, a, m.name)
+			c.CapAdd = nil
+			if r := rows(t, a)["platform-members"]; !r.OK {
+				t.Fatalf("restored: %+v", r)
+			}
+			// Another container at its address, under another name or as a
+			// project's PostgREST.
+			delete(f.ctrs, m.name)
+			dashCtrOn(f, "squatter", m.role, m.addr)
+			fails(t, a, "squatter")
+		})
+	}
+	// Every other member is still refused beside the four.
+	a, f := node(t, "studio.test")
+	dashCtrOn(f, "sp-pgmeta-2", "pgmeta", "10.212.0.7")
+	fails(t, a, "sp-pgmeta-2")
+}
+
+// fwdNode is a good node with a gateway and one PostgREST as this agent
+// creates them.
+func fwdNode(t *testing.T) (*Agent, *fakeHost, Spec) {
+	a, f := goodNode(t)
+	s := Spec{Ref: testRef, Epoch: 1, Generation: 1, UID: 700005, GID: 700005, SubnetIndex: 14, DiskQuotaMB: 8192, MemMB: 512, Pids: 512,
+		Keys: prKeys(t), UserRoles: []string{"authenticated"}}
+	s.Secrets.AuthenticatorPassword = "pw"
+	writeSeccomp(t, a)
+	writeTLS(t, a)
+	delete(f.ctrs, "sp-gateway")
+	delete(f.ctrs, "postgrest-"+s.Ref)
+	ctx := context.Background()
+	if err := a.EnsureGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.nftErr = nil
+	if err := a.EnsurePostgREST(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	return a, f, s
+}
+
+// The row forwarding reads Docker's record of the gateway, of every
+// PostgREST and of the proxy: each setting, at its value. A gateway or a
+// PostgREST of another configuration label is the next ensure's to make
+// again and is not judged here.
+func TestNodeCheck_Forwarding(t *testing.T) {
+	a, f, s := fwdNode(t)
+	if r := rows(t, a)["forwarding"]; !r.OK {
+		t.Fatalf("a gateway and a PostgREST as created: %+v", r)
+	}
+	fails := func(t *testing.T, a *Agent, wants ...string) {
+		t.Helper()
+		r := rows(t, a)["forwarding"]
+		if r.OK || !Blocking(r) {
+			t.Fatalf("row %+v (blocking %v), want a blocking failure", r, Blocking(r))
+		}
+		for _, w := range wants {
+			if !strings.Contains(r.Detail, w) {
+				t.Fatalf("detail %q lacks %q", r.Detail, w)
+			}
+		}
+	}
+	proxyCtr(a, f, s)
+	if r := rows(t, a)["forwarding"]; !r.OK {
+		t.Fatalf("with the proxy: %+v", r)
+	}
+	for _, name := range []string{"sp-gateway", "postgrest-" + s.Ref, dashcfg.PgcapName} {
+		c := f.ctrs[name]
+		for k, v := range noForward() {
+			delete(c.Sysctls, k)
+			fails(t, a, name, k)
+			c.Sysctls[k] = "2"
+			fails(t, a, name, k)
+			c.Sysctls[k] = v
+		}
+		saved := c.Sysctls
+		c.Sysctls = nil
+		fails(t, a, name)
+		c.Sysctls = saved
+		if r := rows(t, a)["forwarding"]; !r.OK {
+			t.Fatalf("%s restored: %+v", name, r)
+		}
+	}
+	// A second PostgREST, of another project, is read too.
+	s2 := s
+	s2.Ref, s2.SubnetIndex = prRef(15), 15
+	prNet(a, f, s2.Ref, 15)
+	f.ip["-j -d addr show dev "+nodecfg.BridgeName(15)] = bridgeIface(nodecfg.BridgeName(15), false)
+	if err := a.EnsurePostgREST(context.Background(), s2); err != nil {
+		t.Fatal(err)
+	}
+	if r := rows(t, a)["forwarding"]; !r.OK {
+		t.Fatalf("two PostgRESTs: %+v", r)
+	}
+	delete(f.ctrs["postgrest-"+s2.Ref].Sysctls, "net.ipv4.ip_forward")
+	fails(t, a, "postgrest-"+s2.Ref, "net.ipv4.ip_forward")
+	// Stopped, it is still Docker's record of what its next start runs with.
+	f.ctrs["postgrest-"+s2.Ref].Running = false
+	fails(t, a, "postgrest-"+s2.Ref)
+	delete(f.ctrs, "postgrest-"+s2.Ref)
+
+	// Another configuration label (an older daemon's container, a changed
+	// file): not adopted, made again at the next ensure, not this row's.
+	for _, name := range []string{"sp-gateway", "postgrest-" + s.Ref} {
+		c := f.ctrs[name]
+		label, saved := c.Labels["supapace.config"], c.Sysctls
+		c.Labels["supapace.config"], c.Sysctls = strings.Repeat("0", 64), nil
+		if r := rows(t, a)["forwarding"]; !r.OK {
+			t.Fatalf("%s of another configuration fails the row: %+v", name, r)
+		}
+		// The proxy has no such grace: it never existed without the settings.
+		c.Labels["supapace.config"], c.Sysctls = label, saved
+	}
+	px := f.ctrs[dashcfg.PgcapName]
+	px.Labels["supapace.config"], px.Sysctls = strings.Repeat("0", 64), nil
+	fails(t, a, dashcfg.PgcapName)
+	delete(f.ctrs, dashcfg.PgcapName)
+
+	// None of the three exists: nothing to read.
+	delete(f.ctrs, "sp-gateway")
+	delete(f.ctrs, "postgrest-"+s.Ref)
+	if r := rows(t, a)["forwarding"]; !r.OK {
+		t.Fatalf("no container: %+v", r)
+	}
+	// Docker does not answer: the row fails, whichever read it is.
+	for _, what := range []string{"sp-gateway", dashcfg.PgcapName, "list supapace.role=postgrest"} {
+		a, f, _ = fwdNode(t)
+		f.failInspect[what] = errors.New("daemon busy")
+		fails(t, a, "daemon busy")
+	}
+	a, f, _ = fwdNode(t)
+	f.failVerb["container inspect"] = errors.New("daemon busy")
+	fails(t, a, "daemon busy")
+
+	// The gateway's own label cannot be computed (its certificate is gone):
+	// nothing says the container is this daemon's, and the row gateway reports
+	// it.
+	a, f, _ = fwdNode(t)
+	f.ctrs["sp-gateway"].Sysctls = nil
+	if err := os.Remove(filepath.Join(a.p.GatewayDir(), "tls", "cert.pem")); err != nil {
+		t.Fatal(err)
+	}
+	if all := rows(t, a); !all["forwarding"].OK || all["gateway"].OK {
+		t.Fatalf("no gateway label: forwarding %+v, gateway %+v", all["forwarding"], all["gateway"])
+	}
+
+	// A container whose labels and address give this daemon's label is read,
+	// whatever made it; one whose ref label is no ref is not, and no file is
+	// looked up by that label.
+	for _, ref := range []string{prRef(20), "../evil"} {
+		a, f, _ = fwdNode(t)
+		other := Spec{Ref: ref, SubnetIndex: 20, Generation: 1, Epoch: 1}
+		dir := a.postgrestDir(ref)
+		mkdirs(t, dir)
+		if err := os.WriteFile(filepath.Join(dir, postgrestConf), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		hash, err := renderedHash(dir, postgrestConf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flags, tail := a.postgrestArgs(other)
+		f.ctr(fakeCtr{Name: "postgrest-other", Running: true, CapDrop: []string{"ALL"},
+			Labels: map[string]string{"supapace.role": "postgrest", "supapace.ref": ref, "supapace.generation": "1", "supapace.epoch": "1",
+				"supapace.config": prLabel(t, a, hash, slices.Concat(flags, tail))},
+			Nets: map[string]string{"platform": a.cfg.PlatformAddr(20).String()}})
+		if r := rows(t, a)["forwarding"]; r.OK != (ref == "../evil") {
+			t.Fatalf("ref label %q: %+v", ref, r)
+		}
+	}
+}
+
+// A PostgREST of a later generation or epoch is this daemon's as much as the
+// first: the row forwarding computes the label from the container's own
+// generation and epoch labels, so such a container is judged too.
+func TestNodeCheck_Forwarding_LaterGenerationAndEpoch(t *testing.T) {
+	a, f, s := fwdNode(t)
+	for _, later := range [][2]int64{{2, 1}, {1, 2}, {7, 3}} {
+		s.Generation, s.Epoch = later[0], later[1]
+		if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+			t.Fatal(err)
+		}
+		c := f.ctrs["postgrest-"+s.Ref]
+		if c.Labels["supapace.generation"] != fmt.Sprint(later[0]) || c.Labels["supapace.epoch"] != fmt.Sprint(later[1]) {
+			t.Fatalf("fixture: labels %v", c.Labels)
+		}
+		if r := rows(t, a)["forwarding"]; !r.OK {
+			t.Fatalf("generation %d, epoch %d, as created: %+v", later[0], later[1], r)
+		}
+		delete(c.Sysctls, "net.ipv4.ip_forward")
+		if r := rows(t, a)["forwarding"]; r.OK || !Blocking(r) || !strings.Contains(r.Detail, "postgrest-"+s.Ref) {
+			t.Fatalf("generation %d, epoch %d, without a setting: row %+v, want a blocking failure naming it", later[0], later[1], r)
+		}
+	}
+}
+
+// The row project-addresses holds every project network to its members: an
+// extra or a misplaced one fails it, a missing one does not.
+func TestNodeCheck_ProjectAddresses(t *testing.T) {
+	proj := "proj-" + testRef
+	s := Spec{Ref: testRef, SubnetIndex: 14}
+	other := Spec{Ref: prRef(15), SubnetIndex: 15}
+	cases := []struct {
+		name, domain string
+		arrange      func(a *Agent, f *fakeHost)
+		fails        string // what the detail must name; "" for a passing row
+	}{
+		{"the cluster and the PostgREST", "", func(a *Agent, f *fakeHost) {}, ""},
+		{"the cluster alone", "", func(a *Agent, f *fakeHost) { delete(f.ctrs, "postgrest-"+testRef) }, ""},
+		{"no member", "", func(a *Agent, f *fakeHost) {
+			delete(f.ctrs, "postgrest-"+testRef)
+			delete(f.ctrs, "pg-"+testRef)
+		}, ""},
+		{"no project network", "", func(a *Agent, f *fakeHost) {
+			delete(f.ctrs, "postgrest-"+testRef)
+			delete(f.ctrs, "pg-"+testRef)
+			delete(f.nets, proj)
+		}, ""},
+		{"the proxy at its address", "studio.test", func(a *Agent, f *fakeHost) { proxyCtr(a, f, s) }, ""},
+		{"the proxy missing on a node with a studio domain", "studio.test", func(a *Agent, f *fakeHost) {}, ""},
+		{"the proxy on a node without a studio domain", "", func(a *Agent, f *fakeHost) { proxyCtr(a, f, s) }, dashcfg.PgcapName},
+		{"the proxy at another address", "studio.test", func(a *Agent, f *fakeHost) {
+			proxyCtr(a, f, s).Nets[proj] = "10.213.3.140"
+		}, dashcfg.PgcapName},
+		{"a hardened stranger", "", func(a *Agent, f *fakeHost) {
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{proj: "10.213.3.140"}})
+		}, "stranger"},
+		{"a stranger at the reserved address", "", func(a *Agent, f *fakeHost) {
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{proj: "10.213.3.133"}})
+		}, "stranger"},
+		{"the cluster at another address", "", func(a *Agent, f *fakeHost) { f.ctrs["pg-"+testRef].Nets[proj] = "10.213.3.140" }, "pg-" + testRef},
+		{"the PostgREST at the cluster's address", "", func(a *Agent, f *fakeHost) {
+			delete(f.ctrs, "pg-"+testRef)
+			f.ctrs["postgrest-"+testRef].Nets[proj] = a.cfg.ClusterAddr(14).String()
+		}, "postgrest-" + testRef},
+		{"a second project network as it should be", "studio.test", func(a *Agent, f *fakeHost) {
+			prNet(a, f, other.Ref, 15)
+			tenants(a, f, other)
+			proxyCtr(a, f, s).Nets["proj-"+other.Ref] = dashcfg.ProxyAddr(a.cfg, 15).String()
+		}, ""},
+		{"a stranger on a second project network", "", func(a *Agent, f *fakeHost) {
+			prNet(a, f, other.Ref, 15)
+			tenants(a, f, other)
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"},
+				Nets: map[string]string{"proj-" + other.Ref: "10.213.3.204"}})
+		}, "proj-" + other.Ref},
+		{"this project's cluster on another project's network", "", func(a *Agent, f *fakeHost) {
+			prNet(a, f, other.Ref, 15)
+			f.ctrs["pg-"+testRef].Nets["proj-"+other.Ref] = a.cfg.ClusterAddr(15).String()
+		}, "pg-" + testRef},
+		{"a member on a network whose subnet is no slice of its bridge", "", func(a *Agent, f *fakeHost) {
+			f.nets[proj].Subnet = a.cfg.Slice(15).String()
+		}, "not a slice of this node"},
+		{"no member on a network whose subnet is no slice of its bridge", "", func(a *Agent, f *fakeHost) {
+			delete(f.ctrs, "postgrest-"+testRef)
+			delete(f.ctrs, "pg-"+testRef)
+			f.nets[proj].Subnet = a.cfg.Slice(15).String()
+		}, ""},
+		{"the members cannot be read", "", func(a *Agent, f *fakeHost) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return "", errors.New("daemon busy"), flagValue(args, "--format") == "{{json .Containers}}" && args[len(args)-1] == proj
+			}
+		}, "daemon busy"},
+		{"the network cannot be read", "", func(a *Agent, f *fakeHost) { f.failInspect[proj] = errors.New("daemon busy") }, "daemon busy"},
+		{"the members' configuration cannot be read", "", func(a *Agent, f *fakeHost) {
+			f.failVerb["container inspect"] = errors.New("daemon busy")
+		}, "daemon busy"},
+		{"a persistent endpoint key", "", func(a *Agent, f *fakeHost) { listedAsEndpointOn(f, proj, "pg-"+testRef, 1<<30) }, "endpoint without a container"},
+		{"a transient endpoint key", "", func(a *Agent, f *fakeHost) { listedAsEndpointOn(f, proj, "pg-"+testRef, 1) }, ""},
+		{"a network removed since the listing", "", func(a *Agent, f *fakeHost) {
+			f.onRun = func(args []string, _ []byte) (string, error, bool) {
+				return proj + " bridge\nproj-" + other.Ref + " bridge\n", nil, args[0] == "network" && args[1] == "ls"
+			}
+		}, ""},
+		{"the networks cannot be listed", "", func(a *Agent, f *fakeHost) { f.failVerb["network ls"] = errors.New("daemon busy") }, "daemon busy"},
+		{"a member on a network named like a project's, with no ref in its name", "", func(a *Agent, f *fakeHost) {
+			prNet(a, f, "x", 15)
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"}, Nets: map[string]string{"proj-x": "10.213.3.204"}})
+		}, "proj-x"},
+	}
+	fastReread(t)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a, f := goodNode(t)
+			a.cfg.StudioDomain = c.domain
+			if r := rows(t, a)["project-addresses"]; !r.OK {
+				t.Fatalf("control: %+v", r)
+			}
+			c.arrange(a, f)
+			r := rows(t, a)["project-addresses"]
+			switch {
+			case c.fails == "" && !r.OK:
+				t.Fatalf("row fails: %+v", r)
+			case c.fails != "" && (r.OK || !Blocking(r) || !strings.Contains(r.Detail, c.fails)):
+				t.Fatalf("row %+v (blocking %v), want a blocking failure naming %q", r, Blocking(r), c.fails)
+			}
+		})
 	}
 }

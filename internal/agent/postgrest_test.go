@@ -276,6 +276,11 @@ func TestEnsurePostgREST_Flags(t *testing.T) {
 		{"--ulimit", "nofile=65536:65536"},
 		{"--ipc", "private"},
 		{"--sysctl", "net.ipv4.ping_group_range=1 0"},
+		{"--sysctl", "net.ipv4.ip_forward=0"},
+		{"--sysctl", "net.ipv4.conf.all.rp_filter=1"},
+		{"--sysctl", "net.ipv4.conf.all.arp_ignore=1"},
+		{"--sysctl", "net.ipv4.conf.default.rp_filter=1"},
+		{"--sysctl", "net.ipv4.conf.default.arp_ignore=1"},
 		{"--sysctl", "net.ipv6.conf.all.disable_ipv6=1"},
 		{"-e", "GHCRTS=-N2"},
 		{"--network", "proj-" + s.Ref},
@@ -1970,5 +1975,64 @@ func TestEnsurePostgREST_AdoptionIncomplete_LeftRunning(t *testing.T) {
 				t.Fatal("container not left as it was")
 			}
 		})
+	}
+}
+
+// A PostgREST is on two networks: it is created with the forwarding settings (the
+// one it already had is not repeated), its label covers them, and a
+// PostgREST created without them is made again once.
+func TestPostgRESTArgs_ForwardingSettings(t *testing.T) {
+	a, f, s := prAgent(t, 14)
+	flags, tail := a.postgrestArgs(s)
+	for k, v := range noForward() {
+		if n := pairs(flags, "--sysctl", k+"="+v); n != 1 {
+			t.Errorf("--sysctl %s=%s is %d times in the options", k, v, n)
+		}
+	}
+	if pairs(flags, "--sysctl", "net.ipv4.ping_group_range=1 0") != 1 || len(flagValues(flags, "--sysctl")) != 7 {
+		t.Errorf("settings: %q", flagValues(flags, "--sysctl"))
+	}
+	prRunning(t, a, f, s)
+	c := f.ctrs["postgrest-"+s.Ref]
+	label := c.Labels["supapace.config"]
+	for k, v := range noForward() {
+		if c.Sysctls[k] != v {
+			t.Errorf("created with %s=%q", k, c.Sysctls[k])
+		}
+	}
+	// The label of the arguments an older daemon created it with: the three
+	// settings it did not have are left out.
+	fileHash, err := renderedHash(a.postgrestDir(s.Ref), postgrestConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := prLabel(t, a, fileHash, slices.Concat(flags, tail)); got != label {
+		t.Fatalf("label %s, recomputed %s", label, got)
+	}
+	older := prLabel(t, a, fileHash, slices.Concat(
+		without(flags, "net.ipv4.ip_forward=0", "net.ipv4.conf.all.rp_filter=1", "net.ipv4.conf.all.arp_ignore=1",
+			"net.ipv4.conf.default.rp_filter=1", "net.ipv4.conf.default.arp_ignore=1"), tail))
+	if older == label {
+		t.Fatal("the label does not cover the settings")
+	}
+	c.Labels["supapace.config"] = older
+	if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	m := f.mutations()
+	if len(m) != 4 || m[0] != "docker rm -f -- postgrest-"+s.Ref || !strings.HasPrefix(m[1], "docker create ") {
+		t.Fatalf("a PostgREST created without the settings: %q", m)
+	}
+	if got := f.ctrs["postgrest-"+s.Ref].Labels["supapace.config"]; got != label {
+		t.Fatalf("made again with label %s, want %s", got, label)
+	}
+	for range 2 {
+		f.resetLog()
+		if err := a.EnsurePostgREST(context.Background(), s); err != nil {
+			t.Fatal(err)
+		}
+		if m := f.mutations(); len(m) != 0 {
+			t.Fatalf("made again a second time: %q", m)
+		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/testdocker"
 )
@@ -73,12 +74,12 @@ func gnHostConfig(t *testing.T, name string) string {
 func TestNode_GateSeesNetworkNamespaceSharer(t *testing.T) {
 	a, s, run := gnCase(t)
 	img := a.cfg.Images.ControlPlane
-	run("run", "-d", "--name", "sp-test-gate-member", "--label", "supapace.test=1", "--network", networkName(s.Ref),
+	run("run", "-d", "--name", "sp-test-gate-member", "--label", "supapace.test=1", "--network", platformNet,
 		"--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")
 	run("run", "-d", "--name", "sp-test-gate-sharer", "--label", "supapace.test=1", "--network", "container:sp-test-gate-member",
 		"--entrypoint", "sleep", img, "300")
 	t.Logf("sharer: %s", gnHostConfig(t, "sp-test-gate-sharer"))
-	n, _ := dockerInspectNetwork(context.Background(), networkName(s.Ref))
+	n, _ := dockerInspectNetwork(context.Background(), platformNet)
 	t.Logf("network members: %v", n.Containers)
 	err := a.CheckAdopted(context.Background(), s)
 	t.Logf("gate with a NET_RAW namespace sharer: %v", err)
@@ -99,11 +100,13 @@ func TestNode_StoppedHolderOfPlatformAddr(t *testing.T) {
 	t.Logf("gate with a created foreign holder of %s: %v", addr, err)
 	// Our PostgREST stand-in, created, connected at the same address, gated, started.
 	pr := postgrestName(s.Ref)
-	run("create", "--name", pr, "--label", "supapace.test=1", "--network", networkName(s.Ref), "--cap-drop", "ALL",
-		"--entrypoint", "sleep", img, "300")
+	run("create", "--name", pr, "--label", "supapace.test=1", "--network", networkName(s.Ref), "--ip", a.cfg.PostgRESTAddr(s.SubnetIndex).String(),
+		"--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")
 	out, cerr := exec.Command("docker", "network", "connect", "--ip", addr, platformNet, pr).CombinedOutput()
 	t.Logf("connect ours at the same address while the foreign one is created: %v %s", cerr, out)
-	t.Logf("gate before our start: %v", a.CheckAdopted(context.Background(), s))
+	if err := a.CheckAdopted(context.Background(), s); err != nil {
+		t.Errorf("gate before our start, ours created at both its addresses: %v", err)
+	}
 	out, serr := exec.Command("docker", "start", pr).CombinedOutput()
 	t.Logf("start ours: %v %s", serr, out)
 	out, ferr := exec.Command("docker", "start", "sp-test-gate-holder").CombinedOutput()
@@ -125,7 +128,7 @@ func TestNode_StoppedHolderOfPlatformAddr(t *testing.T) {
 }
 
 // Every way of asking for a capability at create time: what Docker
-// records, and the gate's verdict for a project member so configured.
+// records, and the gate's verdict for a platform member so configured.
 func TestNode_GateCapabilitySpellings(t *testing.T) {
 	a, s, run := gnCase(t)
 	img := a.cfg.Images.ControlPlane
@@ -148,7 +151,7 @@ func TestNode_GateCapabilitySpellings(t *testing.T) {
 	}
 	for i, c := range cases {
 		name := "sp-test-gate-cap" + string(rune('a'+i))
-		args := slices.Concat([]string{"run", "-d", "--name", name}, testdocker.Labels(t), []string{"--network", networkName(s.Ref)}, c.flags)
+		args := slices.Concat([]string{"run", "-d", "--name", name}, testdocker.Labels(t), []string{"--network", platformNet}, c.flags)
 		args = append(args, "--entrypoint", "sleep", img, "300")
 		out, err := exec.Command("docker", args...).CombinedOutput()
 		if err != nil {
@@ -176,7 +179,7 @@ func TestNode_GateHostileLabel(t *testing.T) {
 	img := a.cfg.Images.ControlPlane
 	hostile := "x\"}\n{\"id\":\"y\",\"name\":\"/z\",\"privileged\":false,\"cap_drop\":[\"ALL\"]}\n"
 	run("run", "-d", "--name", "sp-test-gate-label", "--label", "supapace.test=1", "--label", "evil="+hostile,
-		"--network", networkName(s.Ref), "--cap-drop", "ALL", "--cap-add", "NET_RAW", "--entrypoint", "sleep", img, "300")
+		"--network", platformNet, "--cap-drop", "ALL", "--cap-add", "NET_RAW", "--entrypoint", "sleep", img, "300")
 	err := a.CheckAdopted(context.Background(), s)
 	t.Logf("gate with a NET_RAW member carrying a hostile label: %v", err)
 	if !errors.Is(err, ErrContainment) || !strings.Contains(err.Error(), "NET_RAW") {
@@ -184,7 +187,7 @@ func TestNode_GateHostileLabel(t *testing.T) {
 	}
 	run("rm", "-f", "sp-test-gate-label")
 	run("run", "-d", "--name", "sp-test-gate-label2", "--label", "supapace.test=1", "--label", "evil="+hostile,
-		"--network", networkName(s.Ref), "--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")
+		"--network", platformNet, "--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")
 	if err := a.CheckAdopted(context.Background(), s); err != nil {
 		t.Errorf("hardened member with a hostile label refused: %v", err)
 	}
@@ -248,4 +251,75 @@ func TestNode_PlatformContainersWithOtherArgumentsRecreated(t *testing.T) {
 	if !strings.Contains(string(out), `["ALL"] none user="70:70"`) {
 		t.Errorf("%s left running with other arguments: %s", cpName, out)
 	}
+}
+
+// The member rule against Docker's own record of each member: a project
+// network holds its cluster and its PostgREST at their addresses and, on a
+// node with a studio domain, the proxy at its own; anything else, anything
+// elsewhere, refuses the start whatever its capabilities.
+func TestNode_GateProjectNetworkMembers(t *testing.T) {
+	a, s, run := gnCase(t)
+	ctx := context.Background()
+	img := a.cfg.Images.ControlPlane
+	proj := networkName(s.Ref)
+	i := s.SubnetIndex
+	member := func(name, ip string) {
+		t.Helper()
+		args := []string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", proj}
+		if ip != "" {
+			args = append(args, "--ip", ip)
+		}
+		run(append(args, "--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")...)
+	}
+	want := func(refusedFor, what string) {
+		t.Helper()
+		err := a.CheckAdopted(ctx, s)
+		t.Logf("%s: %v", what, err)
+		switch {
+		case refusedFor == "" && err != nil:
+			t.Errorf("%s: refused: %v", what, err)
+		case refusedFor != "" && (!errors.Is(err, ErrContainment) || errors.Is(err, ErrCheckIncomplete) ||
+			!strings.Contains(err.Error(), "member rule: "+refusedFor+" is on it")):
+			t.Errorf("%s: got %v, want the member rule naming %s", what, err, refusedFor)
+		}
+	}
+	pg, pr := clusterName(s.Ref), postgrestName(s.Ref)
+	// The cluster's stand-in alone, then with the PostgREST's.
+	member(pg, a.cfg.ClusterAddr(i).String())
+	want("", "the cluster alone")
+	member(pr, a.cfg.PostgRESTAddr(i).String())
+	run("network", "connect", "--ip", a.cfg.PlatformAddr(i).String(), platformNet, pr)
+	want("", "the cluster and the PostgREST")
+	// A hardened stranger: at an address Docker chose, at the reserved one.
+	member("sp-test-gate-stranger", "")
+	want("sp-test-gate-stranger", "a hardened stranger at an address Docker chose")
+	run("rm", "-f", "sp-test-gate-stranger")
+	r := a.cfg.Slice(i).Addr()
+	for range dashcfg.ReservedHost {
+		r = r.Next()
+	}
+	reserved := r.String()
+	member("sp-test-gate-stranger", reserved)
+	want("sp-test-gate-stranger", "a hardened stranger at the reserved address "+reserved)
+	run("rm", "-f", "sp-test-gate-stranger")
+	want("", "the stranger removed")
+	// The proxy's stand-in at the proxy's address: only with a studio domain.
+	proxy := dashcfg.ProxyAddr(a.cfg, i).String()
+	member(dashcfg.PgcapName, proxy)
+	want(dashcfg.PgcapName, "sp-pgcap at "+proxy+" on a node without a studio domain")
+	a.cfg.StudioDomain = "studio.test"
+	want("", "sp-pgcap at "+proxy+" on a node with a studio domain")
+	run("rm", "-f", dashcfg.PgcapName)
+	member(dashcfg.PgcapName, reserved)
+	want(dashcfg.PgcapName, "sp-pgcap at the reserved address")
+	run("rm", "-f", dashcfg.PgcapName)
+	// The cluster at another address, running and created.
+	run("rm", "-f", pg)
+	member(pg, reserved)
+	want(pg, "the cluster at the reserved address")
+	run("rm", "-f", pg)
+	run("create", "--name", pg, "--label", "supapace.test=1", "--network", proj, "--cap-drop", "ALL", "--entrypoint", "sleep", img, "300")
+	want(pg, "a created cluster without an address")
+	run("rm", "-f", pg)
+	want("", "the PostgREST alone")
 }

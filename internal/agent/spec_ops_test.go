@@ -56,7 +56,7 @@ func fixedKey() jwtx.Key {
 // OpsSpec must never be the cause.
 const (
 	recordedCluster = "a3c52bfb551e5ad945cdb5ad991f2eb19c82ebec89f5cf034d013df09a5a4f90"
-	recordedREST    = "5a3abc83bdab8fe17f9dc64d9a11ae65be3e6cb4dea4482698fbccc6c2d80348"
+	recordedREST    = "e20095f29427d2ef18eb180909433d68223197430168f085d6e394ac179bddc9"
 )
 
 func TestOpsSpec_ZeroValueChangesNoRenderedByte(t *testing.T) {

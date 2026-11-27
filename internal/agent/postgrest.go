@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/jwtx"
 	"github.com/Amphoze/supapace/internal/pgconf"
 )
@@ -111,13 +112,16 @@ func (a *Agent) postgrestArgs(s Spec) (flags, tail []string) {
 		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(),
 		"--read-only", "--memory", "256m", "--memory-swap", "256m", "--pids-limit", "64",
 		"--ulimit", "core=0", "--ulimit", "nofile=65536:65536", "--no-healthcheck", "--ipc", "private",
-		"--sysctl", "net.ipv4.ping_group_range=1 0", "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
+		"--sysctl", "net.ipv4.ping_group_range=1 0",
 		"-e", "GHCRTS=-N2",
 		"--network", networkName(s.Ref), "--ip", a.cfg.PostgRESTAddr(i).String(),
 		"-v", a.postgrestDir(s.Ref) + ":/etc/postgrest:ro",
 		"--label", labelRole + "=postgrest", "--label", labelRef + "=" + s.Ref,
 		"--label", labelGeneration + "=" + strconv.FormatInt(s.Generation, 10), "--label", labelEpoch + "=" + strconv.FormatInt(s.Epoch, 10),
 		"--label", labelImage + "=" + a.cfg.Images.PostgREST}
+	// On two networks: nothing is forwarded between them (IPv6 off, which it
+	// always had, is one of these settings).
+	flags = append(flags, dashcfg.NoForwardArgs()...)
 	tail = []string{"--", a.cfg.Images.PostgREST, "/bin/postgrest", "/etc/postgrest/" + postgrestConf}
 	return flags, tail
 }

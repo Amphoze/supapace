@@ -249,7 +249,9 @@ func TestNoForwardArgs(t *testing.T) {
 	want := []string{
 		"--sysctl", "net.ipv4.ip_forward=0",
 		"--sysctl", "net.ipv4.conf.all.rp_filter=1",
+		"--sysctl", "net.ipv4.conf.default.rp_filter=1",
 		"--sysctl", "net.ipv4.conf.all.arp_ignore=1",
+		"--sysctl", "net.ipv4.conf.default.arp_ignore=1",
 		"--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
 	}
 	got := NoForwardArgs()

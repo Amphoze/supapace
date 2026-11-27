@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgconf"
@@ -428,6 +429,7 @@ func (a *Agent) gatewayConfig(ctx context.Context) (opts, cmd []string, conf str
 		"--stop-timeout", "15", "--restart", "unless-stopped", "--label", labelRole + "=gateway",
 		"--network", ingressNet, "--ip", a.cfg.GatewayIngressIP, "-p", "0.0.0.0:443:8443", "-p", "0.0.0.0:80:8080",
 		"-v", gw + ":/etc/supapace/gateway:ro"}
+	opts = append(opts, dashcfg.NoForwardArgs()...) // on ingress and platform: nothing is forwarded between them
 	cmd = []string{a.cfg.Images.Gateway}
 	extra, err := fileDigests(filepath.Join(gw, "tls", "cert.pem"), a.seccompFile())
 	if err != nil {

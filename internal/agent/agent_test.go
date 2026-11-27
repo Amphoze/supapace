@@ -91,6 +91,7 @@ type fakeCtr struct {
 	Labels          map[string]string
 	Nets            map[string]string // network → configured address
 	NetMode         string            // HostConfig.NetworkMode; "" reads as Docker's default, "bridge"
+	Sysctls         map[string]string // HostConfig.Sysctls
 	Argv            []string          // the create/run argv that made it
 }
 
@@ -332,6 +333,9 @@ func (f *fakeHost) listContainers(ctx context.Context, label string) ([]dockerx.
 	f.record("list " + label)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.failInspect["list "+label]; err != nil {
+		return nil, err
+	}
 	k, v, withValue := strings.Cut(label, "=")
 	var out []dockerx.Container
 	for _, c := range f.ctrs {
@@ -569,7 +573,8 @@ func (c *fakeCtr) configJSON() string {
 		nets[n] = e
 	}
 	b, _ := json.Marshal(map[string]any{"id": c.ID, "name": "/" + c.Name, "running": c.Running, "privileged": c.Privileged,
-		"cap_add": c.CapAdd, "cap_drop": c.CapDrop, "restart": c.Restart, "netmode": c.mode(), "labels": c.Labels, "networks": nets})
+		"cap_add": c.CapAdd, "cap_drop": c.CapDrop, "restart": c.Restart, "netmode": c.mode(), "labels": c.Labels, "networks": nets,
+		"sysctls": c.Sysctls})
 	return string(b)
 }
 
@@ -624,6 +629,13 @@ func parseRun(args []string) *fakeCtr {
 	for _, l := range flagValues(args, "--label") {
 		k, v, _ := strings.Cut(l, "=")
 		c.Labels[k] = v
+	}
+	for _, l := range flagValues(args, "--sysctl") {
+		k, v, _ := strings.Cut(l, "=")
+		if c.Sysctls == nil {
+			c.Sysctls = map[string]string{}
+		}
+		c.Sysctls[k] = v
 	}
 	switch n := flagValue(args, "--network"); {
 	case n == "none" || n == "host" || strings.HasPrefix(n, "container:"):
@@ -1106,8 +1118,12 @@ func TestCheckContainment_CapabilitiesFromConfig(t *testing.T) {
 		"privileged":              func(a *Agent, f *fakeHost, s Spec) { f.ctrs["pg-"+s.Ref].Privileged = true },
 		"no cap_drop ALL":         func(a *Agent, f *fakeHost, s Spec) { f.ctrs["postgrest-"+s.Ref].CapDrop = []string{"NET_RAW"} },
 		"platform member net_raw": func(a *Agent, f *fakeHost, s Spec) { f.ctrs["sp-gateway"].CapAdd = []string{"CAP_NET_RAW"} },
-		"project member privileged": func(a *Agent, f *fakeHost, s Spec) {
+		"platform member privileged": func(a *Agent, f *fakeHost, s Spec) {
 			f.ctr(fakeCtr{Name: "stranger", Running: true, Privileged: true, CapDrop: []string{"ALL"},
+				Nets: map[string]string{"platform": "10.212.6.20"}})
+		},
+		"project stranger, hardened": func(a *Agent, f *fakeHost, s Spec) {
+			f.ctr(fakeCtr{Name: "stranger", Running: true, CapDrop: []string{"ALL"},
 				Nets: map[string]string{"proj-" + s.Ref: "10.213.3.140"}})
 		},
 		"cap_add any other": func(a *Agent, f *fakeHost, s Spec) { f.ctrs["pg-"+s.Ref].CapAdd = []string{"CHOWN"} },
@@ -1699,6 +1715,9 @@ func TestEnsureGateway_Args(t *testing.T) {
 		"--security-opt seccomp=" + filepath.Join(a.p.PlatformDir(), "seccomp.json"), "--read-only",
 		"--memory 768m", "--memory-swap 768m", "--pids-limit 256", "--ulimit core=0", "--stop-timeout 15",
 		"--restart unless-stopped", "--label supapace.role=gateway", "--network ingress --ip 10.212.8.2",
+		"--sysctl net.ipv4.ip_forward=0", "--sysctl net.ipv4.conf.all.rp_filter=1", "--sysctl net.ipv4.conf.all.arp_ignore=1",
+		"--sysctl net.ipv4.conf.default.rp_filter=1", "--sysctl net.ipv4.conf.default.arp_ignore=1",
+		"--sysctl net.ipv6.conf.all.disable_ipv6=1",
 		"-p 0.0.0.0:443:8443", "-p 0.0.0.0:80:8080", "-v " + gw + ":/etc/supapace/gateway:ro", "-- supapace-gateway:local",
 	} {
 		if !strings.Contains(argv, want) {
@@ -2004,7 +2023,7 @@ func rows(t *testing.T, a *Agent) map[string]nodecfg.CheckResult {
 
 var blockingRows = []string{"nft", "docker-version", "daemon.json", "live-restore", "docker-networks", "docker-seccomp",
 	"uplinks", "quota-accounting", "quota-enforcement", "ptrace_scope", "kek", "platform-members", "core_pattern",
-	"br_netfilter", "file-max"}
+	"br_netfilter", "file-max", "forwarding", "project-addresses"}
 
 func TestNodeCheck_Rows(t *testing.T) {
 	a, _ := goodNode(t)

@@ -6421,3 +6421,90 @@ Known limits:
   is read once after the page's read. WebKit keeps no cookie, the mark included, on a host that
   is itself a listed suffix, so a wait for the mark there can only time out.
 - A barrier cookie must be one the engine keeps on that host; a refused barrier is not a delay.
+
+### 2026-11-27 — Node network: exact members of a project network; no forwarding on two networks
+internal/agent (gate.go, nodecheck.go, postgrest.go, platform.go), internal/dashcfg (env.go).
+- dashcfg.NoForwardArgs(): the docker arguments that keep a container on two networks from
+  forwarding between them - six --sysctl pairs, in this order: net.ipv4.ip_forward=0,
+  net.ipv4.conf.all.rp_filter=1, net.ipv4.conf.default.rp_filter=1,
+  net.ipv4.conf.all.arp_ignore=1, net.ipv4.conf.default.arp_ignore=1,
+  net.ipv6.conf.all.disable_ipv6=1. sp-gateway and every postgrest-<ref> are created with them
+  (a PostgREST after its own options; the IPv6 setting is there once); the wire proxy must be.
+- Why the conf.default pair: for the reverse-path filter and arp_ignore the kernel takes the
+  larger of conf.all and the interface's own value, and an interface starts with its
+  namespace's default, which a new namespace takes from the host - often 2, the loose filter.
+  With conf.all=1 alone every interface stayed loose. With both, the first interface, one
+  connected before the start and one attached after it are strict. The arp_ignore default
+  changes nothing in effect (conf.all=1 already gives 1); it keeps each interface's value at 1.
+- The settings are part of the configuration label of the gateway and of each PostgREST. At
+  the first daemon start after the upgrade the gateway is made again (log: "re-creating
+  sp-gateway: its configuration changed") and each PostgREST at its adoption; clusters are not
+  touched. Measured with two projects: about 1 s of refused connections, then about 3 s of 503
+  on each project. Later starts make nothing again. Changing the list changes every label.
+- Start gate, condition 7 (CheckContainment, CheckAdopted) - the member rule: proj-<ref> holds
+  at most pg-<ref> at ClusterAddr(i), postgrest-<ref> at PostgRESTAddr(i) and, only on a node
+  whose dashboard is configured (a studio domain and a configuration dashcfg.For accepts),
+  sp-pgcap at dashcfg.ProxyAddr(cfg, i). Any other member, one of the three at another address
+  (the reserved host included), or one created without a configured address refuses the start,
+  whatever its capabilities. Fewer members are not refused. It covers every container the gate
+  reads: the running members of the three networks and the two tenant containers by name,
+  running or created. Text (match on "member rule"):
+    proj-<ref>: member rule: <container> is on it at "<address>"; it may hold only
+    pg-<ref> at <a>, postgrest-<ref> at <b>[, sp-pgcap at <c>]
+  It names nothing of another network and no label. A completed finding: ErrContainment, never
+  ErrCheckIncomplete. An operation ends as final with containment_failed; a refused restart
+  leaves the project restarting with its route draining until the member is removed and
+  'supapace op retry <id>' is run. Other projects start and serve meanwhile.
+- Start gate, fixed addresses: each of the dashboard's four addresses on platform
+  (dashcfg.Static, on every node) may be held only by its own container - sp-studio,
+  sp-pgmeta-0, sp-pgmeta-1, sp-pgcap. Another holder, running or created, refuses every start:
+    <container> holds <address> on platform, the address of <owner>
+  A stranger elsewhere on platform does not refuse a start; the node check reports it.
+- ctrConf.Sysctls: Docker's record of a container's sysctls, read with
+  index .HostConfig "Sysctls" - Docker leaves the key out of a container that has none, and a
+  field reference then fails the read of every container in the call.
+- Node check rows, all blocking under Blocking():
+  - platform-members also accepts the dashboard's four containers, each at its address with
+    its role label (studio, pgmeta, pgmeta, pgcap), only on a node whose dashboard is
+    configured; elsewhere each is "foreign member <name>". A mismatch reads
+    "<name> at <address>: not at <want> with the role label <role>".
+  - project-addresses: every network named proj-*, its members read as the gate reads them,
+    held to the member rule; the slice is the number in the bridge name spp<i>, confirmed by
+    the subnet. A member on such a network that is no slice of the node:
+    "<network>: member rule: <container> is on it, and it is not a slice of this node".
+    It passes with a member missing, a network empty or gone since the listing, an endpoint key
+    that resolves within the re-reads; it fails on any read error and on a key that stays.
+    Cost: three Docker calls a project network (about 50 ms each network on a test node).
+  - forwarding: Docker's record of sp-gateway, of every container labelled
+    supapace.role=postgrest (running or not) and of any container named sp-pgcap holds each
+    setting at its value, else "<container> was not created with <key>=<value>". The gateway
+    and a PostgREST are judged only when they carry the configuration label this daemon
+    computes now (a PostgREST's from its own ref, generation and epoch labels, its platform
+    address and postgrest.conf on disk): one with another label is not adopted, is made again
+    by its next ensure, and the rows gateway and rest-container report it - so a daemon start
+    after an upgrade does not stop the node's projects. sp-pgcap is always judged, whatever
+    its label, state or networks.
+- Caller rules:
+  - Attach a container to a project network only with --ip; a connect without one takes the
+    first free address, and from then on every start of that project is refused.
+  - Create the proxy with NoForwardArgs from its first version, with no capability, the role
+    label pgcap, at its platform address. On a node whose dashboard is no longer configured
+    remove it, with its attachments, before the node check of a daemon start: left there,
+    platform-members and project-addresses fail and every project is stopped until it is gone
+    (the node then recovers by itself within seconds). The same holds for sp-studio and
+    sp-pgmeta-*.
+  - A package that exempts dashboard container rows in Blocking() leaves project-addresses
+    and forwarding blocking.
+- Known limits: Docker lists only running containers as members, so a stopped stranger
+  configured on a project network is seen when it runs (the two tenant containers are read
+  created or stopped). The row forwarding reads Docker's record, not the namespace; the node
+  test TestNode_ForwardingDefaultsAndApplied reads the namespace, per interface. The gate
+  accepts sp-pgcap on a project network by name and address alone; its settings are the row's.
+  A container on one project's network fails project-addresses for the node: at the next
+  daemon start every project is stopped, not only that one.
+- Tests: TestGate_ProjectNetworkMembers, TestGate_FixedPlatformAddressUnderAnotherName,
+  TestGate_TransientEndpointIsReadAgain, TestNodeCheck_ProjectAddresses,
+  TestNodeCheck_Forwarding, TestNodeCheck_PlatformMembers_AcceptsTheFour_OnlyWithAStudioDomain;
+  on a node (make node-proof PKG=internal/agent) TestNode_ForwardingDefaultsAndApplied and
+  TestNode_GateProjectNetworkMembers. A test that needs a scratch member for the capability
+  rule puts it on the platform network, never on a project's.
