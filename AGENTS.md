@@ -5979,3 +5979,32 @@ For the wiring that calls these:
   Known limits: a crash loop whose crashes are more than a minute apart passes the restart rule
   outside the minute after each restart; a postgres-meta that restarted while root had removed
   its key copy keeps the built-in key until it is made again.
+
+### 2026-11-27 — Studio: no secret in settings responses; keys from the control plane
+The secrets patches of the Studio series. What a dashboard answer may hold of a project's keys:
+- `settings`, `config`, `config/postgrest`: no `jwt_secret` member; the server holds no JWT
+  secret. `settings.service_api_keys` names the anon and service_role keys with empty values;
+  the props route has no `defaultApiKey`/`serviceApiKey`. These routes ask the control plane
+  for no key, so they answer while it is silent.
+- `GET /api/v1/projects/<ref>/api-keys` and `…/api-keys/<id>`: one `keys` call per request with
+  the request's own assertion (`projectKeys()` in `lib/api/self-hosted/api-keys.ts`), nothing
+  kept. The list holds the anon key; `service_role` is listed only when the query is exactly
+  `reveal=true` AND the control plane answered the key, which the client module accepts only
+  for an owner under the purpose `reveal`. Unknown id: `404` `API key not found`. Both answer
+  `Cache-Control: no-store`.
+- `GET …/config/auth/signing-keys`: the control plane's public keys in its order, each
+  `{id: kid, algorithm, status: "in_use", public_jwk: {kty, kid, alg, n, e}}`, no dates.
+- Refusals are the control plane client's: its five passed-on codes, else
+  `503 project_unavailable`; no key in an error body or a log line.
+- postgres-meta receives `Content-Type` and `x-connection-encrypted` (the request project's,
+  never the caller's) beside the HTTP client's own headers; type generation also sends a
+  request id its sender makes.
+- Key page: the anon key from the key list; `Reveal` sends `…/api-keys/service_role?reveal=true`
+  once, on the click. JWT keys page: a read-only table of the signing keys.
+Caller rules: call `projectKeys()` in the request's own flow; only the two key routes pass on
+`service_role_key`; an answer that can hold a key is `no-store`. Removed: the self-hosted
+constants file, `AUTH_JWT_SECRET` and the four `SUPABASE_*` key names (an importer or a read
+fails the build).
+Known limits: three client components still fetch the revealed list on load (an owner's page
+load fetches the key; others get the anon key alone); the `Reveal` button shows for every role;
+pages that read the anon key from `settings` show none. Proof: `studio/prove/secrets.sh`.

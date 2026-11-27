@@ -15,8 +15,9 @@
 #   - and the controls: with a valid assertion every served API route is answered by its own
 #     handler, and every page by the application — whose HTML holds no value of the project:
 #     neither one the control plane answered nor one of the process's own settings, all of
-#     them marked for this (and a route that answers one of the process's shows that the
-#     search finds them).
+#     them marked for this. No route answers a value of the process any more, so the control
+#     plants them: each marked setting, read from the server container's own environment,
+#     is appended to a page the server answered, and the search must find every one.
 # A row is one request; a row that is answered otherwise fails the proof, and so does a row
 # that was started and left no line. Prints the failed rows and the count of rows by kind and
 # answer; exits 1 when a row fails.
@@ -195,19 +196,23 @@ logged
 # Then the pages, on a server whose own settings are marked too — the names the application
 # still takes from the process. With a valid assertion every page is answered by the
 # application, and its HTML holds no marked value: none the control plane answered for the
-# project, none of the process. That the marks are there to be found is the control: a route
-# that still answers one of them is searched in the same way.
-studio -e SUPABASE_URL=http://spmarkurl \
-  -e SUPABASE_ANON_KEY=spmarkAnonKey -e SUPABASE_SERVICE_KEY=spmarkServiceKey \
-  -e AUTH_JWT_SECRET=spmarkJwtSecret -e POSTGRES_PASSWORD=spmarkPassword \
+# project, none of the process. That the marks are in the process and that the search finds
+# them is the control: no route answers one, so each is planted — read from the container's
+# environment as a process started in it sees it, and appended to a page the server answered.
+PLANTED='spmarkurl spmarkPassword spmarkpghost spmarkdb spmarkmeta'
+studio -e SUPABASE_URL=http://spmarkurl -e POSTGRES_PASSWORD=spmarkPassword \
   -e POSTGRES_HOST=spmarkpghost -e POSTGRES_DB=spmarkdb -e STUDIO_PG_META_URL=http://spmarkmeta ||
   { echo "manifest.sh: the server did not restart" >&2; exit 1; }
 marked() { grep -i -c -e spmark -e '10\.212\.' "$1"; }
 own
-curl -s --path-as-is -m 60 -o "$T/page" "$U/api/platform/projects/$A/settings" -H "X-Supapace-Assertion: $TOKEN"
-# the process's marks alone: "spmark" and a letter (the control plane's go on with - or .)
-n=$(grep -c 'spmark[A-Za-z]' "$T/page")
-put 'a route that answers a marked value of the process: the search finds it (control)' "$([ "$n" -gt 0 ] && echo found || echo 'not found')" "$([ "$n" -gt 0 ] && echo ok || echo FAIL)" "GET /api/platform/projects/$A/settings"
+curl -s --path-as-is -m 60 -o "$T/page" "$U/project/$A" -H "X-Supapace-Assertion: $TOKEN" -H 'Accept: text/html'
+docker exec "$PREFIX-studio" node -e 'for (const [k, v] of Object.entries(process.env)) console.log(k + "=" + v)' >"$T/env"
+n=0
+for m in $PLANTED; do
+  { cat "$T/page" && grep -F -- "$m" "$T/env"; } >"$T/planted"
+  [ "$(marked "$T/planted")" -gt 0 ] && n=$((n + 1))
+done
+put 'a marked value of the process, planted in a page: the search finds it (control)' "$n of 5, the page alone: $(marked "$T/page")" "$([ "$n" = 5 ] && [ "$(marked "$T/page")" = 0 ] && echo ok || echo FAIL)" "GET /project/$A"
 while IFS=$'\t' read -r kind id methods; do
   [ "$kind" = page ] || continue
   own
