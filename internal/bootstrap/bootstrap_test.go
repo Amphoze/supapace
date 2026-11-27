@@ -243,11 +243,11 @@ func TestStatements_AreConstants(t *testing.T) {
 				pos := fset.Position(call.Pos())
 				switch f := call.Fun.(type) {
 				case *ast.SelectorExpr:
-					if raw[f.Sel.Name] && fn.Name.Name != "execSQL" && fn.Name.Name != "querySQL" {
-						t.Errorf("%s: %s called outside execSQL/querySQL", pos, f.Sel.Name)
+					if raw[f.Sel.Name] && fn.Name.Name != "execSQL" && fn.Name.Name != "querySQL" && fn.Name.Name != "pipeSQL" {
+						t.Errorf("%s: %s called outside execSQL/querySQL/pipeSQL", pos, f.Sel.Name)
 					}
 				case *ast.Ident:
-					if f.Name != "execSQL" && f.Name != "querySQL" {
+					if f.Name != "execSQL" && f.Name != "querySQL" && f.Name != "pipeSQL" {
 						return true
 					}
 					calls++
@@ -369,17 +369,18 @@ func unqualified(body string) error {
 // ---- tests against the pinned cluster image ----
 
 func TestRun_PasswordsAreVerifiers(t *testing.T) {
-	c := startCluster(t)
+	c := startReadOnlyCluster(t)
 	conn := c.dial("supabase_admin")
 	for role, pw := range map[string]string{"supabase_admin": c.secrets.SupabaseAdminPassword,
-		"postgres": c.secrets.PostgresPassword, "authenticator": c.secrets.AuthenticatorPassword} {
+		"postgres": c.secrets.PostgresPassword, "authenticator": c.secrets.AuthenticatorPassword,
+		"supabase_read_only_user": c.secrets.ReadOnlyPassword} {
 		want, _ := pgsock.ScramVerifier(pw, c.secrets.ScramSalts[role])
 		if got := c.str(conn, "select rolpassword from pg_catalog.pg_authid where rolname = $1", role); got != want {
 			t.Errorf("%s: stored %q, want %q", role, got, want)
 		}
 	}
-	if n := c.str(conn, "select count(*)::text from pg_catalog.pg_authid where rolname = any($1) and rolpassword is null", servicePasswordRoles); n != "6" {
-		t.Errorf("%s of the six service roles without a password", n)
+	if n := c.str(conn, "select count(*)::text from pg_catalog.pg_authid where rolname = any($1) and rolpassword is null", servicePasswordRoles); n != strconv.Itoa(len(servicePasswordRoles)) {
+		t.Errorf("%s of the %d service roles without a password", n, len(servicePasswordRoles))
 	}
 	// Phase B: the platform's administrative role logs in with its password.
 	c.phaseB()
@@ -390,13 +391,39 @@ func TestRun_PasswordsAreVerifiers(t *testing.T) {
 }
 
 func TestRun_NoPasswordsForServiceRoles(t *testing.T) {
-	c := startCluster(t)
+	c := startReadOnlyCluster(t)
 	conn := c.dial("supabase_admin")
 	if n := c.str(conn, "select count(*)::text from pg_catalog.pg_authid where rolname = any($1) and rolpassword is not null", servicePasswordRoles); n != "0" {
 		t.Fatalf("%s service roles with a password", n)
 	}
+	// The read-only login has the platform's verifier: no finding; a foreign
+	// verifier on it is one.
+	ro := func() []nodecfg.CheckResult {
+		r, err := AssertReadOnlyVerifier(context.Background(), conn, c.secrets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	c.wantFindings(append(c.assert(conn), ro()...))
+	c.exec(conn, "alter role supabase_read_only_user password 'x-foreign-1234'")
+	c.wantFindings(ro(), "service-passwords")
+	c.wantFindings(c.assert(conn))
 	c.exec(conn, "alter role pgbouncer password 'x-1234'")
 	c.wantFindings(c.assert(conn), "service-passwords")
+}
+
+// startReadOnlyCluster is startCluster with a read-only password: Run sets
+// the fourth verifier.
+func startReadOnlyCluster(t *testing.T) *cluster {
+	c := newCluster(t, 1)
+	c.withReadOnly()
+	c.run()
+	if err := Run(context.Background(), c.dial("supabase_admin"), c.secrets); err != nil {
+		c.logs()
+		t.Fatalf("run: %v", err)
+	}
+	return c
 }
 
 func TestRun_Idempotent(t *testing.T) {
@@ -1141,7 +1168,7 @@ func TestStatements_AreConstantsStrict(t *testing.T) {
 	raw := map[string]bool{"Exec": true, "Query": true, "QueryRow": true, "SendBatch": true, "CopyFrom": true,
 		"Prepare": true, "PgConn": true, "LoadType": true, "LoadTypes": true, "Begin": true, "BeginTx": true,
 		"Deallocate": true, "DeallocateAll": true, "WaitForNotification": true, "Ping": true}
-	wrapper := map[string]bool{"execSQL": true, "querySQL": true}
+	wrapper := map[string]bool{"execSQL": true, "querySQL": true, "pipeSQL": true}
 	fromVerifierStatement := func(id *ast.Ident) bool {
 		as, ok := id.Obj.Decl.(*ast.AssignStmt)
 		if !ok || len(as.Rhs) != 1 {
@@ -1603,12 +1630,12 @@ func TestVerifierStatement_RefusesOtherPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator} {
+	for _, p := range []string{sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator, sqlPasswordReadOnly} {
 		if _, err := verifierStatement(p, v); err != nil {
 			t.Errorf("%q refused: %v", p, err)
 		}
 	}
-	for _, p := range []string{"", "select 1; " + sqlPasswordPostgres, "alter role anon password '"} {
+	for _, p := range []string{"", "select 1; " + sqlPasswordPostgres, "alter role anon password '", "select 1; " + sqlPasswordReadOnly} {
 		if _, err := verifierStatement(p, v); err == nil {
 			t.Errorf("prefix %q accepted", p)
 		}

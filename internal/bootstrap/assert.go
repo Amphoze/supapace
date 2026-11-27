@@ -91,9 +91,10 @@ var (
 		"pgbouncer", "supabase_privileged_role", "supabase_realtime_admin", "supapace_backup"}
 	// servicePasswordRoles have no password after bootstrap. This list is the
 	// one place that says so: a role the platform later gives a password is
-	// removed from it.
+	// removed from it. The read-only login has none or the platform's
+	// (AssertReadOnlyVerifier).
 	servicePasswordRoles = []string{"pgbouncer", "supabase_auth_admin", "supabase_storage_admin",
-		"supabase_replication_admin", "supabase_etl_admin", "supabase_read_only_user"}
+		"supabase_replication_admin", "supabase_etl_admin"}
 	authFunctions = []string{"email", "jwt", "role", "uid"}
 )
 

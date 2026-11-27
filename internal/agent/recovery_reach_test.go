@@ -41,8 +41,9 @@ var rrLeak = regexp.MustCompile(`(?i)SCRAM-SHA-256|alter role|pg_read_all_settin
 
 func rrSecrets(t *testing.T, ref string, dek []byte) bootstrap.Secrets {
 	s := bootstrap.Secrets{SupabaseAdminPassword: clRandom(t, 32), PostgresPassword: clRandom(t, 32),
-		AuthenticatorPassword: clRandom(t, 32), PgsodiumRootKey: clRandom(t, 32), ScramSalts: map[string][]byte{}}
-	for _, r := range []string{"supabase_admin", "postgres", "authenticator"} {
+		AuthenticatorPassword: clRandom(t, 32), PgsodiumRootKey: clRandom(t, 32), ScramSalts: map[string][]byte{},
+		ReadOnlyPassword: clRandom(t, 32)}
+	for _, r := range []string{"supabase_admin", "postgres", "authenticator", "supabase_read_only_user"} {
 		var err error
 		if s.ScramSalts[r], err = pgsock.ScramSalt(dek, ref, r); err != nil {
 			t.Fatal(err)
@@ -542,7 +543,8 @@ func rrSettings(kind string, kvs []string) []string {
 // start promotes, the re-key completes, and nothing of it is in the server
 // log, the statement statistics, the activity view (as the tenant's own job
 // copies it) or the tenant's capture tables; the normal start's login works
-// with the new password and the old one is refused. Controls: without the
+// with the new password and the old one is refused, the read-only login's
+// (the fourth statement) as the platform's. Controls: without the
 // three extension pins a registered login check refuses the platform's
 // login; with the recovery read sent first, the statements after it are
 // logged.
@@ -563,8 +565,8 @@ func TestRekey_OnRestoredContentWithEverySettingOfTheExperiment(t *testing.T) {
 	})
 	ctx := context.Background()
 	old := s
-	s.Secrets.SupabaseAdminPassword, s.Secrets.PostgresPassword, s.Secrets.AuthenticatorPassword =
-		clRandom(t, 32), clRandom(t, 32), clRandom(t, 32) // the next generation's passwords, the same salts
+	s.Secrets.SupabaseAdminPassword, s.Secrets.PostgresPassword, s.Secrets.AuthenticatorPassword, s.Secrets.ReadOnlyPassword =
+		clRandom(t, 32), clRandom(t, 32), clRandom(t, 32), clRandom(t, 32) // the next generation's passwords, the same salts
 	rrRecover(t, a, s, pgconf.RecoveryTarget{Timeline: "latest"}, "")
 
 	from := len(rrLog(t, s, 0))
@@ -627,6 +629,13 @@ func TestRekey_OnRestoredContentWithEverySettingOfTheExperiment(t *testing.T) {
 	if c, err := pgsock.Dial(ctx, a.clusterTarget(old, st, false)); err == nil {
 		closeSession(c)
 		t.Error("the previous password logs in")
+	}
+	// The read-only login over TCP: the current password, not the backup's.
+	if out, err := rrReadOnlyLogin(s, s.Secrets.ReadOnlyPassword); err != nil || out != "supabase_read_only_user on" {
+		t.Errorf("read-only login with the current password: %v %q", err, out)
+	}
+	if out, err := rrReadOnlyLogin(s, old.Secrets.ReadOnlyPassword); err == nil {
+		t.Errorf("the read-only login logs in with the password of the backup's time: %q", out)
 	}
 
 	// Control: a login check enabled in the system file refuses the platform's
@@ -1108,4 +1117,14 @@ func TestRekey_ScheduledJobDoesNotRunBesideTheRekey(t *testing.T) {
 	if _, err := a.Rekey(ctx, s); !pgsock.IsBudget(err) {
 		t.Fatalf("control: without the scheduler's pins the re-key gave %v, want a budget error", err)
 	}
+}
+
+// rrReadOnlyLogin logs in as the read-only login over TCP inside the cluster's
+// container, requiring SCRAM, and reports the user and its default
+// transaction mode.
+func rrReadOnlyLogin(s Spec, password string) (string, error) {
+	out, err := exec.Command("docker", "exec", "-e", "PGPASSWORD="+password, clusterName(s.Ref), "psql", "-XAt",
+		"host=127.0.0.1 port=5432 dbname=postgres sslmode=disable require_auth=scram-sha-256 user=supabase_read_only_user",
+		"-c", "select current_user || ' ' || current_setting('transaction_read_only')").CombinedOutput()
+	return strings.TrimSpace(string(out)), err
 }

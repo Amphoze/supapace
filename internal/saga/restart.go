@@ -12,6 +12,7 @@ import (
 	"github.com/Amphoze/supapace/internal/agent"
 	"github.com/Amphoze/supapace/internal/bklimit"
 	"github.com/Amphoze/supapace/internal/bootstrap"
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/pgsock"
 	"github.com/Amphoze/supapace/internal/store"
 )
@@ -27,7 +28,8 @@ import (
 // role's grant and the project's first backup) run after the project is
 // served again, and only while it has no backup set, so a layout-1
 // project's restart to layout 2 (the switch) is completed by any later
-// restart.
+// restart. R6, last and at every layout, gives a project made before the
+// read-only login's secret existed its verifier and secret.
 var restartSteps = []step{
 	{"R0", (*job).checkBase},
 	{"R1", (*job).prevalidate},
@@ -41,6 +43,7 @@ var restartSteps = []step{
 	{"S4", firstBackup(func(x *job, ctx context.Context) error { _, err := x.awaitJob(ctx, "backup"); return err })},
 	{"S5", firstBackup(func(x *job, ctx context.Context) error { _, err := x.awaitJob(ctx, "check"); return err })},
 	{"S6", firstBackup((*job).replicate)},
+	{"R6", (*job).readOnlyLogin},
 }
 
 // restartLayout2 are the restart steps of a pass whose target is at layout 2.
@@ -509,4 +512,34 @@ func (x *job) stranded(ctx context.Context, msg string) string {
 		"'supapace op retry %d' continues this restart; 'supapace project restart %s --set KEY=VALUE' replaces it with "+
 		"other settings; 'supapace project delete %s' removes the project", p.Generation, x.op.ID, x.op.Ref, x.op.Ref)
 	return pgsock.Sanitize(msg, maxLastError-len(note)) + note
+}
+
+// R6: the read-only login's platform password, once. A project that has its
+// secret completes the step at once. One that has none gets a new password:
+// the verifier first (SetReadOnlyLogin), then the secret. Nothing is written
+// to the parameters: the secret's existence is the record, and a stop
+// between the two leaves no secret, so the next restart sets a fresh one.
+func (x *job) readOnlyLogin(ctx context.Context) error {
+	if _, _, err := x.r.st.GetSecret(ctx, x.op.Ref, dashcfg.SecretROPassword); !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	s, err := x.current(ctx)
+	if err != nil {
+		return err
+	}
+	plain, err := password()
+	if err != nil {
+		return err
+	}
+	defer clear(plain)
+	s.Secrets.ReadOnlyPassword = string(plain)
+	if err := x.r.ag.SetReadOnlyLogin(ctx, s); err != nil {
+		return err
+	}
+	dek, err := x.r.dek(ctx, x.op.Ref, false)
+	if err != nil {
+		return err
+	}
+	defer clear(dek)
+	return x.r.putSecret(ctx, dek, x.op.Ref, dashcfg.SecretROPassword, plain)
 }

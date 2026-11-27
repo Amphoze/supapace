@@ -578,6 +578,7 @@ func TestSessionStatements_NamesCarryTheirSchema(t *testing.T) {
 		"sqlCanaryRelation": sqlCanaryRelation, "sqlCanaryDrop": sqlCanaryDrop,
 		"sqlTerminateRole": sqlTerminateRole, "sqlUnlinkReadOnlyLargeObjects": sqlUnlinkReadOnlyLargeObjects,
 		"sqlReadOnlySignalOn": sqlReadOnlySignalOn, "sqlReadOnlySignalOff": sqlReadOnlySignalOff, "sqlRestorePoint": sqlRestorePoint,
+		"sqlReadOnlyJobsPass": sqlReadOnlyJobsPass, "sqlReadOnlyVerifier": sqlReadOnlyVerifier,
 	} {
 		if bad := check(stmt); len(bad) > 0 {
 			t.Errorf("%s: %v", name, bad)

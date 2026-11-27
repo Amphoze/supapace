@@ -48,6 +48,8 @@ type clPG struct {
 	assertConf  []byte
 	assertNames []string // the command-line names the last assertion was given
 	assertHBA   []byte
+	roFinds     []nodecfg.CheckResult // the read-only login's check
+	roSecrets   []bootstrap.Secrets   // the secrets each such check was given
 
 	taskExit map[string]string // task kind → exit code printed by the poll ("0" when absent)
 	taskOut  map[string]string // task kind → logs, stdout
@@ -104,6 +106,13 @@ func clFakePG(t *testing.T, f *fakeHost) *clPG {
 			defer pg.mu.Unlock()
 			pg.assertHBA = slices.Clone(hba)
 			return slices.Clone(pg.hbaFinds), nil
+		}),
+		swap(&bootstrapAssertReadOnlyVerifier, func(ctx context.Context, c *pgx.Conn, s bootstrap.Secrets) ([]nodecfg.CheckResult, error) {
+			f.record("assert read-only login")
+			pg.mu.Lock()
+			defer pg.mu.Unlock()
+			pg.roSecrets = append(pg.roSecrets, s)
+			return slices.Clone(pg.roFinds), nil
 		}),
 		swap(&readyPoll, time.Millisecond),
 		swap(&taskPoll, time.Millisecond),
@@ -2449,5 +2458,44 @@ func TestEnsureCluster_AdoptionIPFailureRetried(t *testing.T) {
 	err := a.EnsureCluster(context.Background(), s)
 	if m := f.mutations(); err != nil || len(m) != 0 {
 		t.Fatalf("one failed ip call: err %v, mutations %q; want the running cluster adopted", err, m)
+	}
+}
+
+// TestClusterAssert_ReadOnlyVerifierChecked: the assertion's three callers —
+// the create's first boot, the first phase-B start and the drift check (a
+// restart's verification) — run the read-only login's check with the spec's
+// secrets, and report its finding: blocking at the first two, drift at the
+// third.
+func TestClusterAssert_ReadOnlyVerifierChecked(t *testing.T) {
+	finding := []nodecfg.CheckResult{{Name: "service-passwords", Detail: "role supabase_read_only_user has a password that differs from the platform's"}}
+	a, _, s, pg := clSetup(t)
+	s.Secrets.ReadOnlyPassword = "pw-read-only-0123456789"
+	pg.roFinds = finding
+	if err := a.EnsureCluster(context.Background(), s); !errors.Is(err, bootstrap.ErrAssertion) || !strings.Contains(err.Error(), "service-passwords") {
+		t.Fatalf("first boot: %v", err)
+	}
+	if len(pg.roSecrets) != 1 || pg.roSecrets[0].ReadOnlyPassword != s.Secrets.ReadOnlyPassword {
+		t.Fatalf("first boot: secrets given %d times", len(pg.roSecrets))
+	}
+
+	a, f, s, pg := clSetup(t)
+	s.FirstBoot = false
+	clState(t, a, s, State{Epoch: s.Epoch, Generation: s.Generation, Phase: PhaseADone})
+	pg.roFinds = finding
+	if err := a.EnsureCluster(context.Background(), s); !errors.Is(err, bootstrap.ErrAssertion) || !strings.Contains(err.Error(), "service-passwords") {
+		t.Fatalf("first phase-B start: %v", err)
+	}
+	pg.roFinds = nil
+	clToPhaseB(t, a, f, s)
+	pg.roFinds, pg.roSecrets = finding, nil
+	drift, err := a.CheckCluster(context.Background(), s)
+	if err != nil || !slices.Equal(drift, finding) || len(pg.roSecrets) != 1 {
+		t.Fatalf("drift check: %v %v, %d checks", drift, err, len(pg.roSecrets))
+	}
+	if err := a.VerifyCluster(context.Background(), s); err != nil {
+		t.Fatalf("a finding failed the verification: %v", err)
+	}
+	if i, j := slices.Index(f.calls(), "assert"), slices.Index(f.calls(), "assert read-only login"); i < 0 || j < i {
+		t.Fatalf("calls %q", f.calls())
 	}
 }

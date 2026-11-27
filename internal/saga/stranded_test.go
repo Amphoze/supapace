@@ -113,7 +113,7 @@ func TestRestart_StartFailureRollsBack(t *testing.T) {
 	op := e.waitState(id, "aborted")
 	want := "rolled_back: the project runs its previous configuration at generation 3; the restart to generation 2 was " +
 		"rolled back because its stop/start step failed: internal: " + errNoStart.Error()
-	if op.LastError != want || op.Step != "R5" || op.Attempts != 1 {
+	if op.LastError != want || op.Step != "R6" || op.Attempts != 1 {
 		t.Fatalf("op %s", brief(op))
 	}
 	var quotas []int
@@ -222,7 +222,7 @@ func TestRestart_StrandedProjectExits(t *testing.T) {
 		id, err := e.submit(r, "restart", ref, 3, next)
 		must(t, err)
 		op := e.waitState(id, "done")
-		wantSeq(t, e.steps(id), []string{"R0", "R1", "R2", "R3", "R4", "R5"})
+		wantSeq(t, e.steps(id), []string{"R0", "R1", "R2", "R3", "R4", "R5", "R6"})
 		p := e.project(ref)
 		if p.State != "active" || p.Generation != 4 || p.AppliedGen != 4 || p.Config.GUC["max_connections"] != "300" ||
 			p.Config.DiskQuotaMB != 16384 || op.Generation != 4 {

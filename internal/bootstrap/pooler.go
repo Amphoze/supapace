@@ -26,7 +26,7 @@ func poolerVerifier(s Secrets) ([]roleVerifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: verifier for supapace_pooler: %w", err)
 	}
-	return []roleVerifier{{"supapace_pooler", sqlPasswordPooler, v}}, nil
+	return []roleVerifier{{"supapace_pooler", sqlPasswordPooler, v, true}}, nil
 }
 
 // EnsurePoolerLogin makes the pooler's manager role supapace_pooler with the

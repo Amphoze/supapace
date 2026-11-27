@@ -69,6 +69,8 @@ type Agent interface {
 	RenderCluster(context.Context, agent.Spec) error                // restore T1 (replaced node)
 	WipeData(context.Context, agent.Spec) error                     // restore T5
 	HostState(context.Context, agent.Spec) (agent.HostState, error) // restore submit and T1
+
+	SetReadOnlyLogin(context.Context, agent.Spec) error // restart R6
 }
 
 // Jobs is what the steps need from the backup job runner; *backup.Runner

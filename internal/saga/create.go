@@ -15,6 +15,7 @@ import (
 
 	"github.com/Amphoze/supapace/internal/agent"
 	"github.com/Amphoze/supapace/internal/bootstrap"
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/jwtx"
 	"github.com/Amphoze/supapace/internal/pgsock"
 	"github.com/Amphoze/supapace/internal/secrets"
@@ -55,6 +56,7 @@ var secretMakers = []struct {
 	{"pg.supabase_admin.password", password},
 	{"pg.postgres.password", password},
 	{"pg.authenticator.password", password},
+	{dashcfg.SecretROPassword, password},
 	{"jwt.anon.private", rsaKey},
 	{"jwt.service_role.private", rsaKey},
 	{"jwt.secret", func() ([]byte, error) { return random(32) }},
@@ -65,7 +67,7 @@ var secretMakers = []struct {
 }
 
 // scramRoles are the roles the platform logs in as or sets a password for.
-var scramRoles = []string{"supabase_admin", "postgres", "authenticator"}
+var scramRoles = []string{"supabase_admin", "postgres", "authenticator", dashcfg.LoginRO}
 
 func random(n int) ([]byte, error) {
 	b := make([]byte, n)
@@ -164,8 +166,9 @@ func keyRow(ref string, k jwtx.Key) (store.KeyRow, error) {
 }
 
 // spec is the project's state as the agent applies it at generation gen with
-// configuration cfg: placement from the row, secrets unwrapped, the SCRAM
-// salts of the platform's roles, and the keys stored so far.
+// configuration cfg: placement from the row, secrets unwrapped (the read-only
+// password whenever its secret exists), the SCRAM salts of the platform's
+// roles, and the keys stored so far.
 func (r *Runner) spec(ctx context.Context, p store.Project, epoch, gen int64, cfg store.ProjectConfig) (agent.Spec, error) {
 	s, err := bareSpec(p, epoch, gen, cfg)
 	if err != nil {
@@ -193,6 +196,13 @@ func (r *Runner) spec(ctx context.Context, p store.Project, epoch, gen int64, cf
 		if *v.dst, err = get(v.name); err != nil {
 			return s, err
 		}
+	}
+	// The read-only login's password, when the project has it (a project made
+	// before it has none until a restart's R6).
+	if sec.ReadOnlyPassword, err = get(dashcfg.SecretROPassword); errors.Is(err, store.ErrNotFound) {
+		err = nil
+	} else if err != nil {
+		return s, err
 	}
 	for _, role := range scramRoles {
 		if sec.ScramSalts[role], err = pgsock.ScramSalt(dek, p.Ref, role); err != nil {
@@ -258,8 +268,8 @@ func (x *job) current(ctx context.Context) (agent.Spec, error) {
 	return x.r.spec(ctx, p, x.op.Epoch, p.Generation, p.Config)
 }
 
-// 2: the data key, the passwords, the two platform key pairs, jwt.secret
-// and the pgsodium root key.
+// 2: the data key, the passwords (the read-only login's among them), the two
+// platform key pairs, jwt.secret and the pgsodium root key.
 func (x *job) createSecrets(ctx context.Context) error {
 	dek, err := x.r.dek(ctx, x.op.Ref, true)
 	if err != nil {

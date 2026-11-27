@@ -37,6 +37,8 @@ var (
 	bootstrapAssert    = bootstrap.AssertPins
 	bootstrapAssertHBA = bootstrap.AssertHBA
 
+	bootstrapAssertReadOnlyVerifier = bootstrap.AssertReadOnlyVerifier
+
 	bootstrapGrantBackup         = bootstrap.GrantBackup
 	bootstrapResetStatementStats = bootstrap.ResetStatementStats
 
@@ -374,7 +376,8 @@ func closeSession(c *pgx.Conn) {
 
 // clusterAssert runs the assertion (and with hba AssertHBA) against the rendered
 // files as they are on disk, with the names the layout sets on the command
-// line (layout 0 is rendered as layout 1).
+// line (layout 0 is rendered as layout 1), and the check of the read-only
+// login's verifier against the spec's secrets.
 func (a *Agent) clusterAssert(ctx context.Context, conn *pgx.Conn, s Spec, hba bool) ([]nodecfg.CheckResult, error) {
 	bl, err := clusterBaseline()
 	if err != nil {
@@ -398,7 +401,11 @@ func (a *Agent) clusterAssert(ctx context.Context, conn *pgx.Conn, s Spec, hba b
 		return nil, err
 	}
 	f, err := bootstrapAssert(ctx, conn, bl, conf, pgconf.PinnedNames(max(s.Layout, 1)))
-	return append(out, f...), err
+	if err != nil {
+		return append(out, f...), err
+	}
+	ro, err := bootstrapAssertReadOnlyVerifier(ctx, conn, s.Secrets)
+	return slices.Concat(out, f, ro), err
 }
 
 // blockingAssert is the create-time assertion: any finding is ErrAssertion.

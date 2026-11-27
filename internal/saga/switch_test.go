@@ -141,7 +141,7 @@ func (e *env) recordSets(j store.Job) {
 	}
 }
 
-var switchSteps = []string{"R0", "R1", "S1", "R2", "R3", "R4", "R5", "S2", "S3", "S4", "S5", "S6"}
+var switchSteps = []string{"R0", "R1", "S1", "R2", "R3", "R4", "R5", "S2", "S3", "S4", "S5", "S6", "R6"}
 
 // ───────── R2's drain push ─────────
 
@@ -378,7 +378,7 @@ func TestSwitch_HealthFailureRollsForwardToLayout1(t *testing.T) {
 	if len(e.jobsOf(id)) != 0 || len(e.ag.callsOf(ref, "GrantBackupRole")) != 0 || len(e.ag.callsOf(ref, "EnsureSpoolDirs")) != 1 {
 		t.Fatalf("jobs %v, calls %v", e.jobSteps(id), e.ag.methods(ref))
 	}
-	wantSeq(t, e.steps(id), []string{"R0", "R1", "S1", "R2", "R3", "R1", "R2", "R3", "R4", "R5"})
+	wantSeq(t, e.steps(id), []string{"R0", "R1", "S1", "R2", "R3", "R1", "R2", "R3", "R4", "R5", "R6"})
 }
 
 // A switch rolled back to layout 1 leaves its spool and repository trees;

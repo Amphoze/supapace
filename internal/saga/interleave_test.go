@@ -78,7 +78,7 @@ func TestAbort_CrashAtEveryEntry(t *testing.T) {
 // rollback, resumes to the right generation and never re-applies an older one.
 func TestRestart_CrashAtEveryBoundary(t *testing.T) {
 	for _, rollback := range []bool{false, true} {
-		for _, s := range []string{"R0", "R1", "R2", "R3", "R4", "R5"} {
+		for _, s := range []string{"R0", "R1", "R2", "R3", "R4", "R5", "R6"} {
 			if rollback && s == "R0" {
 				continue // the rollback starts at R1
 			}

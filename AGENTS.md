@@ -5774,3 +5774,72 @@ the hold-file supervisor.
 Known limits: images, kernel tables, quota limits and /run survive the wipe (the image archive
 option of recover is not exercised); the epoch check sees two calls in one run, not a call by a
 stopped run.
+
+### 2026-11-24 — The read-only login's platform password, and the clean-up of its scheduled jobs
+
+What it provides
+- `bootstrap.Secrets.ReadOnlyPassword`, with the salt key `supabase_read_only_user` in
+  `ScramSalts`. Empty: nothing is sent or expected for that login. Set: `Run` and `Rekey` send a
+  fourth password statement after supabase_admin, postgres and authenticator (in a re-key before
+  the pooler manager's). The four passwords must differ.
+- `Rekey` skips the read-only login's statement, like the pooler manager's, when the server
+  answers that the role does not exist (SQLSTATE 42704). For the three platform roles, and in
+  `Run` for all four, that answer is an error. Nothing reports a skip; a missing role is drift.
+- `bootstrap.SetReadOnlyVerifier(ctx, conn, Secrets) error`: that one statement as the session's
+  first, in the form and through the check of the other password statements.
+- `bootstrap.AssertReadOnlyVerifier(ctx, conn, Secrets) ([]nodecfg.CheckResult, error)`: the
+  check `service-passwords` for this login. No stored password passes. With `ReadOnlyPassword`
+  set, only the platform's verifier passes ("differs from the platform's"); without it any stored
+  password is a finding ("present without a platform secret"). At most 512 characters of the
+  stored value are read and compared as a whole, in constant time; nothing read is parsed. The
+  login is no longer in the list of roles that must have no password. The agent's assertion runs
+  the check at a create's two blocking assertions and in the drift check.
+- `bootstrap.DeleteReadOnlyJobs(ctx, conn) error`: ends every session and worker of the login and
+  deletes its rows of the scheduler's job table. One pass is one transaction of seven constant
+  statements sent as one query: begin; end the login's backends; lock the job table; delete the
+  login's rows; clear the session's activity snapshot (the server reads its activity view once
+  in a transaction); end the login's backends again; commit. Passes repeat 0.1 s apart until a
+  clean one: the lock granted, no row deleted, no backend other than a client session ended at
+  either ending, and begun at least 3 s after the answers of the last pass that ended such a
+  backend or deleted a row. It returns no count.
+- `(*agent.Agent).SetReadOnlyLogin(ctx, Spec) error`: one superuser session, the verifier, then
+  the statement-statistics reset (best effort, logged). `saga.Agent` has the method.
+- `(*agent.Agent).DropReadOnlyJobs(ctx, Spec) error`: `DeleteReadOnlyJobs` in a superuser session
+  with `lock_timeout` 2 s and `statement_timeout` 10 s, triggers on, under 15 s of its own.
+  `saga.Agent` does not have it.
+- `pgsock.Target.LockTimeout` and `StatementTimeout`: above zero they are sent at startup in
+  place of the list's 0, in milliseconds rounded up; they hold against role and database
+  settings.
+- Saga: create step 2 makes the secret `pg.supabase_read_only_user.password`; a specification
+  carries the password exactly when the secret exists (a secret that cannot be read fails the
+  specification); restart step `R6`, last and at every layout, gives a project without the
+  secret its verifier and then stores the secret.
+
+Caller rules
+- Use `DropReadOnlyJobs` on a cluster started for service. Its outcome is "ran" or "failed" and
+  nothing more: what the cluster answers decides only whether a pass is repeated.
+- A lock not granted (55P03 at the lock) is repeated. No job table or schema (42P01 or 3F000, as
+  the lock's answer only) ends the run without error, after the first ending. Any other error
+  ends the run at once.
+- A deadline is worded by its cause and matches `context.DeadlineExceeded`: `no clean pass
+  within 15 s` with the last pass's reason (the lock was not granted, a worker was ended, a row
+  was deleted); `the caller's deadline passed before a clean pass`; `a pass ran out of its
+  statement budget`. A failed run is safe to run again.
+- A run that ended a worker or deleted a row lasts at least 3 s; one that finds nothing ends
+  after one pass. The 3 s cover one loop of the scheduler (at most 1 s) and a worker's launch.
+- `R6` writes nothing to the operation's parameters: the secret's existence is the record. A
+  stop between verifier and secret leaves no secret, and the next attempt sets a fresh password.
+  A refused verifier fails the step and stores nothing.
+- A statement of the clean-up is a package constant sent through `pipeSQL`; the two
+  constant-statement tests admit that wrapper beside `execSQL` and `querySQL`.
+- Tests of the clean-up on the pinned image go through the platform's own session (its budget
+  included), not a bare driver connection.
+
+Known limits
+- The delete is by the login's name; rows under any other name are not touched.
+- A session of another role that holds a lock on the job table makes every run fail at its
+  deadline. The delete has the statement timeout as its only bound on the number of rows.
+- "No job table" is the cluster's word, as every answer is: it does not prove that no job runs.
+- A project made before this has no read-only password until its next completed restart, and a
+  failing `R6` ends a restart failed after its configuration is in force.
+- `pgsock.Target`'s printers do not show the two timeouts.

@@ -28,6 +28,7 @@ import (
 
 	"github.com/Amphoze/supapace/internal/agent"
 	"github.com/Amphoze/supapace/internal/bootstrap"
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/jwtx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgsock"
@@ -192,6 +193,8 @@ type fakeAgent struct {
 	inflight, maxInflight atomic.Int32
 
 	used atomic.Int64 // bytes DiskUsage reports
+
+	roLogins []string // the read-only password of each SetReadOnlyLogin call that took effect
 
 	gwLag   int   // polls that still report an older route generation
 	gwAhead int64 // added to the generation the gateway reports (it may be past the one written)
@@ -464,6 +467,15 @@ func (f *fakeAgent) EnsureSpoolDirs(ctx context.Context, s agent.Spec) error {
 }
 func (f *fakeAgent) GrantBackupRole(ctx context.Context, s agent.Spec) error {
 	return f.effect(ctx, "GrantBackupRole", s, "", false)
+}
+func (f *fakeAgent) SetReadOnlyLogin(ctx context.Context, s agent.Spec) error {
+	if err := f.effect(ctx, "SetReadOnlyLogin", s, "", false); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.roLogins = append(f.roLogins, s.Secrets.ReadOnlyPassword)
+	return nil
 }
 func (f *fakeAgent) RemoveFetch(ctx context.Context, s agent.Spec) error {
 	return f.effect(ctx, "RemoveFetch", s, "", false)
@@ -1013,7 +1025,7 @@ func TestStepIDs_Fixed(t *testing.T) {
 		return out
 	}
 	wantSeq(t, ids(tables["create"]), createIDs2)
-	wantSeq(t, ids(tables["restart"]), []string{"R0", "R1", "S1", "R2", "R3", "R4", "R5", "S2", "S3", "S4", "S5", "S6"})
+	wantSeq(t, ids(tables["restart"]), []string{"R0", "R1", "S1", "R2", "R3", "R4", "R5", "S2", "S3", "S4", "S5", "S6", "R6"})
 	wantSeq(t, ids(tables["delete"]), []string{"D1", "D2", "Db", "D3", "Dp", "Dr", "D4", "D5"})
 	wantSeq(t, ids(tables["purge"]), []string{"P1", "P2", "P3", "P4", "P5"})
 	wantSeq(t, ids(compensation), []string{"C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7"})
@@ -1939,7 +1951,7 @@ func TestRestart_HappyPathOrder(t *testing.T) {
 	id := e.restart(r, ref, withGUC("max_connections", "200"))
 	e.start(r)
 	op := e.waitState(id, "done")
-	wantSeq(t, e.steps(id), []string{"R0", "R1", "R2", "R3", "R4", "R5"})
+	wantSeq(t, e.steps(id), []string{"R0", "R1", "R2", "R3", "R4", "R5", "R6"})
 	wantSeq(t, e.ag.methods(ref), []string{"Prevalidate", "SetRoute", "StopPostgREST", "StopCluster", "SetQuota",
 		"PromoteCandidate", "EnsureCluster", "EnsureCluster", "VerifyCluster", "EnsurePostgREST", "SetRoute", "ProbeREST"})
 	p := e.project(ref)
@@ -2422,14 +2434,14 @@ func TestSpecFor_DesiredStateWithSecrets(t *testing.T) {
 	must(t, err)
 	dek, err := secrets.UnwrapDEK(e.kek, ref, n, w)
 	must(t, err)
-	for _, role := range []string{"supabase_admin", "postgres", "authenticator"} {
+	for _, role := range []string{"supabase_admin", "postgres", "authenticator", "supabase_read_only_user"} {
 		want, err := pgsock.ScramSalt(dek, ref, role)
 		must(t, err)
 		if !bytes.Equal(s.Secrets.ScramSalts[role], want) {
 			t.Fatalf("salt of %s", role)
 		}
 	}
-	if len(s.Secrets.ScramSalts) != 3 {
+	if len(s.Secrets.ScramSalts) != 4 {
 		t.Fatalf("salts %v", s.Secrets.ScramSalts)
 	}
 	// Every spec the create handed the agent carried the same secrets.
@@ -2438,7 +2450,7 @@ func TestSpecFor_DesiredStateWithSecrets(t *testing.T) {
 			t.Fatal("no specs recorded")
 		}
 		for _, got := range e.ag.specs {
-			if got.Secrets.PostgresPassword != s.Secrets.PostgresPassword || len(got.Secrets.ScramSalts) != 3 ||
+			if got.Secrets.PostgresPassword != s.Secrets.PostgresPassword || len(got.Secrets.ScramSalts) != 4 ||
 				!bytes.Equal(got.Secrets.ScramSalts["authenticator"], s.Secrets.ScramSalts["authenticator"]) {
 				t.Fatalf("spec without secrets or salts: %#v", got)
 			}
@@ -2481,7 +2493,7 @@ func TestSecrets_NeverInParamsErrorsOrLogs(t *testing.T) {
 	e.start(r)
 	e.waitState(id, "failed")
 	var plain []string
-	for _, n := range []string{"pg.supabase_admin.password", "pg.postgres.password", "pg.authenticator.password",
+	for _, n := range []string{"pg.supabase_admin.password", "pg.postgres.password", "pg.authenticator.password", "pg.supabase_read_only_user.password",
 		"jwt.secret", "pgsodium.root_key", "token.anon", "token.service_role"} {
 		plain = append(plain, e.secret(ref, n))
 	}
@@ -3567,13 +3579,13 @@ func TestLogs_SummaryAfterLastStep(t *testing.T) {
 	id := e.restart(r, ref, withGUC("max_connections", "200"))
 	e.start(r)
 	e.settled(id)
-	if s := e.summaries(id, 1); !slices.Equal(s, []string{"rolled_back@R5"}) {
+	if s := e.summaries(id, 1); !slices.Equal(s, []string{"rolled_back@R6"}) {
 		t.Fatalf("rolled-back restart summaries %v", s)
 	}
 	e.ag.setErr(nil)
 	next := e.restart(r, ref, withGUC("max_connections", "150"))
 	e.waitState(next, "done")
-	if s := e.summaries(next, 1); !slices.Equal(s, []string{"done@R5"}) {
+	if s := e.summaries(next, 1); !slices.Equal(s, []string{"done@R6"}) {
 		t.Fatalf("restart summaries %v", s)
 	}
 }
@@ -3649,5 +3661,204 @@ func TestCreate_IncompleteCheckRetried(t *testing.T) {
 	e.start(e.runner())
 	if op := e.waitState(id, "done"); op.Attempts < 2 {
 		t.Fatalf("op = %+v", op)
+	}
+}
+
+// ───────── the read-only login's secret ─────────
+
+// dropReadOnlySecret makes ref a project made before the read-only login's
+// secret existed.
+func (e *env) dropReadOnlySecret(ref string) {
+	e.t.Helper()
+	sql(e.t, "delete from secret where ref = $1 and name = $2", ref, dashcfg.SecretROPassword)
+}
+
+func (e *env) hasReadOnlySecret(ref string) bool {
+	e.t.Helper()
+	_, _, err := e.st.GetSecret(context.Background(), ref, dashcfg.SecretROPassword)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		e.t.Fatal(err)
+	}
+	return err == nil
+}
+
+func (f *fakeAgent) readOnlyLogins() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.roLogins)
+}
+
+// TestCreate_GeneratesTheReadOnlySecret: step 2 makes the read-only login's
+// password once, as it makes the others, and the first boot's spec carries
+// it, so that the first boot sets its verifier.
+func TestCreate_GeneratesTheReadOnlySecret(t *testing.T) {
+	e := newEnv(t)
+	ref, id := e.create()
+	e.start(e.runner())
+	e.waitState(id, "done")
+	pw := e.secret(ref, dashcfg.SecretROPassword)
+	if len(pw) != 43 || strings.Trim(pw, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != "" {
+		t.Fatalf("password of %d bytes", len(pw))
+	}
+	for _, n := range []string{"pg.supabase_admin.password", "pg.postgres.password", "pg.authenticator.password"} {
+		if e.secret(ref, n) == pw {
+			t.Fatalf("the same password as %s", n)
+		}
+	}
+	e.ag.mu.Lock()
+	specs := slices.Clone(e.ag.specs)
+	e.ag.mu.Unlock()
+	first := slices.IndexFunc(specs, func(s agent.Spec) bool { return s.FirstBoot })
+	if first < 0 || specs[first].Secrets.ReadOnlyPassword != pw || len(specs[first].Secrets.ScramSalts[dashcfg.LoginRO]) == 0 {
+		t.Fatal("the first boot's spec lacks the read-only password or its salt")
+	}
+}
+
+// TestSpec_CarriesTheReadOnlyPasswordWhenTheSecretExists: the spec carries
+// the read-only password while its secret exists, and an empty one without
+// error when it does not; the salt is there either way.
+func TestSpec_CarriesTheReadOnlyPasswordWhenTheSecretExists(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	r := e.runner()
+	s, err := r.SpecFor(context.Background(), ref)
+	must(t, err)
+	if s.Secrets.ReadOnlyPassword == "" || s.Secrets.ReadOnlyPassword != e.secret(ref, dashcfg.SecretROPassword) {
+		t.Fatal("the spec lacks the stored read-only password")
+	}
+	e.dropReadOnlySecret(ref)
+	s, err = r.SpecFor(context.Background(), ref)
+	must(t, err)
+	if s.Secrets.ReadOnlyPassword != "" || len(s.Secrets.ScramSalts[dashcfg.LoginRO]) == 0 {
+		t.Fatalf("without the secret: password %d bytes, salt %d bytes", len(s.Secrets.ReadOnlyPassword), len(s.Secrets.ScramSalts[dashcfg.LoginRO]))
+	}
+}
+
+// TestRestart_R6_LastAndAlwaysInTheTable: R6 is the restart's last step and
+// runs at every layout; for a project without the secret it sets the login
+// and stores the secret.
+func TestRestart_R6_LastAndAlwaysInTheTable(t *testing.T) {
+	if last := restartSteps[len(restartSteps)-1].id; last != "R6" || restartLayout2["R6"] {
+		t.Fatalf("last step %s, layout-2 only %v", last, restartLayout2["R6"])
+	}
+	e := newEnv(t)
+	ref := e.active()
+	e.dropReadOnlySecret(ref)
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	e.waitState(id, "done")
+	if st := e.steps(id); st[len(st)-1] != "R6" {
+		t.Fatalf("steps %v", st)
+	}
+	if got := e.ag.readOnlyLogins(); len(got) != 1 || got[0] != e.secret(ref, dashcfg.SecretROPassword) {
+		t.Fatalf("%d logins set", len(got))
+	}
+	if p := e.project(ref); p.State != "active" || p.Generation != 2 {
+		t.Fatalf("project %+v", p)
+	}
+}
+
+// TestRestart_R6_CompletesAtOnceWithTheSecret: a project that has the
+// secret: R6 calls nothing and changes nothing.
+func TestRestart_R6_CompletesAtOnceWithTheSecret(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	pw := e.secret(ref, dashcfg.SecretROPassword)
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	e.start(r)
+	e.waitState(id, "done")
+	if !slices.Contains(e.steps(id), "R6") || len(e.ag.callsOf(ref, "SetReadOnlyLogin")) != 0 || e.secret(ref, dashcfg.SecretROPassword) != pw {
+		t.Fatalf("steps %v, %d logins set", e.steps(id), len(e.ag.callsOf(ref, "SetReadOnlyLogin")))
+	}
+}
+
+// TestRestart_R6_VerifierThenSecret_AStopBetweenLeavesNoSecret: the verifier
+// is set before the secret is stored; a stop of the worker as the verifier is
+// set leaves no secret, and the resumed step sets a fresh password and stores
+// that one.
+func TestRestart_R6_VerifierThenSecret_AStopBetweenLeavesNoSecret(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	e.dropReadOnlySecret(ref)
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	e.ag.hook = func(_ context.Context, c call) {
+		if c.Method == "SetReadOnlyLogin" {
+			if e.hasReadOnlySecret(ref) {
+				t.Error("the secret was stored before the verifier was set")
+			}
+			once.Do(cancel)
+		}
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("the restart never set the read-only login")
+	}
+	if e.hasReadOnlySecret(ref) {
+		t.Fatal("a secret was stored after a stop at the verifier")
+	}
+	if op := e.op(id); op.State == "done" {
+		t.Fatalf("op %+v", op)
+	}
+	e.start(e.runner())
+	e.waitState(id, "done")
+	calls := e.ag.callsOf(ref, "SetReadOnlyLogin")
+	got := e.ag.readOnlyLogins()
+	if len(calls) != 2 || len(got) != 1 || got[0] != e.secret(ref, dashcfg.SecretROPassword) {
+		t.Fatalf("%d calls, %d took effect", len(calls), len(got))
+	}
+	e.ag.mu.Lock()
+	var pws []string
+	for _, s := range e.ag.specs {
+		if s.Secrets.ReadOnlyPassword != "" && !s.FirstBoot {
+			pws = append(pws, s.Secrets.ReadOnlyPassword)
+		}
+	}
+	e.ag.mu.Unlock()
+	if len(pws) < 2 || pws[len(pws)-2] == pws[len(pws)-1] {
+		t.Fatal("the resumed step did not set a fresh password")
+	}
+}
+
+// TestRestart_R6_WritesNothingToTheParameters: the parameters after R6 are
+// those before it.
+func TestRestart_R6_WritesNothingToTheParameters(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	e.dropReadOnlySecret(ref)
+	r := e.runner()
+	id := e.restart(r, ref, withGUC("max_connections", "200"))
+	var before json.RawMessage
+	e.ag.hook = func(_ context.Context, c call) {
+		if c.Method == "SetReadOnlyLogin" {
+			before = e.op(id).Params
+		}
+	}
+	e.start(r)
+	op := e.waitState(id, "done")
+	if before == nil || !bytes.Equal(op.Params, before) {
+		t.Fatalf("parameters\n%s\nbefore R6\n%s", op.Params, before)
+	}
+}
+
+// TestSpec_AnUnreadableReadOnlySecretIsAnError: only a missing secret reads
+// as "no read-only password"; one that cannot be read fails the
+// specification, so that a spec never lacks a password the cluster holds.
+func TestSpec_AnUnreadableReadOnlySecretIsAnError(t *testing.T) {
+	e := newEnv(t)
+	ref := e.active()
+	r := e.runner()
+	sql(t, "update secret set ciphertext = $3 where ref = $1 and name = $2", ref, dashcfg.SecretROPassword, []byte("t-not-a-sealed-secret"))
+	if s, err := r.SpecFor(context.Background(), ref); err == nil {
+		t.Fatalf("spec built with an unreadable secret (password %d bytes)", len(s.Secrets.ReadOnlyPassword))
 	}
 }

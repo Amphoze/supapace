@@ -65,6 +65,10 @@ type Target struct {
 	AllowTrust    bool   // accept a login without authentication; SASL is then refused
 	Superuser     bool   // also send the superuser parameters (superuserParams)
 	Budget        Budget // zero value: DefaultBudget
+	// LockTimeout and StatementTimeout, when above zero, are sent in place of
+	// the list's 0 for lock_timeout and statement_timeout, in milliseconds
+	// rounded up.
+	LockTimeout, StatementTimeout time.Duration
 }
 
 var (
@@ -442,6 +446,11 @@ func config(t Target, b Budget) (*pgx.ConnConfig, error) {
 		return &pgconn.DeadlineContextWatcherHandler{Conn: pc.Conn()}
 	}
 	c.RuntimeParams = StartupParams(t.Superuser)
+	for k, d := range map[string]time.Duration{"lock_timeout": t.LockTimeout, "statement_timeout": t.StatementTimeout} {
+		if d > 0 {
+			c.RuntimeParams[k] = strconv.FormatInt((d+time.Millisecond-1).Milliseconds(), 10) + "ms" // rounded up: 0 would mean none
+		}
+	}
 	c.KerberosSrvName, c.KerberosSpn = "", ""
 	c.SSLNegotiation = "postgres"
 	c.SSLCertMode = "disable"

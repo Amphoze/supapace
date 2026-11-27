@@ -430,7 +430,7 @@ func TestCheckCluster_NoArchiverQuery(t *testing.T) {
 		t.Fatalf("verdict: %v", err)
 	}
 	if got := f.calls(); !slices.Equal(got, []string{fmt.Sprintf("dial supabase_admin pid=%d start=%d trust=false",
-		clReadState(t, a, s).PMPid, clReadState(t, a, s).PMStart), "assert hba", "assert"}) {
+		clReadState(t, a, s).PMPid, clReadState(t, a, s).PMStart), "assert hba", "assert", "assert read-only login"}) {
 		t.Fatalf("session %q", got)
 	}
 	// Control: the login is the verdict.

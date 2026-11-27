@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 
 	"github.com/Amphoze/supapace/internal/pgsock"
@@ -15,10 +16,11 @@ import (
 // the verifiers of s on a cluster started from a restored data directory
 // (one session as supabase_admin). It computes the verifiers before sending
 // anything, then sends exactly: the three password statements, in that order
-// and before any other statement; when s.PoolerPassword is set, the pooler
-// manager's password statement, skipped when that role does not exist (the
-// re-key creates no role); the backup role's existence read and its creation
-// when absent; its two grants. Each statement also restores the
+// and before any other statement; when s.ReadOnlyPassword is set, the
+// read-only login's, then, when s.PoolerPassword is set, the pooler
+// manager's password statement, each skipped when its role does not exist
+// (the re-key creates no role); the backup role's existence read and its
+// creation when absent; its two grants. Each statement also restores the
 // role's login right, connection limit and expiry. Rekey is idempotent.
 //
 // A later identity is re-keyed by appending its password statement to the
@@ -34,12 +36,9 @@ func Rekey(ctx context.Context, c *pgx.Conn, s Secrets) error {
 	if err != nil {
 		return err
 	}
-	if err := setVerifiers(ctx, c, vs); err != nil {
-		return err
-	}
-	for _, v := range pv {
+	for _, v := range slices.Concat(vs, pv) {
 		err := setVerifier(ctx, c, v.prefix, v.verifier)
-		if se := (*pgsock.ServerError)(nil); errors.As(err, &se) && se.Code == "42704" {
+		if se := (*pgsock.ServerError)(nil); v.optional && errors.As(err, &se) && se.Code == "42704" {
 			err = nil // the role does not exist: nothing to re-key
 		}
 		if err != nil {

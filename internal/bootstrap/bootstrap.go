@@ -33,13 +33,16 @@ import (
 
 // Secrets are a project's database secrets. ScramSalts maps each of
 // supabase_admin, postgres and authenticator (and supapace_pooler when
-// PoolerPassword is set) to its salt (pgsock.ScramSalt). An empty
-// PoolerPassword: nothing of the pooler's manager role is sent or expected.
+// PoolerPassword is set, supabase_read_only_user when ReadOnlyPassword is)
+// to its salt (pgsock.ScramSalt). An empty PoolerPassword: nothing of the
+// pooler's manager role is sent or expected. An empty ReadOnlyPassword: no
+// password statement for the read-only login, and no verifier expected on it.
 type Secrets struct {
 	SupabaseAdminPassword, PostgresPassword, AuthenticatorPassword string
 	PgsodiumRootKey                                                string
 	ScramSalts                                                     map[string][]byte
 	PoolerPassword                                                 string
+	ReadOnlyPassword                                               string
 }
 
 // ErrAssertion is what a caller returns when a blocking assertion has
@@ -158,17 +161,25 @@ func roleExists(ctx context.Context, c *pgx.Conn, name string) (bool, error) {
 }
 
 // roleVerifier is one password statement: the role, its sqlPassword…
-// prefix and the verifier.
-type roleVerifier struct{ role, prefix, verifier string }
+// prefix and the verifier. An optional role may be absent from a restored
+// cluster: the re-key skips its statement then.
+type roleVerifier struct {
+	role, prefix, verifier string
+	optional               bool
+}
 
 // verifiers computes the verifiers of the platform's passwords, without
 // sending anything, in the order their statements are sent: supabase_admin,
-// postgres, authenticator. The three passwords must differ.
+// postgres, authenticator, and, when s.ReadOnlyPassword is set, the read-only
+// login last (optional). The passwords must differ.
 func verifiers(s Secrets) ([]roleVerifier, error) {
 	pw := []struct{ role, password, prefix string }{
 		{"supabase_admin", s.SupabaseAdminPassword, sqlPasswordSupabaseAdmin},
 		{"postgres", s.PostgresPassword, sqlPasswordPostgres},
 		{"authenticator", s.AuthenticatorPassword, sqlPasswordAuthenticator},
+	}
+	if s.ReadOnlyPassword != "" {
+		pw = append(pw, struct{ role, password, prefix string }{"supabase_read_only_user", s.ReadOnlyPassword, sqlPasswordReadOnly})
 	}
 	vs := make([]roleVerifier, len(pw))
 	for i, p := range pw {
@@ -181,7 +192,7 @@ func verifiers(s Secrets) ([]roleVerifier, error) {
 		if err != nil {
 			return nil, fmt.Errorf("bootstrap: verifier for %s: %w", p.role, err)
 		}
-		vs[i] = roleVerifier{p.role, p.prefix, v}
+		vs[i] = roleVerifier{p.role, p.prefix, v, i == 3}
 	}
 	return vs, nil
 }

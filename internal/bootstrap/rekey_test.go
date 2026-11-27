@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Amphoze/supapace/internal/pgconf"
 	"github.com/Amphoze/supapace/internal/pgsock"
@@ -442,7 +443,7 @@ func TestRekey_VerifierStatementsAreTheFirstThree(t *testing.T) {
 // no expiry; the forms without them are refused.
 func TestVerifierStatement_AlsoSetsLoginLimitAndExpiry(t *testing.T) {
 	for role, p := range map[string]string{"supabase_admin": sqlPasswordSupabaseAdmin, "postgres": sqlPasswordPostgres,
-		"authenticator": sqlPasswordAuthenticator} {
+		"authenticator": sqlPasswordAuthenticator, "supabase_read_only_user": sqlPasswordReadOnly} {
 		if want := "alter role " + role + " with login connection limit -1 valid until 'infinity' password '"; p != want {
 			t.Errorf("%s: %q, want %q", role, p, want)
 		}
@@ -461,13 +462,14 @@ func TestVerifierStatement_AlsoSetsLoginLimitAndExpiry(t *testing.T) {
 
 func TestRun_FreshClusterAttributesUnchanged(t *testing.T) {
 	c := newCluster(t, 1)
+	c.withReadOnly()
 	c.run()
 	conn := c.dial("supabase_admin")
 	const attrs = `select string_agg(rolname::text || ' ' || rolcanlogin::text || ' ' || rolconnlimit::text || ' ' ||
 	  coalesce(rolvaliduntil, 'infinity')::text, ',' order by rolname) from pg_catalog.pg_authid
-	  where rolname in ('supabase_admin', 'postgres', 'authenticator')`
+	  where rolname in ('supabase_admin', 'postgres', 'authenticator', 'supabase_read_only_user')`
 	before := c.str(conn, attrs)
-	if before != "authenticator true -1 infinity,postgres true -1 infinity,supabase_admin true -1 infinity" {
+	if before != "authenticator true -1 infinity,postgres true -1 infinity,supabase_admin true -1 infinity,supabase_read_only_user true -1 infinity" {
 		t.Fatalf("control: the image's attributes %s", before)
 	}
 	if err := Run(context.Background(), conn, c.secrets); err != nil {
@@ -1193,5 +1195,326 @@ func TestAssertPins_NameNotInTheStartupListStillReported(t *testing.T) {
 	c.wantFindings(r, "source-file")
 	if len(r) != 1 || !hasDetail(r, "source-file", "work_mem is not set on the command line") {
 		t.Fatalf("findings %+v", r)
+	}
+}
+
+// ---- the read-only login's platform password ----
+
+// roSecrets are test secrets with a read-only password and its salt, and the
+// read-only login's password statement for them.
+func roSecrets(t *testing.T) (Secrets, string) {
+	t.Helper()
+	s := testSecrets(t)
+	s.ReadOnlyPassword = rnd(32)
+	salt, err := pgsock.ScramSalt([]byte(rnd(32)), rnd(10), "supabase_read_only_user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ScramSalts["supabase_read_only_user"] = salt
+	v, err := pgsock.ScramVerifier(s.ReadOnlyPassword, salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := verifierStatement(sqlPasswordReadOnly, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, stmt
+}
+
+// runStatements is what Run sends over a recording connection that answers
+// as a cluster of the baseline.
+func runStatements(t *testing.T, s Secrets) []string {
+	t.Helper()
+	bl, err := LoadBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, rec := recordingConn(t, imageAnswer(bl.Preload, bl.SessionSettings))
+	if err := run(context.Background(), conn, s, bl); err != nil {
+		t.Fatal(err)
+	}
+	return rec.statements()
+}
+
+func rekeyStatements(t *testing.T, s Secrets) []string {
+	t.Helper()
+	conn, rec := recordingConn(t, func(sql string) ([]uint32, [][]string) {
+		if sql == sqlRoleExists {
+			return []uint32{16}, [][]string{{"t"}}
+		}
+		return nil, nil
+	})
+	if err := Rekey(context.Background(), conn, s); err != nil {
+		t.Fatal(err)
+	}
+	return rec.statements()
+}
+
+// TestRun_FourthVerifierWhenThePasswordIsSet: with the read-only password
+// set, Run sends the read-only login's password statement right after the
+// three, before anything else.
+func TestRun_FourthVerifierWhenThePasswordIsSet(t *testing.T) {
+	s, stmt := roSecrets(t)
+	got := runStatements(t, s)
+	if len(got) < 6 || !strings.HasPrefix(got[2], sqlPasswordSupabaseAdmin) || !strings.HasPrefix(got[3], sqlPasswordPostgres) ||
+		!strings.HasPrefix(got[4], sqlPasswordAuthenticator) || got[5] != stmt {
+		t.Fatalf("sent %q", got)
+	}
+}
+
+// TestRun_ThreeWhenEmpty: with it empty, nothing of the read-only login is sent.
+func TestRun_ThreeWhenEmpty(t *testing.T) {
+	for _, st := range runStatements(t, testSecrets(t)) {
+		if strings.Contains(st, "supabase_read_only_user") {
+			t.Fatalf("sent %q", st)
+		}
+	}
+}
+
+// TestRun_NothingBeyondTheFourthVerifier: what Run and Rekey send with the
+// read-only password set is what they send with it empty plus exactly the
+// read-only login's password statement: no grant, no revoke, no attribute or
+// setting statement.
+func TestRun_NothingBeyondTheFourthVerifier(t *testing.T) {
+	s, stmt := roSecrets(t)
+	empty := s
+	empty.ReadOnlyPassword = ""
+	for name, sent := range map[string]func(*testing.T, Secrets) []string{"Run": runStatements, "Rekey": rekeyStatements} {
+		with, without := sent(t, s), sent(t, empty)
+		i := slices.Index(with, stmt)
+		if i < 0 || !slices.Equal(slices.Delete(slices.Clone(with), i, i+1), without) {
+			t.Fatalf("%s: with the password\n%q\nwithout\n%q", name, with, without)
+		}
+	}
+}
+
+// TestVerifiers_FourMustDiffer: a read-only password equal to one of the
+// three, or one without its salt, is refused before any statement.
+func TestVerifiers_FourMustDiffer(t *testing.T) {
+	for name, bad := range map[string]func(*Secrets){
+		"password of supabase_admin": func(s *Secrets) { s.ReadOnlyPassword = s.SupabaseAdminPassword },
+		"password of postgres":       func(s *Secrets) { s.ReadOnlyPassword = s.PostgresPassword },
+		"password of authenticator":  func(s *Secrets) { s.ReadOnlyPassword = s.AuthenticatorPassword },
+		"no salt":                    func(s *Secrets) { delete(s.ScramSalts, "supabase_read_only_user") },
+	} {
+		s, _ := roSecrets(t)
+		bad(&s)
+		for call, fn := range map[string]func(context.Context, *pgx.Conn, Secrets) error{
+			"Run": Run, "Rekey": Rekey, "SetReadOnlyVerifier": SetReadOnlyVerifier} {
+			conn, rec := recordingConn(t, func(string) ([]uint32, [][]string) { return nil, nil })
+			if err := fn(context.Background(), conn, s); err == nil || len(rec.statements()) != 0 {
+				t.Errorf("%s, %s: %v, sent %q", call, name, err, rec.statements())
+			}
+		}
+	}
+}
+
+// TestRekey_FourthVerifierAfterTheThree_BeforeAnythingElse: the re-key sends
+// the three, then the read-only login's statement, then the manager's, then
+// the backup role's statements.
+func TestRekey_FourthVerifierAfterTheThree_BeforeAnythingElse(t *testing.T) {
+	s, stmt := roSecrets(t)
+	ms, mstmt := managerSecrets(t)
+	s.PoolerPassword, s.ScramSalts["supapace_pooler"] = ms.PoolerPassword, ms.ScramSalts["supapace_pooler"]
+	got := rekeyStatements(t, s)
+	want := []string{sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator}
+	if len(got) != 8 {
+		t.Fatalf("sent %q", got)
+	}
+	for i, p := range want {
+		if !strings.HasPrefix(got[i], p) {
+			t.Fatalf("statement %d: %q", i, got[i])
+		}
+	}
+	if !slices.Equal(got[3:], []string{stmt, mstmt, sqlRoleExists, sqlGrantBackupSettings, sqlGrantBackupFuncs}) {
+		t.Fatalf("sent %q", got[3:])
+	}
+}
+
+// TestRekey_ThreeWhenEmpty: with the read-only password empty the re-key
+// sends nothing of that login.
+func TestRekey_ThreeWhenEmpty(t *testing.T) {
+	for _, st := range rekeyStatements(t, testSecrets(t)) {
+		if strings.Contains(st, "supabase_read_only_user") {
+			t.Fatalf("sent %q", st)
+		}
+	}
+}
+
+// TestRekey_FourthRoleAbsent_IsASkip: SQLSTATE 42704 on the read-only
+// login's statement is a skip in the re-key, which goes on; on one of the
+// three it is a failure, and on the fourth in Run too. No statement reads
+// whether the role exists and none creates it.
+func TestRekey_FourthRoleAbsent_IsASkip(t *testing.T) {
+	s, stmt := roSecrets(t)
+	absent := func(prefix string) func(string, bool) reply {
+		return func(sql string, run bool) reply {
+			if run && strings.HasPrefix(sql, prefix) {
+				return reply{code: "42704"}
+			}
+			return asDefined(sql, run)
+		}
+	}
+	conn, rec := scriptedConn(t, absent(sqlPasswordReadOnly))
+	if err := Rekey(context.Background(), conn, s); err != nil {
+		t.Fatalf("absent read-only login: %v", err)
+	}
+	got := rec.statements()
+	if i := slices.Index(got, stmt); i != 3 || !slices.Equal(got[4:], []string{sqlRoleExists, sqlGrantBackupSettings, sqlGrantBackupFuncs}) {
+		t.Fatalf("sent %q", got)
+	}
+	for _, st := range got {
+		if strings.Contains(st, "create role supabase_read_only_user") || st == sqlRoleExists && slices.Index(got, st) < 4 {
+			t.Fatalf("sent %q", st)
+		}
+	}
+	for _, p := range []string{sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator} {
+		conn, _ := scriptedConn(t, absent(p))
+		if err := Rekey(context.Background(), conn, s); err == nil {
+			t.Errorf("42704 on %q skipped", p)
+		}
+	}
+	bl, err := LoadBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := imageAnswer(bl.Preload, bl.SessionSettings)
+	conn, _ = scriptedConn(t, func(sql string, run bool) reply {
+		if run && strings.HasPrefix(sql, sqlPasswordReadOnly) {
+			return reply{code: "42704"}
+		}
+		oids, rows := img(sql)
+		return reply{oids: oids, rows: rows}
+	})
+	if err := run(context.Background(), conn, s, bl); err == nil {
+		t.Error("42704 on the fourth statement skipped in Run")
+	}
+}
+
+// TestVerifierStatement_FourthUsesTheOneForm: the read-only login's statement
+// has the form of the three and verifierStatement admits it.
+func TestVerifierStatement_FourthUsesTheOneForm(t *testing.T) {
+	for _, p := range []string{sqlPasswordSupabaseAdmin, sqlPasswordPostgres, sqlPasswordAuthenticator} {
+		if strings.Replace(sqlPasswordReadOnly, "supabase_read_only_user", strings.Fields(p)[2], 1) != p {
+			t.Fatalf("%q is not of the form of %q", sqlPasswordReadOnly, p)
+		}
+	}
+	_, stmt := roSecrets(t)
+	if !strings.HasPrefix(stmt, sqlPasswordReadOnly) {
+		t.Fatalf("statement %q", stmt)
+	}
+}
+
+// TestSetReadOnlyVerifier_IsTheSessionsFirstStatement: it sends exactly the
+// read-only login's password statement and nothing before or after it, and
+// it does so through setVerifier; without a password it sends nothing.
+func TestSetReadOnlyVerifier_IsTheSessionsFirstStatement(t *testing.T) {
+	s, stmt := roSecrets(t)
+	conn, rec := recordingConn(t, func(string) ([]uint32, [][]string) { return nil, nil })
+	if err := SetReadOnlyVerifier(context.Background(), conn, s); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.statements(); !slices.Equal(got, []string{stmt}) {
+		t.Fatalf("sent %q", got)
+	}
+	empty := s
+	empty.ReadOnlyPassword = ""
+	conn, rec = recordingConn(t, func(string) ([]uint32, [][]string) { return nil, nil })
+	if err := SetReadOnlyVerifier(context.Background(), conn, empty); err == nil || len(rec.statements()) != 0 {
+		t.Fatalf("empty password: %v, sent %q", err, rec.statements())
+	}
+	file, err := parseSource(token.NewFileSet(), "rojobs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	for _, d := range file.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == "SetReadOnlyVerifier" {
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if c, ok := n.(*ast.CallExpr); ok {
+					if id, ok := c.Fun.(*ast.Ident); ok {
+						calls = append(calls, id.Name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	if !slices.Contains(calls, "setVerifier") || slices.Contains(calls, "execSQL") || slices.Contains(calls, "querySQL") {
+		t.Fatalf("SetReadOnlyVerifier calls %v", calls)
+	}
+}
+
+// TestAssert_ServicePasswords_ReadOnlyLogin: AssertReadOnlyVerifier passes
+// with no verifier and with the platform's; a verifier the platform did not
+// set, and any verifier while the password is empty, is a finding
+// service-passwords; a stored verifier of 2^31-1 iterations is a finding at
+// once (nothing read is used to compute), and no finding holds any part of
+// either verifier. The other service roles keep the list.
+func TestAssert_ServicePasswords_ReadOnlyLogin(t *testing.T) {
+	if want := []string{"pgbouncer", "supabase_auth_admin", "supabase_storage_admin", "supabase_replication_admin",
+		"supabase_etl_admin"}; !slices.Equal(servicePasswordRoles, want) {
+		t.Fatalf("list %v", servicePasswordRoles)
+	}
+	s, _ := roSecrets(t)
+	mine, _ := pgsock.ScramVerifier(s.ReadOnlyPassword, s.ScramSalts["supabase_read_only_user"])
+	foreign, _ := pgsock.ScramVerifier("t-foreign-password", s.ScramSalts["supabase_read_only_user"])
+	slow := strings.Replace(foreign, "$4096:", "$2147483647:", 1)
+	empty := s
+	empty.ReadOnlyPassword = ""
+	for _, c := range []struct {
+		name    string
+		s       Secrets
+		stored  []string // rows answered; none: the role or its verifier absent
+		finding string
+	}{
+		{"none", s, nil, ""},
+		{"none, no secret", empty, nil, ""},
+		{"the platform's", s, []string{mine}, ""},
+		{"foreign", s, []string{foreign}, "differs"},
+		{"any without a secret", empty, []string{mine}, "present without a platform secret"},
+		{"2^31-1 iterations", s, []string{slow}, "differs"},
+	} {
+		conn, rec := recordingConn(t, func(sql string) ([]uint32, [][]string) {
+			if sql != sqlReadOnlyVerifier || c.stored == nil {
+				return nil, nil
+			}
+			return []uint32{25}, [][]string{c.stored}
+		})
+		t0 := time.Now()
+		r, err := AssertReadOnlyVerifier(context.Background(), conn, c.s)
+		took := time.Since(t0)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := rec.statements(); !slices.Equal(got, []string{sqlReadOnlyVerifier}) {
+			t.Fatalf("%s: sent %q", c.name, got)
+		}
+		switch {
+		case c.finding == "" && len(r) != 0:
+			t.Errorf("%s: findings %+v", c.name, r)
+		case c.finding != "" && (len(r) != 1 || r[0].Name != "service-passwords" || !strings.Contains(r[0].Detail, c.finding) ||
+			!strings.Contains(r[0].Detail, "supabase_read_only_user")):
+			t.Errorf("%s: findings %+v", c.name, r)
+		case took > 50*time.Millisecond:
+			t.Errorf("%s: took %v", c.name, took)
+		}
+		for _, f := range r {
+			for _, v := range []string{mine, foreign} {
+				for _, part := range strings.FieldsFunc(v, func(r rune) bool { return r == '$' || r == ':' }) {
+					if len(part) > 8 && strings.Contains(f.Detail, part) {
+						t.Errorf("%s: finding %q holds a part of a verifier", c.name, f.Detail)
+					}
+				}
+			}
+		}
+	}
+	// A password set without its salt is an error, not a finding.
+	bad := s
+	delete(bad.ScramSalts, "supabase_read_only_user")
+	conn, _ := recordingConn(t, func(string) ([]uint32, [][]string) { return nil, nil })
+	if _, err := AssertReadOnlyVerifier(context.Background(), conn, bad); err == nil {
+		t.Error("no salt accepted")
 	}
 }
