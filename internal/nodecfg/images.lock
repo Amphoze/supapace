@@ -5,5 +5,6 @@
   "node":          {"tag": "docker:29-dind", "digest": "sha256:4bbc7223f81db790097c6dea42fb93e05b8fead4f0431fbe6ccaba6e8473201c", "amd64": "sha256:4eea5f48923988bc80515bf582ffec1eece35f5c13bceae1b2074dc80ead1e3d", "arm64": "sha256:eef28e5a97a3f31e277a8416e2e849d882e52670f1f72fba0569a53159abc379"},
   "s3_standin":    {"tag": "chrislusf/seaweedfs:4.54", "digest": "sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15", "amd64": "sha256:e7d4b80af9bd49b2630a60ac6fbb7ffb620ac6a2c501f689c22a71b9f89f0203", "arm64": "sha256:6f6fc8c7586c6c8f97ed4f9ab4c5a19d11dd97beecf20486e02155bcef7f0fd2"},
   "worker_base":   {"tag": "alpine:3.24", "digest": "sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf", "amd64": "sha256:0f49f331d9212aff11b932863be4eb01cdf962969aa86dab7d1ee21ac6f5f52b", "arm64": "sha256:1829893486be257df5049ab3b7fc95afbd0fc09d89803cbc580bda1ba5386b29"},
-  "worker_source": {"tag": "pgbackrest-2.58.0.tar.gz", "digest": "sha256:2517ec0a7f66be0f1bc77795c3a19cd41c4b106699321d3ac511bc539dd2bfca"}
+  "worker_source": {"tag": "pgbackrest-2.58.0.tar.gz", "digest": "sha256:2517ec0a7f66be0f1bc77795c3a19cd41c4b106699321d3ac511bc539dd2bfca"},
+  "pgmeta":        {"tag": "public.ecr.aws/supabase/postgres-meta:v0.100.0", "digest": "sha256:145325b7e39f8ef4931d6e8cfd3f6f4d655de09d72a2ccc96d9513542c2202bd", "amd64": "sha256:822227a8d12c109b24b8d8f1dae98a9c089a698b4586d35527dadf929e655136", "arm64": "sha256:e3e00f3d8315884717b9751cbf47888a0359c640097d96abff987de37a0edf81"}
 }

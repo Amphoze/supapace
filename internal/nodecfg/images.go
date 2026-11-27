@@ -89,3 +89,7 @@ func LockedPostgresVersion() (string, error) {
 	}
 	return v, nil
 }
+
+// PgMetaImage returns the pinned postgres-meta image the dashboard runs,
+// "<repository>@<index digest>". Only a node with a studio domain uses it.
+func PgMetaImage() (string, error) { return lockedRef("pgmeta") }

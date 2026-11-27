@@ -5912,3 +5912,70 @@ Known limits:
   that fails with "unable to select packages" now means a version moved. Look at what changed,
   bump that pin, rebuild, and let the node suite run.
 - The base image stays pinned by digest in internal/nodecfg/images.lock.
+
+### 2026-11-27 — The dashboard node side: keys, Studio, postgres-meta, data volume, gateway files
+internal/agent/dash.go. Nothing here acts on a node without a studio domain: no directory, no
+file, no image, no Docker call, no row.
+- EnsureDashboardFiles(ctx): calls dashcfg.For first; a refusal makes it do nothing (nil) and
+  becomes the failing row dashboard-config. Creates the keys once in KeyDir (root 0700, each
+  file root 0600, never replaced): assert.key and assert.pub (dashtok.GenerateKey), cache.key
+  (32 random bytes: 43 base64url and one line end), crypto.key (48 random bytes: exactly 64
+  base64url characters, no line end - the one form Studio's reader and postgres-meta's file read
+  take alike). Then the copies, each written by nodefs.WriteFile (temporary name, no link
+  followed, rename) only when not in place in content, mode and owner:
+  StudioKeys assert.pub root 0444, cache.key and crypto.key Studio's uid 0400;
+  <platform dir>/dash/pgmeta/crypto.key postgres-meta's uid 0400 (directory root 0755);
+  GatewayDash assert.key gateway uid 0400 and domain root 0444 (one line);
+  GatewayStudioTLS key.pem gateway uid 0400, cert.pem root 0444 (from StudioTLS).
+  SocketDir root, group Studio's uid, 0750. Starts no container.
+- Refused and left as found: a KeyDir file that is not a regular file of mode 0600 owned by the
+  daemon, a link, a key not in its form, a public half not matching assert.key, a public half
+  without its key (a key without its public half gets one). Errors name the path, never a key.
+- EnsureDashboard(ctx): EnsureDashboardFiles, then Studio's user quota (Limits.StudioVolumeMB) on
+  the projects filesystem before DataDir (<projects dir>/dash, Studio's uid 0700) is handed
+  over, then sp-studio, sp-pgmeta-0, sp-pgmeta-1. Each is adopted only at its configuration
+  label, alone on platform at its address (started when stopped), else removed and made
+  again. The label covers options, command, image id, the seccomp profile and the keys read at
+  start (Studio: its three copies; postgres-meta: KeyDir's crypto.key). A failing
+  dashcfg.Limits.Check renders nothing.
+- Every dashboard container (dashHardening): cap-drop ALL, no-new-privileges, the node's
+  seccomp profile, read-only root, core 0, no healthcheck, restart unless-stopped, ipc
+  private, the two sysctls, one network (platform) at a fixed address, a supapace.role label
+  (studio, pgmeta).
+- sp-studio: StudioImage, Studio's uid, 896 MiB (swap the same), 256 pids, tmpfs /tmp; SocketDir
+  at /run/dash ro, StudioKeys at /etc/dash ro, DataDir at /var/lib/dash rw. Environment:
+  dashcfg.StudioEnv with the image label supapace.studio.env (a JSON object of strings); a label
+  StudioEnv refuses, a missing label, or an image ENV naming a listener name, a fixed name or
+  ENABLED_FEATURES_* fails the creation naming the image.
+- sp-pgmeta-0/1: nodecfg.PgMetaImage() (the lock's "pgmeta"), postgres-meta's uid, 768 MiB, one
+  CPU, 128 pids, tmpfs /tmp; dashcfg.PgMetaEnv plus CRYPTO_KEY_FILE=/etc/pgmeta/crypto.key, the
+  copy's directory mounted read-only there: the key is in no container configuration. The
+  image falls back to a built-in key when that file is missing or empty, so postgres-meta is
+  rendered only while the copy is in place. Refused: any libpq name (PG followed by a letter) in
+  the image's ENV or the arguments; CRYPTO_KEY or CRYPTO_KEY_FILE in the image's own ENV.
+- CheckDashboard(ctx) []nodecfg.CheckResult: nil without a studio domain; dashboard-config alone
+  when dashcfg.For refuses; else dashboard-config, dashboard-files (KeyDir root 0700 and its
+  files, every copy, DataDir Studio's 0700), and one row per container: exists, runs, carries
+  this daemon's label, at its address - and fails while Docker restarts it or when it has
+  restarted and its last start is under a minute old (Docker reports it running meanwhile),
+  with its last log line cut at 256 bytes on a character boundary and quoted.
+- The gateway's label also covers dash/domain, KeyDir's assert.pub and the studio certificate,
+  only with a studio domain (a node without one keeps its label).
+- nodefs SetQuotaAt and QuotaUsage accept dashcfg.StudioUID. scripts/cache-images.sh handles
+  the lock key pgmeta only with SP_DASH=1, in both modes, saved under dash/.
+For the wiring that calls these:
+- Call EnsureDashboardFiles before the daemon's first EnsureGateway (it starts nothing).
+  EnsureImageFiles (the seccomp profile) and EnsurePlatformNetworks must have run before
+  EnsureDashboard; nothing checks that order. The images are not pulled: Studio's image and
+  the pinned postgres-meta must be in the node's store.
+- Every row above is containment-blocking under Blocking() as it stands (only control-plane-db
+  and gateway are exempt); a later package may exempt the three container rows, never
+  dashboard-config or dashboard-files (a wrong key file is an exposure, not an outage).
+- The purge of a project's data directory (<DataDir>/<ref>) is the wiring's: DataDir is
+  writable by Studio's uid, so remove it relative to DataDir without following links (Go's
+  os.RemoveAll on Linux does), only for a valid ref, after the project has left the
+  dashboard file.
+- A further dashboard container reuses dashHardening, ensureDashContainer and the row pattern.
+  Known limits: a crash loop whose crashes are more than a minute apart passes the restart rule
+  outside the minute after each restart; a postgres-meta that restarted while root had removed
+  its key copy keeps the built-in key until it is made again.

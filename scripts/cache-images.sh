@@ -6,6 +6,10 @@
 # node) and the worker image's base and source ("worker_base", "worker_source",
 # built from).
 #
+# SP_DASH=1 (make images DASH=1): also the images of the lock that only a node with
+# a studio domain runs ("pgmeta"), in both modes; saved under DIR/dash, which only
+# such a node loads. Without it they are neither pulled nor saved.
+#
 # A digest-only image is saved without a name and would load into the node
 # untagged, unreachable by the reference the platform uses. So the fully qualified
 # "<repository>@<digest>" is written into the archive's index.json as the
@@ -82,6 +86,7 @@ lock=$(dirname "$0")/../internal/nodecfg/images.lock
 # images.lock keeps one entry per line: "key": {"tag": "…", "digest": "sha256:…", …}
 entries=$(sed -n 's/^ *"\([a-z_]*\)": *{"tag": *"\([^"]*\)", *"digest": *"\(sha256:[0-9a-f]\{64\}\)".*/\1 \2 \3/p' "$lock" |
 	grep -Ev '^(node|s3_standin|worker_base|worker_source) ' || true)
+[[ ${SP_DASH:-} == 1 ]] || entries=$(grep -Ev '^pgmeta ' <<<"$entries" || true)
 if [[ $(wc -l <<<"$entries") -lt 3 ]]; then
 	echo "cache-images: cannot read the image entries of $lock" >&2
 	exit 1
@@ -96,7 +101,12 @@ while read -r key tag digest; do
 		echo "pulled   $ref"
 		continue
 	fi
-	tar=$dir/$key-${digest:7:12}.tar
+	sub=$dir
+	if [[ $key == pgmeta ]]; then
+		sub=$dir/dash
+		mkdir -p "$sub"
+	fi
+	tar=$sub/$key-${digest:7:12}.tar
 	if [[ -s $tar ]] && tar -xOf "$tar" index.json | grep -q "\"io.containerd.image.name\":\"[^\"]*@$digest\""; then
 		echo "cached   $ref"
 		continue

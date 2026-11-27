@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 )
 
@@ -36,10 +37,11 @@ func SetQuota(p nodecfg.Paths, uid, quotaMB int) error {
 }
 
 // SetQuotaAt is SetQuota on any XFS mount (a root-owned directory writable
-// by no one else), for a project id or exactly the control plane's or the
-// replicator's id; every other id, 0 included, is refused.
+// by no one else), for a project id, exactly the control plane's or the
+// replicator's id, or Studio's (dashcfg.StudioUID, for its data volume on the
+// projects filesystem); every other id, 0 included, is refused.
 func SetQuotaAt(mount string, id, quotaMB int) error {
-	if !quotaID(id) {
+	if !quotaID(id) && id != dashcfg.StudioUID {
 		return fmt.Errorf("nodefs: invalid quota id %d", id)
 	}
 	return setQuotaAt(mount, id, quotaMB)
@@ -143,7 +145,7 @@ func DiskUsage(ctx context.Context, p nodecfg.Paths, uid int) (int64, error) {
 // An id with neither usage nor limits has no record: 0, 0. The quota tool is
 // killed, with what it started, when ctx ends; the error is then ctx's.
 func QuotaUsage(ctx context.Context, mount string, id int) (usedKB, hardKB int64, err error) {
-	if !quotaID(id) {
+	if !quotaID(id) && id != dashcfg.StudioUID {
 		return 0, 0, fmt.Errorf("nodefs: invalid quota id %d", id)
 	}
 	if !filepath.IsAbs(mount) {

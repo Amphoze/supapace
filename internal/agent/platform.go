@@ -417,7 +417,9 @@ func (a *Agent) EnsureGateway(ctx context.Context) error {
 // gatewayConfig is sp-gateway's create options, command and configuration
 // label: what the gateway takes at create and start, as now on disk and in
 // the image store — its certificate (never the key), the profile, and the
-// image the tag names (a rebuilt image under the same tag re-creates it).
+// image the tag names (a rebuilt image under the same tag re-creates it);
+// with a studio domain also its domain file, the node's public assertion key
+// and its studio certificate (gatewayDashDigests).
 func (a *Agent) gatewayConfig(ctx context.Context) (opts, cmd []string, conf string, err error) {
 	gw := a.p.GatewayDir()
 	opts = []string{"create", "--name", gatewayName, "--user", fmt.Sprintf("%d:%d", gatewayUID, gatewayUID),
@@ -431,11 +433,15 @@ func (a *Agent) gatewayConfig(ctx context.Context) (opts, cmd []string, conf str
 	if err != nil {
 		return nil, nil, "", err
 	}
+	dash, err := a.gatewayDashDigests()
+	if err != nil {
+		return nil, nil, "", err
+	}
 	img, err := imageID(ctx, a.cfg.Images.Gateway)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	return opts, cmd, configHash(opts, cmd, append(extra, "image id="+img)...), nil
+	return opts, cmd, configHash(opts, cmd, slices.Concat(extra, dash, []string{"image id=" + img})...), nil
 }
 
 // ensurePlatformDir makes /var/lib/supapace (root 0700) and its platform tree
