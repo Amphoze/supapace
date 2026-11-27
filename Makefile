@@ -111,7 +111,7 @@ load_browsers = { test -f "$(BROWSERS_TAR)" || { echo "$(BROWSERS_TAR) is missin
 	$(call load_tar,$(BROWSERS_TAR))
 
 .PHONY: setup build images unit gate-test node-up node-bare node-down reach reach-reboot reach-host measure public-check \
-	standin-test harness-test lab studio browsers reach-dash node-proof browser-test
+	standin-test harness-test lab studio browsers reach-dash node-proof browser-test check-exp
 
 setup:
 	git config core.hooksPath .githooks
@@ -174,6 +174,15 @@ unit: gate-test
 # End-to-end cases of the public-content gate and its hooks, in throw-away repositories.
 gate-test:
 	scripts/test-check-public.sh
+
+# The experiments' kit, compiled and linted, never run: ag/exp.go vetted inside cmd/supapaced
+# through the overlay ag/lab.sh builds with, and the scripts' shellcheck.
+EXP = test/harness/experiments
+check-exp:
+	@o=$$(mktemp) && trap 'rm -f "$$o"' EXIT && \
+	printf '{"Replace":{"%s/cmd/supapaced/zz_exp.go":"%s/$(EXP)/ag/exp.go"}}\n' "$(CURDIR)" "$(CURDIR)" >"$$o" && \
+	$(GO) vet -tags supapace_exp -overlay "$$o" ./cmd/supapaced
+	cd $(EXP) && shellcheck -s sh e2[0-8].sh lib-agent.sh && shellcheck ag/lab.sh
 
 node-up: MODE := full
 node-bare: MODE := bare

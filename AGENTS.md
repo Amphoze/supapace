@@ -6363,3 +6363,46 @@ Known limits:
 - One Studio process writes a data volume: one writer per project's audit file is a rule of the
   process.
 - A request whose client leaves costs eleven log lines of the server framework's own.
+
+### 2026-11-27 — Experiments e20–e28 on the platform's own code (ag/exp.go, ag/lab.sh)
+- Files: `test/harness/experiments/e20.sh` … `e28.sh`, `lib-agent.sh` (sourced after
+  `lib-backup.sh`), `ag/lab.sh` (host runner, bash) and `ag/exp.go` (build tag `supapace_exp`).
+- Run, from a checkout with Go and Docker: `make images`, `make node-bare NODE=sp-x`
+  (with the object-store stand-in; never `SP_OFFSITE=0`), then
+  `test/harness/experiments/ag/lab.sh sp-x test/harness/experiments/eNN.sh`; `make node-down
+  NODE=sp-x` at the end. One script per node at a time.
+- lab.sh builds `supapaced` from the tree with one more command, `supapaced exp …`: `go build
+  -overlay` puts `ag/exp.go` into `cmd/supapaced` as `zz_exp.go`, with `-tags supapace_exp`.
+  No product build or test build contains it; `go build -tags supapace_exp ./...` fails
+  on purpose (the file is a fragment of `cmd/supapaced`). `make check-exp` (a step of CI's unit
+  job) vets it through the same overlay and shellchecks the scripts; nothing of the kit runs in
+  CI. It calls internal/agent, nft, s3x, store, jobio, pgsock and walname.
+- The binary and the node's `supapace-arch` go to `/var/lib/sp-exp/ag/bin` in the node (root,
+  0755): every job, task and archive-binary copy runs the platform's programs, because RunJob
+  mounts the daemon's own executable. `exp` refuses a non-root caller; lab secrets are derived
+  from a random seed in the kit directory (0700) and never printed.
+- lab.sh refuses a node where the daemon runs or the kit directory exists; on TERM, INT or HUP it
+  stops the run by its recorded pid (60 s, then KILL) and removes the lab: `exp downall`
+  (projects, control-plane database, platform networks, ruleset, quotas, by name) and
+  `lab_down`. After a KILL of lab.sh, run `make node-down`.
+- Output: PASS / FAIL / CONTROL / RECORDED lines, then one `VERDICT ENN: confirmed — …` line;
+  exit 0 confirmed, 1 a criterion failed (`unknown`), 3 a lab error (the EXIT trap prints an
+  `unknown` line naming the step).
+- Questions: e20 the replicator's group read of repo/ and hostile entries; e21 the repository
+  quota at push and backup, fetch/ charged to the replicator, a disk-quota stop with and without
+  the runbook; e22 conditional create and versions on the stand-in, the probe job; e23 the backup
+  network's egress with the off-site set, F7, no lookup, a set change in flight, the drift check;
+  e24 the re-key against hostile restored settings and content; e25 recovery leftovers (target
+  beyond the archive, a seeded repository, an altered segment, a stop between promotion and
+  re-key, a self-promoted cluster); e26 the control-plane stanza end to end; e27 idle WAL and a
+  segment archived again after a crash; e28 the `.partial` rule under the real server.
+- Durations on a loaded workstation: e20 2–3 min, e21 5–8, e22 <1, e23 3, e24 2, e25 15–18,
+  e26 2–3, e27 ~28 (25 of them idle sampling at `archive_timeout` 300 s), e28 2–3.
+- Stand-ins left in the lab: the fetch plan is built from the store's listing (`exp` xPlan), the
+  record of timelines is shell state (the serve job admits `SERVE_TL`, default 1,2,3), single
+  connection probes and the slow reader are sp-probe containers, and pgBackRest's verify, info
+  and expire run in a plain worker container.
+- Limits: the stand-in keeps every object a day on a 512 MiB tmpfs; one round of all nine uses
+  about 111 MiB, so about four rounds fit one node. e20's repository holds about half the
+  replication job's file cap (1037 of 2048 files). Re-run e24 at every image
+  bump of the cluster image (the platform session's startup list is one image's).

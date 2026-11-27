@@ -105,6 +105,12 @@ jobs:
       - run: go vet -tags reach ./...
       - run: go vet -tags 'reach dash' ./...
       - run: go vet -tags browser ./...
+      # The experiments' kit is compiled and linted here, never run (it needs a bare node).
+      # shellcheck is the runner image's own.
+      - name: Experiments kit
+        run: |
+          shellcheck --version | sed -n 2p
+          make check-exp
       # The Docker tests skip when their pinned image is absent: pull both so they run.
       - name: Pinned images
         run: |
