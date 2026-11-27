@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH 18/18] config: further cases of the per-project values
+
+The project config route answers the project's Data API settings; a context read after
+waiting on what another request settles is the request's own; a key file with a slash or
+a leading line end stops the process.
+---
+ .../lib/api/self-hosted/config-review.test.ts | 112 ++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/config-review.test.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/config-review.test.ts b/apps/studio/lib/api/self-hosted/config-review.test.ts
+new file mode 100644
+index 00000000..b4f6f548
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/config-review.test.ts
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: Apache-2.0
++// Further cases of the per-project values: the one served route that still answered built-in
++// Data API settings, a context read after waiting on what another request settles, and two
++// more key files of another form.
++import { setTimeout as sleep } from 'node:timers/promises'
++import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { describe, expect, it, vi } from 'vitest'
++
++import { getProjectContext, projectContext, runWithProject, type ResolveAnswer } from './project-context'
++import { contextProject, dataApi, projectUrls } from './project-values'
++
++vi.mock('@sentry/react', () => ({
++  startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
++  captureException: () => {},
++}))
++
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++
++function answer(ref: string): ResolveAnswer {
++  const a = ref === REF_A
++  return {
++    ref,
++    name: a ? 'project alpha' : 'project bravo',
++    state: a ? 'active' : 'restoring',
++    db_version: a ? '17.6.1' : '15.8.1',
++    pg_meta: 0,
++    dsn_rw: `postgresql://postgres:pw@10.212.0.6:${a ? 20001 : 20002}/postgres?sslmode=disable`,
++    api_url: `https://${ref}.${a ? 'alpha' : 'bravo'}.test`,
++    data_api: a
++      ? { schemas: ['public', 'graphql_public'], extra_search_path: ['public', 'extensions'], max_rows: null }
++      : { schemas: ['api', 'reporting'], extra_search_path: ['extensions'], max_rows: 250 },
++    generation: 1,
++    at: '2026-11-19T10:00:00Z',
++  }
++}
++const context = (ref: string) =>
++  projectContext(
++    { text: 'v1.a.b', ref, iss: 'https://issuer.test', sub: 'u', name: 'U', role: 'owner', purpose: '' },
++    answer(ref)
++  )
++
++describe('per-project values: further cases', () => {
++  it('the project config route answers the project’s Data API settings, not built-in ones', async () => {
++    const { Route } = await import('@/routes/api/platform/projects/$ref/config/index')
++    for (const ref of [REF_A, REF_B]) {
++      const response: Response = await runWithProject(context(ref), () =>
++        (Route as any).options.server.handlers.GET({
++          request: new Request(`http://studio.test/api/platform/projects/${ref}/config/`),
++          params: { ref },
++        })
++      )
++      const got = await response.json()
++      const want = answer(ref).data_api
++      expect(got).toMatchObject({
++        db_schema: want.schemas.join(','),
++        db_extra_search_path: want.extra_search_path.join(','),
++        max_rows: want.max_rows,
++      })
++    }
++  })
++
++  it('a value read after waiting on a promise another request settles is the request’s own', async () => {
++    // B settles what A waits on, from inside B's own flow; A reads its values only afterwards.
++    let settle!: () => void
++    const shared = new Promise<void>((done) => (settle = done))
++    const a = runWithProject(context(REF_A), async () => {
++      await shared
++      return { ref: getProjectContext().ref, project: contextProject(), urls: projectUrls(), api: dataApi() }
++    })
++    const b = runWithProject(context(REF_B), async () => {
++      await sleep(5)
++      settle()
++      await sleep(1)
++      return contextProject().ref
++    })
++    const [gotA, gotB] = await Promise.all([a, b])
++    expect(gotB).toBe(REF_B)
++    expect(gotA.ref).toBe(REF_A)
++    expect(gotA.project).toMatchObject({ ref: REF_A, name: 'project alpha', status: 'ACTIVE_HEALTHY', dbVersion: '17.6.1' })
++    expect(gotA.urls.endpoint).toBe(`${REF_A}.alpha.test`)
++    expect(gotA.api).toEqual({ schemas: 'public,graphql_public', extraSearchPath: 'public,extensions', maxRows: null })
++  })
++})
++
++describe('the header key file: characters outside base64url', () => {
++  const KEY = Buffer.alloc(48, 9).toString('base64url')
++  it.each([
++    ['a slash', KEY.slice(1) + '/'],
++    ['a line end first', '\n' + KEY],
++  ])('a key file with %s stops the process', async (_, text) => {
++    const dir = mkdtempSync(join(tmpdir(), 'header-key-review-'))
++    try {
++      writeFileSync(join(dir, 'crypto.key'), text)
++      vi.resetModules()
++      vi.stubEnv('SUPAPACE_DASH_KEYS', dir)
++      const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
++        throw new Error('the process exited')
++      })
++      vi.spyOn(console, 'error').mockImplementation(() => {})
++      const { checkHeaderKey } = await import('./util')
++      expect(() => checkHeaderKey()).toThrow('the process exited')
++      expect(exit).toHaveBeenCalledWith(1)
++    } finally {
++      vi.unstubAllEnvs()
++      vi.restoreAllMocks()
++      rmSync(dir, { recursive: true, force: true })
++    }
++  })
++})

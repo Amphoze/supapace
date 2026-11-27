@@ -28,8 +28,8 @@ A=aaaaaaaaaaaaaaaaaaa1 B=bbbbbbbbbbbbbbbbbbb2 C=ccccccccccccccccccc3
 PA=20001 PB=20002 PC=20003
 ISS=https://issuer.test
 NODE=node-1
-# Until the address of postgres-meta and the key of its header come from the node's settings,
-# the server takes both from these two names.
+# postgres-meta's header key, the file crypto.key of the keys directory. Until the address of
+# postgres-meta comes from the node's settings, the server takes it from STUDIO_PG_META_URL.
 CRYPTO='proof-only-header-key_0123456789abcdefghijklmnopqrstuvwxyzABCDEF'
 fails=0 rows=0
 
@@ -123,8 +123,8 @@ standins_up() {
   openssl pkey -in "$T/assert.pem" -pubout -outform DER | tail -c 32 | b64url >"$T/keys/assert.pub"
   head -c 32 /dev/urandom | b64url >"$T/keys/cache.key"
   printf '\n' | tee -a "$T/keys/assert.pub" >>"$T/keys/cache.key"
-  chmod 0644 "$T/keys/assert.pub" "$T/keys/cache.key"
-  printf '%s' "$CRYPTO" >"$T/crypto.key"
+  printf '%s' "$CRYPTO" >"$T/keys/crypto.key" # no line end: enc() of a proof seals with it too
+  chmod 0644 "$T/keys/assert.pub" "$T/keys/cache.key" "$T/keys/crypto.key"
 
   # The table of the control plane's stand-in. Every value of a project carries "spmark", so
   # that a proof can look for one where none belongs.
@@ -149,13 +149,13 @@ standins_up() {
 
   docker network create --internal "${L[@]}" "$PREFIX-net" >/dev/null || return 1
   docker run -d --name "$PREFIX-pgmeta" "${L[@]}" --network "$PREFIX-net" --network-alias pgmeta \
-    --user "$(id -u):$(id -g)" -v "$T/bin/sp-dashstub:/sp-dashstub:ro" -v "$T/crypto.key:/crypto.key:ro" \
+    --user "$(id -u):$(id -g)" -v "$T/bin/sp-dashstub:/sp-dashstub:ro" -v "$T/keys/crypto.key:/crypto.key:ro" \
     "$NODE_BASE" /sp-dashstub pgmeta --listen :8080 --crypto-key-file /crypto.key --delay-ms 40 >/dev/null || return 1
   STUDIO_ENV=(-e NODE_ENV=production -e PORT=3000 -e "SUPAPACE_NODE_ID=$NODE"
     -e SUPAPACE_DASH_SOCKET=/run/dash/dash.sock -e SUPAPACE_DASH_KEYS=/etc/dash -e SUPAPACE_DASH_DATA=/var/lib/dash
     -e SUPAPACE_PGCAP=10.212.0.6:20000:21023 -e SUPAPACE_PGMETA=http://10.212.0.4:8080,http://10.212.0.5:8080
     -e "SUPAPACE_LIMITS=$LIMITS"
-    -e STUDIO_PG_META_URL=http://pgmeta:8080 -e "PG_META_CRYPTO_KEY=$CRYPTO")
+    -e STUDIO_PG_META_URL=http://pgmeta:8080)
   socket && studio
 }
 

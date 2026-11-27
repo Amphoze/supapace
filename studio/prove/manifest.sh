@@ -197,8 +197,7 @@ logged
 # application, and its HTML holds no marked value: none the control plane answered for the
 # project, none of the process. That the marks are there to be found is the control: a route
 # that still answers one of them is searched in the same way.
-studio -e DEFAULT_PROJECT_NAME=spmarkProjectName -e DEFAULT_ORGANIZATION_NAME=spmarkOrgName \
-  -e SUPABASE_PUBLIC_URL=http://spmarkpublic -e SUPABASE_URL=http://spmarkurl \
+studio -e SUPABASE_URL=http://spmarkurl \
   -e SUPABASE_ANON_KEY=spmarkAnonKey -e SUPABASE_SERVICE_KEY=spmarkServiceKey \
   -e AUTH_JWT_SECRET=spmarkJwtSecret -e POSTGRES_PASSWORD=spmarkPassword \
   -e POSTGRES_HOST=spmarkpghost -e POSTGRES_DB=spmarkdb -e STUDIO_PG_META_URL=http://spmarkmeta ||

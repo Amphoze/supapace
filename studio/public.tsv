@@ -34,5 +34,3 @@ process.env.TSS_ROUTER_BASEPATH	""
 process.env.TSS_SERVER_FN_BASE	"/_serverFn/"
 #
 @upstream:apps/studio/.env:NEXT_PUBLIC_SUPABASE_URL	server/mcp-server+[...].mjs
-@upstream:apps/studio/.env:SUPABASE_PUBLIC_URL	server/_ssr/router-[hash].mjs
-@upstream:apps/studio/.env:SUPABASE_URL	server/_ssr/router-[hash].mjs

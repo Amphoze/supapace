@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:35:39 +0000
+Subject: [PATCH 16/18] config: the organisation's name in the profile and
+ organisation stubs
+
+Inside a project's origin there is one project: the organisation the profile and the
+organisation list name bears the request's project's name, and the profile's one project
+is the request's.
+---
+ apps/studio/routes/api/platform/organizations/index.ts | 4 +++-
+ apps/studio/routes/api/platform/profile/index.ts       | 6 ++++--
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/apps/studio/routes/api/platform/organizations/index.ts b/apps/studio/routes/api/platform/organizations/index.ts
+index 04af8bfc..e7dd4570 100644
+--- a/apps/studio/routes/api/platform/organizations/index.ts
++++ b/apps/studio/routes/api/platform/organizations/index.ts
+@@ -5,2 +5,3 @@ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
++import { contextProject } from '@/lib/api/self-hosted/project-values'
+ 
+@@ -25,3 +26,4 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+       id: 1,
+-      name: process.env.DEFAULT_ORGANIZATION_NAME || 'Default Organization',
++      // one project per origin: its organisation bears its name
++      name: contextProject().name,
+       slug: 'default-org-slug',
+diff --git a/apps/studio/routes/api/platform/profile/index.ts b/apps/studio/routes/api/platform/profile/index.ts
+index eecb2ac0..ebdf26bb 100644
+--- a/apps/studio/routes/api/platform/profile/index.ts
++++ b/apps/studio/routes/api/platform/profile/index.ts
+@@ -5,3 +5,3 @@ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { DEFAULT_PROJECT } from '@/lib/constants/api'
++import { contextProject } from '@/lib/api/self-hosted/project-values'
+ 
+@@ -23,2 +23,4 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+   // Platform specific endpoint
++  // the request's project, under the name upstream's lines below use
++  const DEFAULT_PROJECT = contextProject()
+   const response = {
+@@ -32,3 +34,3 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+         id: 1,
+-        name: process.env.DEFAULT_ORGANIZATION_NAME || 'Default Organization',
++        name: DEFAULT_PROJECT.name,
+         slug: 'default-org-slug',

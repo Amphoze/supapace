@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:35:39 +0000
+Subject: [PATCH 17/18] config: the database's major version through upstream's
+ helper
+
+The read-replica eligibility check read the major version by splitting the version text
+itself; it uses upstream's helper, as every other reader does.
+---
+ .../ReadReplicaForm/useCheckEligibilityDeployReplica.ts    | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/apps/studio/components/interfaces/Settings/Infrastructure/ReadReplicas/ReadReplicaForm/useCheckEligibilityDeployReplica.ts b/apps/studio/components/interfaces/Settings/Infrastructure/ReadReplicas/ReadReplicaForm/useCheckEligibilityDeployReplica.ts
+index 8e4ec868..6b3e6e27 100644
+--- a/apps/studio/components/interfaces/Settings/Infrastructure/ReadReplicas/ReadReplicaForm/useCheckEligibilityDeployReplica.ts
++++ b/apps/studio/components/interfaces/Settings/Infrastructure/ReadReplicas/ReadReplicaForm/useCheckEligibilityDeployReplica.ts
+@@ -15,6 +15,7 @@ import {
+   useIsHighAvailability,
+   useSelectedProjectQuery,
+ } from '@/hooks/misc/useSelectedProject'
++import { getDatabaseMajorVersion } from '@/lib/helpers'
+ 
+ export const useCheckEligibilityDeployReplica = () => {
+   const { ref: projectRef } = useParams()
+@@ -53,10 +54,8 @@ export const useCheckEligibilityDeployReplica = () => {
+   const isReachedMaxReplicas =
+     (databases ?? []).filter((db) => db.identifier !== projectRef).length >= maxNumberOfReplicas
+ 
+-  const parsedPgVersion = Number(
+-    (project?.dbVersion ?? '').split('supabase-postgres-')[1]?.split('.')[0]
+-  )
+-  const currentPgVersion = Number.isNaN(parsedPgVersion) ? undefined : parsedPgVersion
++  // 0 when the version has no major number to read
++  const currentPgVersion = getDatabaseMajorVersion(project?.dbVersion ?? '') || undefined
+ 
+   const upgradeEligibilityQuery = useProjectUpgradeEligibilityQuery({ projectRef })
+   const upgradeEligibility = upgradeEligibilityQuery.data

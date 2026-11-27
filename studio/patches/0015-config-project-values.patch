@@ -1,0 +1,856 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:35:39 +0000
+Subject: [PATCH 15/18] config: per-project values from the request's context
+
+What upstream read once from the process for its one project is read for the request's
+project from its context: the public URL and what it derives from it (the REST URL, the
+endpoint, the protocol, the host), the Data API settings (exposed schemas, extra search path,
+maximum rows; type generation and lints use the project's schemas), the project's name, its
+version and its state, and the organisation's name, which is the project's. The project
+routes answer the context's ref, name, version and state. The per-project constants and their
+built-in defaults are deleted, so that an importer left behind stops the build. No answer
+about the project asks its database.
+---
+ .../lib/api/self-hosted/constants.test.ts     |   5 +-
+ apps/studio/lib/api/self-hosted/constants.ts  |   6 -
+ .../api/self-hosted/generate-types.test.ts    |  13 +-
+ .../lib/api/self-hosted/generate-types.ts     |   6 +-
+ apps/studio/lib/api/self-hosted/mcp.ts        |   6 +-
+ .../api/self-hosted/project-values.test.ts    | 230 ++++++++++++++++++
+ .../lib/api/self-hosted/project-values.ts     |  52 ++++
+ apps/studio/lib/api/self-hosted/settings.ts   |  22 +-
+ apps/studio/lib/constants/api.ts              |  22 --
+ apps/studio/routes/api/mcp/index.ts           |   4 +-
+ .../platform/projects/$ref/config/index.ts    |   9 +-
+ .../projects/$ref/config/postgrest.ts         |  10 +-
+ .../api/platform/projects/$ref/databases.ts   |  19 +-
+ .../api/platform/projects/$ref/index.ts       |   6 +-
+ .../api/platform/projects/$ref/run-lints.ts   |   4 +-
+ .../routes/api/platform/projects/index.ts     |   4 +-
+ .../api/platform/props/project/$ref/api.ts    |  31 ++-
+ .../api/platform/props/project/$ref/index.ts  |   4 +-
+ 18 files changed, 358 insertions(+), 95 deletions(-)
+ create mode 100644 apps/studio/lib/api/self-hosted/project-values.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/project-values.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/constants.test.ts b/apps/studio/lib/api/self-hosted/constants.test.ts
+index c2b6ba87..9478a8cd 100644
+--- a/apps/studio/lib/api/self-hosted/constants.test.ts
++++ b/apps/studio/lib/api/self-hosted/constants.test.ts
+@@ -5,7 +5,8 @@ describe('api/self-hosted/constants', () => {
+     vi.resetModules()
+   })
+ 
+-  // Skipped: the header key is the node's key file (header-key.test.ts).
++  // Skipped, here and below: the header key is the node's key file (header-key.test.ts), and no
++  // per-project value is a constant (project-values.test.ts).
+   describe.skip('ENCRYPTION_KEY', () => {
+     it('should use PG_META_CRYPTO_KEY when set', async () => {
+       vi.stubEnv('PG_META_CRYPTO_KEY', 'my-secret-key-123')
+@@ -20,7 +21,7 @@ describe('api/self-hosted/constants', () => {
+     })
+   })
+ 
+-  describe('POSTGRES_PORT', () => {
++  describe.skip('POSTGRES_PORT', () => {
+     it('should use POSTGRES_PORT when set', async () => {
+       vi.stubEnv('POSTGRES_PORT', '5433')
+       const { POSTGRES_PORT } = await import('./constants')
+diff --git a/apps/studio/lib/api/self-hosted/constants.ts b/apps/studio/lib/api/self-hosted/constants.ts
+index 0bbc003b..586d0bbf 100644
+--- a/apps/studio/lib/api/self-hosted/constants.ts
++++ b/apps/studio/lib/api/self-hosted/constants.ts
+@@ -1,11 +1,5 @@
+ // Constants specific to self-hosted environments
+ 
+-// Schemas exposed via PostgREST Data API, read from the PGRST_DB_SCHEMAS env var
+-// that is passed to the Studio container via docker-compose / CLI.
+-export const DEFAULT_EXPOSED_SCHEMAS = process.env.PGRST_DB_SCHEMAS ?? 'public,graphql_public'
+-
+-export const POSTGRES_PORT = parseInt(process.env.POSTGRES_PORT || '5432', 10)
+-
+ // Fallback used when AUTH_JWT_SECRET is not provided to the Studio container
+ // (e.g. local dev without docker-compose). The string is the same default
+ // shipped by the supabase/cli — keep them in sync.
+diff --git a/apps/studio/lib/api/self-hosted/generate-types.test.ts b/apps/studio/lib/api/self-hosted/generate-types.test.ts
+index a20a8be7..766c9978 100644
+--- a/apps/studio/lib/api/self-hosted/generate-types.test.ts
++++ b/apps/studio/lib/api/self-hosted/generate-types.test.ts
+@@ -20,12 +20,9 @@ vi.mock('./util', async (original) => ({
+ }))
+ 
+ // A distinctive, non-default value so the assertions verify the URL reflects the
+-// configured exposed schemas (PGRST_DB_SCHEMAS) — whatever they are — rather than
++// exposed schemas of the request's project — whatever they are — rather than
+ // coupling the test to a specific default.
+-const EXPOSED_SCHEMAS = 'public,custom_schema,graphql_public'
+-vi.mock('./constants', () => ({
+-  DEFAULT_EXPOSED_SCHEMAS: 'public,custom_schema,graphql_public',
+-}))
++const EXPOSED_SCHEMAS = ['public', 'custom_schema', 'graphql_public']
+ 
+ const REF_A = 'abcdefghij0123456789'
+ const REF_B = 'bcdefghij0123456789a'
+@@ -44,7 +41,7 @@ function context(ref: string, port: number, role: Assertion['role'] = 'owner') {
+       ...(role === 'read_only' ? {} : { dsn_rw: dsn('postgres', port) }),
+       dsn_ro: dsn('supabase_read_only_user', port),
+       api_url: `https://${ref}.example.test`,
+-      data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
++      data_api: { schemas: EXPOSED_SCHEMAS, extra_search_path: [], max_rows: null },
+       generation: 1,
+       at: '2026-11-19T10:00:00Z',
+     }
+@@ -81,8 +78,8 @@ describe('api/self-hosted/generate-types', () => {
+ 
+       const callUrl = mockFetchGet.mock.calls[0][0]
+       expect(callUrl).toContain('http://localhost:8080/generators/typescript')
+-      // Forwards the exposed-schemas config verbatim as the plural allowlist param.
+-      expect(callUrl).toContain(`included_schemas=${EXPOSED_SCHEMAS}`)
++      // Forwards the project's exposed schemas, encoded, as the plural allowlist param.
++      expect(callUrl).toContain('included_schemas=public%2Ccustom_schema%2Cgraphql_public')
+       // No hardcoded exclude list — the exposed-schemas config is the source of truth.
+       expect(callUrl).not.toContain('excluded_schemas=')
+     })
+diff --git a/apps/studio/lib/api/self-hosted/generate-types.ts b/apps/studio/lib/api/self-hosted/generate-types.ts
+index 62b0f8a2..2fede54e 100644
+--- a/apps/studio/lib/api/self-hosted/generate-types.ts
++++ b/apps/studio/lib/api/self-hosted/generate-types.ts
+@@ -1,4 +1,4 @@
+-import { DEFAULT_EXPOSED_SCHEMAS } from './constants'
++import { dataApi } from './project-values'
+ import { assertSelfHosted, encryptString, getConnectionString } from './util'
+ import { fetchGet } from '@/data/fetchers'
+ import { PG_META_URL } from '@/lib/constants'
+@@ -27,12 +27,12 @@ export async function generateTypescriptTypes({
+   const named = new Headers(headers)
+   named.set('x-connection-encrypted', encryptString(getConnectionString({ readOnly: false })))
+ 
+-  // Use the schemas actually exposed via PostgREST (PGRST_DB_SCHEMAS) so generated
++  // Use the schemas the project's Data API exposes so generated
+   // types match the Data API surface, instead of a hardcoded include/exclude list.
+   // Note the param is `included_schemas` (plural) — pg-meta treats a non-empty list
+   // as a strict allowlist; the singular spelling is silently ignored (includes all).
+   const response = await fetchGet<GenerateTypescriptTypesResult>(
+-    `${PG_META_URL}/generators/typescript?included_schemas=${DEFAULT_EXPOSED_SCHEMAS}`,
++    `${PG_META_URL}/generators/typescript?included_schemas=${encodeURIComponent(dataApi().schemas)}`,
+     { headers: Object.fromEntries(named) }
+   )
+ 
+diff --git a/apps/studio/lib/api/self-hosted/mcp.ts b/apps/studio/lib/api/self-hosted/mcp.ts
+index 55fc17b5..c511d443 100644
+--- a/apps/studio/lib/api/self-hosted/mcp.ts
++++ b/apps/studio/lib/api/self-hosted/mcp.ts
+@@ -17,11 +17,11 @@ import {
+ import { isFeatureEnabled, type Feature } from 'common/enabled-features'
+ import { getEnabledFeaturesOverrideDisabledList } from 'common/enabled-features/overrides'
+ 
+-import { DEFAULT_EXPOSED_SCHEMAS } from './constants'
+ import { generateTypescriptTypes } from './generate-types'
+ import { getLints } from './lints'
+ import { retrieveAnalyticsData } from './logs'
+ import { applyAndTrackMigrations, listMigrationVersions } from './migrations'
++import { dataApi } from './project-values'
+ import { executeQuery } from './query'
+ import { getProjectSettings } from './settings'
+ import { isStudioError } from '@/lib/errors/studio-errors'
+@@ -171,7 +171,7 @@ export function getDebuggingOperations({
+     async getSecurityAdvisors(_projectRef) {
+       const { data, error } = await getLints({
+         headers,
+-        exposedSchemas: DEFAULT_EXPOSED_SCHEMAS,
++        exposedSchemas: dataApi().schemas,
+       })
+ 
+       if (error) {
+@@ -183,7 +183,7 @@ export function getDebuggingOperations({
+     async getPerformanceAdvisors(_projectRef) {
+       const { data, error } = await getLints({
+         headers,
+-        exposedSchemas: DEFAULT_EXPOSED_SCHEMAS,
++        exposedSchemas: dataApi().schemas,
+       })
+ 
+       if (error) {
+diff --git a/apps/studio/lib/api/self-hosted/project-values.test.ts b/apps/studio/lib/api/self-hosted/project-values.test.ts
+new file mode 100644
+index 00000000..2cbc532c
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/project-values.test.ts
+@@ -0,0 +1,230 @@
++// SPDX-License-Identifier: Apache-2.0
++// What upstream read once from the process for its one project — the public URL, the Data API
++// settings, the names, the version and the state — is the request's project's, from its
++// context: every route that answers one of them, under two projects' requests interleaved.
++import { setTimeout as sleep } from 'node:timers/promises'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { projectContext, runWithProject, type ResolveAnswer } from './project-context'
++
++vi.mock('@sentry/react', () => ({
++  startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
++  captureException: () => {},
++}))
++vi.mock('@/lib/constants', async (original) => ({
++  ...(await original<Record<string, unknown>>()),
++  IS_PLATFORM: false,
++  PG_META_URL: 'http://meta.test',
++}))
++vi.mock('@/lib/constants/index', async (original) => ({
++  ...(await original<Record<string, unknown>>()),
++  IS_PLATFORM: false,
++  PG_META_URL: 'http://meta.test',
++}))
++vi.mock('./util', async (original) => ({
++  ...(await original<typeof import('./util')>()),
++  encryptString: (text: string) => `encrypted(${text})`,
++}))
++const lints = vi.hoisted(() => vi.fn())
++vi.mock('@/lib/api/self-hosted/lints', () => ({ getLints: lints }))
++
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++
++type Over = Partial<ResolveAnswer>
++function answer(ref: string, over: Over = {}): ResolveAnswer {
++  const a = ref === REF_A
++  return {
++    ref,
++    name: a ? 'project alpha' : 'project bravo',
++    state: 'active',
++    db_version: a ? '17.6.1' : '15.8.1',
++    pg_meta: a ? 1 : 0,
++    dsn_rw: `postgresql://postgres:pw@10.212.0.6:${a ? 20001 : 20002}/postgres?sslmode=disable`,
++    api_url: `https://${ref}.${a ? 'alpha' : 'bravo'}.test`,
++    data_api: a
++      ? { schemas: ['public', 'graphql_public'], extra_search_path: ['public', 'extensions'], max_rows: null }
++      : { schemas: ['api', 'reporting'], extra_search_path: ['extensions'], max_rows: 250 },
++    generation: 1,
++    at: '2026-11-19T10:00:00Z',
++    ...over,
++  }
++}
++const context = (ref: string, over: Over = {}) =>
++  projectContext(
++    { text: 'v1.a.b', ref, iss: 'https://issuer.test', sub: 'u', name: 'U', role: 'owner', purpose: '' },
++    answer(ref, over)
++  )
++
++/** A route's GET as the server runs it, the path's $ref naming the OTHER project. */
++async function get(module: string, path: string, otherRef: string) {
++  const { Route } = await import(/* @vite-ignore */ module)
++  const response: Response = await (Route as any).options.server.handlers.GET({
++    request: new Request(`http://studio.test${path.replace('$ref', otherRef)}`),
++    params: { ref: otherRef },
++  })
++  expect(response.status).toBe(200)
++  return response.json()
++}
++
++// What each converted value is for a project, and where its answer holds it.
++const host = (ref: string) => new URL(answer(ref).api_url).host
++const rest = (ref: string) => `${answer(ref).api_url}/rest/v1/`
++const schemas = (ref: string) => answer(ref).data_api.schemas.join(',')
++
++const ROUTES: [string, string, string, (ref: string) => unknown][] = [
++  ['projects/$ref', '@/routes/api/platform/projects/$ref/index', '/api/platform/projects/$ref/',
++    (ref) => ({ ref, name: answer(ref).name, restUrl: rest(ref), dbVersion: answer(ref).db_version })],
++  ['projects', '@/routes/api/platform/projects/index', '/api/platform/projects/',
++    (ref) => [{ ref, name: answer(ref).name }]],
++  ['props/project/$ref', '@/routes/api/platform/props/project/$ref/index', '/api/platform/props/project/$ref/',
++    (ref) => ({ project: { ref, name: answer(ref).name } })],
++  ['props/project/$ref/api', '@/routes/api/platform/props/project/$ref/api', '/api/platform/props/project/$ref/api',
++    (ref) => ({
++      project: { ref, name: answer(ref).name, db_host: ref + (ref === REF_A ? '.alpha.test' : '.bravo.test'),
++        services: [{ app_config: { endpoint: host(ref) } }] },
++      autoApiService: { project: { ref }, protocol: 'https', endpoint: host(ref), restUrl: rest(ref),
++        app_config: { endpoint: host(ref) } },
++    })],
++  ['databases', '@/routes/api/platform/projects/$ref/databases', '/api/platform/projects/$ref/databases',
++    (ref) => [{ identifier: ref, db_host: new URL(answer(ref).api_url).hostname, restUrl: rest(ref) }]],
++  ['settings', '@/routes/api/platform/projects/$ref/settings', '/api/platform/projects/$ref/settings',
++    (ref) => ({ ref, name: answer(ref).name, db_host: new URL(answer(ref).api_url).hostname,
++      app_config: { endpoint: host(ref), storage_endpoint: host(ref), protocol: 'https' } })],
++  ['config/postgrest', '@/routes/api/platform/projects/$ref/config/postgrest',
++    '/api/platform/projects/$ref/config/postgrest',
++    (ref) => ({ db_schema: schemas(ref), db_extra_search_path: answer(ref).data_api.extra_search_path.join(','),
++      max_rows: answer(ref).data_api.max_rows })],
++  ['organizations', '@/routes/api/platform/organizations/index', '/api/platform/organizations/',
++    (ref) => [{ name: answer(ref).name }]],
++  ['profile', '@/routes/api/platform/profile/index', '/api/platform/profile/',
++    (ref) => ({ organizations: [{ name: answer(ref).name, projects: [{ ref, name: answer(ref).name }] }] })],
++]
++
++describe('per-project values from the request context', () => {
++  let sent: string[]
++
++  beforeEach(() => {
++    sent = []
++    lints.mockReset()
++    lints.mockImplementation(async () => ({ data: [], error: undefined }))
++    vi.stubGlobal(
++      'fetch',
++      vi.fn(async (url: string) => {
++        sent.push(String(url))
++        await sleep(Math.random() * 5)
++        return new Response(JSON.stringify({ types: '' }), {
++          status: 200,
++          headers: { 'Content-Type': 'application/json' },
++        })
++      })
++    )
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++  })
++
++  it.each(ROUTES)(
++    'each converted value under two interleaved contexts: %s',
++    async (_, module, path, want) => {
++      const one = async (ref: string, other: string) =>
++        runWithProject(context(ref), async () => {
++          await sleep(Math.random() * 5)
++          const got = await get(module, path, other)
++          expect(got).toMatchObject(want(ref) as object)
++          const text = JSON.stringify(got)
++          expect(text).not.toContain(other)
++          expect(text).not.toContain(answer(other).name)
++          // upstream's one project and its fallbacks
++          expect(text).not.toMatch(/"default"|Default (Project|Organization)|localhost:/)
++        })
++      await Promise.all(
++        Array.from({ length: 20 }, (_, n) => (n % 2 ? one(REF_A, REF_B) : one(REF_B, REF_A)))
++      )
++    },
++    120_000
++  )
++
++  it('each converted value under two interleaved contexts: the schemas of lints and of type generation', async () => {
++    const { generateTypescriptTypes } = await import('./generate-types')
++    const one = (ref: string, other: string) =>
++      runWithProject(context(ref), async () => {
++        await sleep(Math.random() * 5)
++        await get('@/routes/api/platform/projects/$ref/run-lints', '/api/platform/projects/$ref/run-lints', other)
++        await generateTypescriptTypes({ headers: {} })
++        return ref
++      })
++    const refs = await Promise.all(
++      Array.from({ length: 20 }, (_, n) => (n % 2 ? one(REF_A, REF_B) : one(REF_B, REF_A)))
++    )
++    expect(lints).toHaveBeenCalledTimes(20)
++    expect(lints.mock.calls.map(([o]: any) => o.exposedSchemas).sort()).toEqual(
++      refs.map(schemas).sort()
++    )
++    expect(sent.map((url) => new URL(url).searchParams.get('included_schemas')).sort()).toEqual(
++      refs.map(schemas).sort()
++    )
++  })
++
++  it('each converted value under two interleaved contexts: the opt-in tool’s advisors', async () => {
++    const { getDebuggingOperations } = await import('./mcp')
++    const one = (ref: string, other: string) =>
++      runWithProject(context(ref), async () => {
++        await sleep(Math.random() * 5)
++        await getDebuggingOperations({ headers: {} }).getSecurityAdvisors(other)
++        return ref
++      })
++    const refs = await Promise.all(
++      Array.from({ length: 10 }, (_, n) => (n % 2 ? one(REF_A, REF_B) : one(REF_B, REF_A)))
++    )
++    expect(lints.mock.calls.map(([o]: any) => o.exposedSchemas).sort()).toEqual(
++      refs.map(schemas).sort()
++    )
++  }, 120_000)
++
++  it.each([
++    ['active', 'ACTIVE_HEALTHY'],
++    ['restarting', 'RESTARTING'],
++    ['restoring', 'RESTORING'],
++  ] as const)('the version and state of the answer reach the project response: %s', async (state, status) => {
++    for (const ref of [REF_A, REF_B]) {
++      const got = await runWithProject(context(ref, { state }), () =>
++        get('@/routes/api/platform/projects/$ref/index', '/api/platform/projects/$ref/', ref)
++      )
++      expect(got).toMatchObject({ ref, status, dbVersion: answer(ref).db_version })
++    }
++  })
++
++  it('a tenant-chosen version is never read: no project answer asks postgres-meta', async () => {
++    // control: a statement on the same path is seen
++    const { executeQuery } = await import('./query')
++    await runWithProject(context(REF_A), () => executeQuery({ query: 'select version()' }))
++    expect(sent).toEqual(['http://meta.test/query'])
++    sent = []
++    for (const [, module, path] of ROUTES) {
++      const got = await runWithProject(context(REF_A), () => get(module, path, REF_A))
++      if (path === '/api/platform/projects/$ref/')
++        expect(got.dbVersion).toBe(answer(REF_A).db_version)
++    }
++    expect(sent).toEqual([])
++  })
++
++  it('outside a request no route answers a project', async () => {
++    for (const [, module, path] of ROUTES) {
++      const { Route } = await import(/* @vite-ignore */ module)
++      await expect(
++        (Route as any).options.server.handlers.GET({
++          request: new Request(`http://studio.test${path.replace('$ref', REF_A)}`),
++          params: { ref: REF_A },
++        })
++      ).rejects.toMatchObject({ code: 'no_project_context' })
++    }
++  })
++
++  it('no per-project constant is left to import', async () => {
++    expect(Object.keys(await import('@/lib/constants/api'))).toEqual(['PROJECT_ANALYTICS_URL'])
++    const constants = await import('./constants')
++    for (const name of ['DEFAULT_EXPOSED_SCHEMAS', 'ENCRYPTION_KEY', 'POSTGRES_PORT'])
++      expect(constants).not.toHaveProperty(name)
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/project-values.ts b/apps/studio/lib/api/self-hosted/project-values.ts
+new file mode 100644
+index 00000000..058aac28
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/project-values.ts
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++// What upstream read once, from the process, for its one project — the public URL and what it
++// derived from it, the Data API settings, the name, the version and the state — read here for
++// the request's project, from its context. There is no default: outside a request each throws.
++
++import { getProjectContext } from './project-context'
++
++const STATUS = {
++  active: 'ACTIVE_HEALTHY',
++  restarting: 'RESTARTING',
++  restoring: 'RESTORING',
++} as const
++
++/** Every project's server listens on this port inside its own cluster. */
++export const PROJECT_DB_PORT = 5432
++
++/** The project's public URL, in the forms upstream derived from it. */
++export function projectUrls() {
++  const url = new URL(getProjectContext().api_url)
++  return {
++    restUrl: `${url.origin}/rest/v1/`,
++    endpoint: url.host,
++    protocol: url.protocol.replace(':', ''),
++    dbHost: url.hostname,
++  }
++}
++
++/** The project's Data API settings, in upstream's comma-separated form. */
++export function dataApi() {
++  const { schemas, extra_search_path, max_rows } = getProjectContext().data_api
++  return {
++    schemas: schemas.join(','),
++    extraSearchPath: extra_search_path.join(','),
++    maxRows: max_rows,
++  }
++}
++
++/** The request's project, in the shape of upstream's one default project. */
++export function contextProject() {
++  const { ref, name, state, db_version } = getProjectContext()
++  return {
++    id: 1,
++    ref,
++    name,
++    organization_id: 1,
++    cloud_provider: 'localhost',
++    status: STATUS[state],
++    region: 'local',
++    inserted_at: '2021-08-02T06:40:40.646Z',
++    dbVersion: db_version,
++  }
++}
+diff --git a/apps/studio/lib/api/self-hosted/settings.ts b/apps/studio/lib/api/self-hosted/settings.ts
+index 8a6ca68a..51e33b24 100644
+--- a/apps/studio/lib/api/self-hosted/settings.ts
++++ b/apps/studio/lib/api/self-hosted/settings.ts
+@@ -1,8 +1,8 @@
+ import { components } from 'api-types'
+ 
+-import { AUTH_JWT_SECRET, POSTGRES_PORT } from './constants'
++import { AUTH_JWT_SECRET } from './constants'
++import { contextProject, PROJECT_DB_PORT, projectUrls } from './project-values'
+ import { assertSelfHosted } from './util'
+-import { PROJECT_DB_HOST, PROJECT_ENDPOINT, PROJECT_ENDPOINT_PROTOCOL } from '@/lib/constants/api'
+ 
+ type ProjectAppConfig = components['schemas']['ProjectSettingsResponse_Output']['app_config'] & {
+   protocol?: string
+@@ -19,26 +19,28 @@ export type ProjectSettings = components['schemas']['ProjectSettingsResponse_Out
+  */
+ export function getProjectSettings() {
+   assertSelfHosted()
++  const { endpoint, protocol, dbHost } = projectUrls()
++  const project = contextProject()
+ 
+   const response = {
+     app_config: {
+       db_schema: 'public',
+-      endpoint: PROJECT_ENDPOINT,
+-      storage_endpoint: PROJECT_ENDPOINT,
++      endpoint,
++      storage_endpoint: endpoint,
+       // manually added to force the frontend to use the correct URL
+-      protocol: PROJECT_ENDPOINT_PROTOCOL,
++      protocol,
+     },
+     cloud_provider: 'AWS',
+     db_dns_name: '-',
+-    db_host: PROJECT_DB_HOST,
++    db_host: dbHost,
+     db_ip_addr_config: 'legacy' as const,
+     db_name: 'postgres',
+-    db_port: POSTGRES_PORT,
++    db_port: PROJECT_DB_PORT,
+     db_user: 'postgres',
+     inserted_at: '2021-08-02T06:40:40.646Z',
+     jwt_secret: AUTH_JWT_SECRET,
+-    name: process.env.DEFAULT_PROJECT_NAME || 'Default Project',
+-    ref: 'default',
++    name: project.name,
++    ref: project.ref,
+     region: 'local',
+     service_api_keys: [
+       {
+@@ -53,7 +55,7 @@ export function getProjectSettings() {
+       },
+     ],
+     ssl_enforced: false,
+-    status: 'ACTIVE_HEALTHY',
++    status: project.status,
+   } satisfies ProjectSettings
+ 
+   return response
+diff --git a/apps/studio/lib/constants/api.ts b/apps/studio/lib/constants/api.ts
+index a810b93e..78d36e3c 100644
+--- a/apps/studio/lib/constants/api.ts
++++ b/apps/studio/lib/constants/api.ts
+@@ -1,26 +1,4 @@
+-export const DEFAULT_SUPABASE_PUBLIC_URL = 'http://localhost:8000'
+-
+-const PUBLIC_URL = new URL(process.env.SUPABASE_PUBLIC_URL || DEFAULT_SUPABASE_PUBLIC_URL)
+-
+ // Use LOGFLARE_URL until analytics/v1/ routing is supported
+ export const PROJECT_ANALYTICS_URL = process.env.LOGFLARE_URL
+   ? `${process.env.LOGFLARE_URL}/api/`
+   : undefined
+-
+-export const PROJECT_REST_URL = `${PUBLIC_URL.origin}/rest/v1/`
+-export const PROJECT_ENDPOINT = PUBLIC_URL.host
+-export const PROJECT_ENDPOINT_PROTOCOL = PUBLIC_URL.protocol.replace(':', '')
+-export const PROJECT_DB_HOST = PUBLIC_URL.hostname
+-
+-export const DEFAULT_PROJECT = {
+-  id: 1,
+-  ref: 'default',
+-  name: !!process.env.CURRENT_CLI_VERSION
+-    ? 'Supabase Studio (CLI)'
+-    : process.env.DEFAULT_PROJECT_NAME || 'Default Project',
+-  organization_id: 1,
+-  cloud_provider: 'localhost',
+-  status: 'ACTIVE_HEALTHY',
+-  region: 'local',
+-  inserted_at: '2021-08-02T06:40:40.646Z',
+-}
+diff --git a/apps/studio/routes/api/mcp/index.ts b/apps/studio/routes/api/mcp/index.ts
+index b9194a2d..19383889 100644
+--- a/apps/studio/routes/api/mcp/index.ts
++++ b/apps/studio/routes/api/mcp/index.ts
+@@ -4,7 +4,7 @@ import { stripIndent } from 'common-tags'
+ import { z } from 'zod'
+ 
+ import { commaSeparatedStringIntoArray, zBooleanString } from '@/lib/api/apiHelpers'
+-import { DEFAULT_PROJECT } from '@/lib/constants/api'
++import { contextProject } from '@/lib/api/self-hosted/project-values'
+ 
+ const supportedFeatureGroupSchema = z.enum([
+   'docs',
+@@ -57,7 +57,7 @@ const POST = async ({ request }: { request: Request }) => {
+   try {
+     const server = createSupabaseMcpServer({
+       platform,
+-      projectId: DEFAULT_PROJECT.ref,
++      projectId: contextProject().ref,
+       features,
+       readOnly: read_only,
+     })
+diff --git a/apps/studio/routes/api/platform/projects/$ref/config/index.ts b/apps/studio/routes/api/platform/projects/$ref/config/index.ts
+index 14b8bc30..d9732f28 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/config/index.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/config/index.ts
+@@ -3,6 +3,7 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
++import { dataApi } from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -20,13 +21,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+ 
+ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+   // Platform specific endpoint
++  const { schemas, extraSearchPath, maxRows } = dataApi()
+   return res.status(200).json({
+     db_anon_role: 'anon',
+-    db_extra_search_path: 'public',
+-    db_schema: 'public, storage',
++    db_extra_search_path: extraSearchPath,
++    db_schema: schemas,
+     jwt_secret:
+       process.env.AUTH_JWT_SECRET ?? 'super-secret-jwt-token-with-at-least-32-characters-long',
+-    max_rows: 100,
++    // null: the project's Data API sets no limit
++    max_rows: maxRows,
+     role_claim_key: '.role',
+   })
+ }
+diff --git a/apps/studio/routes/api/platform/projects/$ref/config/postgrest.ts b/apps/studio/routes/api/platform/projects/$ref/config/postgrest.ts
+index 1d43d6fc..7d08a2e9 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/config/postgrest.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/config/postgrest.ts
+@@ -4,7 +4,7 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { DEFAULT_EXPOSED_SCHEMAS } from '@/lib/api/self-hosted/constants'
++import { dataApi } from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -21,13 +21,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+ }
+ 
+ const handleGet = async (_req: NextApiRequest, res: NextApiResponse) => {
++  const { schemas, extraSearchPath, maxRows } = dataApi()
+   const responseObj: components['schemas']['GetPostgrestConfigResponse_Output'] = {
+     db_anon_role: 'anon',
+-    db_extra_search_path: process.env.PGRST_DB_EXTRA_SEARCH_PATH ?? 'public',
+-    db_schema: DEFAULT_EXPOSED_SCHEMAS,
++    db_extra_search_path: extraSearchPath,
++    db_schema: schemas,
+     jwt_secret:
+       process.env.AUTH_JWT_SECRET ?? 'super-secret-jwt-token-with-at-least-32-characters-long',
+-    max_rows: Number(process.env.PGRST_DB_MAX_ROWS) || 1000,
++    // null: the project's Data API sets no limit
++    max_rows: maxRows as number,
+     role_claim_key: '.role',
+   }
+ 
+diff --git a/apps/studio/routes/api/platform/projects/$ref/databases.ts b/apps/studio/routes/api/platform/projects/$ref/databases.ts
+index 45684382..c578e666 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/databases.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/databases.ts
+@@ -4,8 +4,11 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { POSTGRES_PORT } from '@/lib/api/self-hosted/constants'
+-import { PROJECT_DB_HOST, PROJECT_REST_URL } from '@/lib/constants/api'
++import {
++  contextProject,
++  PROJECT_DB_PORT,
++  projectUrls,
++} from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -25,21 +28,23 @@ type ResponseData =
+   paths['/platform/projects/{ref}/databases']['get']['responses']['200']['content']['application/json']
+ 
+ const handleGet = async (_req: NextApiRequest, res: NextApiResponse<ResponseData>) => {
++  const { dbHost, restUrl } = projectUrls()
++  const { ref, status } = contextProject()
+   return res.status(200).json([
+     {
+       cloud_provider: 'localhost' as any,
+       connectionString: '',
+       connection_string_read_only: '',
+-      db_host: PROJECT_DB_HOST,
++      db_host: dbHost,
+       db_name: 'postgres',
+-      db_port: POSTGRES_PORT,
++      db_port: PROJECT_DB_PORT,
+       db_user: 'postgres',
+-      identifier: 'default',
++      identifier: ref,
+       inserted_at: '',
+       region: 'local',
+-      restUrl: PROJECT_REST_URL,
++      restUrl,
+       size: '',
+-      status: 'ACTIVE_HEALTHY',
++      status,
+     },
+   ])
+ }
+diff --git a/apps/studio/routes/api/platform/projects/$ref/index.ts b/apps/studio/routes/api/platform/projects/$ref/index.ts
+index 0cea4958..0d91ac02 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/index.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/index.ts
+@@ -3,7 +3,7 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { DEFAULT_PROJECT, PROJECT_REST_URL } from '@/lib/constants/api'
++import { contextProject, projectUrls } from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -22,9 +22,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+ const handleGet = async (_req: NextApiRequest, res: NextApiResponse) => {
+   // Platform specific endpoint
+   const response = {
+-    ...DEFAULT_PROJECT,
++    ...contextProject(),
+     connectionString: '',
+-    restUrl: PROJECT_REST_URL,
++    restUrl: projectUrls().restUrl,
+   }
+ 
+   return res.status(200).json(response)
+diff --git a/apps/studio/routes/api/platform/projects/$ref/run-lints.ts b/apps/studio/routes/api/platform/projects/$ref/run-lints.ts
+index 722ff136..76bb3ac7 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/run-lints.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/run-lints.ts
+@@ -4,8 +4,8 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ import { toWebHandler } from '@/compat/next/api'
+ import { constructHeaders } from '@/lib/api/apiHelpers'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { DEFAULT_EXPOSED_SCHEMAS } from '@/lib/api/self-hosted/constants'
+ import { getLints } from '@/lib/api/self-hosted/lints'
++import { dataApi } from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -16,7 +16,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+     case 'GET':
+       const { data, error } = await getLints({
+         headers: constructHeaders(req.headers),
+-        exposedSchemas: DEFAULT_EXPOSED_SCHEMAS,
++        exposedSchemas: dataApi().schemas,
+       })
+ 
+       if (error) {
+diff --git a/apps/studio/routes/api/platform/projects/index.ts b/apps/studio/routes/api/platform/projects/index.ts
+index be44c6c2..3f5a46bb 100644
+--- a/apps/studio/routes/api/platform/projects/index.ts
++++ b/apps/studio/routes/api/platform/projects/index.ts
+@@ -3,7 +3,7 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { DEFAULT_PROJECT } from '@/lib/constants/api'
++import { contextProject } from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -21,7 +21,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+ 
+ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+   // Platform specific endpoint
+-  const response = [DEFAULT_PROJECT]
++  const response = [contextProject()]
+   return res.status(200).json(response)
+ }
+ 
+diff --git a/apps/studio/routes/api/platform/props/project/$ref/api.ts b/apps/studio/routes/api/platform/props/project/$ref/api.ts
+index e00af477..23d5ece6 100644
+--- a/apps/studio/routes/api/platform/props/project/$ref/api.ts
++++ b/apps/studio/routes/api/platform/props/project/$ref/api.ts
+@@ -3,14 +3,11 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { POSTGRES_PORT } from '@/lib/api/self-hosted/constants'
+ import {
+-  DEFAULT_PROJECT,
+-  PROJECT_DB_HOST,
+-  PROJECT_ENDPOINT,
+-  PROJECT_ENDPOINT_PROTOCOL,
+-  PROJECT_REST_URL,
+-} from '@/lib/constants/api'
++  contextProject,
++  PROJECT_DB_PORT,
++  projectUrls,
++} from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -28,13 +25,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+ 
+ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+   // Platform specific endpoint
++  const project = contextProject()
++  const { endpoint, protocol, dbHost, restUrl } = projectUrls()
+   const response = {
+     project: {
+-      ...DEFAULT_PROJECT,
++      ...project,
+       api_key_supabase_encrypted: '',
+-      db_host: PROJECT_DB_HOST,
++      db_host: dbHost,
+       db_name: 'postgres',
+-      db_port: POSTGRES_PORT,
++      db_port: PROJECT_DB_PORT,
+       db_ssl: false,
+       db_user: 'postgres',
+       services: [
+@@ -44,7 +43,7 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+           app: { id: 1, name: 'Auto API' },
+           app_config: {
+             db_schema: 'public',
+-            endpoint: PROJECT_ENDPOINT,
++            endpoint,
+             realtime_enabled: true,
+           },
+           service_api_keys: [
+@@ -65,16 +64,16 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+     autoApiService: {
+       id: 1,
+       name: 'Default API',
+-      project: { ref: 'default' },
++      project: { ref: project.ref },
+       app: { id: 1, name: 'Auto API' },
+       app_config: {
+         db_schema: 'public',
+-        endpoint: PROJECT_ENDPOINT,
++        endpoint,
+         realtime_enabled: true,
+       },
+-      protocol: PROJECT_ENDPOINT_PROTOCOL,
+-      endpoint: PROJECT_ENDPOINT,
+-      restUrl: PROJECT_REST_URL,
++      protocol,
++      endpoint,
++      restUrl,
+       defaultApiKey: process.env.SUPABASE_ANON_KEY,
+       serviceApiKey: process.env.SUPABASE_SERVICE_KEY,
+       service_api_keys: [
+diff --git a/apps/studio/routes/api/platform/props/project/$ref/index.ts b/apps/studio/routes/api/platform/props/project/$ref/index.ts
+index aed80ad6..04094205 100644
+--- a/apps/studio/routes/api/platform/props/project/$ref/index.ts
++++ b/apps/studio/routes/api/platform/props/project/$ref/index.ts
+@@ -3,7 +3,7 @@ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { DEFAULT_PROJECT } from '@/lib/constants/api'
++import { contextProject } from '@/lib/api/self-hosted/project-values'
+ 
+ const nextHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -23,7 +23,7 @@ const handleGetAll = async (_req: NextApiRequest, res: NextApiResponse) => {
+   // Platform specific endpoint
+   const response = {
+     project: {
+-      ...DEFAULT_PROJECT,
++      ...contextProject(),
+       services: [],
+     },
+   }

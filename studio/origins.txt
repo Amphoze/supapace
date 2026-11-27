@@ -304,7 +304,6 @@
 9deeb77a1ebfc7b9	both	text
 9fc96260152c4882	server	text
 @upstream:apps/studio/.env:NEXT_PUBLIC_SUPABASE_URL	server	text
-@upstream:apps/studio/.env:STUDIO_PG_META_URL	server	text
 a04a8ac5c25cc97e	both	text
 a24b30d442267798	server	text
 a24ebab7585ca462	both	text

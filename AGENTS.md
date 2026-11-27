@@ -5843,3 +5843,61 @@ Known limits
 - A project made before this has no read-only password until its next completed restart, and a
   failing `R6` ends a restart failed after its configuration is in force.
 - `pgsock.Target`'s printers do not show the two timeouts.
+
+### 2026-11-27 — Studio: per-project configuration, version and state from the request context
+Patches 0014-0018 (topic config). What upstream read once from the process for its one project
+is read for the request's project from its context; the per-project constants and their
+defaults are deleted, so an importer left behind stops the build.
+- lib/api/self-hosted/util.ts: checkHeaderKey() - postgres-meta's key for the
+  x-connection-encrypted header, the file <SUPAPACE_DASH_KEYS>/crypto.key: exactly 64 base64url
+  characters and at most one line end (^[A-Za-z0-9_-]{64}\n?$), used byte for byte, the line end
+  included. Read by checkStart() at process start and by the request path at its first use;
+  never re-read. A missing, unreadable or malformed file, or a key directory that is not an
+  absolute path, stops the process ("supapace: the header key file ...; the server stops"); the
+  message never holds the key. encryptString() uses it. There is no other key: upstream's
+  PG_META_CRYPTO_KEY setting and its built-in key are deleted.
+- lib/api/self-hosted/project-values.ts: projectUrls() {restUrl, endpoint, protocol, dbHost}
+  from the context's api_url; dataApi() {schemas, extraSearchPath (comma-joined), maxRows
+  (number or null)}; contextProject() - upstream's project shape with the context's ref, name,
+  status (active ACTIVE_HEALTHY, restarting RESTARTING, restoring RESTORING) and dbVersion (the
+  answer's db_version); PROJECT_DB_PORT = 5432. Each throws outside a request
+  (no_project_context): there is no default.
+- Routes answering from them: projects/, projects/$ref/, props/project/$ref/ and /api,
+  projects/$ref/{databases,settings,config/,config/postgrest,run-lints}, organizations/,
+  profile/, type generation (included_schemas = the project's schemas, URL-encoded); the
+  opt-in MCP files compile against them. The organisation bears the project's name; the
+  profile's one project is the request's. max_rows is null when the project sets no limit.
+- No project answer asks the project's database: the version is the control plane's.
+- studio/build.sh test single-quotes each test path for the build container's shell, so a
+  test file under a directory named $ref runs.
+Caller rules:
+- Read every per-project value through these helpers, synchronously, before the first await
+  of the handler; never from the path's $ref, the process or a module variable.
+- postgres-meta must receive the header key BY FILE: CRYPTO_KEY_FILE naming the same bytes (it
+  reads the file untrimmed); CRYPTO_KEY as an environment value cannot carry a line end. The
+  pinned postgres-meta falls back silently to its built-in key when the setting is missing or
+  empty, so a node checks that a header sealed with the file is accepted. A new key needs
+  Studio and postgres-meta restarted together.
+- A container needs crypto.key beside assert.pub and cache.key or it exits at start (the
+  measured containers of build.sh and the proofs' stand-ins write a throwaway one).
+- Patch 0016 is exported with one line of context (upstream's stub lines beside it hold e-mail
+  literals the content gate refuses); `build.sh export` writes default context, so re-export it
+  with -U1 until the gate exempts context lines. Patch 0015 builds only with 0016 after it.
+studio/prove/config.sh (28 rows): two projects with different names, Data API settings,
+versions and states, every converted route interleaved; no postgres-meta request for a project
+answer; no start without the key file or with one of another form; the key with and without a
+line end against postgres-meta's stand-in.
+What the next packages inherit:
+- Keys: the API keys and the JWT secret are still answered from the process and upstream's
+  defaults (settings, props/project/$ref/api, the key routes, jwt_secret of config/ and
+  config/postgrest, apiKey sent to postgres-meta) - release-blocking until the keys come from
+  the control plane; manifest.sh's process-value control then moves. The edits of this patch
+  set in settings.ts and props/project/$ref/api.ts are local (imports, two consts, values).
+- Stores: no shared file; nothing to rebase.
+- Query: generate-types.ts sends included_schemas from dataApi(); keep it when the request goes
+  through the one postgres-meta caller; STUDIO_PG_META_URL is still in the proofs' stand-ins
+  and manifest.sh's marked list.
+Known limits:
+- LOGFLARE_URL (analytics) is still a process value; only opt-in and deleted routes reach it.
+- The UI's edge-function URL for hooks and cron jobs is upstream's fixed internal address.
+- The Data API settings form rejects a null row limit; the pooling route is a fixed stub.

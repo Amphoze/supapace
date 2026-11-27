@@ -400,6 +400,7 @@ measure() {
   # vectors' public test key; nothing here signs, so every request is answered 401.
   sed -n 's/^ *"public_file": "\(.*\)",$/\1/p' "$W/vectors/tokens.json" >"$m/keys/assert.pub"
   head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' >"$m/keys/cache.key"
+  head -c 48 /dev/urandom | base64 | tr '+/' '-_' >"$m/keys/crypto.key"
   local node=(-v "$m:/data:ro" -e SUPAPACE_NODE_ID=build -e SUPAPACE_DASH_SOCKET=/run/dash/dash.sock
     -e SUPAPACE_DASH_KEYS=/data/keys -e SUPAPACE_DASH_DATA=/tmp/dash -e SUPAPACE_PGCAP=10.212.0.6:20000:21023
     -e "SUPAPACE_LIMITS=$(cat "$W/vectors/limits.json")")
@@ -538,7 +539,8 @@ cmd_test() {
   clone
   prepare_tree
   local tests
-  tests=$(awk -F'\t' '$1 != "D" && $2 ~ /^apps\/studio\/.*\.test\.tsx?$/ { sub(/^apps\/studio\//, "", $2); print $2 }' "$G/name-status.txt" | tr '\n' ' ')
+  # each path single-quoted for the build container's shell: a directory may be named $ref
+  tests=$(awk -F'\t' '$1 != "D" && $2 ~ /^apps\/studio\/.*\.test\.tsx?$/ { sub(/^apps\/studio\//, "", $2); print "\047" $2 "\047" }' "$G/name-status.txt" | tr '\n' ' ')
   if [ -z "$tests" ]; then
     say "test: the series adds no unit tests"
     return
