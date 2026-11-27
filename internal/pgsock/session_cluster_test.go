@@ -28,6 +28,7 @@ import (
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgconf"
 	"github.com/Amphoze/supapace/internal/pgsock"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 // imageUID is the uid of the image's postgres user, the owner of its socket.
@@ -73,8 +74,8 @@ func newPG(t *testing.T) *pgc {
 	}
 	t.Cleanup(func() {
 		exec.Command("docker", "rm", "-f", "-v", c.name).Run()
-		exec.Command("docker", "run", "--rm", "--network", "none", "--label", "supapace.test=1", "-v", c.root+":/r",
-			"--entrypoint", "rm", c.image, "-rf", "/r/"+c.ref).Run()
+		exec.Command("docker", slices.Concat([]string{"run", "--rm", "--network", "none"}, testdocker.Labels(t), []string{"-v", c.root + ":/r",
+			"--entrypoint", "rm", c.image, "-rf", "/r/" + c.ref})...).Run()
 		os.RemoveAll(c.root)
 	})
 	c.sock = filepath.Join(c.root, c.ref, "sock")
@@ -97,14 +98,14 @@ func newPG(t *testing.T) *pgc {
 func (c *pgc) run(args ...string) {
 	c.t.Helper()
 	exec.Command("docker", "rm", "-f", "-v", c.name).Run()
-	opts, cmd := args, []string(nil)
+	opts, cmd := args, []string{"postgres", "-D", "/etc/postgresql"} // the image's own command
 	if i := slices.Index(args, "--"); i >= 0 {
 		opts, cmd = args[:i], args[i+1:]
 	}
-	a := slices.Concat([]string{"run", "-d", "--name", c.name, "--label", "supapace.test=1", "--network", "none",
+	a := slices.Concat([]string{"run", "-d", "--name", c.name}, testdocker.Labels(c.t), []string{"--network", "none",
 		"--memory", "512m", "--memory-swap", "512m", "--shm-size", "64m",
 		"-v", filepath.Join(c.root, c.ref, "data") + ":/var/lib/postgresql/data", "-v", c.sock + ":/var/run/postgresql",
-		"-v", c.hba + ":/etc/postgresql/pg_hba.conf:ro"}, opts, []string{c.image}, cmd)
+		"-v", c.hba + ":/etc/postgresql/pg_hba.conf:ro"}, opts, testdocker.Bounded(c.image, append([]string{"docker-entrypoint.sh"}, cmd...)...))
 	if out, err := exec.Command("docker", a...).CombinedOutput(); err != nil {
 		c.t.Fatalf("docker run: %v %s", err, out)
 	}

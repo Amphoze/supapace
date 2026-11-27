@@ -28,6 +28,7 @@ import (
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgconf"
 	"github.com/Amphoze/supapace/internal/pgsock"
+	"github.com/Amphoze/supapace/internal/testdocker"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -952,7 +953,7 @@ func (c *cluster) run() {
 		c.t.Fatal(err)
 	}
 	r := c.render
-	args := []string{"run", "-d", "--name", c.name, "--hostname", c.name, "--label", "supapace.test=1",
+	args := slices.Concat([]string{"run", "-d", "--name", c.name, "--hostname", c.name}, testdocker.Labels(c.t), []string{
 		"--user", strconv.Itoa(c.uid) + ":" + strconv.Itoa(c.gid), "--network", "none",
 		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1",
@@ -962,14 +963,14 @@ func (c *cluster) run() {
 		"-v", r + "/pgsodium_root.key:" + c.baseline.Files.PgsodiumKey + ":ro",
 		"-v", r + "/conf.d:" + c.baseline.Files.IncludeDir + ":ro",
 		"-v", r + "/supautils.conf:" + c.baseline.Files.SupautilsConf + ":ro",
-		"-v", r + "/tools:/opt/supapace/tools:ro"}
+		"-v", r + "/tools:/opt/supapace/tools:ro"})
 	if c.phase == "A" {
 		args = append(args, "-e", "POSTGRES_PASSWORD="+rnd(32))
 	} else {
 		args = append(args, "-v", r+"/pg_hba.conf:"+c.baseline.Files.HBAFile+":ro",
 			"-v", r+"/pg_ident.conf:"+c.baseline.Files.IdentFile+":ro")
 	}
-	args = append(append(append(args, c.image, "postgres", "-D", "/etc/postgresql"), cl...), c.extraArgs...)
+	args = append(append(append(args, testdocker.Bounded(c.image, "docker-entrypoint.sh", "postgres", "-D", "/etc/postgresql")...), cl...), c.extraArgs...)
 	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
 		c.t.Fatalf("docker run: %v %s", err, out)
 	}

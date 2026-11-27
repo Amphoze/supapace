@@ -884,10 +884,13 @@ func TestSchedule_OneRowPerSubject(t *testing.T) {
 	opsJob(t, s, a, "push", "done", 1, now.Add(-time.Hour), `{}`)
 	opsJob(t, s, a, "push", "failed", 2, now.Add(-time.Minute), `{}`)
 	opsJob(t, s, a, "push", "queued", 0, time.Time{}, "")
-	opsJob(t, s, a, "backup", "failed", 3, now.Add(-time.Minute), `{}`)
-	opsJob(t, s, a, "backup", "queued", 0, time.Time{}, "")
+	failed := opsJob(t, s, a, "backup", "failed", 3, now.Add(-time.Minute), `{}`)
+	queued := opsJob(t, s, a, "backup", "queued", 0, time.Time{}, "")
 	old := opsJob(t, s, a, "backup", "done", 4, now.Add(-time.Minute), `{}`)
-	sqlExec(t, s, "update backup_job set created_at = now() - interval '2 days' where id = $1", old)
+	// FullsToday counts by UTC day: the two of today are created at the day's
+	// first instant, the old one at the last instant before it, whatever the hour.
+	sqlExec(t, s, "update backup_job set created_at = date_trunc('day', now(), 'UTC') where id = any($1)", []int64{failed, queued})
+	sqlExec(t, s, "update backup_job set created_at = date_trunc('day', now(), 'UTC') - interval '1 microsecond' where id = $1", old)
 	opsJob(t, s, b, "push", "failed", 5, now.Add(-time.Hour), `{}`)
 	opsJob(t, s, b, "push", "done", 6, now.Add(-time.Minute), `{}`)
 	must(t, s.SetFullDue(ctx, a, true))

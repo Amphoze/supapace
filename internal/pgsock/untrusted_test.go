@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 // ───────── authentication sequences ─────────
@@ -1010,16 +1012,16 @@ func TestUntrusted_VerifierEveryPrintableASCII(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		exec.Command("docker", "run", "--rm", "-v", root+":/r", "--network", "none", "--entrypoint", "rm", im.ControlPlane, "-rf", "/r/"+testRef).Run()
+		exec.Command("docker", slices.Concat([]string{"run", "--rm"}, testdocker.Labels(t), []string{"-v", root + ":/r", "--network", "none", "--entrypoint", "rm", im.ControlPlane, "-rf", "/r/" + testRef})...).Run()
 		os.RemoveAll(root)
 	})
 	sock := filepath.Join(root, testRef, "sock")
 	os.MkdirAll(sock, 0o755)
 	os.Chmod(sock, 0o777)
 	name := fmt.Sprintf("sp-test-pgsock-ascii-%d", os.Getpid())
-	out, err := exec.Command("docker", "run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none",
+	out, err := exec.Command("docker", slices.Concat([]string{"run", "-d", "--name", name}, testdocker.Labels(t), []string{"--network", "none",
 		"-e", "POSTGRES_PASSWORD=initpw", "-e", "POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256",
-		"-v", sock+":/var/run/postgresql", im.ControlPlane).CombinedOutput()
+		"-v", sock + ":/var/run/postgresql"}, testdocker.Bounded(im.ControlPlane, "docker-entrypoint.sh", "postgres"))...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v %s", err, out)
 	}

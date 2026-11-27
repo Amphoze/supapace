@@ -457,6 +457,35 @@ chk K22 "hook refuses a commit under an e-mail identity that is not a noreply ad
 k23() { hooked; f a.txt "ok\n"; c_try "feat: a"; }
 chk K23 "hook accepts a clean commit under the noreply identity in UTC" pass k23
 
+# ---- patches of upstream (studio/patches/*.patch): quoted lines and the e-mail/host rules ----
+UPM=$(mail up upstream com); UPH=$(host api upstream com)
+# patch HEADER_FROM BODY_LINES...: a one-hunk patch whose hunk holds the lines given
+patch() { local from=$1; shift; printf 'From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nFrom: %s\nSubject: [PATCH] x\n\nmessage\n---\ndiff --git a/f.ts b/f.ts\n--- a/f.ts\n+++ b/f.ts\n@@ -1,%d +1,%d @@\n' \
+	"$from" "$(printf '%s\n' "$@" | grep -c '^[ -]')" "$(printf '%s\n' "$@" | grep -c '^[ +]')"; printf '%s\n' "$@"; }
+NR="X <1+x$AT$GHN>"
+q1() { mkdir -p studio/patches; patch "$NR" " // $UPM" "-const u = 'https://$UPH'" "+const u = 'x'" >studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U01 "patch: upstream e-mail and host on context and removed lines pass" pass q1
+q2() { mkdir -p studio/patches; patch "$NR" " ctx" "+const u = '$UPM'" >studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U02 "patch: the same e-mail on an added line" block q2
+q3() { mkdir -p studio/patches; patch "$NR" " ctx $DW" "+x" >studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U03 "patch: a deny-list word on a context line" block q3
+q4() { mkdir -p studio/patches; patch "Up Stream <$UPM>" " ctx" "+x" >studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U04 "patch: From header with an address that is not noreply" block q4
+q5() { mkdir -p studio; patch "$NR" " // $UPM" "+x" >studio/0001-x.patch; git add studio; gate --staged; }
+chk U05 "the same content outside studio/patches" block q5
+q6() { mkdir -p studio/patches; { patch "$NR" " ctx" "+x"; printf '%s\n' " after the hunk $UPM"; } >studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U06 "patch: a context-looking line after the hunk's counts" block q6
+q7() { mkdir -p studio/patches; { patch "$NR" " ctx" "+x"; printf -- '-- \n2.47.0\n-%s\n' "$UPH"; } >studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U07 "patch: a removed-looking line in the trailer after the last hunk" block q7
+q8() { mkdir -p studio/patches; patch "$NR" " // $UPM" "+x" >studio/patches/0001-x.patch; git add studio/patches; git commit -qm a --no-verify; gate --range HEAD; }
+chk U08 "--range: a committed patch's quoted e-mail passes" pass q8
+q9() { mkdir -p studio/patches; patch "$NR" " ctx" "+$UPM" >studio/patches/0001-x.patch; git add studio/patches; git commit -qm a --no-verify; gate --range HEAD; }
+chk U09 "--range: a committed patch's added e-mail" block q9
+q10() { mkdir -p studio/patches; patch "$NR" " ctx $PUB" "+x" >studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U10 "patch: an IPv4 address on a context line" block q10
+q11() { mkdir -p studio/patches; printf 'From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nFrom: %s\nSubject: [PATCH] x\n\n@@ -1,1 +1,1 @@\n ask %s\n---\n' "$NR" "$UPM" >studio/patches/0001-x.patch; patch "$NR" " ctx" "+x" | sed 1,5d >>studio/patches/0001-x.patch; git add studio/patches; gate --staged; }
+chk U11 "patch: a hunk header forged in the commit message quotes nothing" block q11
+
 # ---- run on this repository's own tree ----
 r1() { cd "$ROOT" && "$GATE" --tree >"$T/own.out" 2>"$T/own.err"; }
 chk R01 "own tree (--tree) clean against fixture deny-list" pass r1

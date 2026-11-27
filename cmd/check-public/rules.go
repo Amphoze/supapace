@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	pathpkg "path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -28,6 +29,7 @@ const (
 	ruleIPv4  = "IPv4"
 	ruleIPv6  = "IPv6"
 	ruleHost  = "host name"
+	ruleCode  = "short code"
 	ruleZone  = "time zone" // an author, committer or tagger zone other than +0000
 	allowPath = "scripts/public-allow.txt"
 )
@@ -100,7 +102,12 @@ func init() {
 // line returns the names of the rules that line breaks, in report order. The
 // deny-list sees the line as written; the two noreply addresses are exempt from
 // the e-mail and host rules only.
-func (c *checker) line(s string) []string {
+func (c *checker) line(s string) []string { return c.rules(s, false) }
+
+// rules is line; a line that quotes an upstream tree (see quoted) is not
+// judged by the generic e-mail and host-name rules, and by every other rule as
+// any line is.
+func (c *checker) rules(s string, quote bool) []string {
 	ex := exemptMailRE.ReplaceAllString(s, " ")
 	var hit []string
 	add := func(rule string, ok bool) {
@@ -109,11 +116,12 @@ func (c *checker) line(s string) []string {
 		}
 	}
 	add(ruleDeny, c.denied(s))
-	add(ruleMail, mailRE.MatchString(ex))
+	add(ruleMail, !quote && mailRE.MatchString(ex))
 	add(ruleHome, c.home(s))
 	add(ruleIPv4, c.ipv4(s))
 	add(ruleIPv6, c.ipv6(s))
-	add(ruleHost, c.host(ex))
+	add(ruleHost, !quote && c.host(ex))
+	add(ruleCode, c.code(s))
 	return hit
 }
 
@@ -164,6 +172,37 @@ func (c *checker) denied(s string) bool {
 
 func isAlnum(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+// code reports a short code: two letters of one case and two digits (written
+// LLDD below) standing as a whole token or beginning a name: x-LLDD-y, LLDD_y,
+// lowercase LLDD followed by Name. Not a code: one after a letter or digit
+// (TestReach14), one followed by a digit or by a letter of its case (LLDDD,
+// LLDDLL), and one of two hex letters (fe80, FF05). A token in the allow file
+// passes.
+func (c *checker) code(s string) bool {
+	isLower := func(b byte) bool { return b >= 'a' && b <= 'z' }
+	isUpper := func(b byte) bool { return b >= 'A' && b <= 'Z' }
+	isDigit := func(b byte) bool { return b >= '0' && b <= '9' }
+	isHex := func(b byte) bool { return b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F' }
+	for i := 0; i+4 <= len(s); i++ {
+		a, b := s[i], s[i+1]
+		same := isUpper
+		if isLower(a) {
+			same = isLower
+		}
+		if i > 0 && isAlnum(s[i-1]) || !same(a) || !same(b) || !isDigit(s[i+2]) || !isDigit(s[i+3]) {
+			continue
+		}
+		if k := i + 4; k < len(s) && (isDigit(s[k]) || same(s[k])) {
+			continue
+		}
+		if isHex(a) && isHex(b) || c.allow[s[i:i+4]] {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (c *checker) ipv4(s string) bool {
@@ -448,4 +487,60 @@ func (c *checker) header(prefix string, raw []byte, need []string, report func(l
 		}
 	}
 	return msg, nil
+}
+
+// upstreamPatch: a patch of studio/patches, a diff against a public upstream
+// tree whose context and removed lines quote that tree.
+func upstreamPatch(path string) bool {
+	ok, _ := pathpkg.Match("studio/patches/*.patch", path)
+	return ok
+}
+
+var hunkRE = regexp.MustCompile(`^@@ -[0-9]+(?:,([0-9]+))? \+[0-9]+(?:,([0-9]+))? @@`)
+
+// quoted marks the lines of a patch that quote upstream: the context lines
+// (first byte a space) and the removed lines ('-') of its hunks. A hunk is the
+// lines after a header "@@ -a[,b] +c[,d] @@", counted as git applies them: a
+// context line uses one of b and one of d, a removed line one of b, an added
+// line ('+') one of d, a "\ No newline" line none (b and d are 1 when left
+// out). The hunk ends when b and d are both used up, or at the first line that
+// does not fit them, which is not part of it. Every line outside a hunk — the
+// mail header and message, diff --git, index, the ---/+++ header pairs, the
+// trailer after the last hunk, a line past a hunk's counts — is not quoted.
+// Hunks count only after the first "diff --git " line: git am never applies
+// the commit message, so a hunk header there would quote nothing upstream.
+func quoted(ls []string) []bool {
+	q := make([]bool, len(ls))
+	old, nw, diff := 0, 0, false
+	for i, s := range ls {
+		diff = diff || strings.HasPrefix(s, "diff --git ")
+		if old > 0 || nw > 0 {
+			switch {
+			case s == "" || s[0] == '\\' && strings.HasPrefix(s, `\ `):
+				if s != "" {
+					continue
+				}
+			case s[0] == ' ' && old > 0 && nw > 0:
+				q[i], old, nw = true, old-1, nw-1
+				continue
+			case s[0] == '-' && old > 0:
+				q[i], old = true, old-1
+				continue
+			case s[0] == '+' && nw > 0:
+				nw--
+				continue
+			}
+			old, nw = 0, 0 // does not fit: the hunk ended before this line
+		}
+		if m := hunkRE.FindStringSubmatch(s); diff && m != nil {
+			old, nw = 1, 1
+			if m[1] != "" {
+				old, _ = strconv.Atoi(m[1])
+			}
+			if m[2] != "" {
+				nw, _ = strconv.Atoi(m[2])
+			}
+		}
+	}
+	return q
 }

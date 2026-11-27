@@ -106,12 +106,14 @@ func wakeEnv(t *testing.T, f routes.File, s *standIn) *env {
 		}
 		os.RemoveAll(dir)
 	})
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		if _, err := os.Stat(path); err == nil {
+	// The file exists from the bind on, before Serve listens; the mode it
+	// sets after listening is the sign that it does.
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if fi, err := os.Stat(path); err == nil && fi.Mode().Perm() == 0o660 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("wake socket never appeared")
+			t.Fatal("not within 30 s: a wake socket of mode 0660")
 		}
 	}
 	e.gw.SetWake(wakesock.NewClient(path))

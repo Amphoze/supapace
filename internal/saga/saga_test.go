@@ -1531,13 +1531,17 @@ func TestRun_StepDeadlineFailsAttempt(t *testing.T) {
 	r := e.runner()
 	r.stepDeadline = 100 * time.Millisecond
 	r.backoff = []time.Duration{time.Hour}
-	e.start(r)
+	stop := e.start(r)
 	op := e.wait(id, "backed off", func(op store.Operation) bool { return op.State == "pending" && op.Attempts == 2 })
 	if !strings.HasPrefix(op.LastError, "timeout: ") || op.Step != "3" {
 		t.Fatalf("op = %+v", op)
 	}
+	// The rest runs under the default step deadline: under 100 ms a step that
+	// is merely slow on a loaded machine would fail the attempt too.
+	stop()
 	stall.Store(false)
 	sql(t, "update operation set not_before = now() where id = $1", id)
+	e.start(e.runner())
 	e.waitState(id, "done")
 	if n := len(e.ag.callsOf(ref, "EnsureDir")); n != 1 {
 		t.Fatalf("resumed before the step it reached: %d EnsureDir calls", n)

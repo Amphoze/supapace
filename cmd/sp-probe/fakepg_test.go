@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -542,8 +543,7 @@ func TestFakePG_ExitsZeroOnStopSignals(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
-		line := make([]byte, 9)
-		if _, err := io.ReadFull(out, line); err != nil || string(line) != "listening" {
+		if line, err := childLine(cmd, out, 9); err != nil || line != "listening" {
 			cmd.Process.Kill()
 			t.Fatalf("%v: first output %q (%v)", sig, line, err)
 		}
@@ -582,18 +582,65 @@ func startFakeProcess(t *testing.T, args ...string) (func(), error, string) {
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait(); pw.Close() }()
+	// A child that hangs before its first line, or after a first line that is
+	// not it, is killed: its end ends the reads below.
+	timer := time.AfterFunc(childBound, func() { cmd.Process.Kill() })
 	line := make([]byte, 9)
 	n, _ := io.ReadFull(pr, line)
 	out.Write(line[:n])
-	if string(line[:n]) == "listening" {
+	if string(line[:n]) == "listening" && timer.Stop() {
 		go io.Copy(io.Discard, pr)
 		var once sync.Once
-		kill := func() { once.Do(func() { cmd.Process.Kill(); <-done }) }
+		kill := func() {
+			once.Do(func() {
+				cmd.Process.Kill()
+				select {
+				case <-done:
+				case <-time.After(childBound):
+					t.Errorf("fakepg %q: not ended %v after SIGKILL", args, childBound)
+				}
+			})
+		}
 		t.Cleanup(kill)
 		return kill, nil, ""
 	}
 	io.Copy(&out, pr)
-	return nil, <-done, out.String()
+	err = <-done
+	if !timer.Stop() {
+		t.Fatalf("fakepg %q: killed after %v without its first line or its end: %q", args, childBound, out.String())
+	}
+	return nil, err, out.String()
+}
+
+// childBound bounds each wait on a child process: its first line, its end.
+const childBound = 30 * time.Second
+
+// childLine reads the n bytes cmd prints first from r. A child that has not
+// printed them within childBound is killed, which ends the read.
+func childLine(cmd *exec.Cmd, r io.Reader, n int) (string, error) {
+	timer := time.AfterFunc(childBound, func() { cmd.Process.Kill() })
+	b := make([]byte, n)
+	k, err := io.ReadFull(r, b)
+	if !timer.Stop() {
+		err = fmt.Errorf("killed after %v without its first line (%v)", childBound, err)
+	}
+	return string(b[:k]), err
+}
+
+// childExit waits for cmd to end, at most childBound; then it kills cmd and
+// fails the test.
+func childExit(t *testing.T, cmd *exec.Cmd, what string) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(childBound):
+		cmd.Process.Kill()
+		t.Errorf("%s: still running after %v", what, childBound)
+		return fmt.Errorf("still running after %v", childBound)
+	}
 }
 
 // A fake killed without cleanup leaves its socket; the next fake on the same
@@ -683,9 +730,8 @@ func TestFakePG_StopKeepsTheSocketOfAFakeThatTookOver(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
-	line := make([]byte, 9)
-	if _, err := io.ReadFull(out, line); err != nil || string(line) != "listening" {
+	t.Cleanup(func() { cmd.Process.Kill(); childExit(t, cmd, "the fake after SIGKILL") })
+	if line, err := childLine(cmd, out, 9); err != nil || line != "listening" {
 		t.Fatalf("first fake: %q %v", line, err)
 	}
 	go io.Copy(io.Discard, out)
@@ -707,7 +753,7 @@ func TestFakePG_StopKeepsTheSocketOfAFakeThatTookOver(t *testing.T) {
 		t.Fatalf("second fake on a free path: %v %q", err, msg)
 	}
 	cmd.Process.Signal(syscall.SIGTERM)
-	cmd.Wait()
+	childExit(t, cmd, "the first fake after SIGTERM")
 	c, err := net.Dial("unix", sock)
 	if err != nil {
 		t.Fatalf("the second fake's socket is gone after the first fake stopped: %v", err)
@@ -733,14 +779,13 @@ func TestFakePG_StopRemovesItsSocket(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
-	line := make([]byte, 9)
-	if _, err := io.ReadFull(out, line); err != nil || string(line) != "listening" {
+	t.Cleanup(func() { cmd.Process.Kill(); childExit(t, cmd, "the fake after SIGKILL") })
+	if line, err := childLine(cmd, out, 9); err != nil || line != "listening" {
 		t.Fatalf("fake: %q %v", line, err)
 	}
 	go io.Copy(io.Discard, out)
 	cmd.Process.Signal(syscall.SIGTERM)
-	if err := cmd.Wait(); err != nil {
+	if err := childExit(t, cmd, "the fake after SIGTERM"); err != nil {
 		t.Fatalf("exit: %v", err)
 	}
 	if _, err := os.Lstat(sock); !os.IsNotExist(err) {

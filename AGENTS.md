@@ -6008,3 +6008,37 @@ fails the build).
 Known limits: three client components still fetch the revealed list on load (an owner's page
 load fetches the key; others get the anon key alone); the `Reveal` button shows for every role;
 pages that read the anon key from `settings` show none. Proof: `studio/prove/secrets.sh`.
+
+### 2026-11-27 — test-container watchdog, node-test lock, content-gate patch rule, serve order
+- internal/testdocker (tests only): Labels(t) returns --label supapace.test=1 and
+  --label supapace.test.owner=<random per process>; the first call starts a watchdog in its own
+  session that waits until the process (pid and /proc start time) is gone, then removes every
+  container and volume of that owner value at once, after 5 s and after 30 s. Never by name, age
+  or the shared label. Bounded(image, cmd...) runs cmd as pid 1 and sends it SIGINT after 4 h;
+  cmd must end on SIGINT (postgres does). Callers: pass Labels to every docker run/create and
+  volume create of a test; give Bounded the image's own entrypoint and command explicitly.
+  Known limit: a docker run still under way 30 s after the process is gone is not removed.
+- Node tests on one node run one at a time: reach, reach-dash, reach-reboot and node-proof hold a
+  host lock file named after the node ($TMPDIR/sp-node-tests-<node>.lock, flock) over everything
+  they do to the node (node-proof from building its test binary, reach-reboot from the restart).
+  A docker exec ended by ^C leaves its process in the node after the lock is released. By hand:
+  one package at a time (go test -tags reach -p 1).
+- make reach, reach-dash, reach-reboot pass SUPAPACE_BACKUP into the node only when it is set.
+- The reach suite's TestMain requires a dial of the admin socket to succeed within 30 s.
+- bkjob serve: a request is answered only when no answer of its name waits in out/, checked
+  before the request itself; with the archive binary removing the request before the answer,
+  no request is answered twice. A refused request (not a regular file, wrong owner) whose answer
+  still waits is refused on the first pass after the answer is taken.
+- check-public: new rule "short code", two letters of one case and two digits standing as a
+  token or a name's start (not after a letter or digit, not followed by a digit or a letter of
+  its case, not two hex letters such as fe80). An exact token in scripts/public-allow.txt passes
+  this rule; the deny-list ignores the allow file. Name test containers by meaning
+  (sp-test-logs-..., sp-test-job-...), never by an id.
+- check-public: in studio/patches/*.patch the context and removed lines of a hunk, counted as
+  git applies them and only after the patch's first diff --git line (never in the commit
+  message), are exempt from the generic e-mail and host-name rules only; the deny-list,
+  IPv4/IPv6, home-path and short-code rules apply to every line, and headers, message, file and
+  hunk headers, added lines and the trailer are judged in full. A context line is taken as
+  written; the apply gate of the Studio build shows whether upstream holds it.
+- Test helpers wait for a final state, not a first sign: the wake socket's mode 0660, a relay's
+  end before its test ends, a bound of 30 s on every wait for a child process in sp-probe.

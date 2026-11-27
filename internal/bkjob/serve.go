@@ -221,15 +221,19 @@ func (s *server) list(ctx context.Context) ([]request, error) {
 				refuse(name)
 				continue
 			}
+			// The answer before the request: the archive binary removes the request
+			// first and then the answer, so a request still seen once no answer is
+			// waiting is one still asked; the other order answers a request being
+			// taken a second time.
+			if s.waiting(name) {
+				continue
+			}
 			var st syscall.Stat_t
 			if err := statNoFollow(s.req, name, &st); err != nil {
 				continue // gone
 			}
 			if st.Mode&syscall.S_IFMT != syscall.S_IFREG || int(st.Uid) != s.in.UID {
 				refuse(name)
-				continue
-			}
-			if s.waiting(name) {
 				continue
 			}
 			if s.answers[name] >= s.max {

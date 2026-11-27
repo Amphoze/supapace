@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 // pinnedFive are the override-file lines the command line takes over.
@@ -396,8 +397,16 @@ func testName() string {
 	return "sp-test-pgconf-" + hex.EncodeToString(b)
 }
 
+// docker runs the docker command args; a container or volume it creates
+// carries this process's labels, so that the watchdog removes it.
 func docker(t *testing.T, args ...string) string {
 	t.Helper()
+	switch {
+	case args[0] == "run":
+		args = slices.Concat(args[:1], testdocker.Labels(t), args[1:])
+	case args[0] == "volume" && args[1] == "create":
+		args = slices.Concat(args[:2], testdocker.Labels(t), args[2:])
+	}
 	out, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker %s: %v\n%s", strings.Join(args, " "), err, out)
@@ -463,8 +472,8 @@ func newPinCluster(t *testing.T) pinCluster {
 	c := pinCluster{img: img, data: volume(t), tools: volume(t)}
 	name := testName()
 	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "-v", name).Run() })
-	docker(t, "run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
-		"-e", "POSTGRES_PASSWORD="+testName(), "-v", c.data+":/var/lib/postgresql/data", img)
+	docker(t, append([]string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
+		"-e", "POSTGRES_PASSWORD=" + testName(), "-v", c.data + ":/var/lib/postgresql/data"}, testdocker.Bounded(img, "docker-entrypoint.sh", "postgres", "-D", "/etc/postgresql")...)...)
 	if !until(t, name, 5*time.Minute, func() bool {
 		return exec.Command("docker", "exec", name, "psql", "-XAtq", "-h", "/var/run/postgresql", "-U", "supabase_admin",
 			"-d", "postgres", "-c", "select 1").Run() == nil && strings.Contains(logs(name), "init process complete")
@@ -494,9 +503,9 @@ func (c pinCluster) start(t *testing.T, recovery bool, args []string) string {
 	}
 	name := testName()
 	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "-v", name).Run() })
-	docker(t, append([]string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
-		"-v", run + ":/var/lib/postgresql/data", "-v", c.tools + ":/opt/supapace/tools:ro",
-		c.img, "postgres", "-D", "/etc/postgresql"}, append(cl, args...)...)...)
+	docker(t, slices.Concat([]string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
+		"-v", run + ":/var/lib/postgresql/data", "-v", c.tools + ":/opt/supapace/tools:ro"},
+		testdocker.Bounded(c.img, "docker-entrypoint.sh", "postgres", "-D", "/etc/postgresql"), cl, args)...)
 	return name
 }
 

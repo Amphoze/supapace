@@ -62,7 +62,8 @@ func sockPath(t *testing.T) string {
 }
 
 // serve runs Serve on a fresh socket until the test ends and returns its path
-// once the socket exists.
+// once the socket is in its final state: Serve listens first and then sets the
+// mode, so the file exists, with the mode of the umask, before it is 0660.
 func serve(t *testing.T, uid int, h Handler) string {
 	t.Helper()
 	path := sockPath(t)
@@ -80,12 +81,13 @@ func serve(t *testing.T, uid int, h Handler) string {
 			t.Error("Serve did not return after its context ended")
 		}
 	})
-	for deadline := time.Now().Add(10 * time.Second); ; {
+	last := "no socket"
+	for deadline := time.Now().Add(30 * time.Second); ; {
 		if fi, err := os.Stat(path); err == nil {
-			if fi.Mode().Perm() != 0o660 {
-				t.Fatalf("socket mode %v, want 0660", fi.Mode().Perm())
+			if fi.Mode().Perm() == 0o660 {
+				return path
 			}
-			return path
+			last = "socket mode " + fi.Mode().Perm().String()
 		}
 		select {
 		case err := <-done:
@@ -93,7 +95,7 @@ func serve(t *testing.T, uid int, h Handler) string {
 		case <-time.After(5 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("socket never appeared")
+			t.Fatalf("not within 30 s: a socket of mode 0660 (%s)", last)
 		}
 	}
 }

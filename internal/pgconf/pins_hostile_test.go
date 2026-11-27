@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 // More hostile sources than the first server test: other spellings of the
@@ -38,7 +40,7 @@ func (c pinCluster) effective(t *testing.T, args []string, names ...string) map[
 		a := slices.Concat([]string{"run", "--rm", "--name", testName(), "--label", "supapace.test=1", "--network", "none",
 			"--user", "postgres", "-v", c.data + ":/var/lib/postgresql/data:ro", "--entrypoint", "postgres", c.img, "-D", "/etc/postgresql"},
 			cl, args, []string{"-C", n})
-		b, err := exec.Command("docker", a...).CombinedOutput()
+		b, err := exec.Command("docker", slices.Concat(a[:1], testdocker.Labels(t), a[1:])...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("-C %s: %v\n%s", n, err, b)
 		}
@@ -81,7 +83,7 @@ func TestPins_HostileFilesAndIncludesDoNotMovePins(t *testing.T) {
 	// Control: the hostile files alone set several recovery targets; the
 	// server refuses them, so the pins are what makes this start possible.
 	cl, _ := CommandLine(image(t, "postgresql.conf"))
-	b, err := exec.Command("docker", slices.Concat([]string{"run", "--rm", "--name", testName(), "--label", "supapace.test=1",
+	b, err := exec.Command("docker", slices.Concat([]string{"run", "--rm", "--name", testName()}, testdocker.Labels(t), []string{"--label", "supapace.test=1",
 		"--network", "none", "--user", "postgres", "-v", c.data + ":/var/lib/postgresql/data:ro", "--entrypoint", "postgres", c.img,
 		"-D", "/etc/postgresql"}, cl, []string{"-C", "max_connections"})...).CombinedOutput()
 	if err == nil || !strings.Contains(string(b), "multiple recovery targets specified") {

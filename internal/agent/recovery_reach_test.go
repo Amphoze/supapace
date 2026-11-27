@@ -30,6 +30,7 @@ import (
 	"github.com/Amphoze/supapace/internal/nft"
 	"github.com/Amphoze/supapace/internal/pgconf"
 	"github.com/Amphoze/supapace/internal/pgsock"
+	"github.com/Amphoze/supapace/internal/testdocker"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -226,11 +227,11 @@ func rrJob(t *testing.T, a *Agent, s Spec, kind, repo, admit string, cmd ...stri
 	}
 	name := "sp-test-recovery-" + kind + "-" + s.Ref
 	nodeDockerQuiet("rm", "-f", name)
-	args := []string{"run", "--name", name, "--label", "supapace.test=1", "--user", fmt.Sprintf("%d:%d", s.UID, s.GID),
+	args := slices.Concat([]string{"run", "--name", name}, testdocker.Labels(t), []string{"--user", fmt.Sprintf("%d:%d", s.UID, s.GID),
 		"--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--security-opt", "seccomp=" + a.seccompFile(), "--read-only",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=128m", "--cpus", "1", "--ulimit", "core=0", "--ulimit", "nofile=65536:65536",
 		"--no-healthcheck", "--ipc", "private", "--memory", "512m", "--memory-swap", "512m", "--pids-limit", "256",
-		"--network", "none", "--env-file", ef, "-v", x + ":/x:ro"}
+		"--network", "none", "--env-file", ef, "-v", x + ":/x:ro"})
 	for _, m := range mounts {
 		args = append(args, "-v", m)
 	}

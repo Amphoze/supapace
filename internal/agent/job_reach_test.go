@@ -25,6 +25,7 @@ import (
 	"github.com/Amphoze/supapace/internal/jobio"
 	"github.com/Amphoze/supapace/internal/nft"
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 // Job containers on a bare node with the object-store stand-in, as root.
@@ -353,15 +354,15 @@ func TestJobReach_PushAndReplicateFromOutside(t *testing.T) {
 	t.Cleanup(func() { exec.Command("docker", "network", "rm", "proj-"+other.Ref).Run() })
 	peer := n.c.ClusterAddr(3).String() + ":7075"
 	worker := func(name string, args ...string) *exec.Cmd {
-		return exec.Command("docker", slices.Concat([]string{"run", "--name", name, "--label", "supapace.test=1", "--network", "proj-" + other.Ref},
+		return exec.Command("docker", slices.Concat([]string{"run", "--name", name}, testdocker.Labels(t), []string{"--network", "proj-" + other.Ref},
 			args, []string{"-v", n.exe + ":/supapaced:ro", "--entrypoint", "/supapaced", nodecfg.WorkerImage})...)
 	}
-	if out, err := worker("sp-test-wp75-listen", "-d", "--ip", n.c.ClusterAddr(3).String(), "-e", "SUPAPACE_JOBPROBE=listen").CombinedOutput(); err != nil {
+	if out, err := worker("sp-test-job-listen", "-d", "--ip", n.c.ClusterAddr(3).String(), "-e", "SUPAPACE_JOBPROBE=listen").CombinedOutput(); err != nil {
 		t.Fatalf("listener: %v %s", err, out)
 	}
-	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "sp-test-wp75-listen").Run() })
+	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "sp-test-job-listen").Run() })
 	// Control, before the ruleset is loaded: a member of that network reaches it.
-	out, err := worker("sp-test-wp75-peer", "--rm", "-e", "SUPAPACE_JOBPROBE=dial", "-e", "SUPAPACE_JOBPROBE_DIAL="+peer).Output()
+	out, err := worker("sp-test-job-peer", "--rm", "-e", "SUPAPACE_JOBPROBE=dial", "-e", "SUPAPACE_JOBPROBE_DIAL="+peer).Output()
 	if err != nil || !strings.Contains(string(out), `"`+peer+`":"connected"`) {
 		t.Fatalf("control: a member of the project network does not reach its peer: %v %s", err, out)
 	}
@@ -532,14 +533,15 @@ func TestJobReach_PushAndReplicateFromOutside(t *testing.T) {
 	args := n.a.jobArgs(x, env, vs)
 	i := slices.Index(args, "--dns")
 	args = slices.Delete(args, i, i+2)
-	args[slices.Index(args, x.name)] = "sp-test-wp75-nodns"
+	args[slices.Index(args, x.name)] = "sp-test-job-nodns"
+	args = slices.Concat(args[:1], testdocker.Labels(t), args[1:]) // removed by the watchdog should this process be killed
 	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
 		t.Fatalf("control run: %v %s", err, out)
 	}
-	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "sp-test-wp75-nodns").Run() })
+	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "sp-test-job-nodns").Run() })
 	var cres struct{ Dial map[string]string }
 	for end := time.Now().Add(60 * time.Second); ; time.Sleep(500 * time.Millisecond) {
-		logs, _ := exec.Command("docker", "logs", "--", "sp-test-wp75-nodns").Output()
+		logs, _ := exec.Command("docker", "logs", "--", "sp-test-job-nodns").Output()
 		if json.Unmarshal(logs, &cres) == nil {
 			break
 		}

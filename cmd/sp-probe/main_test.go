@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -25,9 +26,24 @@ func start(t *testing.T, args ...string) string {
 	t.Helper()
 	pr, pw := io.Pipe()
 	go run(args, pw)
-	line, err := bufio.NewReader(pr).ReadString('\n')
-	if err != nil {
-		t.Fatalf("%v: %v", args, err)
+	type first struct {
+		line string
+		err  error
+	}
+	got := make(chan first, 1)
+	go func() {
+		line, err := bufio.NewReader(pr).ReadString('\n')
+		got <- first{line, err}
+	}()
+	var line string
+	select {
+	case f := <-got:
+		if f.err != nil {
+			t.Fatalf("%v: %v", args, f.err)
+		}
+		line = f.line
+	case <-time.After(childBound):
+		t.Fatalf("%v: no first line within %v", args, childBound)
 	}
 	go io.Copy(io.Discard, pr)
 	addr, ok := strings.CutPrefix(strings.TrimSpace(line), "listening ")
@@ -514,9 +530,12 @@ func TestFakePG_GarbageAndManyClients(t *testing.T) {
 				t.Error(err)
 				return
 			}
+			c.SetDeadline(time.Now().Add(childBound)) // the fake closes once it has logged all
 			c.Write(msg)
 			c.(*net.UnixConn).CloseWrite()
-			io.Copy(io.Discard, c)
+			if _, err := io.Copy(io.Discard, c); errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Errorf("a connection still open %v after its bytes were sent", childBound)
+			}
 			c.Close()
 		}()
 	}

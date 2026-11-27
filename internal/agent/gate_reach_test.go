@@ -10,10 +10,12 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 func gnCase(t *testing.T) (*Agent, Spec, func(args ...string) string) {
@@ -23,6 +25,9 @@ func gnCase(t *testing.T) (*Agent, Spec, func(args ...string) string) {
 	var made []string
 	run := func(args ...string) string {
 		t.Helper()
+		if args[0] == "run" || args[0] == "create" { // removed by the watchdog should this process be killed
+			args = slices.Concat(args[:1], testdocker.Labels(t), args[1:])
+		}
 		out, err := exec.Command("docker", args...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("docker %s: %v: %s", strings.Join(args, " "), err, out)
@@ -143,7 +148,7 @@ func TestNode_GateCapabilitySpellings(t *testing.T) {
 	}
 	for i, c := range cases {
 		name := "sp-test-gate-cap" + string(rune('a'+i))
-		args := append([]string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", networkName(s.Ref)}, c.flags...)
+		args := slices.Concat([]string{"run", "-d", "--name", name}, testdocker.Labels(t), []string{"--network", networkName(s.Ref)}, c.flags)
 		args = append(args, "--entrypoint", "sleep", img, "300")
 		out, err := exec.Command("docker", args...).CombinedOutput()
 		if err != nil {

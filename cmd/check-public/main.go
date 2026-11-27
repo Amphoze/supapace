@@ -22,7 +22,9 @@
 // addresses), home-directory paths, IPv4 addresses outside the platform and
 // documentation ranges, IPv6 addresses other than unspecified, loopback,
 // link-local, multicast, the metadata endpoint and the documentation range, host names (see
-// the limits below for the TLDs that count), and every pattern of the operator's deny-list
+// the limits below for the TLDs that count), short codes (two letters of one case and
+// two digits standing as a token or a name's start, not two hex letters such as
+// fe80; see code in rules.go), and every pattern of the operator's deny-list
 // (${SUPAPACE_DENYLIST:-$HOME/.config/supapace/denylist}, one case-insensitive
 // regular expression per line). The deny-list sees every line as written. Exact
 // host names, dotted quads, IPv6 addresses and home-path prefixes (/home/ or
@@ -30,6 +32,15 @@
 // the file is read from the index (for --range from the first commit git
 // rev-list prints, the newest since ordering options are refused; for --tag from
 // the commit the tag peels to), never from the work tree.
+//
+// In a patch of upstream (studio/patches/*.patch, read as the blob itself in every
+// mode) the context and removed lines of its hunks (counted only after its first
+// "diff --git " line, never in the commit message) quote the upstream tree and are
+// not judged by the e-mail and host-name rules; every other rule applies to them,
+// and every other line of the patch (header, message, file headers, added lines,
+// anything outside a hunk's counted lines) is judged as any line. A context line
+// is taken as written: the gate cannot see whether upstream holds it, the patch
+// applying is what shows that.
 //
 // Blobs are scanned as bytes whatever their type or attributes, symlink targets
 // included; a blob that starts with a UTF-16 byte-order mark is also scanned as
@@ -191,19 +202,30 @@ func (c *checker) entries(prefix string, entries []entry, report func(loc, rule 
 				report(loc+" (path name)", r)
 			}
 		}
-		for k, text := range texts(blobs[i]) {
-			suffix := ""
-			if k > 0 {
-				suffix = " (UTF-16)"
-			}
-			for ln, s := range text {
-				for _, r := range c.line(s) {
-					report(loc+":"+strconv.Itoa(ln+1)+suffix, r)
-				}
+		c.blob(loc, e.path, blobs[i], report)
+	}
+	return nil
+}
+
+// blob scans one blob, at path, reporting at loc. In a patch of upstream
+// (upstreamPatch) the lines quoted from upstream (quoted) are judged by
+// rules(s, true): the blob's own lines, whatever diff brought the blob.
+func (c *checker) blob(loc, path string, b []byte, report func(loc, rule string)) {
+	for k, text := range texts(b) {
+		suffix := ""
+		if k > 0 {
+			suffix = " (UTF-16)"
+		}
+		q := make([]bool, len(text))
+		if k == 0 && upstreamPatch(path) {
+			q = quoted(text)
+		}
+		for ln, s := range text {
+			for _, r := range c.rules(s, q[ln]) {
+				report(loc+":"+strconv.Itoa(ln+1)+suffix, r)
 			}
 		}
 	}
-	return nil
 }
 
 // revisions reports whether args are only revisions (rev, ^rev, a..b, a...b) and

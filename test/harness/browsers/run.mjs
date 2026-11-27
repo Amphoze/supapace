@@ -26,6 +26,7 @@
 //   eval     {tab, fetch: {url, init}} → {status, headers}
 //   cookies  {}                       → {cookies: [{name, value, domain, path, expires, httpOnly, secure, sameSite}]}
 //   setCookie {tab, cookie, name}     → {kept}          document.cookie = cookie; kept: a cookie of that name is in the jar
+//                                                      once a mark the page wrote after it is (the mark is removed)
 //   requests {}                       → {requests: [{tab, method, url, resourceType, initiator, site, referer, cookies}]} since the last call;
 //                                                      site and referer are the Sec-Fetch-Site and Referer headers sent,
 //                                                      cookies the names in the Cookie header sent
@@ -167,10 +168,26 @@ async function main() {
           case 'cookies':
             r.cookies = await ctx.cookies();
             break;
-          case 'setCookie':
-            await tab(s).evaluate((c) => { document.cookie = c; }, s.cookie);
-            r.kept = (await ctx.cookies()).some((c) => c.name === s.name);
+          case 'setCookie': {
+            // A page's write reaches the jar the context reads later than the
+            // page sees it (WebKit stores it in its network process). A page
+            // has its writes stored in order, so a host-only mark written
+            // after the cookie is waited for in the jar, then removed: when it
+            // is there, so is the cookie, if the engine kept it.
+            const mark = `sp_mark_${out.steps.length}`;
+            await tab(s).evaluate(([c, m]) => { document.cookie = c; document.cookie = `${m}=1; Path=/; Secure`; }, [s.cookie, mark]);
+            const end = Date.now() + (sc.timeout_ms || 15000);
+            let jar;
+            for (;;) {
+              jar = await ctx.cookies();
+              if (jar.some((c) => c.name === mark)) break;
+              if (Date.now() > end) throw new Error('setCookie: the mark written after the cookie never reached the jar');
+              await new Promise((ok) => setTimeout(ok, 20));
+            }
+            await ctx.clearCookies({ name: mark });
+            r.kept = jar.some((c) => c.name === s.name);
             break;
+          }
           case 'requests':
             r.requests = seen.splice(0);
             break;

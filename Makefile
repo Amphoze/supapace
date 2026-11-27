@@ -82,10 +82,21 @@ reset = s=0; rm -f /run/supapace/failpoint || s=1; $(1) nft load || exit 1; \
 	ip -o addr show to 198.51.100.7/32 | while read -r _ d _; do ip addr del 198.51.100.7/32 dev "$$d" || exit 1; done || s=1; \
 	exit $$s
 
+# Node tests of different packages share the node's networks, bridges and tables:
+# one run at a time on a node. A target that runs node tests takes node_lock first
+# (a lock file of the node's name on this host) and holds it to the end of its
+# recipe line, resets included; one started meanwhile waits. Each target holds it
+# over everything it does to the node: node-proof from its build of the test binary
+# on, reach-reboot from the restart on. Running node tests by hand, never run several
+# packages at once (go test -tags reach -p 1). A docker exec ended by ^C leaves its
+# process running inside the node while the lock is already released.
+node_lock = exec 9>"$${TMPDIR:-/tmp}/sp-node-tests-$(NODE).lock" && flock 9 || exit 1;
+
 # Bracketed run on the node: reset, test binary $(3) (default reach.test) with $(1)
 # as extra flags and $(2) as extra docker exec options (environment), reset. A
 # failed reset fails the target, also after a passing run.
-node_reach = docker exec $(NODE) /usr/local/bin/node-init.sh install-bins || exit 1; \
+node_reach = $(node_lock) $(node_reach_run)
+node_reach_run = docker exec $(NODE) /usr/local/bin/node-init.sh install-bins || exit 1; \
 	docker exec $(NODE) sh -c '$(call reset,$(NODE_BIN)/supapaced)' || exit 1; \
 	docker exec $(2) $(NODE) $(NODE_BIN)/$(or $(3),reach.test) $(REACH_FLAGS) $(1); s=$$?; \
 	docker exec $(NODE) sh -c '$(call reset,$(NODE_BIN)/supapaced)' || exit 1; exit $$s
@@ -201,8 +212,11 @@ node-down:
 
 # With the node's stand-in present the suite is told so (SUPAPACE_STANDIN=1): a test
 # that needs it then fails instead of skipping.
+# SUPAPACE_BACKUP, when set, is passed on as set: =1 makes a node below layout 2 fail the
+# backup tests instead of skipping them (reach, reach-dash, reach-reboot).
+backup_env = $(if $(SUPAPACE_BACKUP),--env SUPAPACE_BACKUP=$(SUPAPACE_BACKUP))
 reach: build
-	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1))
+	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1) $(backup_env))
 
 # The suite built with the tags reach and dash (dash.test: every test of reach.test
 # and the dashboard's), on a node started with DASH=1, bracketed as make reach is.
@@ -210,18 +224,19 @@ reach: build
 reach-dash: build
 	CGO_ENABLED=0 $(GO) test -c -tags 'reach dash' -o $(BIN)/dash.test ./test/reach
 	@if [ -f "$(BROWSERS_TAR)" ]; then $(load_browsers); fi
-	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1),dash.test)
+	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1) $(backup_env),dash.test)
 
 # A package's node tests (TestNode_…, or RUN=<pattern>), built with the reach tag, in a
 # node started bare, with the archives of $(IMAGE_CACHE)/dash loaded into it.
 node-proof: build
 	@[ -n "$(PKG)" ] || { echo "usage: make node-proof PKG=<directory> [RUN=<pattern>]" >&2; exit 2; }
-	CGO_ENABLED=0 $(GO) test -c -tags reach -o $(BIN)/proof.test ./$(PKG)
-	@# The archives a dashboard node loads, so that a proof of the proxy has its image;
-	@# a Studio variant (supapace-studio-NAME.tar) is never loaded by itself.
-	@for f in "$(IMAGE_CACHE)"/dash/*.tar; do case $$f in */supapace-studio-*.tar) continue ;; esac; \
-		[ ! -e "$$f" ] || { $(call load_tar,$$f); } || exit 1; done
-	docker exec $(NODE) /usr/local/bin/node-init.sh install-bins
+	@# One line under the lock: the build, the archives a dashboard node loads (so that a
+	@# proof of the proxy has its image; a Studio variant, supapace-studio-NAME.tar, is
+	@# never loaded by itself), the install and the run.
+	$(node_lock) CGO_ENABLED=0 $(GO) test -c -tags reach -o $(BIN)/proof.test ./$(PKG) || exit 1; \
+	for f in "$(IMAGE_CACHE)"/dash/*.tar; do case $$f in */supapace-studio-*.tar) continue ;; esac; \
+		[ ! -e "$$f" ] || { $(call load_tar,$$f); } || exit 1; done; \
+	docker exec $(NODE) /usr/local/bin/node-init.sh install-bins || exit 1; \
 	docker exec $(NODE) $(NODE_BIN)/proof.test -test.v -test.timeout 60m -test.run '$(or $(RUN),^TestNode_)'
 
 # The browser harness's own tests (test/browser), in a node started bare, with the
@@ -233,10 +248,10 @@ browser-test: build
 	docker exec $(NODE) $(NODE_BIN)/browser.test -test.v -test.timeout 60m $(if $(RUN),-test.run '$(RUN)')
 
 reach-reboot: build
-	docker restart -t 60 $(NODE)
-	@for i in $$(seq 180); do docker exec $(NODE) test -S /run/supapace/admin.sock && exit 0; sleep 1; done; \
-		echo "node: admin socket did not appear" >&2; exit 1
-	$(call node_reach,-test.run 'TestReach05_AfterReboot|TestReach03' $(REACH_ARGS),-e SUPAPACE_REBOOT=1)
+	$(node_lock) docker restart -t 60 $(NODE) || exit 1; \
+	up=; for i in $$(seq 180); do docker exec $(NODE) test -S /run/supapace/admin.sock && { up=1; break; }; sleep 1; done; \
+	[ -n "$$up" ] || { echo "node: admin socket did not appear" >&2; exit 1; }; \
+	$(call node_reach_run,-test.run 'TestReach05_AfterReboot|TestReach03' $(REACH_ARGS),-e SUPAPACE_REBOOT=1 $(backup_env))
 
 # On a host prepared by scripts/install-node.sh, as root. The suite runs the
 # binaries from $(NODE_BIN), as in the test node, so they are installed there first.

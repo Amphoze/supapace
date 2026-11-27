@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 // ───────── helper re-execution ─────────
@@ -1602,7 +1604,7 @@ func TestScramVerifier_AcceptedByPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		exec.Command("docker", "run", "--rm", "-v", root+":/r", "--network", "none", "--entrypoint", "rm", im.ControlPlane, "-rf", "/r/"+testRef).Run()
+		exec.Command("docker", slices.Concat([]string{"run", "--rm"}, testdocker.Labels(t), []string{"-v", root + ":/r", "--network", "none", "--entrypoint", "rm", im.ControlPlane, "-rf", "/r/" + testRef})...).Run()
 		os.RemoveAll(root)
 	})
 	sock := filepath.Join(root, testRef, "sock")
@@ -1614,9 +1616,9 @@ func TestScramVerifier_AcceptedByPostgres(t *testing.T) {
 	rand.Read(rnd)
 	name := "sp-test-pgsock-" + hex.EncodeToString(rnd)
 	initPW := hex.EncodeToString(rnd) + "init"
-	out, err := exec.Command("docker", "run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none",
-		"-e", "POSTGRES_PASSWORD="+initPW, "-e", "POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256",
-		"-v", sock+":/var/run/postgresql", im.ControlPlane).CombinedOutput()
+	out, err := exec.Command("docker", slices.Concat([]string{"run", "-d", "--name", name}, testdocker.Labels(t), []string{"--network", "none",
+		"-e", "POSTGRES_PASSWORD=" + initPW, "-e", "POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256",
+		"-v", sock + ":/var/run/postgresql"}, testdocker.Bounded(im.ControlPlane, "docker-entrypoint.sh", "postgres"))...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v %s", err, out)
 	}

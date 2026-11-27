@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -43,8 +44,8 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "reach: suite reset:", err)
 		os.Exit(1)
 	}
-	if fi, err := os.Stat(paths.AdminSock()); err != nil || fi.Mode()&fs.ModeSocket == 0 {
-		fmt.Fprintf(os.Stderr, "reach: admin socket %s absent: supapaced serve is not running\n", paths.AdminSock())
+	if err := adminListening(30 * time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "reach: admin socket %s: %v: supapaced serve is not running\n", paths.AdminSock(), err)
 		os.Exit(1)
 	}
 	mt := &mainT{}
@@ -65,6 +66,21 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	mt.cleanup()
 	os.Exit(code)
+}
+
+// adminListening dials the admin socket until a dial is accepted, for at most
+// d: a socket file left by a daemon that is gone, or one not yet listening,
+// is not a running daemon. It returns the last dial's error.
+func adminListening(d time.Duration) error {
+	for end := time.Now().Add(d); ; time.Sleep(200 * time.Millisecond) {
+		c, err := net.DialTimeout("unix", paths.AdminSock(), 5*time.Second)
+		if err == nil {
+			return c.Close()
+		}
+		if time.Now().After(end) {
+			return err
+		}
+	}
 }
 
 // suiteHooks run in TestMain after the fixtures are built, before any test;

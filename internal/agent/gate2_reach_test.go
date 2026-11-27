@@ -11,13 +11,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 func g2Run(t *testing.T, args ...string) string {
 	t.Helper()
+	if args[0] == "run" || args[0] == "create" { // removed by the watchdog should this process be killed
+		args = slices.Concat(args[:1], testdocker.Labels(t), args[1:])
+	}
 	out, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker %s: %v: %s", strings.Join(args, " "), err, out)

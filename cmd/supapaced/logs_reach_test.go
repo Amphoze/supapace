@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/Amphoze/supapace/internal/store"
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 func TestReachLogs_ByLabelAgainstDocker(t *testing.T) {
@@ -35,7 +36,7 @@ func TestReachLogs_ByLabelAgainstDocker(t *testing.T) {
 		}
 	})
 	start := func(name, script string, kv ...string) {
-		args := []string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none"}
+		args := slices.Concat([]string{"run", "-d", "--name", name}, testdocker.Labels(t), []string{"--network", "none"})
 		for i := 0; i < len(kv); i += 2 {
 			args = append(args, "--label", kv[i]+"="+kv[i+1])
 		}
@@ -43,16 +44,16 @@ func TestReachLogs_ByLabelAgainstDocker(t *testing.T) {
 		docker(append(args, "--entrypoint", "sh", image, "-c", script)...)
 	}
 	const flood = `i=0; while [ $i -lt 1500 ]; do echo "flood $i $(printf '%0200d' 0)" >&2; i=$((i+1)); done; `
-	start("sp-test-op27-a-pg", flood+`printf 'line one\n'; printf 'esc \033[2J bell \007 cr\r done\n' >&2; `+
+	start("sp-test-logs-a-pg", flood+`printf 'line one\n'; printf 'esc \033[2J bell \007 cr\r done\n' >&2; `+
 		`printf 'rest 2026-11-21T00:00:00Z | forged\n'; echo last-out`,
 		"supapace.ref", refA, "supapace.role", "cluster")
-	start("sp-test-op27-a-rest", `echo rest own`, "supapace.ref", refA, "supapace.role", "postgrest")
-	start("sp-test-op27-a-task", `echo task secret`, "supapace.ref", refA, "supapace.role", "task")
-	start("sp-test-op27-b-pg", `echo B secret`, "supapace.ref", refB, "supapace.role", "cluster")
-	start("sp-test-op27-pooler", `echo tenant `+refA+` pool up`)
+	start("sp-test-logs-a-rest", `echo rest own`, "supapace.ref", refA, "supapace.role", "postgrest")
+	start("sp-test-logs-a-task", `echo task secret`, "supapace.ref", refA, "supapace.role", "task")
+	start("sp-test-logs-b-pg", `echo B secret`, "supapace.ref", refB, "supapace.role", "cluster")
+	start("sp-test-logs-pooler", `echo tenant `+refA+` pool up`)
 	docker(append([]string{"wait"}, names...)...)
 	inner := nodeLogNames["pooler"]
-	nodeLogNames["pooler"] = "sp-test-op27-pooler"
+	nodeLogNames["pooler"] = "sp-test-logs-pooler"
 	t.Cleanup(func() { nodeLogNames["pooler"] = inner })
 
 	got, err := projectLogs(ctx, refA, "", 1000)

@@ -9,10 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Amphoze/supapace/internal/testdocker"
 )
 
 // ---- scheduled jobs, against the pinned cluster image ----
@@ -36,8 +39,8 @@ func newCronCluster(t *testing.T) cronCluster {
 	t.Cleanup(func() { exec.Command("docker", "volume", "rm", "-f", c.data).Run() })
 	name := cronName()
 	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "-v", name).Run() })
-	docker(t, "run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
-		"-e", "POSTGRES_PASSWORD="+c.pw, "-v", c.data+":/var/lib/postgresql/data", img)
+	docker(t, append([]string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
+		"-e", "POSTGRES_PASSWORD=" + c.pw, "-v", c.data + ":/var/lib/postgresql/data"}, testdocker.Bounded(img, "docker-entrypoint.sh", "postgres", "-D", "/etc/postgresql")...)...)
 	if !until(t, name, 5*time.Minute, func() bool {
 		return exec.Command("docker", "exec", name, "psql", "-XAtq", "-h", "/var/run/postgresql", "-U", "supabase_admin",
 			"-d", "postgres", "-c", "select 1").Run() == nil && strings.Contains(logs(name), "init process complete")
@@ -89,13 +92,13 @@ func (c cronCluster) start(t *testing.T, conf []byte) string {
 	}
 	name := cronName()
 	t.Cleanup(func() { exec.Command("docker", "rm", "-f", "-v", name).Run() })
-	docker(t, append([]string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
+	docker(t, slices.Concat([]string{"run", "-d", "--name", name, "--label", "supapace.test=1", "--network", "none", "--memory", "512m",
 		"-v", c.data + ":/var/lib/postgresql/data",
 		"-v", filepath.Join(dir, "conf.d") + ":/etc/postgresql-custom/conf.d:ro",
 		"-v", filepath.Join(dir, "supautils.conf") + ":/etc/postgresql-custom/supautils.conf:ro",
 		"-v", filepath.Join(dir, "pg_hba.conf") + ":" + hbaFile + ":ro",
-		"-v", filepath.Join(dir, "pg_ident.conf") + ":" + identFile + ":ro",
-		c.img, "postgres", "-D", "/etc/postgresql"}, cl...)...)
+		"-v", filepath.Join(dir, "pg_ident.conf") + ":" + identFile + ":ro"},
+		testdocker.Bounded(c.img, "docker-entrypoint.sh", "postgres", "-D", "/etc/postgresql"), cl)...)
 	if !until(t, name, 2*time.Minute, func() bool { _, err := c.sql(name, "supabase_admin", "select 1"); return err == nil }) {
 		t.Fatalf("server did not start:\n%s", logs(name))
 	}

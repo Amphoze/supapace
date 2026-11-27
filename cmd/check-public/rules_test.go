@@ -4,6 +4,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -290,6 +291,111 @@ func TestHome_Allow(t *testing.T) {
 	} {
 		if got := c.line(in); !reflect.DeepEqual(got, want) {
 			t.Errorf("line(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// Short codes: two letters of one case and two digits, as a whole token or a
+// name's start. The codes are assembled so this file passes the gate.
+func TestRules_Code(t *testing.T) {
+	lo, up := "qz"+"42", "QZ"+"42"
+	c := testChecker(t, nil)
+	for _, s := range []string{lo, up, "sp-" + lo + "-listen", "sp-test-" + lo + "-nodns", lo + "_x", lo + "Listen",
+		"(" + lo + ")", "x/" + lo + ".go", "name " + up + ".", "fe80 " + lo} {
+		if got := c.line(s); !reflect.DeepEqual(got, []string{"short code"}) {
+			t.Errorf("line(%q) = %v, want the short-code rule", s, got)
+		}
+	}
+	for _, s := range []string{"TestReach14 TestDash15_x", "F1 F7 B1 B14 I1 I2", "fe80 ff02 FF05 fd00 fc00 FE80",
+		"ab" + lo, lo + "9", lo + "ab", up + "QZ", "To16() As16()", "3fab12cd 0xab12", "HH24MIS", "qz4 qz420 q42 qzx42"} {
+		if got := c.line(s); got != nil {
+			t.Errorf("line(%q) = %v, want nothing", s, got)
+		}
+	}
+	if got := testChecker(t, nil, lo).line("sp-" + lo + "-x"); got != nil {
+		t.Errorf("an allowed code: %v", got)
+	}
+}
+
+// upstreamPatchText is a patch whose context and removed lines quote an upstream
+// tree; want maps each 1-based line to the rules it must break.
+func upstreamPatchText() (string, map[int][]string) {
+	mail, host, pub := "up"+q("!")+j("upstream", "com"), j("api", "upstream", "com"), j("8", "8", "4", "4")
+	ls := []string{
+		"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001", // 1
+		"From: Up Stream <" + mail + ">",                                         // 2: the patch's own header
+		"Subject: [PATCH] see " + host,                                           // 3
+		"",                                                                       // 4
+		"message " + mail,                                                        // 5: the commit message
+		"---",                                                                    // 6
+		"diff --git a/f.ts b/f.ts",                                               // 7
+		"--- a/f.ts",                                                             // 8
+		"+++ b/f.ts",                                                             // 9
+		"@@ -1,6 +1,5 @@ ctx " + host,                                            // 10: a hunk header is not quoted
+		" // " + mail,                                                            // 11: context, quoted
+		"-const u = 'https://" + host + "'",                                      // 12: removed, quoted
+		"+const u = '" + mail + "'",                                              // 13: added
+		"  two spaces " + host,                                                   // 14: context (one space, then text)
+		" ctx zz" + "deny",                                                       // 15: deny-list on a context line
+		"\\ No newline at end of file",                                           // 16
+		" " + pub,                                                                // 17: context, IPv4 still refused
+		" after the counts " + mail,                                              // 18: past the hunk: not quoted
+		"-- ",                                                                    // 19
+		"-trailer " + host,                                                       // 20: after the last hunk
+		"@@ -9 +9 @@",                                                            // 21: counts left out: one each
+		"-" + mail,                                                               // 22: quoted
+		"+" + mail,                                                               // 23: added
+		" " + mail,                                                               // 24: past the counts
+	}
+	return strings.Join(ls, "\n") + "\n", map[int][]string{
+		2: {"e-mail", "host name"}, 3: {"host name"}, 5: {"e-mail", "host name"}, 10: {"host name"},
+		13: {"e-mail", "host name"}, 15: {"deny-list"}, 17: {"IPv4"}, 18: {"e-mail", "host name"},
+		20: {"host name"}, 23: {"e-mail", "host name"}, 24: {"e-mail", "host name"},
+	}
+}
+
+func TestBlob_UpstreamPatchQuotesAreNotJudgedAsMailOrHost(t *testing.T) {
+	text, want := upstreamPatchText()
+	c := testChecker(t, []string{"zz" + "deny"})
+	got := map[int][]string{}
+	c.blob("x", "studio/patches/0001-x.patch", []byte(text), func(loc, rule string) {
+		n, _ := strconv.Atoi(loc[strings.LastIndex(loc, ":")+1:])
+		got[n] = append(got[n], rule)
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("patch lines refused %v, want %v", got, want)
+	}
+	// The same content anywhere else is judged line by line as any file.
+	for _, p := range []string{"studio/0001-x.patch", "studio/patches/sub/0001-x.patch", "studio/patches/0001-x.diff", "x/studio/patches/a.patch"} {
+		n := 0
+		c.blob("x", p, []byte(text), func(loc, rule string) {
+			if strings.HasSuffix(loc, ":11") || strings.HasSuffix(loc, ":12") || strings.HasSuffix(loc, ":22") {
+				n++
+			}
+		})
+		if n == 0 {
+			t.Errorf("%s: its context and removed lines passed", p)
+		}
+	}
+}
+
+func TestQuoted_HunkCounting(t *testing.T) {
+	for _, tc := range []struct {
+		lines []string
+		want  []bool
+	}{
+		{[]string{" a", "-b"}, []bool{false, false}},                                      // no hunk header: nothing quoted
+		{[]string{"@@ -1,2 +1,1 @@", " a", "-b", " c"}, []bool{false, true, true, false}}, // past the counts
+		{[]string{"@@ -1,1 +1,2 @@", "+a", " b", "-c"}, []bool{false, false, true, false}},
+		{[]string{"@@ -1,2 +1,2 @@", " a", "x", " b"}, []bool{false, true, false, false}}, // a line that does not fit ends it
+		{[]string{"@@ -1,2 +1,2 @@", " a", "", " b"}, []bool{false, true, false, false}},
+		{[]string{"@@ -0,0 +1,2 @@", "+a", " b"}, []bool{false, false, false}}, // no old lines: a context line cannot fit
+		{[]string{"@@ -1,3 +1,3 @@ x", " a", `\ No newline at end of file`, " b", " c"}, []bool{false, true, false, true, true}},
+		{[]string{"@@ -1 +1 @@", "-a", "+b", " c"}, []bool{false, true, false, false}},
+		{[]string{"@@ -1,1 +1,1 @", " a"}, []bool{false, false}}, // not a hunk header
+	} {
+		if got := quoted(append([]string{"diff --git a/f b/f"}, tc.lines...))[1:]; !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("quoted(%q) = %v, want %v", tc.lines, got, tc.want)
 		}
 	}
 }

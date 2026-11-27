@@ -168,13 +168,26 @@ func relayTo(t *testing.T, c Class, script func(net.Conn), o ...opts) *pair {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
-	t.Cleanup(cancel)
 	conn := Conn{Class: c, Client: acc, First: first, From: netip.MustParseAddr("127.0.0.1"), To: to,
 		Accepted: time.Now(), Streams: op.streams}
 	if op.edit != nil {
 		op.edit(&conn)
 	}
-	go func() { p.done <- Relay(ctx, conn) }()
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		p.done <- Relay(ctx, conn)
+	}()
+	// The relay ends before the test does: one left running reads the
+	// package's hooks (faultHook, newBuffer) while the next test sets them.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-ended:
+		case <-time.After(30 * time.Second):
+			t.Error("the relay did not end 30 s after its context")
+		}
+	})
 	p.client = client
 	return p
 }
@@ -494,7 +507,7 @@ func TestFault_EndsOnlyItsOwnConnection(t *testing.T) {
 			panic("marker")
 		}
 	}
-	defer func() { faultHook = old }()
+	t.Cleanup(func() { faultHook = old }) // after relay B, which outlives the test's body, has ended
 	runB, chB := script(t, login)
 	b := relayTo(t, metaClass(), runB) // another project's connection, opened before
 	b.read(t, len(login))

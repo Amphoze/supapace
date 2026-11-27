@@ -43,8 +43,9 @@ func waitDead(t *testing.T, pid int) {
 	t.Helper()
 	zombie := func() bool {
 		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-		_, rest, ok := strings.Cut(string(b), ") ")
-		return err == nil && ok && strings.HasPrefix(rest, "Z")
+		// The state follows the name in parentheses, and the name may hold ") ".
+		i := strings.LastIndex(string(b), ") ")
+		return err == nil && i >= 0 && strings.HasPrefix(string(b[i+2:]), "Z")
 	}
 	for i := 0; syscall.Kill(pid, 0) != syscall.ESRCH && !zombie(); i++ {
 		if i > 500 { // 10 s

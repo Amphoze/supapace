@@ -554,6 +554,17 @@ func TestBrowsers_FlowModel_ConcurrentAttempts(t *testing.T) {
 			if held != 1 {
 				t.Errorf("%d login cookies after the seventeenth login, want 1", held)
 			}
+			if t.Failed() { // what decides between the engine's jar and the gateway: the jar as listed, and what was sent
+				b, _ := json.Marshal(r.Steps[2+17*2+16]["cookies"])
+				t.Logf("FACT jar after the seventeenth login: %s", b)
+				b, _ = json.Marshal(r.Steps[len(r.Steps)-2]["cookies"])
+				t.Logf("FACT jar at the end: %s", b)
+				for _, q := range rs {
+					if u, _ := url.Parse(q.URL); u != nil && (u.Path == "/-/auth/login" || u.Path == "/-/auth/session") {
+						t.Logf("FACT tab %d %s %s sent %q", q.Tab, q.Method, u.Path, q.Cookies)
+					}
+				}
+			}
 			checkSession(t, cs, m.host(refs[0]))
 			c := logins(rs)
 			for i := range 16 {
