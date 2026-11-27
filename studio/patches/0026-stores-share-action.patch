@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:27:00 +0000
+Subject: [PATCH] stores: the share action in the editor
+
+The share item and the shared section are shown in self-hosted too. A share or an unshare
+moves the snippet and changes its id; the editor's state and an open tab follow the answer.
+---
+ .../SQLEditorNavV2/SQLEditorNav.tsx           |  6 ++--
+ .../SQLEditorNavV2/SQLEditorTreeViewItem.tsx  | 23 ++++++-------
+ .../SQLEditorNavV2/ShareSnippetModal.tsx      | 11 +++---
+ .../SQLEditorNavV2/UnshareSnippetModal.tsx    | 10 +++---
+ .../SQLEditorNavV2/useMovedSnippet.ts         | 34 +++++++++++++++++++
+ 5 files changed, 57 insertions(+), 27 deletions(-)
+ create mode 100644 apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/useMovedSnippet.ts
+
+diff --git a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorNav.tsx b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorNav.tsx
+index 6bf556e5..03ae54bd 100644
+--- a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorNav.tsx
++++ b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorNav.tsx
+@@ -508,8 +508,7 @@ export const SQLEditorNav = ({ sort = 'inserted_at' }: SQLEditorNavProps) => {
+   return (
+     <>
+       <InnerSideMenuSeparator />
+-      {IS_PLATFORM && (
+-        <>
++      {/* supapace: shared queries are listed in self-hosted too */}
+           <InnerSideMenuCollapsible
+             className="px-0"
+             open={showSharedSnippets}
+@@ -584,7 +583,8 @@ export const SQLEditorNav = ({ sort = 'inserted_at' }: SQLEditorNavProps) => {
+           </InnerSideMenuCollapsible>
+ 
+           <InnerSideMenuSeparator />
+-
++      {IS_PLATFORM && (
++        <>
+           <InnerSideMenuCollapsible
+             className="px-0"
+             open={showFavoriteSnippets}
+diff --git a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorTreeViewItem.tsx b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorTreeViewItem.tsx
+index 6df0205f..f619f9b4 100644
+--- a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorTreeViewItem.tsx
++++ b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/SQLEditorTreeViewItem.tsx
+@@ -387,19 +387,16 @@ export const SQLEditorTreeViewItem = ({
+                   Move query
+                 </ContextMenuItem>
+               )}
+-              {onSelectShare !== undefined &&
+-                !isSharedSnippet &&
+-                canCreateSQLSnippet &&
+-                IS_PLATFORM && (
+-                  <ContextMenuItem
+-                    className="gap-x-2"
+-                    onSelect={() => onSelectShare()}
+-                    onFocusCapture={(e) => e.stopPropagation()}
+-                  >
+-                    <ShareIcon size={14} />
+-                    Share query with team
+-                  </ContextMenuItem>
+-                )}
++              {onSelectShare !== undefined && !isSharedSnippet && canCreateSQLSnippet && (
++                <ContextMenuItem
++                  className="gap-x-2"
++                  onSelect={() => onSelectShare()}
++                  onFocusCapture={(e) => e.stopPropagation()}
++                >
++                  <ShareIcon size={14} />
++                  Share query with team
++                </ContextMenuItem>
++              )}
+               {onSelectUnshare !== undefined && isSharedSnippet && isOwner && (
+                 <ContextMenuItem
+                   className="gap-x-2"
+diff --git a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/ShareSnippetModal.tsx b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/ShareSnippetModal.tsx
+index 2d8df413..aea1d045 100644
+--- a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/ShareSnippetModal.tsx
++++ b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/ShareSnippetModal.tsx
+@@ -3,6 +3,7 @@ import { EyeIcon, UnlockIcon } from 'lucide-react'
+ import { toast } from 'sonner'
+ import ConfirmationModal from 'ui-patterns/Dialogs/ConfirmationModal'
+ 
++import { useMovedSnippet } from './useMovedSnippet'
+ import { getContentById } from '@/data/content/content-id-query'
+ import { useContentUpsertMutation } from '@/data/content/content-upsert-mutation'
+ import { Snippet } from '@/data/content/sql-folders-query'
+@@ -20,6 +21,7 @@ export const ShareSnippetModal = ({
+ }) => {
+   const { ref: projectRef } = useParams()
+   const snapV2 = useSqlEditorV2StateSnapshot()
++  const followMove = useMovedSnippet()
+ 
+   const { mutate: upsertContent, isPending: isUpserting } = useContentUpsertMutation({
+     onError: (error) => {
+@@ -56,11 +58,10 @@ export const ShareSnippetModal = ({
+         },
+       },
+       {
+-        onSuccess: () => {
+-          snapV2.updateSnippet({
+-            id: snippet.id,
+-            snippet: { visibility: 'project', folder_id: null },
+-            skipSave: true,
++        onSuccess: async (moved) => {
++          await followMove(projectRef, snippet.id, moved, {
++            visibility: 'project',
++            folder_id: null,
+           })
+           toast.success('Snippet is now shared to the project')
+           onSuccess?.()
+diff --git a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/UnshareSnippetModal.tsx b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/UnshareSnippetModal.tsx
+index 4aa01df1..6cbeb177 100644
+--- a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/UnshareSnippetModal.tsx
++++ b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/UnshareSnippetModal.tsx
+@@ -3,6 +3,7 @@ import { EyeOffIcon } from 'lucide-react'
+ import { toast } from 'sonner'
+ import ConfirmationModal from 'ui-patterns/Dialogs/ConfirmationModal'
+ 
++import { useMovedSnippet } from './useMovedSnippet'
+ import { getContentById } from '@/data/content/content-id-query'
+ import { useContentUpsertMutation } from '@/data/content/content-upsert-mutation'
+ import { Snippet } from '@/data/content/sql-folders-query'
+@@ -20,6 +21,7 @@ export const UnshareSnippetModal = ({
+ }) => {
+   const { ref: projectRef } = useParams()
+   const snapV2 = useSqlEditorV2StateSnapshot()
++  const followMove = useMovedSnippet()
+ 
+   const { mutate: upsertContent } = useContentUpsertMutation({
+     onError: (error) => {
+@@ -56,12 +58,8 @@ export const UnshareSnippetModal = ({
+         },
+       },
+       {
+-        onSuccess: () => {
+-          snapV2.updateSnippet({
+-            id: snippet.id,
+-            snippet: { visibility: 'user', folder_id: null },
+-            skipSave: true,
+-          })
++        onSuccess: async (moved) => {
++          await followMove(projectRef, snippet.id, moved, { visibility: 'user', folder_id: null })
+           toast.success('Snippet is now unshared from the project')
+           onSuccess?.()
+           onClose()
+diff --git a/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/useMovedSnippet.ts b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/useMovedSnippet.ts
+new file mode 100644
+index 00000000..faa583f1
+--- /dev/null
++++ b/apps/studio/components/layouts/SQLEditorLayout/SQLEditorNavV2/useMovedSnippet.ts
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: Apache-2.0
++// supapace: in self-hosted, sharing or unsharing a snippet moves its file and gives it another
++// id (the server derives a snippet's id from where it is kept). The editor's state follows the
++// answer: the old entry goes, the moved one comes, and an open tab follows it.
++import { useRouter } from 'next/router'
++
++import type { SnippetWithContent } from '@/data/content/sql-folders-query'
++import { useSqlEditorV2StateSnapshot } from '@/state/sql-editor/sql-editor-state'
++import { createTabId, useTabsStateSnapshot } from '@/state/tabs'
++
++export function useMovedSnippet() {
++  const router = useRouter()
++  const snapV2 = useSqlEditorV2StateSnapshot()
++  const tabsSnap = useTabsStateSnapshot()
++
++  return async (
++    projectRef: string,
++    id: string,
++    moved: SnippetWithContent | null | undefined,
++    change: Pick<SnippetWithContent, 'visibility' | 'folder_id'>
++  ) => {
++    if (!moved || moved.id === id) {
++      snapV2.updateSnippet({ id, snippet: change, skipSave: true })
++      return
++    }
++    snapV2.removeSnippet(id, true)
++    snapV2.addSnippet({ projectRef, snippet: moved })
++    const tabId = createTabId('sql', { id })
++    if (tabsSnap.hasTab(tabId)) {
++      tabsSnap.removeTab(tabId)
++      await router.push(`/project/${projectRef}/sql/${moved.id}`)
++    }
++  }
++}

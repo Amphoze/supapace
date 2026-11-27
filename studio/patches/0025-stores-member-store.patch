@@ -1,0 +1,3709 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:27:00 +0000
+Subject: [PATCH] stores: snippets private per member, shared per project
+
+The snippet store is kept under the request's project directory on the data volume:
+<ref>/snippets/<P>/ for a member's own (P: the SHA-256 of the principal's length-prefixed
+issuer and subject), <ref>/snippets/shared/<P>/ for what that member shared. Nothing of the
+request names a directory. Shared snippets are readable by every member and changed by their
+author only; a read_only member reads and saves nothing. A shared snippet's id is derived by
+SHA-256 from its author and name and never equals a member's own. Links and non-regular
+files are never followed or read; files are written by rename. Per project, at most
+snippet_entries entries and snippet_bytes bytes, checked and written under the project's
+lock. A snippet, and the SQL of one listing, are at most result_bytes; a listing past it ends
+with a cursor of the sort key and id of its last snippet. An answer that carries SQL is made
+and sent in one of four slots of the process, two at most for a project, held until its body
+has been taken or cut (the client gone, an error, handover_ms); a request waits a bounded
+time behind a bounded queue, else 429 busy. A write whose id another of
+the member's snippets has, and a rename, move or share onto a taken name, are 409 exists.
+The process-wide snippets folder and its setting are gone.
+---
+ .../lib/api/self-hosted/member-store.test.ts  | 1181 +++++++++++++++++
+ .../lib/api/self-hosted/member-store.ts       |  817 ++++++++++++
+ apps/studio/lib/api/snippets.constants.ts     |    1 -
+ apps/studio/lib/api/snippets.utils.test.ts    |  769 -----------
+ apps/studio/lib/api/snippets.utils.ts         |  500 -------
+ .../platform/projects/$ref/content/count.ts   |   30 +-
+ .../projects/$ref/content/folders/$id.ts      |   28 +-
+ .../projects/$ref/content/folders/index.ts    |   38 +-
+ .../platform/projects/$ref/content/index.ts   |   98 +-
+ .../projects/$ref/content/item/$id.ts         |   16 +-
+ 10 files changed, 2057 insertions(+), 1421 deletions(-)
+ create mode 100644 apps/studio/lib/api/self-hosted/member-store.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/member-store.ts
+ delete mode 100644 apps/studio/lib/api/snippets.constants.ts
+ delete mode 100644 apps/studio/lib/api/snippets.utils.test.ts
+ delete mode 100644 apps/studio/lib/api/snippets.utils.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/member-store.test.ts b/apps/studio/lib/api/self-hosted/member-store.test.ts
+new file mode 100644
+index 00000000..531c4ed6
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/member-store.test.ts
+@@ -0,0 +1,1181 @@
++// SPDX-License-Identifier: Apache-2.0
++// The snippet store: private per member, shared per project, bounded per project, and found
++// from the request's context alone.
++import { execFileSync } from 'node:child_process'
++import {
++  existsSync,
++  lstatSync,
++  mkdirSync,
++  mkdtempSync,
++  readdirSync,
++  readFileSync,
++  rmSync,
++  statSync,
++  symlinkSync,
++  writeFileSync,
++} from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join, resolve as resolvePath } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import {
++  acquireRead,
++  checkName,
++  countSnippets,
++  createFolder,
++  deleteFolders,
++  deleteSnippets,
++  getSnippet,
++  listFolders,
++  listSnippets,
++  NAME_BYTES,
++  principalDir,
++  putSnippet,
++  READ_SLOTS,
++  READ_SLOTS_PROJECT,
++  READ_WAITING,
++  READ_WAITING_PROJECT,
++  readsHeld,
++  sharedId,
++  sqlAnswer,
++  type Snippet,
++} from './member-store'
++import { projectContext, ProjectError, runWithProject, type Assertion } from './project-context'
++
++const VECTORS = resolvePath(import.meta.dirname, '../../../../../vectors')
++const LIMITS = JSON.parse(readFileSync(join(VECTORS, 'limits.json'), 'utf8'))
++const MAX_BYTES: number = LIMITS.snippet_bytes
++const MAX_ENTRIES: number = LIMITS.snippet_entries
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++const ISS = 'https://issuer.test'
++const NEW_ID = '00000000-0000-4000-8000-000000000001'
++
++type Who = { ref: string; sub: string; iss?: string; role?: Assertion['role'] }
++const A1: Who = { ref: REF_A, sub: 'alice' }
++const A2: Who = { ref: REF_A, sub: 'bob' }
++const B1: Who = { ref: REF_B, sub: 'carol' }
++
++function as<T>(who: Who, fn: () => Promise<T>): Promise<T> {
++  const role = who.role ?? 'developer'
++  const ctx = projectContext(
++    {
++      text: 'v1.x.y',
++      ref: who.ref,
++      iss: who.iss ?? ISS,
++      sub: who.sub,
++      name: who.sub,
++      role,
++      purpose: '',
++    },
++    {
++      ref: who.ref,
++      name: 'p',
++      state: 'active',
++      db_version: '17.6.1',
++      pg_meta: 0,
++      ...(role === 'read_only' ? {} : { dsn_rw: 'postgresql://x' }),
++      api_url: `https://${who.ref}.example.test`,
++      data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
++      generation: 1,
++      at: new Date().toISOString(),
++    }
++  )
++  return runWithProject(ctx, fn)
++}
++
++/** The refusal `fn` ends in, as `<status> <code>`. */
++async function refusal(fn: () => Promise<unknown>): Promise<string> {
++  try {
++    await fn()
++  } catch (e) {
++    if (e instanceof ProjectError) return `${e.status} ${e.code}`
++    throw e
++  }
++  return 'no refusal'
++}
++
++const put = (who: Who, body: Record<string, unknown>) =>
++  as(who, () => putSnippet({ id: NEW_ID, ...body }))
++const save = (who: Who, name: string, sql = `select '${name}'`, extra = {}) =>
++  put(who, { name, content: { sql }, visibility: 'user', ...extra })
++const names = (r: { snippets: { name: string }[] }) => r.snippets.map((s) => s.name).sort()
++// runs fn in a read slot, as the routes' answers do
++const reading = async <T>(ref: string, fn: () => Promise<T>): Promise<T> => {
++  const release = await acquireRead(ref)
++  try {
++    return await fn()
++  } finally {
++    release()
++  }
++}
++
++describe('the member store', () => {
++  let dir: string
++  let data: string
++  const pdir = (who: Who) => principalDir(who.iss ?? ISS, who.sub)
++  const own = (who: Who) => join(data, who.ref, 'snippets', pdir(who))
++  const shared = (who: Who) => join(data, who.ref, 'snippets', 'shared', pdir(who))
++
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), 'dash-store-'))
++    data = join(dir, 'data')
++    mkdirSync(data)
++    vi.stubEnv('SUPAPACE_DASH_DATA', data)
++    vi.stubEnv('SUPAPACE_LIMITS', JSON.stringify(LIMITS))
++    vi.spyOn(console, 'error').mockImplementation(() => {})
++  })
++  afterEach(() => {
++    vi.unstubAllEnvs()
++    vi.restoreAllMocks()
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  describe('per member and per project', () => {
++    it("a member's snippet is not listed for another member of the project", async () => {
++      await save(A1, 'mine')
++      expect(names(await as(A1, () => listSnippets()))).toEqual(['mine']) // control
++      expect(names(await as(A2, () => listSnippets()))).toEqual([])
++      expect(names(await as(A2, () => listSnippets({ visibility: 'project' })))).toEqual([])
++      expect(names(await as(A2, () => listSnippets({ searchTerm: 'mine' })))).toEqual([])
++    })
++
++    it("a member's snippet is not readable, changeable or deletable by another member", async () => {
++      const s = await save(A1, 'mine', 'select secret')
++      expect(await refusal(() => as(A2, () => getSnippet(s.id)))).toBe('404 not_found')
++      expect(await refusal(() => as(A2, () => deleteSnippets([s.id])))).toBe('404 not_found')
++      // a write with the id makes a snippet of the writer's own; the owner's is unchanged
++      await as(A2, () => putSnippet({ id: s.id, name: 'mine', content: { sql: 'select 2' } }))
++      expect((await as(A1, () => getSnippet(s.id))).content.sql).toBe('select secret')
++      expect((await as(A2, () => getSnippet(s.id))).content.sql).toBe('select 2')
++    })
++
++    it('a shared one is listed and readable for every member of the project', async () => {
++      const s = await save(A1, 'team', 'select 1', { visibility: 'project' })
++      expect(s.visibility).toBe('project')
++      const listed = await as(A2, () => listSnippets({ visibility: 'project' }))
++      expect(names(listed)).toEqual(['team'])
++      expect(listed.snippets[0]).toMatchObject({ id: s.id, owner_id: 0, visibility: 'project' })
++      expect(
++        (await as(A1, () => listSnippets({ visibility: 'project' }))).snippets[0].owner_id
++      ).toBe(1)
++      expect((await as(A2, () => getSnippet(s.id))).content.sql).toBe('select 1')
++      expect(await as(A2, () => countSnippets())).toEqual({ shared: 1, favorites: 0, private: 0 })
++      // not in the other project
++      expect(names(await as(B1, () => listSnippets({ visibility: 'project' })))).toEqual([])
++    })
++
++    it('a shared snippet is changed and deleted by its author only', async () => {
++      const s = await save(A1, 'team', 'select 1', { visibility: 'project' })
++      expect(
++        await refusal(() =>
++          as(A2, () => putSnippet({ id: s.id, content: { sql: 'drop table x' } }))
++        )
++      ).toBe('403 not_author')
++      expect(await refusal(() => as(A2, () => deleteSnippets([s.id])))).toBe('403 not_author')
++      expect((await as(A2, () => getSnippet(s.id))).content.sql).toBe('select 1')
++      // control: its author may
++      await as(A1, () => putSnippet({ id: s.id, content: { sql: 'select 3' } }))
++      expect((await as(A2, () => getSnippet(s.id))).content.sql).toBe('select 3')
++      await as(A1, () => deleteSnippets([s.id]))
++      expect(await refusal(() => as(A2, () => getSnippet(s.id)))).toBe('404 not_found')
++    })
++
++    it('a private and a shared snippet of one name have different ids', async () => {
++      const mine = await save(A1, 'report')
++      const team = await save(A2, 'report', 'select 2', { visibility: 'project' })
++      expect(mine.id).not.toBe(team.id)
++      expect(team.id).toBe(sharedId(pdir(A2), 'report'))
++      // two authors' shared snippets of one name, too
++      const team1 = await put(A1, { id: mine.id, visibility: 'project' })
++      expect(team1.id).not.toBe(team.id)
++      const all = await as(A1, () => listSnippets({ visibility: 'project' }))
++      expect(new Set(all.snippets.map((s) => s.id)).size).toBe(2)
++    })
++
++    it("a member's own snippet keeps the id the editor derives from its folder and name", async () => {
++      const { generateDeterministicUuid } = await import('../snippets.browser')
++      const s = await save(A1, 'Untitled query 1')
++      expect(s.id).toBe(generateDeterministicUuid(['Untitled query 1.sql']))
++      // a second save by that id changes it in place
++      await as(A1, () => putSnippet({ id: s.id, content: { sql: 'select 9' } }))
++      const listed = await as(A1, () => listSnippets())
++      expect(listed.snippets).toHaveLength(1)
++      expect((listed.snippets[0] as Snippet).content.sql).toBe('select 9')
++    })
++
++    it('a share moves the file, and an unshare moves it back', async () => {
++      const s = await save(A1, 'q', 'select 1')
++      expect(readdirSync(own(A1))).toEqual(['q.sql'])
++      const team = await put(A1, { id: s.id, visibility: 'project', folder_id: null })
++      expect(readdirSync(own(A1))).toEqual([])
++      expect(readdirSync(shared(A1))).toEqual(['q.sql'])
++      expect(readFileSync(join(shared(A1), 'q.sql'), 'utf8')).toBe('select 1')
++      expect(team.id).not.toBe(s.id)
++      expect(await refusal(() => as(A1, () => getSnippet(s.id)))).toBe('404 not_found')
++      const back = await put(A1, { id: team.id, visibility: 'user', folder_id: null })
++      expect(back.id).toBe(s.id)
++      expect(readdirSync(shared(A1))).toEqual([])
++      expect(readdirSync(own(A1))).toEqual(['q.sql'])
++    })
++
++    it('a shared snippet is in no folder', async () => {
++      const f = await as(A1, () => createFolder('f'))
++      expect(
++        await refusal(() => save(A1, 'q', 'select 1', { visibility: 'project', folder_id: f.id }))
++      ).toBe('400 bad_request')
++    })
++
++    it('org and public visibility are refused', async () => {
++      for (const visibility of ['org', 'public', 'other']) {
++        expect(await refusal(() => save(A1, 'q', 'x', { visibility }))).toBe('400 bad_request')
++      }
++      expect(existsSync(join(data, REF_A))).toBe(false)
++    })
++
++    it("nothing of one project's directory is reachable under another's context", async () => {
++      const mine = await save(A1, 'a-private')
++      const team = await save(A1, 'a-shared', 'select 1', { visibility: 'project' })
++      const f = await as(A1, () => createFolder('a-folder'))
++      // the same principal in project B sees nothing of A
++      const sameInB: Who = { ref: REF_B, sub: A1.sub }
++      for (const who of [B1, sameInB]) {
++        expect(names(await as(who, () => listSnippets()))).toEqual([])
++        expect(names(await as(who, () => listSnippets({ visibility: 'project' })))).toEqual([])
++        expect(await as(who, () => listFolders())).toEqual([])
++        expect(await as(who, () => countSnippets())).toEqual({
++          shared: 0,
++          favorites: 0,
++          private: 0,
++        })
++        for (const id of [mine.id, team.id]) {
++          expect(await refusal(() => as(who, () => getSnippet(id)))).toBe('404 not_found')
++          expect(await refusal(() => as(who, () => deleteSnippets([id])))).toBe('404 not_found')
++        }
++        expect(await refusal(() => as(who, () => deleteFolders([f.id])))).toBe('404 not_found')
++        expect(
++          await refusal(() => as(who, () => putSnippet({ id: team.id, content: { sql: 'x' } })))
++        ).toBe('400 bad_name') // no such snippet there, and the write names none
++      }
++      expect(readdirSync(join(data, REF_A, 'snippets', pdir(A1))).sort()).toEqual([
++        'a-folder',
++        'a-private.sql',
++      ])
++      expect(existsSync(join(data, REF_B, 'snippets', 'shared'))).toBe(false)
++    })
++  })
++
++  describe('ids and names', () => {
++    const hostileIds = [
++      '..',
++      '../x',
++      'a/b',
++      'a\\b',
++      '%2e%2e%2f',
++      '..%2F..%2Fetc',
++      `${NEW_ID}/..`,
++      `../${NEW_ID}`,
++      `${NEW_ID}\u0000`,
++      NEW_ID.toUpperCase().replace(/-/g, '∕'),
++      '',
++    ]
++    it.each(hostileIds)('an id with `..` or a separator is refused: %j', async (id) => {
++      await save(A1, 'x')
++      expect(await refusal(() => as(A1, () => getSnippet(id)))).toBe('400 bad_id')
++      expect(await refusal(() => as(A1, () => deleteSnippets([id])))).toBe('400 bad_id')
++      expect(await refusal(() => as(A1, () => deleteFolders([id])))).toBe('400 bad_id')
++      expect(await refusal(() => as(A1, () => putSnippet({ id, name: 'y' })))).toBe('400 bad_id')
++      expect(await refusal(() => save(A1, 'y', 'x', { folder_id: id }))).toBe('400 bad_id')
++      expect(await refusal(() => as(A1, () => listSnippets({ folderId: id })))).toBe('400 bad_id')
++      expect(readdirSync(own(A1))).toEqual(['x.sql'])
++    })
++
++    const hostileNames = [
++      '',
++      '.',
++      '..',
++      '.hidden',
++      '../escape',
++      'a/b',
++      'a\\b',
++      'nul\u0000byte',
++      'line\nbreak',
++      'tab\tname',
++      'del\u007f',
++      'half\ud800',
++      'x'.repeat(NAME_BYTES + 1),
++      'é'.repeat(NAME_BYTES / 2 + 1),
++    ]
++    it.each(hostileNames.map((n) => [JSON.stringify(n).slice(0, 24), n]))(
++      'a name is refused: %s',
++      async (_, name) => {
++        expect(await refusal(() => save(A1, name))).toBe('400 bad_name')
++        expect(await refusal(() => as(A1, () => createFolder(name)))).toBe('400 bad_name')
++        expect(existsSync(join(data, REF_A))).toBe(false)
++      }
++    )
++
++    const inertNames = [
++      'a%2Fb',
++      '%2e%2e%2f%2e%2e',
++      'a∕b', // division slash
++      'a⁄b', // fraction slash
++      'a／b', // fullwidth solidus
++      'a⧸b', // big solidus
++      'trailing.',
++      'x'.repeat(NAME_BYTES),
++    ]
++    it.each(inertNames.map((n) => [JSON.stringify(n).slice(0, 24), n]))(
++      'a name that only looks like a path stays one file in place: %s',
++      async (_, name) => {
++        const s = await save(A1, name, 'select 1')
++        expect(readdirSync(own(A1))).toEqual([`${name}.sql`])
++        expect(readdirSync(join(data, REF_A, 'snippets')).sort()).toEqual([pdir(A1)])
++        expect((await as(A1, () => getSnippet(s.id))).name).toBe(name)
++      }
++    )
++
++    it('names differing only in case are two snippets', async () => {
++      const lower = await save(A1, 'report', 'select 1')
++      const upper = await save(A1, 'Report', 'select 2')
++      expect(lower.id).not.toBe(upper.id)
++      expect(names(await as(A1, () => listSnippets()))).toEqual(['Report', 'report'])
++      expect((await as(A1, () => getSnippet(lower.id))).content.sql).toBe('select 1')
++      expect((await as(A1, () => getSnippet(upper.id))).content.sql).toBe('select 2')
++    })
++
++    it('checkName accepts the name as given', () => {
++      expect(checkName('Untitled query 12')).toBe('Untitled query 12')
++    })
++  })
++
++  describe('the directory of a principal', () => {
++    const hostile: [string, string][] = [
++      ['https://issuer.test/../..', 'a/b'],
++      ['..', '..'],
++      ['%2F', '%2F..%2F'],
++      ['/', '/'],
++      ['x'.repeat(5000), 'y'.repeat(5000)],
++      ['', ''],
++    ]
++    it.each(hostile.map(([i, s]) => [JSON.stringify([i, s]).slice(0, 32), i, s]))(
++      'is a fixed-form digest inside the store: %s',
++      async (_, iss, sub) => {
++        const who: Who = { ref: REF_A, iss, sub }
++        await save(who, 'q')
++        const top = readdirSync(join(data, REF_A, 'snippets'))
++        expect(top).toEqual([principalDir(iss, sub)])
++        expect(top[0]).toMatch(/^[0-9a-f]{64}$/)
++        expect(readdirSync(data)).toEqual([REF_A])
++      }
++    )
++
++    it('cannot collide between two principals', () => {
++      const pairs: [string, string][] = [
++        ['ab', 'c'],
++        ['a', 'bc'],
++        ['a\u0000', 'bc'],
++        ['a', '\u0000bc'],
++        ['', 'abc'],
++        ['abc', ''],
++      ]
++      const dirs = pairs.map(([i, s]) => principalDir(i, s))
++      expect(new Set(dirs).size).toBe(pairs.length)
++    })
++
++    it('two principals that differ only in the issuer have two stores', async () => {
++      const other: Who = { ref: REF_A, iss: 'https://other.test', sub: A1.sub }
++      await save(A1, 'mine')
++      expect(names(await as(other, () => listSnippets()))).toEqual([])
++    })
++  })
++
++  describe('what is planted on the volume', () => {
++    it('a link where a snippet file is expected is not followed, not listed, and replaced by a write', async () => {
++      const outside = join(dir, 'outside.sql')
++      writeFileSync(outside, 'select outside')
++      await save(A1, 'real')
++      symlinkSync(outside, join(own(A1), 'planted.sql'))
++      expect(names(await as(A1, () => listSnippets()))).toEqual(['real'])
++      const { generateDeterministicUuid } = await import('../snippets.browser')
++      const plantedId = generateDeterministicUuid(['planted.sql'])
++      expect(await refusal(() => as(A1, () => getSnippet(plantedId)))).toBe('404 not_found')
++      await save(A1, 'planted', 'select new')
++      expect(readFileSync(outside, 'utf8')).toBe('select outside')
++      expect(lstatSync(join(own(A1), 'planted.sql')).isFile()).toBe(true)
++    })
++
++    it('a link to another project is not followed as a folder', async () => {
++      await save(B1, 'b-secret')
++      await save(A1, 'real')
++      symlinkSync(own(B1), join(own(A1), 'linked'))
++      expect(await as(A1, () => listFolders())).toEqual([])
++      expect(names(await as(A1, () => listSnippets({ searchTerm: 'b-' })))).toEqual([])
++    })
++
++    it('a directory where a snippet file is expected refuses the write with a code and no path', async () => {
++      await save(A1, 'real')
++      mkdirSync(join(own(A1), 'planted.sql'))
++      writeFileSync(join(own(A1), 'planted.sql', 'keep'), 'k')
++      let error: unknown
++      try {
++        await save(A1, 'planted')
++      } catch (e) {
++        error = e
++      }
++      expect(error).toBeInstanceOf(ProjectError)
++      expect(error).toMatchObject({ status: 503, code: 'store_unavailable' })
++      expect(
++        JSON.stringify({ code: (error as ProjectError).code, message: (error as Error).message })
++      ).not.toContain(dir)
++      expect(String((error as Error).message)).not.toContain(dir)
++      expect(readFileSync(join(own(A1), 'planted.sql', 'keep'), 'utf8')).toBe('k')
++      for (const call of vi.mocked(console.error).mock.calls)
++        expect(String(call[0])).not.toContain(dir)
++      // the directory is a folder by its name, but no snippet
++      expect(names(await as(A1, () => listSnippets()))).toEqual(['real'])
++    })
++
++    it('a link in place of a directory of the layout refuses every operation, and nothing is followed', async () => {
++      const elsewhere = join(dir, 'elsewhere')
++      mkdirSync(elsewhere)
++      const cases: [string, () => void][] = [
++        ['the project directory', () => symlinkSync(elsewhere, join(data, REF_A))],
++        [
++          'the snippets directory',
++          () => {
++            mkdirSync(join(data, REF_A))
++            symlinkSync(elsewhere, join(data, REF_A, 'snippets'))
++          },
++        ],
++        [
++          "the member's directory",
++          () => {
++            mkdirSync(join(data, REF_A, 'snippets'), { recursive: true })
++            symlinkSync(elsewhere, own(A1))
++          },
++        ],
++        [
++          'the shared directory',
++          () => {
++            mkdirSync(join(data, REF_A, 'snippets'), { recursive: true })
++            symlinkSync(elsewhere, join(data, REF_A, 'snippets', 'shared'))
++          },
++        ],
++      ]
++      for (const [, plant] of cases) {
++        rmSync(join(data, REF_A), { recursive: true, force: true })
++        plant()
++        const shared = await refusal(() => as(A1, () => listSnippets({ visibility: 'project' })))
++        const ownList = await refusal(() => as(A1, () => listSnippets()))
++        expect([shared, ownList]).toContain('503 store_unavailable')
++        expect(await refusal(() => save(A1, 'q'))).toBe('503 store_unavailable')
++        expect(await refusal(() => save(A1, 's', 'x', { visibility: 'project' }))).toBe(
++          '503 store_unavailable'
++        )
++        expect(readdirSync(elsewhere)).toEqual([])
++      }
++    })
++
++    it('a pipe where a snippet file is expected is no snippet and does not block', async () => {
++      await save(A1, 'real')
++      execFileSync('mkfifo', [join(own(A1), 'pipe.sql')])
++      expect(names(await as(A1, () => listSnippets()))).toEqual(['real'])
++      const { generateDeterministicUuid } = await import('../snippets.browser')
++      expect(
++        await refusal(() => as(A1, () => getSnippet(generateDeterministicUuid(['pipe.sql']))))
++      ).toBe('404 not_found')
++    })
++
++    it('another member’s shared directory under a name that is not a digest is not listed', async () => {
++      mkdirSync(join(data, REF_A, 'snippets', 'shared', '..x'), { recursive: true })
++      writeFileSync(join(data, REF_A, 'snippets', 'shared', '..x', 'q.sql'), 'x')
++      expect(names(await as(A1, () => listSnippets({ visibility: 'project' })))).toEqual([])
++    })
++  })
++
++  describe('files and modes', () => {
++    it('directories are 0700 and files 0600', async () => {
++      await save(A1, 'q', 'select 1', { visibility: 'project' })
++      await save(A1, 'p')
++      for (const d of [
++        join(data, REF_A),
++        join(data, REF_A, 'snippets'),
++        own(A1),
++        join(data, REF_A, 'snippets', 'shared'),
++        shared(A1),
++      ]) {
++        expect((statSync(d).mode & 0o777).toString(8)).toBe('700')
++      }
++      expect((statSync(join(own(A1), 'p.sql')).mode & 0o777).toString(8)).toBe('600')
++      expect((statSync(join(shared(A1), 'q.sql')).mode & 0o777).toString(8)).toBe('600')
++    })
++
++    it('a temporary file a stopped writer left is removed at the next write and counts nothing', async () => {
++      await save(A1, 'q')
++      writeFileSync(join(own(A1), '.0123456789abcdef.tmp'), 'x'.repeat(1000))
++      await save(A1, 'r')
++      expect(readdirSync(own(A1)).sort()).toEqual(['q.sql', 'r.sql'])
++    })
++  })
++
++  describe('concurrent writers', () => {
++    it('two members writing the same id at once each keep their own', async () => {
++      const id = (await save(A1, 'same', 'a0')).id
++      await save(A2, 'same', 'b0')
++      await Promise.all(
++        Array.from({ length: 20 }, (_, i) => [
++          as(A1, () => putSnippet({ id, content: { sql: `a${i}` } })),
++          as(A2, () => putSnippet({ id, content: { sql: `b${i}` } })),
++        ]).flat()
++      )
++      expect((await as(A1, () => getSnippet(id))).content.sql).toMatch(/^a\d+$/)
++      expect((await as(A2, () => getSnippet(id))).content.sql).toMatch(/^b\d+$/)
++    })
++
++    it('a reader never sees part of a write', async () => {
++      const big = (c: string) => c.repeat(1 << 20)
++      const id = (await save(A1, 'big', big('a'))).id
++      const texts = new Set([big('a'), big('b'), big('c')])
++      const writes = ['b', 'c', 'b', 'c', 'b', 'c'].map((c) =>
++        as(A1, () => putSnippet({ id, content: { sql: big(c) } }))
++      )
++      // as many as one project may have reading or waiting at once
++      const reads = Array.from({ length: READ_SLOTS_PROJECT + READ_WAITING_PROJECT }, () =>
++        as(A1, () => getSnippet(id)).then((s) => texts.has(s.content.sql))
++      )
++      await Promise.all(writes)
++      expect(await Promise.all(reads)).not.toContain(false)
++    })
++  })
++
++  describe('bounds', () => {
++    const plantEntries = (who: Who, n: number) => {
++      mkdirSync(own(who), { recursive: true })
++      for (let i = 0; i < n; i++) writeFileSync(join(own(who), `planted ${i}.sql`), '')
++    }
++
++    it('the 2,001st entry is refused while another project still writes', async () => {
++      await save(A1, 'first')
++      plantEntries(A2, MAX_ENTRIES - 2) // other members count too
++      await save(A1, 'last') // the 2,000th
++      const [refused, other] = await Promise.all([
++        refusal(() => save(A1, 'one more')),
++        save(B1, 'b'),
++      ])
++      expect(refused).toBe('507 store_full')
++      expect(other.name).toBe('b')
++      expect(await refusal(() => as(A1, () => createFolder('f')))).toBe('507 store_full')
++      expect(await refusal(() => save(A2, 'shared one', 'x', { visibility: 'project' }))).toBe(
++        '507 store_full'
++      )
++      // a change of an existing entry is no new entry
++      await save(A1, 'last', 'select 1')
++      // after a delete, one more fits
++      const first = (await as(A1, () => listSnippets({ searchTerm: 'first' }))).snippets[0]
++      await as(A1, () => deleteSnippets([first.id]))
++      await save(A1, 'one more')
++    })
++
++    it('the sixty-fifth mebibyte is refused while another project still writes', async () => {
++      mkdirSync(own(A2), { recursive: true })
++      writeFileSync(join(own(A2), 'filler.sql'), Buffer.alloc(MAX_BYTES - 10, 0x20))
++      await save(A1, 'ten', '0123456789') // exactly the bound
++      const [refused, other] = await Promise.all([
++        refusal(() => save(A1, 'one', '1')),
++        save(B1, 'b', 'x'.repeat(1 << 20)),
++      ])
++      expect(refused).toBe('507 store_full')
++      expect(other.name).toBe('b')
++      // a replacement counts the replaced file out: same size fits, one byte more does not
++      const ten = (await as(A1, () => listSnippets())).snippets[0]
++      await as(A1, () => putSnippet({ id: ten.id, content: { sql: '9876543210' } }))
++      expect(
++        await refusal(() =>
++          as(A1, () => putSnippet({ id: ten.id, content: { sql: '98765432101' } }))
++        )
++      ).toBe('507 store_full')
++      expect(readFileSync(join(own(A1), 'ten.sql'), 'utf8')).toBe('9876543210')
++    })
++
++    it('shared snippets and the snippets in folders count toward the bounds', async () => {
++      const f = await as(A1, () => createFolder('f'))
++      mkdirSync(shared(A2), { recursive: true })
++      for (let i = 0; i < MAX_ENTRIES / 2; i++) writeFileSync(join(shared(A2), `s ${i}.sql`), '')
++      for (let i = 0; i < MAX_ENTRIES / 2 - 2; i++) {
++        writeFileSync(join(own(A1), 'f', `f ${i}.sql`), '')
++      }
++      await save(A1, 'last') // the 2,000th: the folder, its snippets, the shared ones, this
++      expect(await refusal(() => save(A1, 'one more'))).toBe('507 store_full')
++      expect(await refusal(() => save(A1, 'in f', 'x', { folder_id: f.id }))).toBe('507 store_full')
++      rmSync(join(own(A1), 'f'), { recursive: true })
++      writeFileSync(join(shared(A2), 'big.sql'), Buffer.alloc(MAX_BYTES, 0x20))
++      expect(await refusal(() => save(A1, 'one more', '1'))).toBe('507 store_full')
++    })
++
++    it('parallel writes to a nearly full store pass the entry bound by none', async () => {
++      plantEntries(A2, MAX_ENTRIES - 10)
++      const results = await Promise.all(
++        Array.from({ length: 30 }, (_, i) => refusal(() => save(i % 2 ? A1 : A2, `race ${i}`)))
++      )
++      expect(results.filter((r) => r === 'no refusal')).toHaveLength(10)
++      expect(results.filter((r) => r === '507 store_full')).toHaveLength(20)
++      const onDisk = readdirSync(own(A1)).length + readdirSync(own(A2)).length
++      expect(onDisk).toBe(MAX_ENTRIES)
++    }, 60_000)
++
++    it('parallel writes to a nearly full store pass the byte bound by none', async () => {
++      mkdirSync(own(A2), { recursive: true })
++      writeFileSync(join(own(A2), 'filler.sql'), Buffer.alloc(MAX_BYTES - 10_000, 0x20))
++      const results = await Promise.all(
++        Array.from({ length: 30 }, (_, i) =>
++          refusal(() => save(i % 2 ? A1 : A2, `race ${i}`, 'x'.repeat(1000)))
++        )
++      )
++      expect(results.filter((r) => r === 'no refusal')).toHaveLength(10)
++      let bytes = 0
++      for (const d of [own(A1), own(A2)]) {
++        for (const f of readdirSync(d)) bytes += statSync(join(d, f)).size
++      }
++      expect(bytes).toBe(MAX_BYTES)
++    }, 60_000)
++  })
++
++  describe('a read_only member', () => {
++    const RO: Who = { ref: REF_A, sub: 'reader', role: 'read_only' }
++
++    it('reads shared snippets and saves none', async () => {
++      const team = await save(A1, 'team', 'select 1', { visibility: 'project' })
++      expect(names(await as(RO, () => listSnippets({ visibility: 'project' })))).toEqual(['team'])
++      expect((await as(RO, () => getSnippet(team.id))).content.sql).toBe('select 1')
++      expect(await as(RO, () => listSnippets())).toEqual({ cursor: undefined, snippets: [] })
++      expect(await as(RO, () => listFolders())).toEqual([])
++      expect(await as(RO, () => countSnippets())).toEqual({ shared: 1, favorites: 0, private: 0 })
++
++      const before = readdirSync(join(data, REF_A, 'snippets')).sort()
++      expect(await refusal(() => save(RO, 'mine'))).toBe('403 read_only')
++      expect(await refusal(() => save(RO, 'mine', 'x', { visibility: 'project' }))).toBe(
++        '403 read_only'
++      )
++      expect(
++        await refusal(() => as(RO, () => putSnippet({ id: team.id, content: { sql: 'x' } })))
++      ).toBe('403 read_only')
++      expect(await refusal(() => as(RO, () => deleteSnippets([team.id])))).toBe('403 read_only')
++      expect(await refusal(() => as(RO, () => createFolder('f')))).toBe('403 read_only')
++      expect(await refusal(() => as(RO, () => deleteFolders([NEW_ID])))).toBe('403 read_only')
++      expect(readdirSync(join(data, REF_A, 'snippets')).sort()).toEqual(before)
++      // control: the same writes as a developer
++      await save({ ...RO, role: 'developer' }, 'mine')
++    })
++  })
++
++  describe('what a listing shows', () => {
++    it("never another member's private names, sizes or times", async () => {
++      await save(A1, 'alice-secret-name', 'select 42')
++      await as(A1, () => createFolder('alice-folder'))
++      const seen = JSON.stringify([
++        await as(A2, () => listSnippets()),
++        await as(A2, () => listSnippets({ visibility: 'project' })),
++        await as(A2, () => listSnippets({ searchTerm: 'alice' })),
++        await as(A2, () => listFolders()),
++        await as(A2, () => countSnippets()),
++        await as(A2, () => countSnippets('alice')),
++      ])
++      expect(seen).not.toContain('alice')
++      expect(seen).toBe(
++        JSON.stringify([
++          { snippets: [] },
++          { snippets: [] },
++          { snippets: [] },
++          [],
++          { shared: 0, favorites: 0, private: 0 },
++          { count: 0 },
++        ])
++      )
++    })
++
++    it('folders hold their snippets, and a deleted folder takes them along', async () => {
++      const f = await as(A1, () => createFolder('work'))
++      expect(await refusal(() => as(A1, () => createFolder('work')))).toBe('409 exists')
++      const s = await save(A1, 'in', 'select 1', { folder_id: f.id })
++      expect(s.folder_id).toBe(f.id)
++      expect(names(await as(A1, () => listSnippets({ folderId: f.id })))).toEqual(['in'])
++      expect(names(await as(A1, () => listSnippets()))).toEqual([])
++      expect(await refusal(() => save(A1, 'x', 'x', { folder_id: NEW_ID }))).toBe('404 not_found')
++      await as(A1, () => deleteFolders([f.id]))
++      expect(await as(A1, () => listFolders())).toEqual([])
++      expect(await refusal(() => as(A1, () => getSnippet(s.id)))).toBe('404 not_found')
++    })
++
++    it('pages by cursor and limit', async () => {
++      for (const n of ['a', 'b', 'c']) await save(A1, n)
++      const one = await as(A1, () => listSnippets({ sort: 'name', sortOrder: 'asc', limit: 2 }))
++      expect(names(one)).toEqual(['a', 'b'])
++      const two = await as(A1, () =>
++        listSnippets({ sort: 'name', sortOrder: 'asc', limit: 2, cursor: one.cursor })
++      )
++      expect(names(two)).toEqual(['c'])
++      expect(await refusal(() => as(A1, () => listSnippets({ limit: 1001 })))).toBe(
++        '400 bad_request'
++      )
++    })
++  })
++
++  describe('what one request may hold', () => {
++    const CAP: number = LIMITS.result_bytes
++    const MIB2 = 2_000_000
++    const plantShared = (who: Who, n: number, size: number) => {
++      mkdirSync(shared(who), { recursive: true })
++      for (let i = 0; i < n; i++) {
++        writeFileSync(join(shared(who), `big ${i}.sql`), Buffer.alloc(size, 0x61))
++      }
++    }
++    const sqlBytes = (r: { snippets: unknown[] }) =>
++      (r.snippets as Snippet[]).reduce((n, s) => n + Buffer.byteLength(s.content.sql), 0)
++
++    it('one listing answers at most result_bytes of SQL, and the rest after its cursor', async () => {
++      plantShared(A1, 30, MIB2) // 60 MB of one member's shared snippets
++      const seen = new Set<string>()
++      let cursor: string | undefined
++      let pages = 0
++      do {
++        const page = await as(A2, () =>
++          listSnippets({ visibility: 'project', limit: 1000, cursor })
++        )
++        expect(sqlBytes(page)).toBeLessThanOrEqual(CAP)
++        expect(page.snippets.length).toBeGreaterThan(0)
++        for (const s of page.snippets) {
++          expect(seen.has(s.id)).toBe(false)
++          seen.add(s.id)
++        }
++        cursor = page.cursor
++        pages++
++      } while (cursor && pages < 100)
++      expect(seen.size).toBe(30)
++      expect(pages).toBe(Math.ceil(30 / Math.floor(CAP / MIB2)))
++      // without the SQL the page is not cut
++      expect(
++        (
++          await as(A2, () =>
++            listSnippets({ visibility: 'project', limit: 1000, includeContent: false })
++          )
++        ).snippets
++      ).toHaveLength(30)
++    }, 60_000)
++
++    it('a snippet larger than result_bytes is not saved, and a planted one is neither listed nor read', async () => {
++      expect(await refusal(() => save(A1, 'huge', 'x'.repeat(CAP + 1)))).toBe('413 too_large')
++      await save(A1, 'fits', 'x'.repeat(CAP))
++      mkdirSync(own(A1), { recursive: true })
++      writeFileSync(join(own(A1), 'planted.sql'), Buffer.alloc(CAP + 1, 0x61))
++      expect(names(await as(A1, () => listSnippets()))).toEqual(['fits'])
++      const { generateDeterministicUuid } = await import('../snippets.browser')
++      expect(
++        await refusal(() => as(A1, () => getSnippet(generateDeterministicUuid(['planted.sql']))))
++      ).toBe('404 not_found')
++    }, 60_000)
++
++    it('reads take one of READ_SLOTS slots, at most READ_SLOTS_PROJECT for one project', async () => {
++      const refs = ['r0', 'r1', 'r2', 'r3', 'r4']
++      const ends: (() => void)[] = []
++      const running: string[] = []
++      const hold = (ref: string) =>
++        reading(ref, () => {
++          running.push(ref)
++          return new Promise<void>((done) => ends.push(done))
++        })
++      const tick = () => new Promise((r) => setTimeout(r, 0))
++      const all = [hold(refs[0]), hold(refs[0]), hold(refs[0]), hold(refs[1]), hold(refs[2])]
++      await tick()
++      // A's third waits for A's own; B and C take theirs; the fourth slot is still free
++      expect(running).toEqual([refs[0], refs[0], refs[1], refs[2]])
++      expect(READ_SLOTS).toBe(4)
++      expect(READ_SLOTS_PROJECT).toBe(2)
++      all.push(hold(refs[3]))
++      await tick()
++      expect(running).toHaveLength(4) // the process's four are taken: D waits
++      ends.shift()!() // one of A's ends: A's waiting read is first, and A may hold two
++      await tick()
++      expect(running.slice(4)).toEqual([refs[0]])
++      while (ends.length) {
++        ends.shift()!()
++        await tick()
++      }
++      await Promise.all(all)
++      expect(running.filter((r) => r === refs[3])).toHaveLength(1)
++    })
++
++    it('with too many waiting a read is busy at once, and one past its wait is busy', async () => {
++      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
++      try {
++        const ends: (() => void)[] = []
++        const hold = (ref: string) =>
++          reading(ref, () => new Promise<void>((done) => ends.push(done)))
++        const held = [hold('p'), hold('p')]
++        const waiting = Array.from({ length: READ_WAITING_PROJECT }, () =>
++          hold('p').then(
++            () => 'ok',
++            (e) => `${e.status} ${e.code}`
++          )
++        )
++        expect(await refusal(() => hold('p'))).toBe('429 busy')
++        // other projects still get slots, and then queue up to the process's bound
++        const others = [hold('q'), hold('q')]
++        const queued = Array.from({ length: READ_WAITING - READ_WAITING_PROJECT }, (_, i) =>
++          hold(`w${i % 8}`).catch((e) => `${e.status} ${e.code}`)
++        )
++        expect(await refusal(() => hold('z'))).toBe('429 busy')
++        await vi.advanceTimersByTimeAsync(LIMITS.slot_wait_ms + 1)
++        expect(await Promise.all(waiting)).toEqual(Array(READ_WAITING_PROJECT).fill('429 busy'))
++        expect(new Set(await Promise.all(queued))).toEqual(new Set(['429 busy']))
++        for (const end of ends) end()
++        await Promise.all([...held, ...others])
++        // the queue is empty again: a read runs
++        expect(await reading('p', async () => 'ran')).toBe('ran')
++      } finally {
++        vi.useRealTimers()
++      }
++    })
++
++    // an answer with SQL, as a route makes it, in A1's or another's context
++    const answer = (who: Who, fn: () => Promise<unknown>) => as(who, () => sqlAnswer(fn))
++    const drain = async (r: Response) => JSON.parse(await r.text())
++    const settle = () => new Promise((r) => setTimeout(r, 0))
++
++    it('a read of one snippet takes a slot too', async () => {
++      const s = await save(A1, 'q', 'select 1')
++      const ends: (() => void)[] = []
++      const hold = () => reading(REF_A, () => new Promise<void>((done) => ends.push(done)))
++      const held = Array.from({ length: READ_SLOTS_PROJECT + READ_WAITING_PROJECT }, hold)
++      expect(await refusal(() => answer(A1, () => getSnippet(s.id)))).toBe('429 busy')
++      // without its SQL a listing reads none and takes no slot
++      expect(names(await as(A1, () => listSnippets({ includeContent: false })))).toEqual(['q'])
++      while (ends.length) {
++        ends.shift()!()
++        await settle()
++      }
++      await Promise.all(held)
++      expect((await drain(await answer(A1, () => getSnippet(s.id)))).content.sql).toBe('select 1')
++    })
++
++    it('the slot is held until the answer is taken: a reader that stalls keeps it', async () => {
++      plantShared(A1, 4, MIB2)
++      const list = () => listSnippets({ visibility: 'project', limit: 1000 })
++      const r = await answer(A2, list)
++      expect(readsHeld(REF_A).held).toBe(1)
++      const reader = r.body!.getReader()
++      await reader.read() // one chunk taken, the rest not
++      await settle()
++      expect(readsHeld(REF_A).held).toBe(1)
++      // read to the end: free, and the answer whole
++      let n = 0
++      for (let c = await reader.read(); !c.done; c = await reader.read()) n += c.value.length
++      expect(readsHeld(REF_A).held).toBe(0)
++      expect(n).toBeGreaterThan(4 * MIB2 - 64 * 1024)
++      // a second answer drained by text() frees too, and holds the snippets
++      expect((await drain(await answer(A2, list))).snippets).toHaveLength(4)
++      expect(readsHeld()).toEqual({ held: 0, waiting: 0 })
++    })
++
++    it('a client that goes away frees the slot, and so does an error', async () => {
++      await save(A1, 'q', 'select 1')
++      const r = await answer(A1, () => listSnippets())
++      expect(readsHeld(REF_A).held).toBe(1)
++      await r.body!.cancel()
++      expect(readsHeld(REF_A).held).toBe(0)
++      // the answer fails before it is made: no slot is kept, no answer
++      expect(await refusal(() => answer(A1, () => getSnippet(NEW_ID)))).toBe('404 not_found')
++      await expect(answer(A1, async () => Promise.reject(new Error('x')))).rejects.toThrow('x')
++      expect(readsHeld()).toEqual({ held: 0, waiting: 0 })
++    })
++
++    it('an answer not taken within handover_ms is cut and its slot freed', async () => {
++      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
++      try {
++        await save(A1, 'q', 'select 1')
++        const r = await answer(A1, () => listSnippets())
++        await vi.advanceTimersByTimeAsync(LIMITS.handover_ms - 1)
++        expect(readsHeld(REF_A).held).toBe(1)
++        await vi.advanceTimersByTimeAsync(2)
++        expect(readsHeld(REF_A).held).toBe(0)
++        await expect(r.text()).rejects.toThrow()
++      } finally {
++        vi.useRealTimers()
++      }
++    })
++
++    it('a slot is freed once: an answer read, then cancelled, frees nobody else’s', async () => {
++      await save(A1, 'q', 'select 1')
++      const a = await answer(A1, () => listSnippets())
++      const b = await answer(A1, () => listSnippets())
++      await a.text()
++      await a.body?.cancel().catch(() => {})
++      expect(readsHeld(REF_A).held).toBe(1) // b's
++      // a third of A must still wait: A holds b's and the third's only
++      const c = answer(A1, () => listSnippets())
++      await settle()
++      expect(readsHeld(REF_A)).toEqual({ held: 2, waiting: 0 })
++      await b.text()
++      await (await c).text()
++      expect(readsHeld()).toEqual({ held: 0, waiting: 0 })
++    })
++
++    it('the routes that answer SQL hold their slot until the body is taken; the others take none', async () => {
++      const s = await save(A1, 'q', 'select 1')
++      type Handler = (c: { request: Request; params: Record<string, string> }) => Promise<Response>
++      const route = async (path: string, method: string, url: string, body?: unknown) => {
++        const h = (await import(path)).Route.options.server.handlers[method] as Handler
++        const request = new Request(`http://studio.test${url}`, {
++          method,
++          headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
++          body: body === undefined ? undefined : JSON.stringify(body),
++        })
++        return as(A1, () => h({ request, params: { ref: REF_A, id: s.id } }))
++      }
++      const C = '@/routes/api/platform/projects/$ref/content/index'
++      const held: [string, string, string, unknown?][] = [
++        [C, 'GET', '/x'],
++        ['@/routes/api/platform/projects/$ref/content/item/$id', 'GET', '/x'],
++        [C, 'PUT', '/x', { id: s.id, content: { sql: 'select 2' } }],
++      ]
++      for (const [path, method, url, body] of held) {
++        const r = await route(path, method, url, body)
++        expect(r.status).toBe(200)
++        expect(readsHeld(REF_A).held).toBe(1)
++        expect(JSON.stringify(await r.json())).toContain('select')
++        expect(readsHeld(REF_A).held).toBe(0)
++      }
++      for (const [path, url] of [
++        ['@/routes/api/platform/projects/$ref/content/folders/index', '/x'],
++        ['@/routes/api/platform/projects/$ref/content/count', '/x'],
++      ]) {
++        const r = await route(path, 'GET', url)
++        expect(readsHeld()).toEqual({ held: 0, waiting: 0 })
++        await r.text()
++      }
++    })
++
++    it('sixteen listings of a 60 MB store while the project reads: eight wait and run, eight are busy', async () => {
++      plantShared(A1, 30, MIB2)
++      const ends: (() => void)[] = []
++      const held = [1, 2].map(() =>
++        reading(REF_A, () => new Promise<void>((done) => ends.push(done)))
++      )
++      let busyCount = 0
++      let allAsked!: () => void
++      const asked = new Promise<void>((r) => (allAsked = r))
++      const results = Promise.all(
++        Array.from({ length: 16 }, () =>
++          answer(A2, () => listSnippets({ visibility: 'project', limit: 1000 }))
++            .then(drain)
++            .then((r) => (sqlBytes(r) <= CAP && r.cursor ? 'page' : 'bad page'))
++            .catch((e) => {
++              // the eight past the queue are refused: then all sixteen have asked
++              if (++busyCount === 16 - READ_WAITING_PROJECT) allAsked()
++              return `${e.status} ${e.code}`
++            })
++        )
++      )
++      // the answers of another project are not held up by A's
++      expect((await drain(await answer(B1, () => listSnippets()))).snippets).toEqual([])
++      await asked
++      for (const end of ends) end()
++      await Promise.all(held)
++      const got = await results
++      expect(got.filter((r) => r === 'page')).toHaveLength(READ_WAITING_PROJECT)
++      expect(got.filter((r) => r === '429 busy')).toHaveLength(16 - READ_WAITING_PROJECT)
++      expect(readsHeld()).toEqual({ held: 0, waiting: 0 })
++    }, 60_000)
++
++    it('a cursor goes on after its place when its snippet is deleted, renamed or rewritten', async () => {
++      for (const n of ['a', 'b', 'c', 'd', 'e']) await save(A1, n)
++      const page = (cursor?: string) =>
++        as(A1, () => listSnippets({ sort: 'name', sortOrder: 'asc', limit: 2, cursor }))
++      const one = await page()
++      expect(names(one)).toEqual(['a', 'b'])
++      await as(A1, () => deleteSnippets([one.snippets[1].id])) // b gone
++      expect(names(await page(one.cursor))).toEqual(['c', 'd'])
++      const two = await page(one.cursor)
++      // d renamed to aa: it moves before the place, nothing repeats or restarts
++      await as(A1, () => putSnippet({ id: two.snippets[1].id, name: 'aa' }))
++      expect(names(await page(two.cursor))).toEqual(['e'])
++      // by time: a rewritten snippet does not send the listing back to the start
++      const t1 = await as(A1, () => listSnippets({ limit: 2 }))
++      await as(A1, () => putSnippet({ id: t1.snippets[1].id, content: { sql: 'select 9' } }))
++      const t2 = await as(A1, () => listSnippets({ limit: 2, cursor: t1.cursor }))
++      for (const s of t2.snippets) expect(t1.snippets.map((x) => x.id)).not.toContain(s.id)
++    })
++
++    it('two snippets of one sort key are both listed, one page each', async () => {
++      await save(A1, 'Report')
++      await save(A1, 'report') // the same key in the name order
++      const one = await as(A1, () => listSnippets({ sort: 'name', sortOrder: 'asc', limit: 1 }))
++      const two = await as(A1, () =>
++        listSnippets({ sort: 'name', sortOrder: 'asc', limit: 1, cursor: one.cursor })
++      )
++      expect([...names(one), ...names(two)].sort()).toEqual(['Report', 'report'])
++    })
++
++    it('a release frees its slot once, however often it is called', async () => {
++      const release = await acquireRead('r')
++      const other = await acquireRead('r')
++      release()
++      release()
++      expect(readsHeld('r').held).toBe(1)
++      other()
++      expect(readsHeld()).toEqual({ held: 0, waiting: 0 })
++    })
++
++    it('a forged or foreign cursor reveals nothing', async () => {
++      await save(B1, 'b-secret')
++      for (const n of ['a', 'b']) await save(A1, n)
++      for (const bad of [
++        'x',
++        '%',
++        'W10',
++        Buffer.from('[1,2]').toString('base64url'),
++        'a'.repeat(2000),
++      ]) {
++        expect(await refusal(() => as(A1, () => listSnippets({ cursor: bad })))).toBe(
++          '400 bad_request'
++        )
++      }
++      // a cursor of the name order given to the time order
++      const byName = await as(A1, () => listSnippets({ sort: 'name', limit: 1 }))
++      expect(await refusal(() => as(A1, () => listSnippets({ cursor: byName.cursor })))).toBe(
++        '400 bad_request'
++      )
++      // B's cursor in A: A's snippets after that place, nothing of B
++      await save(B1, 'b-two')
++      const foreign = await as(B1, () => listSnippets({ sort: 'name', sortOrder: 'asc', limit: 1 }))
++      const seen = await as(A1, () =>
++        listSnippets({ sort: 'name', sortOrder: 'asc', cursor: foreign.cursor })
++      )
++      expect(JSON.stringify(seen)).not.toContain('b-')
++      expect(names(seen)).toEqual([])
++    })
++  })
++
++  describe('outside a request', () => {
++    it('there is no store', async () => {
++      expect(await refusal(() => listSnippets())).toBe('500 no_project_context')
++      expect(await refusal(() => putSnippet({ id: NEW_ID, name: 'x' }))).toBe(
++        '500 no_project_context'
++      )
++    })
++  })
++})
++
++describe('the content routes', () => {
++  let dir: string
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), 'dash-routes-'))
++    vi.stubEnv('SUPAPACE_DASH_DATA', dir)
++    vi.stubEnv('SUPAPACE_LIMITS', JSON.stringify(LIMITS))
++  })
++  afterEach(() => {
++    vi.unstubAllEnvs()
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  type Handler = (c: { request: Request; params: Record<string, string> }) => Promise<Response>
++  const handlers = async (path: string) =>
++    (await import(path)).Route.options.server.handlers as Record<string, Handler>
++  const call = async (
++    who: Who,
++    route: string,
++    method: string,
++    url: string,
++    params: Record<string, string>,
++    body?: unknown
++  ) => {
++    const h = (await handlers(route))[method]
++    const request = new Request(`http://studio.test${url}`, {
++      method,
++      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
++      body: body === undefined ? undefined : JSON.stringify(body),
++    })
++    return as(who, () => h({ request, params }))
++  }
++  const CONTENT = '@/routes/api/platform/projects/$ref/content/index'
++  const ITEM = '@/routes/api/platform/projects/$ref/content/item/$id'
++  const COUNT = '@/routes/api/platform/projects/$ref/content/count'
++  const FOLDERS = '@/routes/api/platform/projects/$ref/content/folders/index'
++  const FOLDER = '@/routes/api/platform/projects/$ref/content/folders/$id'
++
++  it('save, list, share, read and delete through the routes; the path names no store', async () => {
++    // the path's ref is another project's: the store is the context's
++    const params = { ref: REF_B }
++    const saved = await call(
++      A1,
++      CONTENT,
++      'PUT',
++      `/api/platform/projects/${REF_B}/content`,
++      params,
++      {
++        id: NEW_ID,
++        name: 'q',
++        content: { sql: 'select 1' },
++        visibility: 'user',
++      }
++    )
++    expect(saved.status).toBe(200)
++    const s = await saved.json()
++    expect(existsSync(join(dir, REF_A, 'snippets', principalDir(ISS, A1.sub), 'q.sql'))).toBe(true)
++    expect(existsSync(join(dir, REF_B))).toBe(false)
++
++    const listed = await (await call(A1, CONTENT, 'GET', '/x?visibility=user', params)).json()
++    expect(listed.data.map((x: Snippet) => x.name)).toEqual(['q'])
++    const item = await (await call(A1, ITEM, 'GET', '/x', { ...params, id: s.id })).json()
++    expect(item.content.sql).toBe('select 1')
++    expect(await (await call(A2, COUNT, 'GET', '/x', params)).json()).toEqual({
++      shared: 0,
++      favorites: 0,
++      private: 0,
++    })
++
++    const shared = await (
++      await call(A1, CONTENT, 'PUT', '/x', params, { ...s, visibility: 'project', folder_id: null })
++    ).json()
++    const seen = await (await call(A2, CONTENT, 'GET', '/x?visibility=project', params)).json()
++    expect(seen.data.map((x: Snippet) => x.id)).toEqual([shared.id])
++
++    const folder = await call(A1, FOLDERS, 'POST', '/x', params, { name: 'f' })
++    expect(folder.status).toBe(201)
++    const f = await folder.json()
++    const inFolder = await (await call(A1, FOLDER, 'GET', '/x', { ...params, id: f.id })).json()
++    expect(inFolder.data).toEqual({ folders: [], contents: [] })
++    const tree = await (await call(A1, FOLDERS, 'GET', '/x', params)).json()
++    expect(tree.data.folders.map((x: { name: string }) => x.name)).toEqual(['f'])
++
++    const del = await call(A1, CONTENT, 'DELETE', `/x?ids=${shared.id}`, params)
++    expect(await del.json()).toEqual([{ id: shared.id }])
++    expect((await call(A1, FOLDERS, 'DELETE', `/x?ids=${f.id}`, params)).status).toBe(200)
++  })
++
++  it('a refusal leaves the route as the store gave it, for the guard to answer', async () => {
++    await expect(call(A1, ITEM, 'GET', '/x', { ref: REF_A, id: '..%2F..' })).rejects.toMatchObject({
++      name: 'ProjectError',
++      status: 400,
++      code: 'bad_id',
++    })
++    await expect(
++      call(
++        { ...A1, role: 'read_only' },
++        CONTENT,
++        'PUT',
++        '/x',
++        { ref: REF_A },
++        { id: NEW_ID, name: 'q' }
++      )
++    ).rejects.toMatchObject({ status: 403, code: 'read_only' })
++    await expect(call(A1, CONTENT, 'GET', '/x?limit=abc', { ref: REF_A })).rejects.toMatchObject({
++      status: 400,
++      code: 'bad_request',
++    })
++    await expect(call(A1, CONTENT, 'DELETE', '/x', { ref: REF_A })).rejects.toMatchObject({
++      status: 400,
++      code: 'bad_request',
++    })
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/member-store.ts b/apps/studio/lib/api/self-hosted/member-store.ts
+new file mode 100644
+index 00000000..c03be566
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/member-store.ts
+@@ -0,0 +1,817 @@
++// SPDX-License-Identifier: Apache-2.0
++// The SQL snippets of the request's project, on Studio's data volume. A member's own snippets
++// are private to that member; a snippet its author shares is readable by every member of the
++// project and writable by its author alone. Nothing is taken from the request to find a file:
++// the project and the member are those of the request's context.
++//
++//   <SUPAPACE_DASH_DATA>/<ref>/snippets/<P>/<name>.sql            a member's own, at the root
++//   <SUPAPACE_DASH_DATA>/<ref>/snippets/<P>/<folder>/<name>.sql   in one of its folders
++//   <SUPAPACE_DASH_DATA>/<ref>/snippets/shared/<P>/<name>.sql     shared by its author
++//
++// <P> is the hex SHA-256 of the principal's issuer and subject, each preceded by its length.
++// Directories are 0700, files 0600, written by rename. No path is followed through a link: a
++// directory of the layout that is not a directory refuses the request, and a file that is not
++// a regular file is not a snippet. Bounds: per project, all members together, at most
++// snippet_entries entries (snippets and folders) and snippet_bytes bytes of SQL; a write is
++// checked and made under the project's lock, so no bound is passed, while another project's
++// writes go on.
++//
++// What one request may hold: a snippet, and the SQL of one listing, are at most result_bytes
++// (row e, as for postgres-meta's answers); a listing past it ends with a cursor. Reads of SQL
++// take one of READ_SLOTS slots of the process, at most READ_SLOTS_PROJECT of them for one project;
++// a read waits for one at most slot_wait_ms, behind a bounded number of others, or is 429 busy.
++
++import { createHash, randomBytes } from 'node:crypto'
++import { constants, type Dirent } from 'node:fs'
++import { lstat, mkdir, open, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
++import { isAbsolute, join } from 'node:path'
++import z from 'zod'
++
++import { generateDeterministicUuid } from '../snippets.browser'
++import { limits } from './limits'
++import { getProjectContext, ProjectError } from './project-context'
++
++const REF = /^[a-z0-9]{20}$/
++const PRINCIPAL = /^[0-9a-f]{64}$/
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
++const TMP = /^\.[0-9a-f]{16}\.tmp$/
++const SUFFIX = '.sql'
++/** A name's UTF-8 bytes: with the suffix and a temporary name it stays below a file name's 255. */
++export const NAME_BYTES = 200
++const OPEN_READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
++
++const fail = (status: number, code: string, message: string) =>
++  new ProjectError(status, code, message)
++const badId = () => fail(400, 'bad_id', 'Not a snippet or folder id')
++const notFound = () => fail(404, 'not_found', 'Not found')
++
++/** The directory name of a principal: no two (issuer, subject) pairs share one. */
++export function principalDir(iss: string, sub: string): string {
++  const h = createHash('sha256')
++  for (const part of [iss, sub]) {
++    const bytes = Buffer.from(part, 'utf8')
++    const length = Buffer.alloc(4)
++    length.writeUInt32BE(bytes.length)
++    h.update(length).update(bytes)
++  }
++  return h.digest('hex')
++}
++
++/**
++ * The id of a shared snippet: from its author's directory and its name, by SHA-256. A member's
++ * own snippet keeps the id the editor derives from folder and name; this one cannot equal it.
++ */
++export function sharedId(author: string, name: string): string {
++  const b = createHash('sha256').update(`shared\0${author}\0${name}`).digest()
++  b[6] = (b[6] & 0x0f) | 0x40
++  b[8] = (b[8] & 0x3f) | 0x80
++  const x = b.subarray(0, 16).toString('hex')
++  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20)}`
++}
++
++const ownId = (folderId: string | null, name: string) =>
++  generateDeterministicUuid([folderId, `${name}${SUFFIX}`])
++const folderIdOf = (name: string) => generateDeterministicUuid([name])
++
++/**
++ * A snippet's or folder's name, or a refusal: not empty, at most NAME_BYTES bytes, no leading
++ * dot, no separator, no control character.
++ */
++export function checkName(name: unknown): string {
++  if (
++    typeof name !== 'string' ||
++    name === '' ||
++    Buffer.byteLength(name, 'utf8') > NAME_BYTES ||
++    name.startsWith('.') ||
++    /[/\\\u0000-\u001f\u007f]/.test(name) ||
++    Buffer.from(name, 'utf8').toString('utf8') !== name // half a surrogate pair
++  ) {
++    throw fail(400, 'bad_name', 'Not a valid name')
++  }
++  return name
++}
++
++export function checkId(id: unknown): string {
++  if (typeof id !== 'string' || !UUID.test(id)) throw badId()
++  return id
++}
++
++// --- where -------------------------------------------------------------------------------
++
++type Store = { ref: string; me: string; readOnly: boolean; root: string }
++
++/** The store of the request's project and member; read before anything waits. */
++function store(): Store {
++  const ctx = getProjectContext()
++  const data = process.env.SUPAPACE_DASH_DATA
++  if (!REF.test(ctx.ref) || !data || !isAbsolute(data)) {
++    throw fail(503, 'store_unavailable', 'The snippet store is not available')
++  }
++  return {
++    ref: ctx.ref,
++    me: principalDir(ctx.principal.iss, ctx.principal.sub),
++    readOnly: ctx.role === 'read_only',
++    root: join(data, ctx.ref, 'snippets'),
++  }
++}
++
++function writer(): Store {
++  const s = store()
++  if (s.readOnly) throw fail(403, 'read_only', 'A read-only member saves no snippet')
++  return s
++}
++
++const ownDir = (s: Store) => join(s.root, s.me)
++const sharedDir = (s: Store) => join(s.root, 'shared')
++
++/**
++ * Whether a directory of the layout exists, creating it when asked. A link or anything else
++ * that is not a directory is refused: no path leaves the project's directory through one.
++ */
++async function realDir(path: string, create: boolean): Promise<boolean> {
++  if (create) {
++    await mkdir(path, { mode: 0o700 }).catch((e) => {
++      if (e?.code !== 'EEXIST') throw e
++    })
++  }
++  const st = await lstat(path).catch((e) => {
++    if (!create && e?.code === 'ENOENT') return undefined
++    throw e
++  })
++  if (st && !st.isDirectory())
++    throw fail(503, 'store_unavailable', 'The snippet store is not available')
++  return st !== undefined
++}
++
++/** Each directory from the project's down to `dirs`' last, in order; false if one is missing. */
++async function chain(s: Store, dirs: string[], create: boolean): Promise<boolean> {
++  for (const d of [join(s.root, '..'), s.root, ...dirs]) {
++    if (!(await realDir(d, create))) return false
++  }
++  return true
++}
++
++const list = (dir: string): Promise<Dirent[]> =>
++  readdir(dir, { withFileTypes: true }).catch((e) => {
++    if (e?.code === 'ENOENT') return []
++    throw e
++  })
++
++function validName(name: string): boolean {
++  try {
++    return checkName(name) === name
++  } catch {
++    return false
++  }
++}
++const snippetName = (file: string) =>
++  file.endsWith(SUFFIX) && validName(file.slice(0, -SUFFIX.length))
++    ? file.slice(0, -SUFFIX.length)
++    : undefined
++
++// --- what is there -----------------------------------------------------------------------
++
++type Item = {
++  id: string
++  name: string
++  folderId: string | null
++  path: string
++  author: string
++  shared: boolean
++  created: Date
++  size: number
++}
++type FolderItem = { id: string; name: string; path: string }
++
++async function items(
++  dir: string,
++  author: string,
++  shared: boolean,
++  folderId: string | null
++): Promise<Item[]> {
++  const out: Item[] = []
++  for (const e of await list(dir)) {
++    const name = e.isFile() ? snippetName(e.name) : undefined
++    if (name === undefined) continue
++    const path = join(dir, e.name)
++    const st = await lstat(path).catch(() => undefined)
++    if (!st?.isFile() || st.size > limits().result_bytes) continue
++    out.push({
++      id: shared ? sharedId(author, name) : ownId(folderId, name),
++      name,
++      folderId,
++      path,
++      author,
++      shared,
++      created: st.birthtime,
++      size: st.size,
++    })
++  }
++  return out
++}
++
++/** The member's own folders and snippets; nothing of another member's directory is read. */
++async function scanOwn(s: Store): Promise<{ folders: FolderItem[]; files: Item[] }> {
++  if (!(await chain(s, [ownDir(s)], false))) return { folders: [], files: [] }
++  const folders: FolderItem[] = []
++  for (const e of await list(ownDir(s))) {
++    if (e.isDirectory() && validName(e.name)) {
++      folders.push({ id: folderIdOf(e.name), name: e.name, path: join(ownDir(s), e.name) })
++    }
++  }
++  const files = await items(ownDir(s), s.me, false, null)
++  for (const f of folders) files.push(...(await items(f.path, s.me, false, f.id)))
++  return { folders, files }
++}
++
++/** Every shared snippet of the project, of every author. */
++async function scanShared(s: Store): Promise<Item[]> {
++  if (!(await chain(s, [sharedDir(s)], false))) return []
++  const out: Item[] = []
++  for (const e of await list(sharedDir(s))) {
++    if (e.isDirectory() && PRINCIPAL.test(e.name)) {
++      out.push(...(await items(join(sharedDir(s), e.name), e.name, true, null)))
++    }
++  }
++  return out
++}
++
++/** A visible snippet by id: the member's own first, then the shared ones. */
++async function find(s: Store, id: string): Promise<Item | undefined> {
++  return (
++    (await scanOwn(s)).files.find((f) => f.id === id) ??
++    (await scanShared(s)).find((f) => f.id === id)
++  )
++}
++
++/** A snippet file's text: a regular file, opened without following a link, within the bound. */
++async function readSql(path: string): Promise<string> {
++  const fh = await open(path, OPEN_READ)
++  try {
++    const st = await fh.stat()
++    if (!st.isFile() || st.size > limits().result_bytes) throw notFound()
++    return await fh.readFile('utf8')
++  } finally {
++    await fh.close()
++  }
++}
++
++/**
++ * What the project's store holds, all members together: every name below a member's or an
++ * author's directory is an entry, every regular file's size counts. Called under the lock, so
++ * a temporary file found is one a stopped process left: it is removed. Stops counting past the
++ * bound.
++ */
++async function usage(s: Store): Promise<{ entries: number; bytes: number }> {
++  let entries = 0
++  let bytes = 0
++  const max = limits().snippet_entries
++  const count = async (dir: string, depth: number) => {
++    for (const e of await list(dir)) {
++      if (entries > max) return
++      const path = join(dir, e.name)
++      if (TMP.test(e.name)) {
++        await rm(path, { force: true })
++        continue
++      }
++      entries++
++      if (e.isFile()) bytes += (await lstat(path)).size
++      else if (e.isDirectory() && depth > 0) await count(path, depth - 1)
++    }
++  }
++  for (const e of await list(s.root)) {
++    if (!e.isDirectory()) continue
++    if (e.name === 'shared') {
++      for (const a of await list(sharedDir(s))) {
++        if (a.isDirectory()) await count(join(sharedDir(s), a.name), 0)
++      }
++    } else {
++      await count(join(s.root, e.name), 1)
++    }
++  }
++  return { entries, bytes }
++}
++
++const full = () => fail(507, 'store_full', "The project's snippet store is full")
++
++// --- reads of SQL: a bounded number at once ----------------------------------------------
++
++// ponytail: fixed figures, fairness by the per-project cap alone; make them rows of the bounds
++// table if a node needs other values.
++export const READ_SLOTS = 4
++export const READ_SLOTS_PROJECT = 2
++export const READ_WAITING = 32
++export const READ_WAITING_PROJECT = 8
++
++let reads = 0
++const readsOf = new Map<string, { held: number; waiting: number }>()
++const waiters: { ref: string; grant: () => void }[] = []
++const busy = () => fail(429, 'busy', 'The server is busy; try again')
++
++const tally = (ref: string) => {
++  let t = readsOf.get(ref)
++  if (!t) readsOf.set(ref, (t = { held: 0, waiting: 0 }))
++  return t
++}
++const forget = (ref: string) => {
++  const t = readsOf.get(ref)
++  if (t && t.held === 0 && t.waiting === 0) readsOf.delete(ref)
++}
++const free = (ref: string) => reads < READ_SLOTS && tally(ref).held < READ_SLOTS_PROJECT
++const take = (ref: string) => {
++  reads++
++  tally(ref).held++
++}
++
++/** Slots held and reads waiting, for the process or for one project. */
++export function readsHeld(ref?: string): { held: number; waiting: number } {
++  if (ref === undefined) return { held: reads, waiting: waiters.length }
++  const t = readsOf.get(ref)
++  return { held: t?.held ?? 0, waiting: t?.waiting ?? 0 }
++}
++
++/**
++ * A slot of the process for an answer that carries SQL: at once when one is free, else after
++ * the reads ahead of it, for at most slot_wait_ms; with too many waiting, or past the wait,
++ * 429 busy. Resolves to the slot's release, which frees it once however often it is called.
++ */
++export async function acquireRead(ref: string): Promise<() => void> {
++  if (free(ref)) {
++    take(ref)
++  } else {
++    const t = tally(ref)
++    if (waiters.length >= READ_WAITING || t.waiting >= READ_WAITING_PROJECT) {
++      forget(ref)
++      throw busy()
++    }
++    await new Promise<void>((granted, refused) => {
++      const w = {
++        ref,
++        grant: () => {
++          clearTimeout(timer)
++          granted()
++        },
++      }
++      const timer = setTimeout(() => {
++        waiters.splice(waiters.indexOf(w), 1)
++        t.waiting--
++        forget(ref)
++        refused(busy())
++      }, limits().slot_wait_ms)
++      waiters.push(w)
++      t.waiting++
++    })
++  }
++  let released = false
++  return () => {
++    if (released) return
++    released = true
++    reads--
++    tally(ref).held--
++    for (let i = 0; i < waiters.length; ) {
++      const w = waiters[i]
++      if (!free(w.ref)) {
++        i++
++        continue
++      }
++      waiters.splice(i, 1)
++      tally(w.ref).waiting--
++      take(w.ref)
++      w.grant()
++    }
++    forget(ref)
++  }
++}
++
++const CHUNK = 64 * 1024
++
++/**
++ * The answer of a route that carries SQL, made and sent inside one slot: the slot is taken
++ * before `fn` reads, and held until the body has been handed over to the server — or cut: the
++ * client gone (the stream cancelled), an error, or handover_ms (row 1s) after the answer was
++ * made. So at most READ_SLOTS answers with SQL exist in the process at once, however slowly
++ * their clients read.
++ */
++export async function sqlAnswer(fn: () => Promise<unknown>): Promise<Response> {
++  const s = store()
++  const release = await acquireRead(s.ref)
++  let body: Buffer | undefined
++  try {
++    body = Buffer.from(JSON.stringify(await fn()), 'utf8')
++  } catch (error) {
++    release()
++    throw error
++  }
++  const size = body.length
++  let at = 0
++  let timer: NodeJS.Timeout | undefined
++  const done = () => {
++    clearTimeout(timer)
++    body = undefined
++    release()
++  }
++  const stream = new ReadableStream<Uint8Array>({
++    start(c) {
++      timer = setTimeout(() => {
++        c.error(new Error('the answer was not taken in time'))
++        done()
++      }, limits().handover_ms)
++    },
++    // the server asks for the next chunk when it has taken the last: the slot is freed when
++    // it asks after the answer's end
++    pull(c) {
++      if (!body) return
++      if (at >= body.length) {
++        c.close()
++        done()
++        return
++      }
++      // a copy: a view would keep the whole answer alive until the server lets go of it
++      c.enqueue(new Uint8Array(body.subarray(at, (at += CHUNK))))
++    },
++    cancel() {
++      done()
++    },
++  })
++  return new Response(stream, {
++    status: 200,
++    headers: { 'Content-Type': 'application/json', 'Content-Length': String(size) },
++  })
++}
++
++// --- one writer at a time per project ----------------------------------------------------
++
++// ponytail: an in-process lock; one Studio process writes the volume. A second writer would
++// need a lock on the volume itself.
++const locks = new Map<string, Promise<void>>()
++
++async function locked<T>(ref: string, fn: () => Promise<T>): Promise<T> {
++  const before = locks.get(ref) ?? Promise.resolve()
++  let release!: () => void
++  const mine = before.then(() => new Promise<void>((done) => (release = done)))
++  locks.set(ref, mine)
++  await before
++  try {
++    return await fn()
++  } finally {
++    release()
++    if (locks.get(ref) === mine) locks.delete(ref)
++  }
++}
++
++/** Runs one operation of the store; a failure of the file system is one answer, with no path. */
++async function guarded<T>(s: Store, fn: () => Promise<T>): Promise<T> {
++  try {
++    return await fn()
++  } catch (error) {
++    if (error instanceof ProjectError) throw error
++    console.error(
++      `supapace: the snippet store of ${s.ref} failed (${(error as NodeJS.ErrnoException)?.code ?? 'error'})`
++    )
++    throw fail(503, 'store_unavailable', 'The snippet store is not available')
++  }
++}
++
++/** Writes a file by rename: a reader sees the old text or the new, never part of one. */
++async function writeAtomic(dir: string, target: string, text: string) {
++  const tmp = join(dir, `.${randomBytes(8).toString('hex')}.tmp`)
++  try {
++    await writeFile(tmp, text, { mode: 0o600, flag: 'wx' })
++    await rename(tmp, target)
++  } catch (error) {
++    await rm(tmp, { force: true })
++    throw error
++  }
++}
++
++// --- the answers -------------------------------------------------------------------------
++
++export type SnippetMetadata = {
++  id: string
++  inserted_at: string
++  updated_at: string
++  type: 'sql'
++  name: string
++  description: string
++  favorite: boolean
++  visibility: 'user' | 'project'
++  project_id: number
++  folder_id: string | null
++  /** 1, the profile's id, when the member asking is its author; 0 otherwise */
++  owner_id: number
++  owner: { id: number; username: string }
++  updated_by: { id: number; username: string }
++}
++export type Snippet = SnippetMetadata & {
++  content: { sql: string; content_id: string; schema_version: '1.0' }
++}
++export type Folder = {
++  id: string
++  name: string
++  owner_id: number
++  parent_id: null
++  project_id: number
++}
++
++function metadata(s: Store, item: Item): SnippetMetadata {
++  const owner = item.author === s.me ? 1 : 0
++  const who = { id: owner, username: owner ? 'johndoe' : '' }
++  return {
++    id: item.id,
++    inserted_at: item.created.toISOString(),
++    updated_at: item.created.toISOString(),
++    type: 'sql',
++    name: item.name,
++    description: '',
++    favorite: false,
++    visibility: item.shared ? 'project' : 'user',
++    project_id: 1,
++    folder_id: item.folderId,
++    owner_id: owner,
++    owner: who,
++    updated_by: who,
++  }
++}
++
++const withContent = (s: Store, item: Item, sql: string): Snippet => ({
++  ...metadata(s, item),
++  content: { sql, content_id: item.id, schema_version: '1.0' },
++})
++
++const folder = (f: FolderItem): Folder => ({
++  id: f.id,
++  name: f.name,
++  owner_id: 1,
++  parent_id: null,
++  project_id: 1,
++})
++
++export type ListParams = {
++  visibility?: 'user' | 'project'
++  searchTerm?: string
++  folderId?: string | null
++  limit?: number
++  cursor?: string
++  sort?: 'name' | 'inserted_at'
++  sortOrder?: 'asc' | 'desc'
++  includeContent?: boolean
++}
++
++// A page's cursor: the sort key and the id of its last snippet, so the next page goes on after
++// that place whether or not the snippet is still there. It names nothing outside the listing.
++type Mark = [number | string, string]
++const order = (a: Mark, b: Mark) =>
++  a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0
++const writeCursor = (m: Mark) => Buffer.from(JSON.stringify(m), 'utf8').toString('base64url')
++function readCursor(text: string, keyType: 'number' | 'string'): Mark {
++  try {
++    const m: unknown =
++      text.length <= 1024 ? JSON.parse(Buffer.from(text, 'base64url').toString('utf8')) : null
++    if (Array.isArray(m) && m.length === 2 && typeof m[0] === keyType && typeof m[1] === 'string') {
++      return m as Mark
++    }
++  } catch {
++    // refused below
++  }
++  throw fail(400, 'bad_request', 'Not a cursor of this listing')
++}
++
++/**
++ * A page of snippets: the shared ones for `project`, else the member's own — in one folder, at
++ * the root, or in all when searching by name; ordered by time or name, then id. With the SQL, at
++ * most result_bytes of it; the rest after the cursor.
++ */
++export async function listSnippets(p: ListParams = {}): Promise<{
++  cursor: string | undefined
++  snippets: (Snippet | SnippetMetadata)[]
++}> {
++  const s = store()
++  const limit = p.limit ?? 100
++  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1000) {
++    throw fail(400, 'bad_request', 'The limit is out of range')
++  }
++  const folderId = p.folderId == null ? null : checkId(p.folderId)
++  const byTime = (p.sort ?? 'inserted_at') === 'inserted_at'
++  const after = p.cursor ? readCursor(p.cursor, byTime ? 'number' : 'string') : undefined
++  const desc = (p.sortOrder ?? 'desc') === 'desc'
++  return guarded(s, async () => {
++    let files = p.visibility === 'project' ? await scanShared(s) : (await scanOwn(s)).files
++    const term = p.searchTerm?.trim().toLowerCase() ?? ''
++    files = term
++      ? files.filter((f) => f.name.toLowerCase().includes(term))
++      : files.filter((f) => f.folderId === folderId)
++    const mark = (f: Item): Mark => [byTime ? f.created.getTime() : f.name.toLowerCase(), f.id]
++    files.sort((a, b) => order(mark(a), mark(b)))
++    if (desc) files.reverse()
++    if (after) files = files.filter((f) => (desc ? -1 : 1) * order(mark(f), after) > 0)
++    let more = files.length > limit
++    files = files.slice(0, limit)
++    const page: Item[] = []
++    const snippets: (Snippet | SnippetMetadata)[] = []
++    let bytes = 0
++    for (const f of files) {
++      if (p.includeContent === false) {
++        snippets.push(metadata(s, f))
++        page.push(f)
++        continue
++      }
++      // by its size when listed, then by what was read: the file can change in between
++      const over = (n: number) => page.length > 0 && bytes + n > limits().result_bytes
++      const sql = over(f.size) ? undefined : await readSql(f.path)
++      if (sql === undefined || over(Buffer.byteLength(sql, 'utf8'))) {
++        more = true
++        break
++      }
++      bytes += Buffer.byteLength(sql, 'utf8')
++      snippets.push(withContent(s, f, sql))
++      page.push(f)
++    }
++    const last = page[page.length - 1]
++    return { cursor: more && last ? writeCursor(mark(last)) : undefined, snippets }
++  })
++}
++
++/** One visible snippet with its text: the member's own or a shared one. */
++export async function getSnippet(id: unknown): Promise<Snippet> {
++  const s = store()
++  const want = checkId(id)
++  return guarded(s, async () => {
++    const item = await find(s, want)
++    if (!item) throw notFound()
++    return withContent(s, item, await readSql(item.path))
++  })
++}
++
++/** The counts the editor's sections show: the member's own, and the project's shared. */
++export async function countSnippets(name?: string) {
++  const s = store()
++  return guarded(s, async () => {
++    const own = (await scanOwn(s)).files
++    if (name) {
++      const term = name.trim().toLowerCase()
++      return { count: own.filter((f) => f.name.toLowerCase().includes(term)).length }
++    }
++    return { shared: (await scanShared(s)).length, favorites: 0, private: own.length }
++  })
++}
++
++const PutBody = z.object({
++  id: z.string(),
++  name: z.string().optional(),
++  content: z.object({ sql: z.string().optional() }).partial().optional(),
++  folder_id: z.string().nullable().optional(),
++  visibility: z.enum(['user', 'project']).optional(),
++})
++
++/**
++ * Creates or changes a snippet by id. `visibility` decides where it is kept: `user` in the
++ * member's own directory (in a folder of its own, or at the root), `project` in its author's
++ * shared directory — a change of visibility moves the file, and the id changes with it. A
++ * shared snippet is changed by its author only. A name already used at the target is
++ * replaced, as upstream's store does.
++ */
++export async function putSnippet(body: unknown): Promise<Snippet> {
++  const s = writer()
++  const parsed = PutBody.safeParse(body)
++  if (!parsed.success) throw fail(400, 'bad_request', 'Not a snippet')
++  const b = parsed.data
++  const id = checkId(b.id)
++  if (b.name !== undefined) checkName(b.name)
++  if (b.folder_id != null) checkId(b.folder_id)
++  if (
++    b.content?.sql !== undefined &&
++    Buffer.byteLength(b.content.sql, 'utf8') > limits().result_bytes
++  ) {
++    throw fail(413, 'too_large', 'The snippet is too large')
++  }
++
++  return guarded(s, () =>
++    locked(s.ref, async () => {
++      const own = await scanOwn(s)
++      const found =
++        own.files.find((f) => f.id === id) ?? (await scanShared(s)).find((f) => f.id === id)
++      if (found && found.author !== s.me) {
++        throw fail(403, 'not_author', 'A shared snippet is changed by its author only')
++      }
++      const name = checkName(b.name ?? found?.name)
++      const visibility = b.visibility ?? (found?.shared ? 'project' : 'user')
++      const folderId = b.folder_id !== undefined ? b.folder_id : (found?.folderId ?? null)
++      let dirs: string[]
++      if (visibility === 'project') {
++        if (folderId) throw fail(400, 'bad_request', 'A shared snippet is in no folder')
++        dirs = [sharedDir(s), join(sharedDir(s), s.me)]
++      } else {
++        const f = folderId ? own.folders.find((x) => x.id === folderId) : undefined
++        if (folderId && !f) throw notFound()
++        dirs = [ownDir(s), ...(f ? [f.path] : [])]
++      }
++      const dir = dirs[dirs.length - 1]
++      const target = join(dir, `${name}${SUFFIX}`)
++      const newId =
++        visibility === 'project'
++          ? sharedId(s.me, name)
++          : ownId(dirs.length > 1 ? folderId : null, name)
++      // the editor's own ids are a 32-bit hash: another snippet with the new id is not this one
++      if (own.files.some((f) => f.id === newId && f.path !== target)) {
++        throw fail(409, 'exists', 'Another snippet has this id')
++      }
++      const sql = b.content?.sql ?? (found ? await readSql(found.path) : '')
++
++      // the bounds, with what this write replaces taken out
++      const used = await usage(s)
++      const there = target === found?.path ? undefined : await lstat(target).catch(() => undefined)
++      // a create replaces a snippet of its name, as upstream's store; a rename, move or share does not
++      if (found && there) throw fail(409, 'exists', 'A snippet of this name is there')
++      const entries = used.entries + 1 - (found ? 1 : 0) - (there ? 1 : 0)
++      const bytes =
++        used.bytes +
++        Buffer.byteLength(sql, 'utf8') -
++        (found?.size ?? 0) -
++        (there?.isFile() ? there.size : 0)
++      if (entries > limits().snippet_entries || bytes > limits().snippet_bytes) throw full()
++
++      await chain(s, dirs, true)
++      await writeAtomic(dir, target, sql)
++      if (found && found.path !== target) await unlink(found.path)
++
++      const item: Item = {
++        id: newId,
++        name,
++        folderId: visibility === 'project' ? null : (folderId ?? null),
++        path: target,
++        author: s.me,
++        shared: visibility === 'project',
++        created: (await lstat(target)).birthtime,
++        size: Buffer.byteLength(sql, 'utf8'),
++      }
++      return withContent(s, item, sql)
++    })
++  )
++}
++
++/** Deletes snippets by id: the member's own, or shared ones the member wrote. */
++export async function deleteSnippets(ids: unknown[]): Promise<void> {
++  const s = writer()
++  const want = ids.map(checkId)
++  if (want.length === 0) throw badId()
++  await guarded(s, () =>
++    locked(s.ref, async () => {
++      const visible = [...(await scanOwn(s)).files, ...(await scanShared(s))]
++      const gone: Item[] = []
++      for (const id of want) {
++        const item = visible.find((f) => f.id === id)
++        if (!item) throw notFound()
++        if (item.author !== s.me) {
++          throw fail(403, 'not_author', 'A shared snippet is deleted by its author only')
++        }
++        gone.push(item)
++      }
++      for (const item of gone) await rm(item.path, { force: true })
++    })
++  )
++}
++
++/** The member's own folders. */
++export async function listFolders(): Promise<Folder[]> {
++  const s = store()
++  return guarded(s, async () => (await scanOwn(s)).folders.map(folder))
++}
++
++export async function createFolder(name: unknown): Promise<Folder> {
++  const s = writer()
++  const want = checkName(name)
++  return guarded(s, () =>
++    locked(s.ref, async () => {
++      const own = await scanOwn(s)
++      if (own.folders.some((f) => f.name === want)) {
++        throw fail(409, 'exists', 'A folder of this name exists')
++      }
++      if ((await usage(s)).entries + 1 > limits().snippet_entries) throw full()
++      const path = join(ownDir(s), want)
++      if (await lstat(path).catch(() => undefined)) {
++        throw fail(409, 'exists', 'A folder or snippet of this name exists')
++      }
++      await chain(s, [ownDir(s)], true)
++      await mkdir(path, { mode: 0o700 })
++      return folder({ id: folderIdOf(want), name: want, path })
++    })
++  )
++}
++
++/** Deletes the member's own folders, with the snippets in them. */
++export async function deleteFolders(ids: unknown[]): Promise<void> {
++  const s = writer()
++  const want = ids.map(checkId)
++  if (want.length === 0) throw badId()
++  await guarded(s, () =>
++    locked(s.ref, async () => {
++      const { folders } = await scanOwn(s)
++      const gone = want.map((id) => {
++        const f = folders.find((x) => x.id === id)
++        if (!f) throw notFound()
++        return f
++      })
++      for (const f of gone) await rm(f.path, { recursive: true, force: true })
++    })
++  )
++}
+diff --git a/apps/studio/lib/api/snippets.constants.ts b/apps/studio/lib/api/snippets.constants.ts
+deleted file mode 100644
+index c89918b0..00000000
+--- a/apps/studio/lib/api/snippets.constants.ts
++++ /dev/null
+@@ -1 +0,0 @@
+-export const SNIPPETS_DIR = process.env.SNIPPETS_MANAGEMENT_FOLDER ?? ''
+diff --git a/apps/studio/lib/api/snippets.utils.test.ts b/apps/studio/lib/api/snippets.utils.test.ts
+deleted file mode 100644
+index f4de48f3..00000000
+--- a/apps/studio/lib/api/snippets.utils.test.ts
++++ /dev/null
+@@ -1,769 +0,0 @@
+-import fs from 'fs/promises'
+-import path from 'path'
+-import { afterEach, describe, expect, it, vi } from 'vitest'
+-
+-import { generateDeterministicUuid } from './snippets.browser'
+-import {
+-  createFolder,
+-  deleteFolder,
+-  deleteSnippet,
+-  getFilesystemEntries,
+-  getFolders,
+-  getSnippet,
+-  getSnippets,
+-  saveSnippet,
+-  updateSnippet,
+-  type Snippet,
+-} from './snippets.utils'
+-
+-// Mock fs/promises — explicit factory required since Vitest 4 automocking
+-// doesn't create mock functions for getter-based exports on Node built-ins.
+-vi.mock('fs/promises', () => ({
+-  default: {
+-    access: vi.fn(),
+-    mkdir: vi.fn(),
+-    readdir: vi.fn(),
+-    readFile: vi.fn(),
+-    writeFile: vi.fn(),
+-    unlink: vi.fn(),
+-    rm: vi.fn(),
+-    stat: vi.fn(),
+-  },
+-}))
+-const mockedFS = vi.mocked(fs)
+-
+-vi.mock('./snippets.constants', () => ({
+-  SNIPPETS_DIR: '/mock/snippets/dir',
+-}))
+-
+-const MOCK_SNIPPETS_DIR = '/mock/snippets/dir'
+-const DEFAULT_BIRTHTIME = new Date('2023-01-01')
+-
+-const file = (name: string) => ({ name, isDirectory: () => false, isFile: () => true })
+-const dir = (name: string) => ({ name, isDirectory: () => true, isFile: () => false })
+-type Dirent = ReturnType<typeof file>
+-
+-/**
+- * Mocks an existing snippets directory. `root` lists entries at the top level, `folders` maps
+- * folder names to their entries. File contents default to `content` unless `contents` has an
+- * entry for the file name.
+- */
+-function mockTree({
+-  root,
+-  folders = {},
+-  content = 'SELECT 1;',
+-  contents = {},
+-}: {
+-  root: Dirent[]
+-  folders?: Record<string, Dirent[]>
+-  content?: string
+-  contents?: Record<string, string>
+-}) {
+-  mockedFS.access.mockResolvedValue(undefined)
+-  mockedFS.readdir.mockImplementation(((dirPath: string) => {
+-    if (dirPath === MOCK_SNIPPETS_DIR) return Promise.resolve(root)
+-    const folderName = path.relative(MOCK_SNIPPETS_DIR, dirPath)
+-    return Promise.resolve(folders[folderName] ?? [])
+-  }) as never)
+-  mockedFS.readFile.mockImplementation(((filePath: string) =>
+-    Promise.resolve(contents[path.basename(filePath)] ?? content)) as never)
+-  mockedFS.stat.mockResolvedValue({ birthtime: DEFAULT_BIRTHTIME } as never)
+-}
+-
+-const makeSnippet = (overrides: Partial<Snippet>): Snippet => ({
+-  id: 'test-id',
+-  inserted_at: '2023-01-01T00:00:00.000Z',
+-  updated_at: '2023-01-01T00:00:00.000Z',
+-  type: 'sql',
+-  name: 'test-snippet',
+-  description: '',
+-  favorite: false,
+-  content: { sql: 'SELECT * FROM test;', content_id: 'content-id', schema_version: '1.0' },
+-  visibility: 'user',
+-  project_id: 1,
+-  folder_id: null,
+-  owner_id: 1,
+-  owner: { id: 1, username: 'testuser' },
+-  updated_by: { id: 1, username: 'testuser' },
+-  ...overrides,
+-})
+-
+-const errnoError = (message: string, code: string) =>
+-  Object.assign(new Error(message), { code }) satisfies NodeJS.ErrnoException
+-
+-const UNSAFE_NAMES = [
+-  ['../ traversal', '../malicious'],
+-  ['nested directories', 'foo/bar/malicious'],
+-  ['null bytes', 'malicious\0name'],
+-  ['absolute path', '/etc/passwd'],
+-]
+-
+-describe('snippets.utils', () => {
+-  afterEach(() => {
+-    vi.resetAllMocks()
+-  })
+-
+-  describe('getFilesystemEntries', () => {
+-    it('should create the snippets directory if it does not exist', async () => {
+-      mockedFS.access.mockRejectedValue(new Error('Directory not found'))
+-      mockedFS.mkdir.mockResolvedValue(undefined)
+-      mockedFS.readdir.mockResolvedValue([])
+-
+-      await getFilesystemEntries()
+-
+-      expect(mockedFS.mkdir).toHaveBeenCalledWith(MOCK_SNIPPETS_DIR, { recursive: true })
+-    })
+-
+-    it('should read SQL files from the root and from folders, ignoring non-SQL files', async () => {
+-      mockTree({
+-        root: [file('root-snippet.sql'), dir('folder1'), file('not-sql.txt')],
+-        folders: { folder1: [file('folder1-snippet.sql')] },
+-        contents: {
+-          'root-snippet.sql': 'SELECT * FROM root;',
+-          'folder1-snippet.sql': 'SELECT * FROM folder1_table;',
+-        },
+-      })
+-
+-      const entries = await getFilesystemEntries()
+-
+-      expect(entries).toHaveLength(3)
+-      expect(entries).toContainEqual(
+-        expect.objectContaining({ type: 'folder', name: 'folder1', folderId: null })
+-      )
+-      expect(entries).toContainEqual(
+-        expect.objectContaining({
+-          type: 'file',
+-          name: 'root-snippet',
+-          content: 'SELECT * FROM root;',
+-          folderId: null,
+-        })
+-      )
+-      expect(entries).toContainEqual(
+-        expect.objectContaining({
+-          type: 'file',
+-          name: 'folder1-snippet',
+-          content: 'SELECT * FROM folder1_table;',
+-          folderId: generateDeterministicUuid(['folder1']),
+-        })
+-      )
+-    })
+-
+-    it('should skip subdirectories inside folders (not supported)', async () => {
+-      mockTree({
+-        root: [dir('folder1')],
+-        folders: { folder1: [file('snippet.sql'), dir('subfolder')] },
+-      })
+-
+-      const entries = await getFilesystemEntries()
+-
+-      expect(entries.map((e) => e.type).sort()).toEqual(['file', 'folder'])
+-    })
+-
+-    it('should handle empty SQL files', async () => {
+-      mockTree({ root: [file('empty.sql')], content: '' })
+-
+-      const entries = await getFilesystemEntries()
+-
+-      expect(entries).toHaveLength(1)
+-      expect(entries[0].content).toBe('')
+-    })
+-
+-    it('should propagate file read errors', async () => {
+-      mockTree({ root: [file('error.sql')] })
+-      mockedFS.readFile.mockRejectedValue(new Error('Permission denied'))
+-
+-      await expect(getFilesystemEntries()).rejects.toThrow('Permission denied')
+-    })
+-
+-    it('should propagate mkdir failure', async () => {
+-      mockedFS.access.mockRejectedValue(new Error('Directory not found'))
+-      mockedFS.mkdir.mockRejectedValue(new Error('Permission denied'))
+-
+-      await expect(getFilesystemEntries()).rejects.toThrow('Permission denied')
+-    })
+-
+-    it('should skip reading file content when includeContent is false', async () => {
+-      mockTree({ root: [file('snippet1.sql'), file('snippet2.sql')] })
+-
+-      const entries = await getFilesystemEntries({ includeContent: false })
+-
+-      expect(entries).toHaveLength(2)
+-      expect(entries.every((f) => f.content === undefined)).toBe(true)
+-      // Listings should never touch file contents off disk.
+-      expect(mockedFS.readFile).not.toHaveBeenCalled()
+-    })
+-  })
+-
+-  describe('getSnippet', () => {
+-    it('should get a specific snippet by id', async () => {
+-      mockTree({ root: [file('test-snippet.sql')], content: 'SELECT * FROM test;' })
+-
+-      const snippet = await getSnippet(generateDeterministicUuid(['test-snippet.sql']))
+-
+-      expect(snippet).toMatchObject({
+-        name: 'test-snippet',
+-        content: { sql: 'SELECT * FROM test;' },
+-        folder_id: null,
+-      })
+-    })
+-
+-    it('should get a snippet from a folder', async () => {
+-      const folderId = generateDeterministicUuid(['my-folder'])
+-      mockTree({
+-        root: [dir('my-folder')],
+-        folders: { 'my-folder': [file('folder-snippet.sql')] },
+-        content: 'SELECT * FROM folder_table;',
+-      })
+-
+-      const snippet = await getSnippet(generateDeterministicUuid([folderId, 'folder-snippet.sql']))
+-
+-      expect(snippet).toMatchObject({
+-        name: 'folder-snippet',
+-        content: { sql: 'SELECT * FROM folder_table;' },
+-        folder_id: folderId,
+-      })
+-    })
+-
+-    it('should throw error when snippet not found', async () => {
+-      mockTree({ root: [] })
+-
+-      await expect(getSnippet('non-existent-id')).rejects.toThrow(
+-        'Snippet with id non-existent-id not found'
+-      )
+-    })
+-  })
+-
+-  describe('getSnippets', () => {
+-    it('should get only root snippets when folderId is null', async () => {
+-      mockTree({
+-        root: [file('snippet1.sql'), file('snippet2.sql'), dir('folder1')],
+-        folders: { folder1: [file('nested.sql')] },
+-      })
+-
+-      const result = await getSnippets({ folderId: null, sort: 'name', sortOrder: 'asc' })
+-
+-      expect(result.snippets.map((s) => s.name)).toEqual(['snippet1', 'snippet2'])
+-      expect(result.snippets.every((s) => s.folder_id === null)).toBe(true)
+-      expect(result.cursor).toBeUndefined()
+-    })
+-
+-    it('should get snippets from a specific folder', async () => {
+-      const folderId = generateDeterministicUuid(['my-folder'])
+-      mockTree({
+-        root: [file('root-snippet.sql'), dir('my-folder')],
+-        folders: { 'my-folder': [file('folder-snippet.sql')] },
+-      })
+-
+-      const result = await getSnippets({ folderId })
+-
+-      expect(result.snippets).toHaveLength(1)
+-      expect(result.snippets[0]).toMatchObject({ name: 'folder-snippet', folder_id: folderId })
+-    })
+-
+-    it('should return empty result when no snippets in folder', async () => {
+-      mockTree({ root: [] })
+-
+-      const result = await getSnippets({ folderId: generateDeterministicUuid(['empty-folder']) })
+-
+-      expect(result.snippets).toEqual([])
+-      expect(result.cursor).toBeUndefined()
+-    })
+-
+-    it('should filter by search term case-insensitively across all folders', async () => {
+-      mockTree({
+-        root: [
+-          file('USER-query.sql'),
+-          file('admin-report.sql'),
+-          file('Test-User-Data.sql'),
+-          dir('my-folder'),
+-        ],
+-        folders: { 'my-folder': [file('user-permissions.sql')] },
+-      })
+-
+-      const result = await getSnippets({ searchTerm: 'user', sort: 'name', sortOrder: 'asc' })
+-
+-      expect(result.snippets.map((s) => s.name)).toEqual([
+-        'Test-User-Data',
+-        'user-permissions',
+-        'USER-query',
+-      ])
+-    })
+-
+-    it('should ignore a whitespace-only search term and filter by folderId', async () => {
+-      const folderId = generateDeterministicUuid(['my-folder'])
+-      mockTree({
+-        root: [file('root-snippet.sql'), dir('my-folder')],
+-        folders: { 'my-folder': [file('folder-snippet.sql')] },
+-      })
+-
+-      const result = await getSnippets({ searchTerm: '   ', folderId })
+-
+-      expect(result.snippets.map((s) => s.name)).toEqual(['folder-snippet'])
+-    })
+-
+-    it.each([
+-      ['asc', ['Apple', 'banana', 'zebra']],
+-      ['desc', ['zebra', 'banana', 'Apple']],
+-    ] as const)('should sort by name case-insensitively (%s)', async (sortOrder, expected) => {
+-      mockTree({ root: [file('zebra.sql'), file('Apple.sql'), file('banana.sql')] })
+-
+-      const result = await getSnippets({ sort: 'name', sortOrder })
+-
+-      expect(result.snippets.map((s) => s.name)).toEqual(expected)
+-    })
+-
+-    it('should sort snippets by creation date', async () => {
+-      mockTree({ root: [file('newest.sql'), file('oldest.sql'), file('middle.sql')] })
+-      const birthtimes: Record<string, string> = {
+-        'newest.sql': '2023-03-01',
+-        'oldest.sql': '2023-01-01',
+-        'middle.sql': '2023-02-01',
+-      }
+-      mockedFS.stat.mockImplementation(((filePath: string) =>
+-        Promise.resolve({ birthtime: new Date(birthtimes[path.basename(filePath)]) })) as never)
+-
+-      const resultDesc = await getSnippets({ sort: 'inserted_at', sortOrder: 'desc' })
+-      expect(resultDesc.snippets.map((s) => s.name)).toEqual(['newest', 'middle', 'oldest'])
+-
+-      const resultAsc = await getSnippets({ sort: 'inserted_at', sortOrder: 'asc' })
+-      expect(resultAsc.snippets.map((s) => s.name)).toEqual(['oldest', 'middle', 'newest'])
+-    })
+-
+-    it('should paginate with limit and cursor', async () => {
+-      mockTree({ root: [file('snippet1.sql'), file('snippet2.sql'), file('snippet3.sql')] })
+-
+-      const firstPage = await getSnippets({ limit: 2, sort: 'name', sortOrder: 'asc' })
+-      expect(firstPage.snippets.map((s) => s.name)).toEqual(['snippet1', 'snippet2'])
+-      expect(firstPage.cursor).toBeDefined()
+-
+-      const secondPage = await getSnippets({
+-        cursor: firstPage.cursor,
+-        limit: 2,
+-        sort: 'name',
+-        sortOrder: 'asc',
+-      })
+-      expect(secondPage.snippets.map((s) => s.name)).toEqual(['snippet3'])
+-    })
+-
+-    it('should ignore an invalid cursor', async () => {
+-      mockTree({ root: [file('snippet1.sql')] })
+-
+-      const result = await getSnippets({ cursor: 'invalid-cursor-id' })
+-
+-      expect(result.snippets.map((s) => s.name)).toEqual(['snippet1'])
+-    })
+-
+-    it('should propagate filesystem errors', async () => {
+-      mockedFS.access.mockRejectedValue(new Error('Directory not accessible'))
+-      mockedFS.mkdir.mockRejectedValue(new Error('Directory not accessible'))
+-
+-      await expect(getSnippets({})).rejects.toThrow('Directory not accessible')
+-    })
+-
+-    it('should return correct snippet structure', async () => {
+-      mockTree({ root: [file('test-snippet.sql')], content: 'SELECT * FROM users;' })
+-      mockedFS.stat.mockResolvedValue({ birthtime: new Date('2023-01-01T10:00:00Z') } as never)
+-
+-      const result = await getSnippets({})
+-
+-      expect(result.snippets).toHaveLength(1)
+-      expect(result.snippets[0]).toMatchObject({
+-        id: expect.any(String),
+-        name: 'test-snippet',
+-        type: 'sql',
+-        content: { sql: 'SELECT * FROM users;', schema_version: '1.0' },
+-        visibility: 'user',
+-        folder_id: null,
+-        inserted_at: '2023-01-01T10:00:00.000Z',
+-        updated_at: '2023-01-01T10:00:00.000Z',
+-      })
+-    })
+-
+-    it('should validate the limit parameter', async () => {
+-      await expect(getSnippets({ limit: 0 })).rejects.toThrow('Limit must be a positive number')
+-      await expect(getSnippets({ limit: -5 })).rejects.toThrow('Limit must be a positive number')
+-      await expect(getSnippets({ limit: 1001 })).rejects.toThrow('Limit cannot exceed 1000')
+-
+-      mockTree({ root: [file('snippet1.sql')] })
+-      await expect(getSnippets({ limit: 1000 })).resolves.toMatchObject({
+-        snippets: [expect.objectContaining({ name: 'snippet1' })],
+-      })
+-    })
+-
+-    it('should omit content but keep metadata when includeContent is false', async () => {
+-      mockTree({ root: [file('test-snippet.sql')] })
+-
+-      const result = await getSnippets({ includeContent: false })
+-
+-      expect(result.snippets).toHaveLength(1)
+-      const snippet = result.snippets[0]
+-      // Matches the Management API folder-listing contract: metadata, no SQL body.
+-      expect(snippet).not.toHaveProperty('content')
+-      expect(snippet).toMatchObject({ name: 'test-snippet', type: 'sql', folder_id: null })
+-      // Listing must not read file contents off disk.
+-      expect(mockedFS.readFile).not.toHaveBeenCalled()
+-    })
+-
+-    it('searches by name without reading content when includeContent is false', async () => {
+-      mockTree({ root: [file('user-query.sql'), file('admin-report.sql')] })
+-
+-      const result = await getSnippets({ searchTerm: 'user', includeContent: false })
+-
+-      expect(result.snippets.map((s) => s.name)).toEqual(['user-query'])
+-      expect(mockedFS.readFile).not.toHaveBeenCalled()
+-    })
+-  })
+-
+-  describe('saveSnippet', () => {
+-    it.each([
+-      ['regular content', 'test-snippet', 'SELECT * FROM test;'],
+-      ['empty content', 'empty-snippet', ''],
+-      ['special characters in the name', 'my-snippet_v2 (copy)', 'SELECT 1;'],
+-    ])('should save a snippet with %s', async (_, name, sql) => {
+-      mockTree({ root: [] })
+-
+-      const result = await saveSnippet(
+-        makeSnippet({ name, content: { sql, content_id: 'c', schema_version: '1.0' } })
+-      )
+-
+-      expect(mockedFS.writeFile).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, `${name}.sql`),
+-        sql,
+-        'utf-8'
+-      )
+-      expect(result.name).toBe(name)
+-      expect(result.content.sql).toBe(sql)
+-    })
+-
+-    it('should throw error when snippet already exists', async () => {
+-      const snippet = makeSnippet({
+-        id: generateDeterministicUuid(['existing-snippet.sql']),
+-        name: 'existing-snippet',
+-      })
+-      mockTree({ root: [file('existing-snippet.sql')] })
+-
+-      await expect(saveSnippet(snippet)).rejects.toThrow(
+-        `Snippet with id ${snippet.id} already exists`
+-      )
+-    })
+-
+-    it('should save snippet to a folder when folder_id is provided', async () => {
+-      const folderId = generateDeterministicUuid(['test-folder'])
+-      mockTree({ root: [dir('test-folder')] })
+-
+-      const result = await saveSnippet(makeSnippet({ name: 'folder-snippet', folder_id: folderId }))
+-
+-      expect(mockedFS.writeFile).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'test-folder', 'folder-snippet.sql'),
+-        'SELECT * FROM test;',
+-        'utf-8'
+-      )
+-      expect(result.folder_id).toBe(folderId)
+-    })
+-
+-    it('should throw error when folder_id is provided but folder does not exist', async () => {
+-      mockTree({ root: [] })
+-
+-      await expect(
+-        saveSnippet(makeSnippet({ folder_id: 'non-existent-folder-id' }))
+-      ).rejects.toThrow('Folder with id non-existent-folder-id not found')
+-    })
+-
+-    it.each(UNSAFE_NAMES)('should reject unsafe names (%s)', async (_, name) => {
+-      mockTree({ root: [] })
+-
+-      await expect(saveSnippet(makeSnippet({ name }))).rejects.toThrow(
+-        'Invalid name: path traversal or null bytes detected'
+-      )
+-      expect(mockedFS.writeFile).not.toHaveBeenCalled()
+-    })
+-  })
+-
+-  describe('deleteSnippet', () => {
+-    it('should delete a snippet file', async () => {
+-      mockTree({ root: [file('test-snippet.sql')] })
+-
+-      await deleteSnippet(generateDeterministicUuid(['test-snippet.sql']))
+-
+-      expect(mockedFS.unlink).toHaveBeenCalledWith(path.join(MOCK_SNIPPETS_DIR, 'test-snippet.sql'))
+-    })
+-
+-    it('should delete a snippet file from a folder', async () => {
+-      const folderId = generateDeterministicUuid(['my-folder'])
+-      mockTree({
+-        root: [dir('my-folder')],
+-        folders: { 'my-folder': [file('folder-snippet.sql')] },
+-      })
+-
+-      await deleteSnippet(generateDeterministicUuid([folderId, 'folder-snippet.sql']))
+-
+-      expect(mockedFS.unlink).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'my-folder', 'folder-snippet.sql')
+-      )
+-    })
+-
+-    it('should not throw when the file is already gone (ENOENT)', async () => {
+-      mockTree({ root: [file('test-snippet.sql')] })
+-      mockedFS.unlink.mockRejectedValue(errnoError('File not found', 'ENOENT'))
+-
+-      await expect(
+-        deleteSnippet(generateDeterministicUuid(['test-snippet.sql']))
+-      ).resolves.toBeUndefined()
+-    })
+-
+-    it('should throw for other filesystem errors', async () => {
+-      mockTree({ root: [file('test-snippet.sql')] })
+-      mockedFS.unlink.mockRejectedValue(errnoError('Permission denied', 'EACCES'))
+-
+-      await expect(deleteSnippet(generateDeterministicUuid(['test-snippet.sql']))).rejects.toThrow(
+-        'Permission denied'
+-      )
+-    })
+-
+-    it('should throw error when snippet not found', async () => {
+-      mockTree({ root: [] })
+-
+-      await expect(deleteSnippet('non-existent-id')).rejects.toThrow(
+-        'Snippet with id non-existent-id not found'
+-      )
+-    })
+-  })
+-
+-  describe('updateSnippet', () => {
+-    const id = generateDeterministicUuid(['existing-snippet.sql'])
+-    const targetFolderId = generateDeterministicUuid(['target-folder'])
+-
+-    it('should rename and update content, removing the old file', async () => {
+-      mockTree({ root: [file('existing-snippet.sql')], content: 'SELECT * FROM old;' })
+-
+-      const result = await updateSnippet(id, {
+-        name: 'updated-snippet',
+-        content: { sql: 'SELECT * FROM new;' },
+-      })
+-
+-      expect(mockedFS.unlink).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'existing-snippet.sql')
+-      )
+-      expect(mockedFS.writeFile).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'updated-snippet.sql'),
+-        'SELECT * FROM new;',
+-        'utf-8'
+-      )
+-      expect(result.name).toBe('updated-snippet')
+-      expect(result.content.sql).toBe('SELECT * FROM new;')
+-    })
+-
+-    it('should update only provided fields', async () => {
+-      mockTree({ root: [file('existing-snippet.sql')], content: 'SELECT * FROM old;' })
+-
+-      const result = await updateSnippet(id, { name: 'new-name' })
+-
+-      expect(result.name).toBe('new-name')
+-      expect(result.content.sql).toBe('SELECT * FROM old;')
+-    })
+-
+-    it('should update content to empty string', async () => {
+-      mockTree({ root: [file('existing-snippet.sql')], content: 'SELECT * FROM old;' })
+-
+-      const result = await updateSnippet(id, { content: { sql: '' } })
+-
+-      expect(result.content.sql).toBe('')
+-      expect(mockedFS.writeFile).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'existing-snippet.sql'),
+-        '',
+-        'utf-8'
+-      )
+-    })
+-
+-    it('should throw error when snippet not found', async () => {
+-      mockTree({ root: [] })
+-
+-      await expect(updateSnippet('non-existent-id', {})).rejects.toThrow(
+-        'Snippet with id non-existent-id not found'
+-      )
+-    })
+-
+-    it('should move snippet to a folder, renaming it at the same time', async () => {
+-      mockTree({
+-        root: [file('existing-snippet.sql'), dir('target-folder')],
+-        content: 'SELECT * FROM old;',
+-      })
+-
+-      const result = await updateSnippet(id, {
+-        name: 'renamed-snippet',
+-        folder_id: targetFolderId,
+-        content: { sql: 'SELECT * FROM new;' },
+-      })
+-
+-      expect(mockedFS.writeFile).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'target-folder', 'renamed-snippet.sql'),
+-        'SELECT * FROM new;',
+-        'utf-8'
+-      )
+-      expect(mockedFS.unlink).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'existing-snippet.sql')
+-      )
+-      expect(result).toMatchObject({ name: 'renamed-snippet', folder_id: targetFolderId })
+-    })
+-
+-    it('should move snippet from folder to root when folder_id is set to null', async () => {
+-      const folderId = generateDeterministicUuid(['source-folder'])
+-      mockTree({
+-        root: [dir('source-folder')],
+-        folders: { 'source-folder': [file('existing-snippet.sql')] },
+-        content: 'SELECT * FROM folder;',
+-      })
+-
+-      const result = await updateSnippet(
+-        generateDeterministicUuid([folderId, 'existing-snippet.sql']),
+-        { folder_id: null }
+-      )
+-
+-      expect(mockedFS.writeFile).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'existing-snippet.sql'),
+-        'SELECT * FROM folder;',
+-        'utf-8'
+-      )
+-      expect(mockedFS.unlink).toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'source-folder', 'existing-snippet.sql')
+-      )
+-      expect(result.folder_id).toBe(null)
+-    })
+-
+-    it('should throw error when trying to move to non-existent folder', async () => {
+-      mockTree({ root: [file('existing-snippet.sql')] })
+-
+-      await expect(updateSnippet(id, { folder_id: 'non-existent-folder-id' })).rejects.toThrow(
+-        'Folder with id non-existent-folder-id not found'
+-      )
+-    })
+-
+-    it('should throw when the target folder already contains a snippet with the same name', async () => {
+-      mockTree({
+-        root: [file('existing-snippet.sql'), dir('target-folder')],
+-        folders: { 'target-folder': [file('existing-snippet.sql')] },
+-      })
+-
+-      await expect(updateSnippet(id, { folder_id: targetFolderId })).rejects.toThrow(
+-        'Snippet named "existing-snippet" already exists in the specified folder'
+-      )
+-    })
+-
+-    it('should throw when old file deletion fails with an error other than ENOENT', async () => {
+-      mockTree({ root: [file('existing-snippet.sql')] })
+-      mockedFS.unlink.mockRejectedValue(errnoError('Permission denied', 'EACCES'))
+-
+-      await expect(updateSnippet(id, { name: 'new-name' })).rejects.toThrow('Permission denied')
+-    })
+-
+-    it('should continue when old file deletion fails with ENOENT', async () => {
+-      mockTree({ root: [file('existing-snippet.sql')], content: 'SELECT * FROM old;' })
+-      mockedFS.unlink.mockRejectedValue(errnoError('File not found', 'ENOENT'))
+-
+-      const result = await updateSnippet(id, { name: 'new-name' })
+-
+-      expect(result.name).toBe('new-name')
+-      expect(result.content.sql).toBe('SELECT * FROM old;')
+-    })
+-  })
+-
+-  describe('getFolders', () => {
+-    it('should return only directories, with deterministic ids', async () => {
+-      mockTree({ root: [dir('folder1'), dir('folder2'), file('snippet.sql')] })
+-
+-      const folders = await getFolders()
+-
+-      expect(folders.map((f) => ({ id: f.id, name: f.name }))).toEqual([
+-        { id: generateDeterministicUuid(['folder1']), name: 'folder1' },
+-        { id: generateDeterministicUuid(['folder2']), name: 'folder2' },
+-      ])
+-    })
+-
+-    it('should return empty array when no directories exist', async () => {
+-      mockTree({ root: [file('snippet.sql')] })
+-
+-      expect(await getFolders()).toEqual([])
+-    })
+-  })
+-
+-  describe('createFolder', () => {
+-    it('should create a new folder as an actual directory', async () => {
+-      const name = 'Folder with spaces & symbols!'
+-      mockTree({ root: [] })
+-
+-      const result = await createFolder(name)
+-
+-      expect(result.id).toBe(generateDeterministicUuid([name]))
+-      expect(result.name).toBe(name)
+-      expect(mockedFS.mkdir).toHaveBeenCalledWith(path.join(MOCK_SNIPPETS_DIR, name), {
+-        recursive: true,
+-      })
+-    })
+-
+-    it('should throw error when folder already exists', async () => {
+-      mockTree({ root: [dir('Existing Folder')] })
+-
+-      await expect(createFolder('Existing Folder')).rejects.toThrow(
+-        'Folder with name Existing Folder already exists'
+-      )
+-    })
+-
+-    it('should propagate mkdir errors', async () => {
+-      mockTree({ root: [] })
+-      mockedFS.mkdir.mockRejectedValue(new Error('Permission denied'))
+-
+-      await expect(createFolder('New Folder')).rejects.toThrow('Permission denied')
+-    })
+-
+-    it.each(UNSAFE_NAMES)('should reject unsafe names (%s)', async (_, name) => {
+-      mockTree({ root: [] })
+-
+-      await expect(createFolder(name)).rejects.toThrow(
+-        'Invalid name: path traversal or null bytes detected'
+-      )
+-      expect(mockedFS.mkdir).not.toHaveBeenCalled()
+-    })
+-  })
+-
+-  describe('deleteFolder', () => {
+-    it('should delete only the targeted folder directory', async () => {
+-      mockTree({ root: [dir('Delete Me'), dir('Keep Me')] })
+-
+-      await deleteFolder(generateDeterministicUuid(['Delete Me']))
+-
+-      expect(mockedFS.rm).toHaveBeenCalledWith(path.join(MOCK_SNIPPETS_DIR, 'Delete Me'), {
+-        recursive: true,
+-        force: true,
+-      })
+-      expect(mockedFS.rm).not.toHaveBeenCalledWith(
+-        path.join(MOCK_SNIPPETS_DIR, 'Keep Me'),
+-        expect.anything()
+-      )
+-    })
+-
+-    it('should throw error when folder not found', async () => {
+-      mockTree({ root: [] })
+-
+-      await expect(deleteFolder('non-existent-folder-id')).rejects.toThrow(
+-        'Folder with id non-existent-folder-id not found'
+-      )
+-    })
+-
+-    it('should propagate directory deletion errors', async () => {
+-      mockTree({ root: [dir('Test Folder')] })
+-      mockedFS.rm.mockRejectedValue(errnoError('Permission denied', 'EACCES'))
+-
+-      await expect(deleteFolder(generateDeterministicUuid(['Test Folder']))).rejects.toThrow(
+-        'Permission denied'
+-      )
+-    })
+-
+-    it('should report not found when the directory disappears during deletion (ENOENT)', async () => {
+-      const folderId = generateDeterministicUuid(['Test Folder'])
+-      mockTree({ root: [dir('Test Folder')] })
+-      mockedFS.rm.mockRejectedValue(errnoError('Directory not found', 'ENOENT'))
+-
+-      await expect(deleteFolder(folderId)).rejects.toThrow(`Folder with id ${folderId} not found`)
+-    })
+-  })
+-})
+diff --git a/apps/studio/lib/api/snippets.utils.ts b/apps/studio/lib/api/snippets.utils.ts
+deleted file mode 100644
+index e0361847..00000000
+--- a/apps/studio/lib/api/snippets.utils.ts
++++ /dev/null
+@@ -1,500 +0,0 @@
+-import fs from 'fs/promises'
+-import path from 'path'
+-import { compact, sortBy } from 'lodash'
+-import { v4 as uuidv4 } from 'uuid'
+-import { z } from 'zod'
+-
+-import { generateDeterministicUuid } from './snippets.browser'
+-import { SNIPPETS_DIR } from './snippets.constants'
+-
+-type DeepPartial<T> = T extends object
+-  ? {
+-      [P in keyof T]?: DeepPartial<T[P]>
+-    }
+-  : T
+-
+-export const SnippetSchema = z.object({
+-  id: z.string().uuid(),
+-  inserted_at: z.string().default(() => new Date().toISOString()),
+-  updated_at: z.string().default(() => new Date().toISOString()),
+-  type: z.literal('sql'),
+-  name: z.string(),
+-  description: z.string().optional(),
+-  favorite: z.boolean().default(false),
+-  content: z.object({
+-    sql: z.string(),
+-    content_id: z.string(),
+-    schema_version: z.literal('1.0'),
+-  }),
+-  visibility: z.union([
+-    z.literal('user'),
+-    z.literal('project'),
+-    z.literal('org'),
+-    z.literal('public'),
+-  ]),
+-  project_id: z.number().default(1),
+-  folder_id: z.string().nullable().default(null),
+-  owner_id: z.number().default(1),
+-  owner: z
+-    .object({
+-      id: z.number(),
+-      username: z.string(),
+-    })
+-    .default({ id: 1, username: 'johndoe' }),
+-  updated_by: z
+-    .object({
+-      id: z.number(),
+-      username: z.string(),
+-    })
+-    .default({ id: 1, username: 'johndoe' }),
+-})
+-
+-export const FolderSchema = z.object({
+-  id: z.string(),
+-  name: z.string(),
+-  owner_id: z.number().default(1),
+-  parent_id: z.string().nullable(),
+-  project_id: z.number().default(1),
+-})
+-
+-export type Snippet = z.infer<typeof SnippetSchema>
+-export type Folder = z.infer<typeof FolderSchema>
+-
+-export type FilesystemEntry = {
+-  id: string
+-  name: string
+-  type: 'file' | 'folder'
+-  folderId: string | null
+-  content?: string // Only for files
+-  createdAt: Date
+-}
+-
+-/**
+- * Snippet without its SQL body — the shape returned for listings, matching the Management API
+- * contract (`GetUserContentFolderResponse.data.contents[]` has no `content`). The body is loaded
+- * on demand via the item endpoint (`getSnippet`).
+- */
+-export type SnippetMetadata = Omit<Snippet, 'content'>
+-
+-const buildSnippetMetadata = (
+-  filename: string,
+-  folderId: string | null,
+-  createdAt: Date
+-): SnippetMetadata => ({
+-  id: generateDeterministicUuid([folderId, `${filename}.sql`]),
+-  inserted_at: createdAt.toISOString(),
+-  updated_at: createdAt.toISOString(),
+-  type: 'sql',
+-  name: filename.replace('.sql', ''),
+-  description: '',
+-  favorite: false,
+-  visibility: 'user',
+-  project_id: 1,
+-  folder_id: folderId,
+-  owner_id: 1,
+-  owner: { id: 1, username: 'johndoe' },
+-  updated_by: { id: 1, username: 'johndoe' },
+-})
+-
+-const buildSnippet = (
+-  filename: string,
+-  content: string,
+-  folderId: string | null,
+-  createdAt: Date
+-): Snippet => ({
+-  ...buildSnippetMetadata(filename, folderId, createdAt),
+-  content: {
+-    sql: content,
+-    content_id: uuidv4(),
+-    schema_version: '1.0',
+-  },
+-})
+-
+-const buildFolder = (name: string) => {
+-  const folder: Folder = {
+-    id: generateDeterministicUuid([name]),
+-    name: name,
+-    owner_id: 1,
+-    parent_id: null,
+-    project_id: 1,
+-  }
+-
+-  return folder
+-}
+-
+-const sanitizeName = (name: string): string => {
+-  // Remove path traversal sequences and normalize
+-  const sanitized = path.basename(name)
+-  if (sanitized !== name || name.includes('\0')) {
+-    throw new Error('Invalid name: path traversal or null bytes detected')
+-  }
+-  return sanitized
+-}
+-
+-/**
+- * Gets a snapshot of the filesystem structure including files and folders.
+- * Pass `includeContent: false` for listings (sidebar/folder tree), which only need metadata —
+- * this skips reading every `.sql` file off disk.
+- * @returns An array of files and folders with their metadata
+- */
+-export async function getFilesystemEntries({
+-  includeContent = true,
+-}: { includeContent?: boolean } = {}): Promise<FilesystemEntry[]> {
+-  if (SNIPPETS_DIR === '') {
+-    throw new Error(
+-      'SNIPPETS_MANAGEMENT_FOLDER env var is not set. Please set it to use snippets properly.'
+-    )
+-  }
+-
+-  // Ensure the snippets directory exists
+-  try {
+-    await fs.access(SNIPPETS_DIR)
+-  } catch {
+-    await fs.mkdir(SNIPPETS_DIR, { recursive: true })
+-  }
+-
+-  const entries: FilesystemEntry[] = []
+-
+-  const readEntriesRecursively = async (
+-    dirPath: string,
+-    folderName: string | null
+-  ): Promise<void> => {
+-    const items = await fs.readdir(dirPath, { withFileTypes: true })
+-    const folderId = folderName ? generateDeterministicUuid([folderName]) : null
+-
+-    for (const item of items) {
+-      const itemPath = path.join(dirPath, item.name)
+-
+-      if (item.isDirectory()) {
+-        // if the folder entry is under another folder, skip it. Subdirectories are not supported.
+-        if (folderName) {
+-          continue
+-        }
+-
+-        const stats = await fs.stat(itemPath)
+-
+-        // Add folder entry
+-        entries.push({
+-          id: generateDeterministicUuid([folderId, item.name]),
+-          name: item.name,
+-          type: 'folder',
+-          // Folders are always at root level in this implementation
+-          folderId: null,
+-          createdAt: stats.birthtime,
+-        })
+-
+-        await readEntriesRecursively(itemPath, item.name)
+-      } else if (item.isFile() && item.name.endsWith('.sql')) {
+-        const [content, stats] = await Promise.all([
+-          includeContent ? fs.readFile(itemPath, 'utf-8') : Promise.resolve(undefined),
+-          fs.stat(itemPath),
+-        ])
+-        const snippetName = item.name.replace('.sql', '')
+-
+-        entries.push({
+-          id: generateDeterministicUuid([folderId, `${snippetName}.sql`]),
+-          name: snippetName,
+-          type: 'file',
+-          folderId: folderId,
+-          content,
+-          createdAt: stats.birthtime,
+-        })
+-      }
+-    }
+-  }
+-
+-  await readEntriesRecursively(SNIPPETS_DIR, null)
+-  return entries
+-}
+-
+-export const getSnippet = async (snippetId: string) => {
+-  const entries = await getFilesystemEntries()
+-  const foundSnippet = entries.find((e) => e.type === 'file' && e.id === snippetId)
+-
+-  if (!foundSnippet) {
+-    throw new Error(`Snippet with id ${snippetId} not found`)
+-  }
+-
+-  return buildSnippet(
+-    foundSnippet.name,
+-    foundSnippet.content || '',
+-    foundSnippet.folderId,
+-    foundSnippet.createdAt
+-  )
+-}
+-
+-interface GetSnippetsParams {
+-  searchTerm?: string
+-  limit?: number
+-  cursor?: string
+-  sortOrder?: 'asc' | 'desc'
+-  sort?: 'name' | 'inserted_at'
+-  folderId?: string | null
+-  /**
+-   * Listings (sidebar/folder tree) only need metadata; the SQL body is loaded on demand via the
+-   * item endpoint. Pass `false` to omit `content` and skip reading files off disk. Defaults to
+-   * `true` for the flat `/content` endpoint, which the contract returns with content.
+-   */
+-  includeContent?: boolean
+-}
+-
+-/**
+- * Gets a filtered paginated list of snippets based on the provided criteria
+- */
+-export function getSnippets(
+-  params: GetSnippetsParams & { includeContent: false }
+-): Promise<{ cursor: string | undefined; snippets: SnippetMetadata[] }>
+-export function getSnippets(
+-  params?: GetSnippetsParams & { includeContent?: true }
+-): Promise<{ cursor: string | undefined; snippets: Snippet[] }>
+-export async function getSnippets({
+-  searchTerm,
+-  limit,
+-  cursor,
+-  sort,
+-  sortOrder,
+-  folderId,
+-  includeContent = true,
+-}: GetSnippetsParams = {}): Promise<{
+-  cursor: string | undefined
+-  snippets: Snippet[] | SnippetMetadata[]
+-}> {
+-  // Normalize and set default values
+-  const normalizedSearchTerm = searchTerm?.trim() ?? ''
+-  const normalizedLimit = limit ?? 100
+-  const normalizedSort = sort ?? 'inserted_at'
+-  const normalizedSortOrder = sortOrder ?? 'desc'
+-  const normalizedCursor = cursor ?? undefined
+-  const normalizedFolderId = folderId ?? null
+-
+-  // Validate inputs
+-  if (normalizedLimit <= 0) {
+-    throw new Error('Limit must be a positive number')
+-  }
+-  if (normalizedLimit > 1000) {
+-    throw new Error('Limit cannot exceed 1000')
+-  }
+-
+-  const entries = await getFilesystemEntries({ includeContent })
+-  const files = entries.filter(
+-    (entry): entry is FilesystemEntry & { type: 'file' } => entry.type === 'file'
+-  )
+-
+-  // Filter snippets based on search term or folder
+-  let filteredSnippets = files
+-  if (normalizedSearchTerm) {
+-    // When searching, look across all folders and support case-insensitive search
+-    filteredSnippets = files.filter((file) =>
+-      file.name.toLowerCase().includes(normalizedSearchTerm.toLowerCase())
+-    )
+-  } else {
+-    // Filter by specific folder or root (null)
+-    filteredSnippets = files.filter((file) => file.folderId === normalizedFolderId)
+-  }
+-
+-  // Sort snippets
+-  const sortedSnippets = sortBy(filteredSnippets, (snippet) => {
+-    if (normalizedSort === 'inserted_at') {
+-      return snippet.createdAt.getTime()
+-    }
+-    return snippet.name.toLowerCase() // Case-insensitive name sorting
+-  })
+-
+-  if (normalizedSortOrder === 'desc') {
+-    sortedSnippets.reverse()
+-  }
+-
+-  // Apply cursor-based pagination
+-  let paginatedSnippets = sortedSnippets
+-  if (normalizedCursor) {
+-    const cursorIndex = sortedSnippets.findIndex((s) => s.id === normalizedCursor)
+-    if (cursorIndex !== -1) {
+-      paginatedSnippets = sortedSnippets.slice(cursorIndex + 1)
+-    }
+-    // If cursor not found, return all snippets (graceful degradation)
+-  }
+-
+-  // Apply limit and determine next cursor
+-  let nextCursor: string | undefined = undefined
+-  let finalSnippets = paginatedSnippets
+-
+-  if (normalizedLimit && paginatedSnippets.length > normalizedLimit) {
+-    finalSnippets = paginatedSnippets.slice(0, normalizedLimit)
+-    nextCursor = finalSnippets[finalSnippets.length - 1].id
+-  }
+-
+-  return {
+-    cursor: nextCursor,
+-    snippets: finalSnippets.map((file) =>
+-      includeContent
+-        ? buildSnippet(file.name, file.content ?? '', file.folderId, file.createdAt)
+-        : buildSnippetMetadata(file.name, file.folderId, file.createdAt)
+-    ),
+-  }
+-}
+-
+-/**
+- * Saves a snippet to the filesystem
+- */
+-export async function saveSnippet(snippet: Snippet): Promise<Snippet> {
+-  const entries = await getFilesystemEntries()
+-  const existingSnippet = entries.find((entry) => entry.id === snippet.id && entry.type === 'file')
+-
+-  if (existingSnippet) {
+-    throw new Error(`Snippet with id ${snippet.id} already exists`)
+-  }
+-
+-  // check if the folder exists
+-  if (snippet.folder_id !== null) {
+-    const existingFolder = entries.find(
+-      (entry) => entry.id === snippet.folder_id && entry.type === 'folder'
+-    )
+-    if (existingFolder === undefined) {
+-      throw new Error(`Folder with id ${snippet.folder_id} not found`)
+-    }
+-  }
+-
+-  const snippetName = sanitizeName(snippet.name)
+-  const content = snippet.content.sql || ''
+-  const folderId = snippet.folder_id || null
+-  const folder = entries.find((f) => f.id === folderId && f.type === 'folder')
+-
+-  const folderPath = folder ? path.join(SNIPPETS_DIR, folder.name) : SNIPPETS_DIR
+-  const filePath = path.join(folderPath, `${snippetName}.sql`)
+-  await fs.writeFile(filePath, content || '', 'utf-8')
+-  const stats = await fs.stat(filePath)
+-
+-  const result = buildSnippet(snippetName, content, snippet.folder_id, stats.birthtime)
+-  return result
+-}
+-
+-/**
+- * Deletes a snippet from the filesystem
+- */
+-export async function deleteSnippet(id: string): Promise<void> {
+-  const entries = await getFilesystemEntries()
+-  const found = entries.find((entry) => entry.id === id && entry.type === 'file')
+-
+-  if (!found) {
+-    throw new Error(`Snippet with id ${id} not found`)
+-  }
+-
+-  const filename = `${found.name}.sql`
+-  const currentFolder = entries.find((f) => f.id === found.folderId && f.type === 'folder')
+-  const paths = compact([SNIPPETS_DIR, currentFolder?.name, filename])
+-  const filePath = path.join(...paths)
+-
+-  try {
+-    await fs.unlink(filePath)
+-  } catch (error) {
+-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+-      throw error
+-    }
+-  }
+-}
+-
+-/**
+- * Updates a snippet in the filesystem. It also handles renaming and moving.
+- */
+-export async function updateSnippet(id: string, updates: DeepPartial<Snippet>): Promise<Snippet> {
+-  const entries = await getFilesystemEntries()
+-  const foundSnippet = entries
+-    .filter(
+-      (entry): entry is FilesystemEntry & { type: 'file'; content: string } => entry.type === 'file'
+-    )
+-    .find((s) => s.id === id)
+-
+-  if (!foundSnippet) {
+-    throw new Error(`Snippet with id ${id} not found`)
+-  }
+-
+-  const newId = generateDeterministicUuid([
+-    updates.folder_id !== undefined ? updates.folder_id : foundSnippet.folderId,
+-    `${updates.name ?? foundSnippet.name}.sql`,
+-  ])
+-
+-  const snippetAtTargetLocation = entries.find(
+-    (entry) => entry.id === newId && entry.type === 'file'
+-  )
+-
+-  if (snippetAtTargetLocation && snippetAtTargetLocation.id !== foundSnippet.id) {
+-    throw new Error(
+-      `Snippet named "${updates.name ?? foundSnippet.name}" already exists in the specified folder`
+-    )
+-  }
+-
+-  const snippet = buildSnippet(
+-    foundSnippet.name,
+-    foundSnippet.content || '',
+-    foundSnippet.folderId,
+-    foundSnippet.createdAt
+-  )
+-
+-  // it's easier to delete the old file first and then recreate a new one
+-  await deleteSnippet(snippet.id)
+-
+-  const updatedSnippet = await saveSnippet({
+-    name: updates.name ?? snippet.name,
+-    content: updates.content ?? snippet.content,
+-    // folder_id can be null
+-    folder_id: updates.folder_id !== undefined ? updates.folder_id : snippet.folder_id,
+-  } as Snippet)
+-
+-  return updatedSnippet
+-}
+-
+-export const getFolders = async (folderId: string | null = null): Promise<Folder[]> => {
+-  const entries = await getFilesystemEntries({ includeContent: false })
+-  const folders = entries
+-    .filter(
+-      (entry): entry is FilesystemEntry & { type: 'folder' } =>
+-        entry.type === 'folder' && entry.folderId === folderId
+-    )
+-    .map((folder) => buildFolder(folder.name))
+-  return folders
+-}
+-
+-/**
+- * Creates a new folder as an actual directory
+- */
+-export async function createFolder(_folderName: string): Promise<Folder> {
+-  const folderName = sanitizeName(_folderName)
+-
+-  const entries = await getFilesystemEntries()
+-  const existingFolder = entries.find((folder) => folder.name === folderName)
+-
+-  if (existingFolder) {
+-    throw new Error(`Folder with name ${folderName} already exists`)
+-  }
+-
+-  const folderPath = path.join(SNIPPETS_DIR, folderName)
+-
+-  await fs.mkdir(folderPath, { recursive: true })
+-  const newFolder = buildFolder(folderName)
+-
+-  return newFolder
+-}
+-
+-/**
+- * Deletes a folder directory from the filesystem
+- * @throws {Error} If the folder doesn't exist
+- */
+-export async function deleteFolder(id: string): Promise<void> {
+-  const entries = await getFilesystemEntries()
+-  const folder = entries.find((f) => f.id === id && f.type === 'folder')
+-
+-  if (!folder) {
+-    throw new Error(`Folder with id ${id} not found`)
+-  }
+-
+-  const folderPath = path.join(SNIPPETS_DIR, folder.name)
+-  try {
+-    await fs.rm(folderPath, { recursive: true, force: true })
+-  } catch (error) {
+-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+-      throw error
+-    }
+-    // If folder doesn't exist, still throw the original error
+-    throw new Error(`Folder with id ${id} not found`)
+-  }
+-}
+diff --git a/apps/studio/routes/api/platform/projects/$ref/content/count.ts b/apps/studio/routes/api/platform/projects/$ref/content/count.ts
+index fd23de94..be89944d 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/content/count.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/content/count.ts
+@@ -1,10 +1,10 @@
++// supapace: counts of the request's member's own snippets and of the project's shared ones.
+ import { createFileRoute } from '@tanstack/react-router'
+-import { paths } from 'api-types'
+ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { getSnippets } from '@/lib/api/snippets.utils'
++import { countSnippets } from '@/lib/api/self-hosted/member-store'
+ 
+ const wrappedHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -20,31 +20,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+   }
+ }
+ 
+-type GetRequestData = paths['/platform/projects/{ref}/content/count']['get']['parameters']['query']
+-
+ const handleGetAll = async (req: NextApiRequest, res: NextApiResponse) => {
+-  const params = req.query as GetRequestData
+-
+-  try {
+-    const { snippets } = await getSnippets({
+-      searchTerm: params?.name,
+-      includeContent: false,
+-    })
+-    if (params?.name) {
+-      return res.status(200).json({
+-        count: snippets.length,
+-      })
+-    } else {
+-      return res.status(200).json({
+-        shared: snippets.filter((s) => s.visibility === 'project').length,
+-        favorites: snippets.filter((s) => s.favorite).length,
+-        private: snippets.filter((s) => s.visibility === 'user').length,
+-      })
+-    }
+-  } catch (error: any) {
+-    console.error('Error fetching snippets:', error)
+-    return res.status(500).json({ message: error?.message ?? 'Failed to get count' })
+-  }
++  const name = typeof req.query.name === 'string' ? req.query.name : undefined
++  return res.status(200).json(await countSnippets(name))
+ }
+ 
+ const webHandler = toWebHandler(wrappedHandler)
+diff --git a/apps/studio/routes/api/platform/projects/$ref/content/folders/$id.ts b/apps/studio/routes/api/platform/projects/$ref/content/folders/$id.ts
+index 187d12ea..735dfc66 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/content/folders/$id.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/content/folders/$id.ts
+@@ -1,10 +1,11 @@
++// supapace: the snippets in one folder of the request's member.
+ import { createFileRoute } from '@tanstack/react-router'
+ import { paths } from 'api-types'
+ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { getFolders, getSnippets } from '@/lib/api/snippets.utils'
++import { checkId, listSnippets } from '@/lib/api/self-hosted/member-store'
+ 
+ const wrappedHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -24,35 +25,28 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+ 
+ type GetRequestData =
+   paths['/platform/projects/{ref}/content/folders/{id}']['get']['parameters']['query']
+-type GetResponseData =
+-  paths['/platform/projects/{ref}/content/folders/{id}']['get']['responses']['200']['content']['application/json']
+ 
+-const handleGetAll = async (req: NextApiRequest, res: NextApiResponse<GetResponseData>) => {
++const handleGetAll = async (req: NextApiRequest, res: NextApiResponse) => {
+   const params = req.query as GetRequestData
+-  const folderId = (req.query.id as string) ?? null
++  const folderId = checkId(req.query.id)
+ 
+-  const folders = await getFolders(folderId)
+-  // Folder listings return metadata only (no SQL body) to match the Management API contract; the
+-  // editor loads each snippet's content on demand via the item endpoint.
+-  const { cursor, snippets } = await getSnippets({
++  // Folders hold no folders: the list of folders in one is empty.
++  const { cursor, snippets } = await listSnippets({
+     searchTerm: params?.name,
+     cursor: params?.cursor,
+-    folderId: folderId,
++    folderId,
+     limit: params?.limit ? Number(params.limit) : undefined,
+     sort: params?.sort_by,
+     sortOrder: params?.sort_order,
+     includeContent: false,
+   })
+ 
+-  return res.status(200).json({ data: { folders: folders, contents: snippets }, cursor })
++  return res.status(200).json({ data: { folders: [], contents: snippets }, cursor })
+ }
+ 
+-type PatchResponseData =
+-  paths['/platform/projects/{ref}/content/folders/{id}']['patch']['responses']['200']['content']
+-
+-const handlePatch = async (_req: NextApiRequest, res: NextApiResponse<PatchResponseData>) => {
+-  // Platform specific endpoint
+-  return res.status(200).json({} as never)
++const handlePatch = async (_req: NextApiRequest, res: NextApiResponse) => {
++  // Platform specific endpoint; it changes nothing here
++  return res.status(200).json({})
+ }
+ 
+ const webHandler = toWebHandler(wrappedHandler)
+diff --git a/apps/studio/routes/api/platform/projects/$ref/content/folders/index.ts b/apps/studio/routes/api/platform/projects/$ref/content/folders/index.ts
+index bf56b4db..c1ac34c8 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/content/folders/index.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/content/folders/index.ts
+@@ -1,10 +1,17 @@
++// supapace: the folders of the request's member, and its snippets at the root.
+ import { createFileRoute } from '@tanstack/react-router'
+ import { paths } from 'api-types'
+ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { createFolder, deleteFolder, getFolders, getSnippets } from '@/lib/api/snippets.utils'
++import {
++  createFolder,
++  deleteFolders,
++  listFolders,
++  listSnippets,
++} from '@/lib/api/self-hosted/member-store'
++import { ProjectError } from '@/lib/api/self-hosted/project-context'
+ 
+ const wrappedHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -26,16 +33,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+ 
+ type GetRequestData =
+   paths['/platform/projects/{ref}/content/folders']['get']['parameters']['query']
+-type GetResponseData =
+-  paths['/platform/projects/{ref}/content/folders']['get']['responses']['200']['content']['application/json']
+ 
+-const handleGetAll = async (req: NextApiRequest, res: NextApiResponse<GetResponseData>) => {
++const handleGetAll = async (req: NextApiRequest, res: NextApiResponse) => {
+   const params = req.query as GetRequestData
+ 
+-  const folders = await getFolders()
++  const folders = await listFolders()
+   // Folder listings return metadata only (no SQL body) to match the Management API contract; the
+   // editor loads each snippet's content on demand via the item endpoint.
+-  const { cursor, snippets } = await getSnippets({
++  const { cursor, snippets } = await listSnippets({
+     searchTerm: params?.name,
+     limit: params?.limit ? Number(params.limit) : undefined,
+     cursor: params?.cursor,
+@@ -47,29 +52,16 @@ const handleGetAll = async (req: NextApiRequest, res: NextApiResponse<GetRespons
+   res.status(200).json({ data: { folders, contents: snippets }, cursor })
+ }
+ 
+-type PostResponseData =
+-  paths['/platform/projects/{ref}/content/folders']['post']['responses']['201']['content']['application/json']
+-
+-type PostRequestData =
+-  paths['/platform/projects/{ref}/content/folders']['post']['requestBody']['content']['application/json']
+-const handlePost = async (req: NextApiRequest, res: NextApiResponse<PostResponseData>) => {
+-  const { name } = req.body as PostRequestData
+-
+-  const folder = await createFolder(name)
+-
+-  return res.status(201).json(folder)
++const handlePost = async (req: NextApiRequest, res: NextApiResponse) => {
++  return res.status(201).json(await createFolder(req.body?.name))
+ }
+ 
+ const handleDelete = async (req: NextApiRequest, res: NextApiResponse) => {
+   const { ids } = req.query
+-
+   if (!ids || typeof ids !== 'string') {
+-    return res.status(400).json({ error: 'Folder IDs are required' })
++    throw new ProjectError(400, 'bad_request', 'Folder ids are required')
+   }
+-  const folderIds = ids.split(',').map((id) => id.trim())
+-
+-  await Promise.all(folderIds.map((id) => deleteFolder(id)))
+-
++  await deleteFolders(ids.split(',').map((id) => id.trim()))
+   return res.status(200).json({})
+ }
+ 
+diff --git a/apps/studio/routes/api/platform/projects/$ref/content/index.ts b/apps/studio/routes/api/platform/projects/$ref/content/index.ts
+index b2784f85..bdc50777 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/content/index.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/content/index.ts
+@@ -1,5 +1,6 @@
++// supapace: the snippets of the request's project and member (lib/api/self-hosted/member-store.ts);
++// nothing of the request names a directory. A refusal is the store's, answered by the guard.
+ import { createFileRoute } from '@tanstack/react-router'
+-import { paths } from 'api-types'
+ import { compact } from 'lodash'
+ import { NextApiRequest, NextApiResponse } from 'next'
+ import { z } from 'zod'
+@@ -7,12 +8,12 @@ import { z } from 'zod'
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+ import {
+-  deleteSnippet,
+-  getSnippets,
+-  saveSnippet,
+-  SnippetSchema,
+-  updateSnippet,
+-} from '@/lib/api/snippets.utils'
++  deleteSnippets,
++  listSnippets,
++  putSnippet,
++  sqlAnswer,
++} from '@/lib/api/self-hosted/member-store'
++import { ProjectError } from '@/lib/api/self-hosted/project-context'
+ 
+ const wrappedHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -33,9 +34,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+   }
+ }
+ 
+-type GetResponseData =
+-  paths['/platform/projects/{ref}/content']['get']['responses']['200']['content']['application/json']
+-
+ const getRequestParamsSchema = z.object({
+   visibility: z.enum(['project', 'user']).optional(),
+   name: z.string().optional(),
+@@ -49,88 +47,42 @@ const getRequestParamsSchema = z.object({
+   sort_order: z.enum(['asc', 'desc']).optional(),
+ })
+ 
+-const handleGetAll = async (req: NextApiRequest, res: NextApiResponse<GetResponseData>) => {
+-  const result = getRequestParamsSchema.safeParse(req.query)
+-
+-  if (!result.success) {
+-    return res.status(400).json({ data: [] })
+-  }
++const badRequest = () => new ProjectError(400, 'bad_request', 'Not a valid request')
+ 
++const handleGetAll = async (req: NextApiRequest, res: NextApiResponse) => {
++  const result = getRequestParamsSchema.safeParse(req.query)
++  if (!result.success) throw badRequest()
+   const params = result.data
+ 
+-  // Platform specific endpoint
+-  if (params.visibility === 'project') {
+-    return res.status(200).json({ data: [] })
+-  }
+-
+-  try {
+-    const { cursor, snippets } = await getSnippets({
++  // the answer carries SQL: it is made and sent in a read slot of the process
++  return sqlAnswer(async () => {
++    const { cursor, snippets } = await listSnippets({
++      visibility: params.visibility,
+       searchTerm: params.name,
+       limit: params.limit,
+       cursor: params.cursor,
+       sort: params.sort_by,
+       sortOrder: params.sort_order,
+     })
+-
+-    return res.status(200).json({ data: snippets, cursor })
+-  } catch (error) {
+-    console.error('Error fetching snippets:', error)
+-    return res.status(500).json({ data: [] })
+-  }
++    return { data: snippets, cursor }
++  })
+ }
+ 
+ const handlePut = async (req: NextApiRequest, res: NextApiResponse) => {
+-  try {
+-    const updates = req.body
+-    const updatedSnippet = await updateSnippet(updates.id, updates)
+-    return res.status(200).json(updatedSnippet)
+-  } catch (error: any) {
+-    if (error instanceof Error && error.message.includes('not found')) {
+-      const body = req.body
+-      const { data, error: parseError } = SnippetSchema.safeParse(body)
+-
+-      if (parseError) {
+-        console.error('Validation error:', parseError)
+-        return res.status(400).json({ error: parseError.message })
+-      }
+-
+-      try {
+-        const savedSnippet = await saveSnippet(data)
+-        return res.status(200).json(savedSnippet)
+-      } catch (error) {
+-        console.error('Error creating snippet:', error)
+-        return res.status(500).json({ error: 'Failed to create snippet' })
+-      }
+-    }
+-    return res.status(500).json({ error: error?.message ?? 'Failed to update snippet' })
+-  }
++  return sqlAnswer(() => putSnippet(req.body))
+ }
+ 
+ const snippetIdsSchema = z
+   .string()
+   .transform((val) => compact(val.split(',').map((id) => id.trim())))
+-  .pipe(z.array(z.string().uuid()).nonempty())
++  .pipe(z.array(z.string()).nonempty())
+ 
+ const handleDelete = async (req: NextApiRequest, res: NextApiResponse) => {
+-  const { ids } = req.query
+-
+-  const result = snippetIdsSchema.safeParse(ids)
+-  if (!result.success) {
+-    return res.status(400).json({ error: 'Snippet IDs are required' })
+-  }
+-
+-  const snippetIds = result.data
+-
+-  try {
+-    for (const id of snippetIds) {
+-      await deleteSnippet(id)
+-    }
+-    res.setHeader('Content-Type', 'application/json')
+-    return res.status(200).send(snippetIds.map((id) => ({ id })))
+-  } catch (error) {
+-    console.error('Error deleting snippets:', error)
+-    return res.status(500).json({ error: 'Failed to delete snippets' })
+-  }
++  const result = snippetIdsSchema.safeParse(req.query.ids)
++  if (!result.success) throw badRequest()
++  await deleteSnippets(result.data)
++  res.setHeader('Content-Type', 'application/json')
++  return res.status(200).send(result.data.map((id) => ({ id })))
+ }
+ 
+ const webHandler = toWebHandler(wrappedHandler)
+diff --git a/apps/studio/routes/api/platform/projects/$ref/content/item/$id.ts b/apps/studio/routes/api/platform/projects/$ref/content/item/$id.ts
+index 148cf436..d8415e17 100644
+--- a/apps/studio/routes/api/platform/projects/$ref/content/item/$id.ts
++++ b/apps/studio/routes/api/platform/projects/$ref/content/item/$id.ts
+@@ -1,9 +1,10 @@
++// supapace: one snippet the request's member may read: its own or a shared one.
+ import { createFileRoute } from '@tanstack/react-router'
+ import { NextApiRequest, NextApiResponse } from 'next'
+ 
+ import { toWebHandler } from '@/compat/next/api'
+ import { apiWrapper } from '@/lib/api/apiWrapper'
+-import { getSnippet } from '@/lib/api/snippets.utils'
++import { getSnippet, sqlAnswer } from '@/lib/api/self-hosted/member-store'
+ 
+ const wrappedHandler = (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+ 
+@@ -19,17 +20,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+   }
+ }
+ 
+-const handleGetAll = async (req: NextApiRequest, res: NextApiResponse) => {
+-  try {
+-    const snippet = await getSnippet(req.query.id as string)
+-
+-    return res.status(200).json(snippet)
+-  } catch (error) {
+-    if (error instanceof Error && error.message.includes('not found')) {
+-      return res.status(404).json({ message: 'Content not found.' })
+-    }
+-    return res.status(500).json({ data: null, error: { message: 'Internal Server Error' } })
+-  }
++const handleGetAll = async (req: NextApiRequest, _res: NextApiResponse) => {
++  return sqlAnswer(() => getSnippet(req.query.id))
+ }
+ 
+ const webHandler = toWebHandler(wrappedHandler)

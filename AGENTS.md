@@ -6042,3 +6042,72 @@ pages that read the anon key from `settings` show none. Proof: `studio/prove/sec
   written; the apply gate of the Studio build shows whether upstream holds it.
 - Test helpers wait for a final state, not a first sign: the wake socket's mode 0660, a relay's
   end before its test ends, a bound of 30 s on every wait for a child process in sp-probe.
+
+### 2026-11-27 — Studio: snippets private per member, shared per project
+Patches 0025-0027 (topic stores). The module is
+lib/api/self-hosted/member-store.ts. The process-wide snippets folder (SNIPPETS_MANAGEMENT_FOLDER)
+is gone; a remaining importer fails the build.
+- Store calls: listSnippets(params), getSnippet(id), putSnippet(body), deleteSnippets(ids),
+  countSnippets(name?), listFolders(), createFolder(name), deleteFolders(ids).
+- Checks and names: checkId, checkName, NAME_BYTES (200), principalDir(iss, sub),
+  sharedId(author, name).
+- Read slots: sqlAnswer(fn), acquireRead(ref), readsHeld(ref?), READ_SLOTS (4),
+  READ_SLOTS_PROJECT (2), READ_WAITING (32), READ_WAITING_PROJECT (8).
+- Types: Snippet, SnippetMetadata, Folder, ListParams.
+- The five content routes under /api/platform/projects/$ref/content call these; their wire shapes
+  are upstream's.
+- Project, member and role come from getProjectContext() alone; nothing in the path, query or
+  body names a directory. Ids are checked to the lower-case UUID form and names are checked.
+On disk, under SUPAPACE_DASH_DATA (directories 0700, files 0600, every write by rename):
+  <ref>/snippets/<P>/<name>.sql            a member's own, at the root
+  <ref>/snippets/<P>/<folder>/<name>.sql   in one of its folders (one level)
+  <ref>/snippets/shared/<P>/<name>.sql     shared by member P
+  .<16 hex>.tmp                            a write in progress; leftovers removed at a write
+<P> = lower-case hex SHA-256 of u32be(len iss) iss u32be(len sub) sub. The file holds the SQL only.
+- Ids. An own id is upstream's, derived by the editor from folder and name (a 32-bit hash). A write
+  whose id another own snippet already has is refused 409 exists. A shared id is SHA-256 of author
+  and name. A share or unshare moves the file and changes the id; the client follows the answer.
+- Names. A create replaces a snippet of its name. A rename, move, share or unshare onto a taken
+  name is refused 409 exists, and so is a folder whose name a file uses.
+- owner_id (and owner.id) is 1, the profile stub's id, for the asking member's own snippets and 0
+  for another member's; the editor then shows another's shared snippet read-only.
+- Names are 1-200 UTF-8 bytes: no leading dot, no / \ NUL or control character, no half surrogate.
+Bounds:
+- Per project, all members together: snippet_entries (2,000 snippets, folders and any other names
+  below a member's directory) and snippet_bytes (64 MiB of SQL). They are checked against the disk
+  and written under one in-process lock per project; other projects do not wait.
+- One snippet, and the SQL of one listing answer, are at most result_bytes (8 MiB). A larger
+  snippet is refused 413 too_large. A listing past it ends with a cursor, the base64url JSON of
+  [sort key, id] of its last snippet; the next page holds the snippets strictly after that place.
+- An answer that carries SQL (content/ GET and PUT, item/$id) holds one of READ_SLOTS slots of the
+  process, at most READ_SLOTS_PROJECT for one project. It holds the slot until the server has taken
+  its body, the client has gone, or handover_ms has passed; at handover_ms the answer is cut.
+- A request that finds no slot waits at most slot_wait_ms, behind at most READ_WAITING requests in
+  the process and READ_WAITING_PROJECT of its project; otherwise it is answered 429 busy.
+Refusals ({code, message}, no path):
+- 400: bad_id, bad_name, bad_request (also a cursor not of this listing);
+- 403: read_only (every write of a read_only member), not_author (another member's shared
+  snippet);
+- 404 not_found; 409 exists; 413 too_large; 429 busy; 507 store_full;
+- 503 store_unavailable: every file-system failure; the log line names the ref and the errno code
+  only.
+Caller rules:
+- Exactly one Studio process writes a data directory: the lock and the slots are in the process.
+- A route whose answer carries SQL returns sqlAnswer(...) unbuffered. A wrapper that reads, clones
+  or buffers the body frees the slot early.
+- Keep the gateway's body deadline below handover_ms.
+- A purge removes <data>/<ref> whole without following links.
+Known limits:
+- The bounds are shared: one member can fill the project's bounds for all, and a 507 shows a
+  member the project's total use.
+- A removed member's private snippets count until the purge; nobody can delete their shared ones.
+- The byte count stops at the entry bound: with more entries on disk than the bound, bytes are
+  under-counted.
+- The slot caps are per project, not per principal: a member of two projects can hold all four
+  slots for handover_ms.
+- Every PUT takes a slot; many writes at once in one project get 429 busy.
+- A snippet rewritten or renamed while a listing pages can move past the cursor and be missed in
+  that pass.
+- Every write walks the project's tree (about 80 ms at 2,000 entries).
+- Favourites are not stored; the folder PATCH changes nothing.
+- Unit tests: studio/build.sh test (member-store.test.ts, member-store.hostile.test.ts).

@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:27:01 +0000
+Subject: [PATCH] stores: tests of a swapped file, equal ids and taken names
+
+---
+ .../self-hosted/member-store.hostile.test.ts  | 275 ++++++++++++++++++
+ 1 file changed, 275 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/member-store.hostile.test.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/member-store.hostile.test.ts b/apps/studio/lib/api/self-hosted/member-store.hostile.test.ts
+new file mode 100644
+index 00000000..85aec36c
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/member-store.hostile.test.ts
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: Apache-2.0
++// The snippet store under hostile conditions: a file swapped for a link or a FIFO between the
++// listing and the open (only a writer of the volume other than the store can do that), ids the
++// editor's derivation makes equal, and moves onto a name that is taken.
++import { execFileSync } from 'node:child_process'
++import {
++  closeSync,
++  constants,
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  openSync,
++  readFileSync,
++  rmSync,
++  symlinkSync,
++  truncateSync,
++} from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join, resolve as resolvePath } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { generateDeterministicUuid } from '../snippets.browser'
++import {
++  createFolder,
++  deleteSnippets,
++  getSnippet,
++  listSnippets,
++  principalDir,
++  putSnippet,
++  type Snippet,
++} from './member-store'
++import { projectContext, ProjectError, runWithProject } from './project-context'
++
++// A hook run after the store's lstat of a path: it lets a test change the file system between
++// the store's check of an entry and its open, as another writer of the volume could.
++const hook: { after?: (path: string) => void } = {}
++vi.mock('node:fs/promises', async (importOriginal) => {
++  const real = await importOriginal<typeof import('node:fs/promises')>()
++  return {
++    ...real,
++    lstat: async (...args: Parameters<typeof real.lstat>) => {
++      const st = await real.lstat(...args)
++      hook.after?.(String(args[0]))
++      return st
++    },
++  }
++})
++
++const VECTORS = resolvePath(import.meta.dirname, '../../../../../vectors')
++const LIMITS = JSON.parse(readFileSync(join(VECTORS, 'limits.json'), 'utf8'))
++const REF_A = 'abcdefghij0123456789'
++const REF_B = 'bcdefghij0123456789a'
++const ISS = 'https://issuer.test'
++const NEW_ID = '00000000-0000-4000-8000-000000000001'
++
++type Who = { ref: string; sub: string }
++const A1: Who = { ref: REF_A, sub: 'alice' }
++const A2: Who = { ref: REF_A, sub: 'bob' }
++const B1: Who = { ref: REF_B, sub: 'carol' }
++
++function as<T>(who: Who, fn: () => Promise<T>): Promise<T> {
++  const ctx = projectContext(
++    {
++      text: 'v1.x.y',
++      ref: who.ref,
++      iss: ISS,
++      sub: who.sub,
++      name: who.sub,
++      role: 'developer',
++      purpose: '',
++    },
++    {
++      ref: who.ref,
++      name: 'p',
++      state: 'active',
++      db_version: '17.6.1',
++      pg_meta: 0,
++      dsn_rw: 'postgresql://x',
++      api_url: `https://${who.ref}.example.test`,
++      data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
++      generation: 1,
++      at: new Date().toISOString(),
++    }
++  )
++  return runWithProject(ctx, fn)
++}
++
++async function refusal(fn: () => Promise<unknown>): Promise<string> {
++  try {
++    await fn()
++  } catch (e) {
++    if (e instanceof ProjectError) return `${e.status} ${e.code}`
++    throw e
++  }
++  return 'no refusal'
++}
++
++const save = (who: Who, name: string, sql: string, extra: Record<string, unknown> = {}) =>
++  as(who, () =>
++    putSnippet({ id: NEW_ID, name, content: { sql }, visibility: 'user', ...extra })
++  ) as Promise<Snippet>
++/** The id the editor gives a new snippet: upstream's derivation from folder and name. */
++const editorId = (folderId: string | null, name: string) =>
++  generateDeterministicUuid([folderId, `${name}.sql`])
++const texts = async (who: Who) =>
++  Object.fromEntries(
++    (await as(who, () => listSnippets())).snippets.map((s) => [s.name, (s as Snippet).content.sql])
++  )
++
++describe('the member store, hostile', () => {
++  let dir: string
++  let data: string
++  const own = (who: Who) => join(data, who.ref, 'snippets', principalDir(ISS, who.sub))
++
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), 'dash-store-h-'))
++    data = join(dir, 'data')
++    mkdirSync(data)
++    vi.stubEnv('SUPAPACE_DASH_DATA', data)
++    vi.stubEnv('SUPAPACE_LIMITS', JSON.stringify(LIMITS))
++    vi.spyOn(console, 'error').mockImplementation(() => {})
++  })
++  afterEach(() => {
++    hook.after = undefined
++    vi.unstubAllEnvs()
++    vi.restoreAllMocks()
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  describe('a file swapped after the store checked it', () => {
++    it('for a link: the open does not follow it', async () => {
++      await save(B1, 'secret', 'select b_secret')
++      const s = await save(A1, 'mine', 'select 1')
++      const victim = join(own(B1), 'secret.sql')
++      const path = join(own(A1), 'mine.sql')
++      hook.after = (p) => {
++        if (p !== path) return
++        hook.after = undefined
++        rmSync(path)
++        symlinkSync(victim, path)
++      }
++      let answer = ''
++      const r = await refusal(async () => {
++        answer = JSON.stringify(await as(A1, () => getSnippet(s.id)))
++      })
++      expect(answer).not.toContain('b_secret')
++      expect(r).toBe('503 store_unavailable')
++    })
++
++    it('for a FIFO: the open does not block', async () => {
++      const s = await save(A1, 'mine', 'select 1')
++      const path = join(own(A1), 'mine.sql')
++      hook.after = (p) => {
++        if (p !== path) return
++        hook.after = undefined
++        rmSync(path)
++        execFileSync('mkfifo', ['-m', '600', path])
++      }
++      let timer: NodeJS.Timeout | undefined
++      const outcome = await Promise.race([
++        refusal(() => as(A1, () => getSnippet(s.id))),
++        new Promise<string>((done) => (timer = setTimeout(() => done('blocked'), 3000))),
++      ])
++      clearTimeout(timer)
++      if (outcome === 'blocked') {
++        // release the open the store is stuck in, so the worker can end
++        closeSync(openSync(path, constants.O_WRONLY | constants.O_NONBLOCK))
++      }
++      expect(outcome).toBe('404 not_found')
++    })
++  })
++
++  describe('ids the editor derives that are equal', () => {
++    // The editor's id is a 32-bit hash of "<folder id>_<name>.sql": "Aa" and "BB" hash alike.
++    it('a new snippet whose id another one has does not delete that one', async () => {
++      const id = editorId(null, 'Aa')
++      expect(editorId(null, 'BB')).toBe(id) // the precondition
++      await save(A1, 'Aa', 'select aa', { id })
++      await refusal(() => save(A1, 'BB', 'select bb', { id }))
++      expect((await texts(A1)).Aa).toBe('select aa')
++    })
++
++    it("a root snippet named '<folder id>_x' does not delete x of that folder", async () => {
++      const f = await as(A1, () => createFolder('f'))
++      await save(A1, 'x', 'select in_folder', { folder_id: f.id, id: editorId(f.id, 'x') })
++      const id = editorId(f.id, 'x')
++      expect(editorId(null, `${f.id}_x`)).toBe(id) // the precondition
++      await refusal(() => save(A1, `${f.id}_x`, 'select at_root', { id, folder_id: null }))
++      const inFolder = await as(A1, () => listSnippets({ folderId: f.id }))
++      expect(inFolder.snippets.map((s) => (s as Snippet).content.sql)).toEqual(['select in_folder'])
++    })
++  })
++
++  describe('a move onto a name that is taken', () => {
++    it("an unshare does not replace the author's private snippet of that name", async () => {
++      const shared = await save(A1, 'q', 'select shared', { visibility: 'project' })
++      await save(A1, 'q', 'select private')
++      await refusal(() =>
++        as(A1, () => putSnippet({ id: shared.id, visibility: 'user', folder_id: null }))
++      )
++      const t = await texts(A1)
++      expect(t.q).toBe('select private')
++    })
++  })
++
++  describe('a folder and a snippet of one file name', () => {
++    it('is refused as taken, not as a failure of the store', async () => {
++      await save(A1, 'x', 'select 1')
++      expect(await refusal(() => as(A1, () => createFolder('x.sql')))).toBe('409 exists')
++    })
++  })
++
++  describe('refusals no other test reaches', () => {
++    it('a delete of several ids of which one is refused deletes none', async () => {
++      const mine = await save(A2, 'mine', 'select mine')
++      const theirs = await save(A1, 'team', 'select team', { visibility: 'project' })
++      expect(await refusal(() => as(A2, () => deleteSnippets([mine.id, theirs.id])))).toBe(
++        '403 not_author'
++      )
++      expect((await as(A2, () => getSnippet(mine.id))).content.sql).toBe('select mine')
++    })
++
++    it('an empty list of ids is refused', async () => {
++      expect(await refusal(() => as(A1, () => deleteSnippets([])))).toBe('400 bad_id')
++    })
++
++    it('a file larger than the byte bound is not read', async () => {
++      const s = await save(A1, 'big', 'select 1')
++      truncateSync(join(own(A1), 'big.sql'), LIMITS.snippet_bytes + 1)
++      expect(await refusal(() => as(A1, () => getSnippet(s.id)))).toBe('404 not_found')
++    })
++
++    it('a data directory that is not absolute is no store', async () => {
++      vi.stubEnv('SUPAPACE_DASH_DATA', 'data')
++      expect(await refusal(() => save(A1, 'x', 'select 1'))).toBe('503 store_unavailable')
++    })
++
++    it('a context whose ref is not a ref reaches nothing outside the data directory', async () => {
++      const odd: Who = { ref: '../escaped', sub: 'alice' }
++      expect(await refusal(() => save(odd, 'x', 'select 1'))).toBe('503 store_unavailable')
++      expect(existsSync(join(dir, 'escaped'))).toBe(false)
++    })
++  })
++
++  describe('a file that grows after the store listed it', () => {
++    it('is not read past result_bytes', async () => {
++      const s = await save(A1, 'grows', 'select 1')
++      const path = join(own(A1), 'grows.sql')
++      hook.after = (p) => {
++        if (p !== path) return
++        hook.after = undefined
++        truncateSync(path, LIMITS.result_bytes + 1)
++      }
++      expect(await refusal(() => as(A1, () => getSnippet(s.id)))).toBe('404 not_found')
++    })
++
++    it("ends the listing's page before it, by what was read", async () => {
++      await save(A1, 'a', 'select 1')
++      await save(A1, 'b', 'select 2')
++      const path = join(own(A1), 'b.sql')
++      hook.after = (p) => {
++        if (p !== path) return
++        hook.after = undefined
++        truncateSync(path, LIMITS.result_bytes)
++      }
++      const page = await as(A1, () => listSnippets({ sort: 'name', sortOrder: 'asc' }))
++      expect(page.snippets.map((s) => s.name)).toEqual(['a'])
++      // the next page goes on after it, with b
++      const next = await as(A1, () =>
++        listSnippets({ sort: 'name', sortOrder: 'asc', cursor: page.cursor })
++      )
++      expect(next.snippets.map((s) => s.name)).toEqual(['b'])
++    })
++  })
++})
