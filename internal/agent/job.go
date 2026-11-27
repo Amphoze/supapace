@@ -368,7 +368,14 @@ func (a *Agent) RunJob(ctx context.Context, j JobSpec) (JobResult, error) {
 	if err != nil {
 		return JobResult{}, errors.Join(err, a.removeJobFiles(x.base))
 	}
-	_, err = dockerRun(ctx, a.jobArgs(x, env, vs)...)
+	// The launch is not cut short when ctx ends: a `docker run` killed half-way
+	// can leave a container that Docker makes after its client is gone — with
+	// the job's environment in its configuration and nothing left to remove
+	// it. The job is started within the removals' bound; a ctx that has ended
+	// then stops and removes it as it does any running job.
+	lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), jobCleanup)
+	_, err = dockerRun(lctx, a.jobArgs(x, env, vs)...)
+	lcancel()
 	if rerr := os.Remove(env); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
 		err = errors.Join(err, rerr)
 	}

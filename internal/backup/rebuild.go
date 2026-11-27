@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 
 	"github.com/Amphoze/supapace/internal/bklimit"
 	"github.com/Amphoze/supapace/internal/jobio"
@@ -17,9 +18,17 @@ import (
 // merged once and in order, which the store does not check.
 
 // buildRebuild is the input of a rebuild job from the stored markers; past
-// bklimit.RebuildMaxPages pages no job is launched.
-func buildRebuild(bs store.BackupState, in *jobio.Input) error {
+// bklimit.RebuildMaxPages pages no job is launched. The subject then stays
+// without uploads and fetch plans until an operator continues the rebuild
+// (`supapaced offsite rebuild-continue`): the refusal raises the notice
+// rebuild-page-cap, which `project backups` shows, and an alert row of that
+// code with severity page — a notice alone is delivered as a warning.
+func (r *Runner) buildRebuild(ctx context.Context, bs store.BackupState, in *jobio.Input) error {
 	if bs.RebuildPages >= bklimit.RebuildMaxPages {
+		r.noticeFailed(bs.Subject, "rebuild-page-cap", r.st.Notice(ctx, bs.Subject, "rebuild-page-cap", strconv.Itoa(bs.RebuildPages)+" pages merged"))
+		if err := r.st.RaiseAlert(ctx, bs.Subject, "rebuild-page-cap", "page", map[string]int64{"pages": int64(bs.RebuildPages)}); err != nil {
+			r.log.Error("raising an alert", "subject", bs.Subject, "code", "rebuild-page-cap", "err", clean(err.Error()))
+		}
 		return jobErr("internal", "the record's rebuild is above its page cap")
 	}
 	in.Repl = &jobio.ReplInput{Mode: "rebuild", KeyMarker: bs.RebuildKeyMarker, VersionMarker: bs.RebuildVersionMarker,

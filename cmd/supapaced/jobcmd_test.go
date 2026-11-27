@@ -11,6 +11,7 @@ import (
 
 	"github.com/Amphoze/supapace/internal/bkjob"
 	"github.com/Amphoze/supapace/internal/jobio"
+	"github.com/Amphoze/supapace/internal/pgsock"
 )
 
 // The fake tool: this test binary run as "pgbackrest" through a link. It
@@ -58,6 +59,7 @@ func newJobLab(t *testing.T, kind string) *jobLab {
 
 func runJob(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
+	keepToolEnv(t)
 	var out, errb bytes.Buffer
 	oldOut, oldErr := stdout, stderr
 	stdout, stderr = &out, &errb
@@ -132,5 +134,45 @@ func TestJobCmd_ExitCodes(t *testing.T) {
 	os.WriteFile(filepath.Join(l.tool, "exit"), []byte("0"), 0o600)
 	if code, out, _ := runJob(t, "push"); code != 0 || !strings.HasPrefix(out, `{"ok":true`) {
 		t.Errorf("a done push: exit %d, %q", code, out)
+	}
+}
+
+// keepToolEnv puts every PG* variable of this process back as it is now
+// when the test ends. The job command replaces them by the tool's options in
+// its own environment, and these tests run it in this process: what it sets
+// would otherwise stay for every later test of the package, and a command
+// that refuses such an environment before it opens the store would refuse.
+func keepToolEnv(t *testing.T) {
+	t.Helper()
+	saved := os.Environ()
+	t.Cleanup(func() {
+		for _, kv := range os.Environ() {
+			if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "PG") {
+				os.Unsetenv(k)
+			}
+		}
+		for _, kv := range saved {
+			if k, v, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "PG") {
+				os.Setenv(k, v)
+			}
+		}
+	})
+}
+
+// A test that ran the job command leaves no tool option in the environment.
+func TestJobCmd_TestsLeaveNoToolVariableBehind(t *testing.T) {
+	cleanPGEnv(t)
+	t.Run("a job", func(t *testing.T) {
+		newJobLab(t, "push")
+		t.Setenv(bkjob.PassName, "the-pass")
+		if code, _, errs := runJob(t, "push"); code != 0 {
+			t.Fatalf("exit %d: %s", code, errs)
+		}
+		if os.Getenv("PGBACKREST_STANZA") == "" {
+			t.Fatal("control: the job command set no tool option in this process")
+		}
+	})
+	if err := pgsock.CheckEnv(); err != nil {
+		t.Fatalf("after a test that ran the job command: %v", err)
 	}
 }

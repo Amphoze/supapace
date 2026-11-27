@@ -345,6 +345,9 @@ var severities = map[string]string{
 	"record-not-in-store": "warn", "restore-shortfall": "warn", "timeline-mismatch": "warn", "quarantine": "warn",
 	"backup-failed": "warn", "offsite-undeclared": "warn", "cp-quota-half": "warn", "repo-space-low": "warn",
 	"repo-quota-full": "warn", "fetch-too-large": "warn",
+	// a subject's record rebuild stopped at its page cap until an operator
+	// continues it: raised as an alert row as well, which is what pages
+	"rebuild-page-cap": "page",
 	// the fixed form of a row no document can carry
 	"unlisted-code": "page",
 }

@@ -117,7 +117,7 @@ func buildReplicateJob(ctx context.Context, r *Runner, j store.Job, in *jobio.In
 			return err
 		}
 		spec.MemMB = bklimit.ReplMemMB(rows)
-		return buildRebuild(bs, in)
+		return r.buildRebuild(ctx, bs, in)
 	}
 	now := r.now()
 	if bs.ReplPausedUntil != nil && now.Before(*bs.ReplPausedUntil) {

@@ -6122,3 +6122,116 @@ Known limits:
 - Tenants see 503 project_restarting for that adoption window on every daemon restart (about one
   to two seconds with a few projects; four adoptions run at a time). The drain is the deliberate
   fail-closed order of a start; whether a start may keep serving shown-contained projects is open.
+
+### 2026-11-27 — supapaced recover, escrow show|ack, offsite check, offsite rebuild-continue
+
+cmd/supapaced: recovercmd.go, escrowcmd.go, offsitecheck.go, offsiterebuild.go. Root only; exit 0
+done, 1 refused or stopped (one line on stderr, prefixed with the command's name), 2 usage.
+
+recover --escrow F [--escrow F2] [--worker-image-archive F] [--accept-shortfall]
+- Brings the control-plane database back from the escrow set and the object store, on a node
+  that holds none. Runs with nodecfg.Defaults(); a node.json left on the node is named in one
+  line and not read, except its uid range (where a surviving owner is looked for).
+- Refused before any write: a key part that is not the document's; a newer document or schema;
+  another control-plane image; a key file, sealed passphrase or declaration that is not the
+  document's (another key, or another endpoint, region, addressing style, CA, bucket or prefix
+  of the control plane); container sp-cp-db; a database at the old data path; a data directory
+  or repository that holds anything without the restore marker; /etc/supapace that is a link,
+  a file, another owner's or group/other writable; an executable that is not root's or no
+  supapace-arch beside it; the worker image absent, or of another id, without an archive.
+- Worker image: with an archive it is loaded when the image is absent or has another id, and
+  the id compared again; an inspection that fails otherwise is "could not be inspected".
+- Holds the daemon's lock (serve.lock) for the whole run: no daemon and no second recover.
+- Order: key 0400 with its marker, passphrase sealed, a partial declaration (the control
+  plane's bucket, read-only credential; the node's own full declaration of the same location
+  is kept); EnsureImageFiles; KillJobs("cp"); PrepareControlPlaneRestore;
+  SetReplicatorQuota(2 x repository quota); backup network; resolve and nft.InstallSet; jobs
+  1-4 of subject cp through Agent.RunJob: fetch (list_current, max_bytes and deadline from the
+  repository quota), seed, restore, serve beside EnsureControlPlaneRecovery(latest) until
+  promotion; the checks; Migrate, ListProjects, EnterNewEpoch once; KillJobs("cp");
+  FinishControlPlaneRestore; the report.
+- The restore job runs in mode standby with a target timeline: the highest fetched history
+  that is not above the newest fetched segment's timeline, else 1.
+- A fetched history of the timeline just above the newest fetched segment's stops the run
+  before the seed; no flag passes it. A node lost after its promotion's history was uploaded
+  and before a segment of that timeline leaves this state, and is refused like any other.
+- After promotion the newest history in the data directory (that of the new timeline N) must
+  name the timelines 1 to N-1, each once, in order, spelled as numbers; otherwise the run
+  stops as a denial. This is what judges which histories replay followed: the names the store
+  lists do not.
+- "Reached" is the segment holding the byte before that history's last switch point (16 MiB
+  segments). Reached below the fetch's newest segment by number, or no serve result: a
+  shortfall — exit 1, or accepted with the flag. Segment names in the store beyond what replay
+  reaches show as a shortfall, whatever put them there.
+- A recovery start that exits before promotion, a failed restore job, a fetch without a
+  segment, a promoted history out of order: a denial ("the store denies this recovery"); the
+  flag does not pass it. The message names the last request the serve job answered: what the
+  server asked for next is what could not be read.
+- The restored database's system identifier must be the document's incarnation.
+- Nothing is written to the restored database before all of these have passed.
+- Every line is scrubbed of the passphrase, the read-only pair and the key, and of any
+  beginning of one of at least 8 bytes.
+- SIGTERM, SIGINT or a closed output end the run "interrupted by a signal". A run that does
+  not finish removes the control plane's job containers and the recovery start and keeps the
+  marker; the next run starts from emptied trees. Every stop exits 1.
+- Report lines: "recovered point: set L, reached segment S, new epoch N"; "memberships,
+  session revocations and service keys are as of the recovered point"; per project that was
+  still being created (layout 2) "… what is under R/ below the projects bucket's prefix";
+  "next: run supapaced init, …".
+
+escrow show [--part kek|rest] / escrow ack
+- nodeEscrow(ctx, paths, cfg, key, store, at) builds the document from the node's state for
+  show, ack and any other reader; refused until the store is declared and the control plane's
+  stanza exists. A missing passphrase file is an error, never made.
+- show prints the whole document or one part on standard output.
+- ack prints the rest part unless its hash is the acknowledged one, refuses the null device,
+  and writes Paths.EscrowAcked() only after a display that succeeded: offsite.EscrowRestHash,
+  64 hex digits, no newline, 0600.
+
+openCPStore / dialCPStore (escrowcmd.go)
+- openCPStore: the control-plane database for a command run by hand; refuses an environment
+  with PG* variables and a node whose restore is marked ("finish supapaced recover first").
+  Used by escrow show, escrow ack and offsite rebuild-continue.
+- dialCPStore: the same without the marker's refusal; recover's own.
+
+offsite check
+- Resolve, nft.InstallSet, backup network, one probe job per bucket (kind probe, subject the
+  bucket's role, write pair then read pair, the other bucket's name only when it differs).
+- Record at Paths.OffsiteCheck(), 0600 by rename, and the same bytes on standard output:
+  {"at","endpoint","rows":[{"bucket","name","ok","detail"}]}. A probe without a result is one
+  row named "probe" with ok null; a refused result (unparsable, more than 32 rows, a malformed,
+  reserved or repeated name) or a failure document is "probe" with ok false. Details are
+  cleaned and cut to 256 bytes.
+- Exit 1 with "not passed: N of M rows are not ok" unless every row is true; the record is
+  written either way. Passed = every row true and the record's endpoint the declared one.
+- A signal stops the running probe and writes no record.
+
+offsite rebuild-continue --subject <ref|cp>
+- Store.ContinueRebuild(ctx, subject, bklimit.RebuildMaxPages): one statement sets the page
+  count to 0 for a subject at the cap whose record is not rebuilt for the epoch and returns
+  the old count; store.ErrConflict otherwise (also for a cap below 1), store.ErrNotFound for an
+  unknown subject. Then ClearAlert(subject, "rebuild-page-cap"). The markers stay.
+- internal/backup: a launch past the cap raises the notice rebuild-page-cap ("<n> pages
+  merged") and the alert of that code, severity page, figures {"pages": n}.
+- Store.EnterNewEpoch empties every subject's rebuild markers and page count.
+- store.SchemaVersion() is the schema version this build migrates to.
+
+Tests
+- The job command's tests put every PG* variable back (keepToolEnv); a test that opens the
+  store through openCPStore still clears them first (cleanPGEnv).
+- The fakes of a recovery bound their waits: a wrong ordering fails in a named test.
+
+Known limits
+- The check of the promoted history assumes this database's timelines arise one per recovery,
+  at the end of its archive. A tool that restores it to an earlier point must restate it.
+- The new epoch is the restored epoch plus one.
+- Agent.RunJob carries a launch through when its context ends during it, then stops and
+  removes the job.
+- recover killed outright (SIGKILL) leaves the recovery start and the serve job running; the
+  marker stays, a daemon start is refused on it, and the next recover run removes both.
+- Killed between the marker's removal and the report, the report is lost; the undone creates
+  are the projects left aborted with an off-site purge due.
+- Two offsite checks at once remove each other's probe; both end "not passed".
+- The quotas and the ruleset are the defaults' until the daemon's first start.
+- The version the escrow document names is fixed unless the build sets main.supapacedVersion.
+- A store that leaves objects out of its listings offers an older state unseen.

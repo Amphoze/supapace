@@ -150,3 +150,47 @@ func TestRunJob_FetchDirAbsentIsMadeNotRefused(t *testing.T) {
 		t.Fatalf("%d runs", len(e.runs()))
 	}
 }
+
+// A context that ends while a job is being launched: Docker's client, killed
+// then, leaves the launch to its daemon, which may make the container after
+// the launcher has looked for it. The launch is therefore carried through,
+// and the job stopped and removed as any running job.
+func TestRunJob_AContextThatEndsDuringTheLaunchLeavesNoContainer(t *testing.T) {
+	e := newJobEnv(t)
+	name := "job-" + testRef + "-serve"
+	s := e.m.script(name)
+	s.polls, s.stdout = -1, `{"ok":true,"served":0}`+"\n"
+	ctx, cancel := context.WithCancel(context.Background())
+	inner := dockerRun
+	var late []string // a launch whose client was killed: made once the launcher has removed nothing
+	dockerRun = func(c context.Context, args ...string) (string, error) {
+		switch {
+		case len(args) > 1 && args[0] == "run":
+			cancel() // the signal arrives as the client starts
+			if err := c.Err(); err != nil {
+				late = args
+				return "", err
+			}
+		case len(args) > 0 && args[0] == "rm" && late != nil:
+			out, err := inner(c, args...)
+			inner(context.Background(), late...)
+			late = nil
+			return out, err
+		}
+		return inner(c, args...)
+	}
+	t.Cleanup(func() { dockerRun = inner })
+	res, err := e.a.RunJob(ctx, e.spec(t, "serve", testRef, 9))
+	if !e.gone(name) {
+		t.Fatalf("the job's container is left (result %+v, %v)", res, err)
+	}
+	if stops := e.f.argv("stop"); len(stops) != 1 {
+		t.Fatalf("the launched job was not stopped: %q", stops)
+	}
+	if err != nil || string(res.Result) != `{"ok":true,"served":0}` {
+		t.Fatalf("result %q, %v", res.Result, err)
+	}
+	if ents, _ := os.ReadDir(e.a.p.JobsDir()); len(ents) != 0 {
+		t.Fatalf("job files left: %v", ents)
+	}
+}

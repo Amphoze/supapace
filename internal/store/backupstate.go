@@ -778,3 +778,34 @@ func (s *Store) RepoQuotaTotals(ctx context.Context) (sumMB int64, maxMB int, er
 		from project where state not in ('purged', 'aborted')`).Scan(&sumMB, &maxMB)
 	return sumMB, maxMB, wrap(err)
 }
+
+// ContinueRebuild lets a record's rebuild that stopped at its page cap go on
+// for another maxPages pages: one statement sets the subject's page count to
+// 0 where its record is not rebuilt for the current epoch and the count is at
+// least maxPages, and returns the count it replaced. The markers and every
+// other column stay, so the rebuild continues where it stopped. No such row
+// is ErrConflict (the subject is not at the cap, or its record is rebuilt),
+// an unknown subject ErrNotFound.
+func (s *Store) ContinueRebuild(ctx context.Context, subject string, maxPages int) (pages int, err error) {
+	if maxPages < 1 {
+		return 0, fmt.Errorf("%w: a page cap of %d", ErrConflict, maxPages)
+	}
+	var known bool
+	// The old count is read by the same statement that replaces it.
+	err = s.pool.QueryRow(ctx, `with old as (select subject, rebuild_pages from backup_state where subject = $1 for update),
+		reset as (update backup_state b set rebuild_pages = 0 from old where b.subject = old.subject
+			and b.rebuild_epoch < (select epoch from cp_meta) and old.rebuild_pages >= $2 returning old.rebuild_pages)
+		select exists (select 1 from old), coalesce((select rebuild_pages from reset), -1)`, subject, maxPages).Scan(&known, &pages)
+	switch {
+	case err != nil:
+		return 0, wrap(err)
+	case !known:
+		return 0, ErrNotFound
+	case pages < 0:
+		return 0, fmt.Errorf("%w: the rebuild of %s is not stopped at its page cap", ErrConflict, subject)
+	}
+	return pages, nil
+}
+
+// SchemaVersion is the schema version this build migrates a database to.
+func SchemaVersion() int { return schemaVersion }

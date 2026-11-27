@@ -3,10 +3,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Amphoze/supapace/internal/bklimit"
 )
 
 // A row rebuilt from a listing that gave no version id has no stored version:
@@ -146,4 +149,126 @@ func TestRecordUploads_InfoInTheSameJobListsTheSet(t *testing.T) {
 		t.Fatalf("sets = %+v", sets)
 	}
 	timeIs(t, "listed_at", sets[0].ListedAt, at)
+}
+
+// bsRebuildAt gives subject's row an unfinished rebuild: its markers and page count.
+func bsRebuildAt(t *testing.T, s *Store, subject, key, version string, pages int) {
+	t.Helper()
+	sqlExec(t, s, `update backup_state set rebuild_key_marker = $2, rebuild_version_marker = $3, rebuild_pages = $4
+		where subject = $1`, subject, key, version, pages)
+}
+
+// bsRowText is every column of subject's backup_state row, as text.
+func bsRowText(t *testing.T, s *Store, subject string) string {
+	t.Helper()
+	var row string
+	must(t, s.pool.QueryRow(context.Background(), "select b::text from backup_state b where subject = $1", subject).Scan(&row))
+	return row
+}
+
+func TestEnterNewEpoch_RestartsAnyRebuildFromTheFirstPage(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	r1, _ := bsProject(t, s, 1)
+	r2, _ := bsProject(t, s, 2)
+	must(t, s.EnsureBackupState(ctx, "cp"))
+	// As restored: an earlier rebuild was under way for two subjects.
+	bsRebuildAt(t, s, r1, "archive/x/17-1/0000000100000000/k", "v7", 3)
+	bsRebuildAt(t, s, "cp", "backup/cp-1/backup.info", "v2", bklimit.RebuildMaxPages)
+	untouched := bsRowText(t, s, r2)
+
+	// The clearing is part of the one transaction: a failure of its last
+	// statement leaves the markers as they were.
+	sqlExec(t, s, `create function sp_fail() returns trigger language plpgsql as $$ begin raise exception 'forced'; end $$`)
+	sqlExec(t, s, "create trigger sp_fail before update of slot_op on project for each statement execute function sp_fail()")
+	if _, err := s.EnterNewEpoch(ctx, 0); err == nil {
+		t.Fatal("the forced failure did not fail the call")
+	}
+	if b := bsState(t, s, r1); b.RebuildKeyMarker == "" || b.RebuildVersionMarker != "v7" || b.RebuildPages != 3 {
+		t.Fatalf("a failed transaction changed the markers: %+v", b)
+	}
+	sqlExec(t, s, "drop trigger sp_fail on project")
+
+	epoch, err := s.EnterNewEpoch(ctx, 0)
+	must(t, err)
+	for _, subject := range []string{r1, "cp"} {
+		b := bsState(t, s, subject)
+		if b.RebuildKeyMarker != "" || b.RebuildVersionMarker != "" || b.RebuildPages != 0 {
+			t.Fatalf("%s after the new epoch: markers %q %q, pages %d", subject, b.RebuildKeyMarker, b.RebuildVersionMarker, b.RebuildPages)
+		}
+		if b.RebuildEpoch >= epoch {
+			t.Fatalf("%s: rebuild_epoch %d is not below the new epoch %d", subject, b.RebuildEpoch, epoch)
+		}
+	}
+	if got := bsRowText(t, s, r2); got != untouched {
+		t.Fatalf("a row without a rebuild changed:\n%s\n%s", untouched, got)
+	}
+}
+
+func TestContinueRebuild_ResetsOnlyTheCountOfASubjectAtTheCap(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	r1, _ := bsProject(t, s, 1)
+	r2, _ := bsProject(t, s, 2)
+	const cap = 8
+	bsRebuildAt(t, s, r1, "k1", "v1", cap+3)
+	bsRebuildAt(t, s, r2, "k2", "v2", cap+3)
+	other := bsRowText(t, s, r2)
+	before := bsState(t, s, r1)
+
+	pages, err := s.ContinueRebuild(ctx, r1, cap)
+	must(t, err)
+	if pages != cap+3 {
+		t.Fatalf("pages replaced %d, want %d", pages, cap+3)
+	}
+	after := bsState(t, s, r1)
+	if after.RebuildPages != 0 {
+		t.Fatalf("pages %d after the reset", after.RebuildPages)
+	}
+	after.RebuildPages = before.RebuildPages
+	if fmt.Sprintf("%+v", after) != fmt.Sprintf("%+v", before) {
+		t.Fatalf("another column changed:\n%+v\n%+v", before, after)
+	}
+	if got := bsRowText(t, s, r2); got != other {
+		t.Fatalf("another subject's row changed:\n%s\n%s", other, got)
+	}
+	// Reset once: the subject is no longer at the cap.
+	if _, err := s.ContinueRebuild(ctx, r1, cap); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a second reset: %v", err)
+	}
+}
+
+func TestContinueRebuild_Refusals(t *testing.T) {
+	s := newStore(t, testConfig())
+	ctx := context.Background()
+	r, _ := bsProject(t, s, 1)
+	const cap = 8
+	refused := func(what, subject string, want error) {
+		t.Helper()
+		before := ""
+		if want != ErrNotFound {
+			before = bsRowText(t, s, subject)
+		}
+		if n, err := s.ContinueRebuild(ctx, subject, cap); !errors.Is(err, want) || n != 0 {
+			t.Fatalf("%s: %d, %v; want %v", what, n, err, want)
+		}
+		if want != ErrNotFound && bsRowText(t, s, subject) != before {
+			t.Fatalf("%s: the row changed", what)
+		}
+	}
+	bsRebuildAt(t, s, r, "k", "v", cap-1)
+	refused("one page below the cap", r, ErrConflict)
+	// At the cap, but the record is rebuilt for the epoch: nothing is stuck.
+	bsRebuildAt(t, s, r, "k", "v", cap)
+	sqlExec(t, s, "update backup_state set rebuild_epoch = (select epoch from cp_meta) where subject = $1", r)
+	refused("a record already rebuilt", r, ErrConflict)
+	refused("an unknown subject", ref(9), ErrNotFound)
+	// Control: the same row, its record behind the epoch, is reset.
+	sqlExec(t, s, "update backup_state set rebuild_epoch = 0 where subject = $1", r)
+	if n, err := s.ContinueRebuild(ctx, r, cap); err != nil || n != cap {
+		t.Fatalf("control: %d, %v", n, err)
+	}
+	if _, err := s.ContinueRebuild(ctx, r, 0); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a cap of 0 must never match: %v", err)
+	}
 }

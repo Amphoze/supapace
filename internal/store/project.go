@@ -439,7 +439,8 @@ const recoveredError = "recovered: the node was recovered while this operation w
 // purge back to pending, every other purge as it is (destroying a deleted
 // project's keys stays an obligation); every provisioning project aborted
 // with its slice released and its off-site prefix marked for purging; every
-// slot freed. It returns the new epoch.
+// subject's rebuild markers emptied and its page count set to 0; every slot
+// freed. It returns the new epoch.
 func (s *Store) EnterNewEpoch(ctx context.Context, uidFloor int) (epoch int64, err error) {
 	err = s.tx(ctx, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, "update cp_meta set epoch = epoch + 1 returning epoch").Scan(&epoch); err != nil {
@@ -457,6 +458,9 @@ func (s *Store) EnterNewEpoch(ctx context.Context, uidFloor int) (epoch int64, e
 			{"update operation set state = 'pending', updated_at = now() where kind = 'purge' and state = 'running'", nil},
 			{"update backup_state set offsite_purge = true where subject in (select ref from project where state = 'provisioning')", nil},
 			{"update project set state = 'aborted', subnet_index = null where state = 'provisioning'", nil},
+			// A rebuild always starts from the first page of the new epoch: markers a
+			// restored row kept would skip the keys before them.
+			{"update backup_state set rebuild_key_marker = '', rebuild_version_marker = '', rebuild_pages = 0", nil},
 			{"update project set slot_op = null where slot_op is not null", nil}, // kept last
 		} {
 			if _, err := tx.Exec(ctx, st.q, st.args...); err != nil {

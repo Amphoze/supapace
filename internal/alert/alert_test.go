@@ -166,7 +166,8 @@ func TestDocument_HasNoTextMember(t *testing.T) {
 func TestCodes_SeverityTable(t *testing.T) {
 	page := "schedule-failed fleet-pusher-lag repository-damaged spool-dropped full-failing clock-jump " +
 		"offsite-marker-unexpected offsite-purge-refused rekey-pending pooler-memory pooler-ended orphan-tenant " +
-		"tenant-row-drift allow-list-node-address"
+		"tenant-row-drift allow-list-node-address " +
+		"rebuild-page-cap" // a backup notice too; it pages through its alert row
 	warn := "test schedule-stale-list schedule-set-mismatch disk-half disk-soft pusher-lag replication-lag " +
 		"expire-held canary-failed offsite-expire-undeclared offsite-expire-failed offsite-unrecorded " +
 		"offsite-retention-exceeded offsite-purge-pending orphan-container orphan-network orphan-directory " +
