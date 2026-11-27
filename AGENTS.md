@@ -6111,3 +6111,14 @@ Known limits:
 - Every write walks the project's tree (about 80 ms at 2,000 entries).
 - Favourites are not stored; the folder PATCH changes nothing.
 - Unit tests: studio/build.sh test (member-store.test.ts, member-store.hostile.test.ts).
+
+### 2026-11-27 — reach: "served" means the gateway's current route generation
+
+- reach: a 200 through the gateway is no proof of the current routes. After a daemon start the
+  routes are drained, then re-activated per project about a second later, and the gateway reads
+  the route file once a second. `gatewayCurrent` (the file shows the projects active and the
+  gateway's /-/health reports that generation or later) gates `cpBack` and `waitServed`.
+- New test TestControlPlane_BackMeansServedAfterADaemonRestart: restart, cpBack, then 3 s of 200s.
+- Tenants see 503 project_restarting for that adoption window on every daemon restart (about one
+  to two seconds with a few projects; four adoptions run at a time). The drain is the deliberate
+  fail-closed order of a start; whether a start may keep serving shown-contained projects is open.

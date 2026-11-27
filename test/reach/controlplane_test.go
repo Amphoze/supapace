@@ -81,6 +81,9 @@ func cpBack(t testing.TB, within time.Duration) {
 			}
 			// After a restart of the daemon a project answers 503 until it is
 			// adopted again: the tests that follow need both fixtures serving.
+			if err := gatewayCurrent(t, *fixA, *fixB); err != nil {
+				return err
+			}
 			for _, p := range []Project{*fixA, *fixB} {
 				resp, err := gatewayRoundTrip(t, p, "GET", whoamiPath, hdr("apikey", p.AnonKey), nil, netip.Addr{})
 				if err != nil {
@@ -439,4 +442,31 @@ func cpID(t testing.TB) string {
 		return ""
 	}
 	return strings.TrimSpace(r.stdout)
+}
+
+// cpBack after a restart of the daemon returns only once the gateway serves
+// the new daemon's routes: for three seconds after it both fixture projects
+// answer 200 through the gateway, every request. A route table the gateway
+// still held from before the restart does not count as back: the new daemon
+// drains every route at its start and the gateway reads the file once a
+// second.
+func TestControlPlane_BackMeansServedAfterADaemonRestart(t *testing.T) {
+	if os.Getenv("SUPAPACE_HOST") == "1" {
+		t.Skip("test node only: the daemon is restarted through the harness's hold")
+	}
+	cpBack(t, time.Minute) // control: both served before the restart
+	release := holdDaemon(t)
+	release()
+	cpBack(t, 3*repairWait)
+	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		for _, p := range []Project{*fixA, *fixB} {
+			resp, err := gatewayRoundTrip(t, p, "GET", whoamiPath, hdr("apikey", p.AnonKey), nil, netip.Addr{})
+			if err != nil {
+				t.Fatalf("%s after cpBack: %s", p.Ref, errText(err))
+			}
+			if resp.StatusCode != 200 {
+				t.Fatalf("%s after cpBack: %s", p.Ref, describe(resp))
+			}
+		}
+	}
 }

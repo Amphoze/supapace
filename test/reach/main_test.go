@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/Amphoze/supapace/internal/jwtx"
+	"github.com/Amphoze/supapace/internal/routes"
 )
 
 // TestMain resets the node (drift hold, failpoint, our tables, scratch
@@ -302,9 +304,42 @@ func loadIssuer(ref string) (*rsa.PrivateKey, error) {
 	return priv, nil
 }
 
-// waitServed waits up to 60 s for p's whoami() to answer through the gateway
-// both "anon" for p's anon key and "authenticated" for a token of p's issuer
-// (which shows the kept issuer key is the one the project trusts).
+// gatewayCurrent is nil when the route file shows every one of ps active and
+// the gateway has loaded that file's generation (or a later one). A 200 from
+// a gateway still holding an older table proves nothing about the routes now:
+// a daemon drains every route at its start, and the gateway reads the file
+// once a second.
+func gatewayCurrent(t testing.TB, ps ...Project) error {
+	b, err := os.ReadFile(filepath.Join(paths.GatewayDir(), "routes.json"))
+	if err != nil {
+		return err
+	}
+	f, err := routes.Parse(b)
+	if err != nil {
+		return err
+	}
+	for _, p := range ps {
+		if s := f.Projects[p.Ref].State; s != "active" {
+			return fmt.Errorf("%s's route is %q", p.Ref, s)
+		}
+	}
+	resp, err := gatewayRoundTrip(t, ps[0], "GET", "/-/health", nil, nil, netip.Addr{})
+	if err != nil {
+		return err
+	}
+	var health struct {
+		Generation int64 `json:"generation"`
+	}
+	if err := json.Unmarshal(bodyOf(resp), &health); err != nil || health.Generation < f.Generation {
+		return fmt.Errorf("the gateway serves route generation %d, the file is at %d (%v)", health.Generation, f.Generation, err)
+	}
+	return nil
+}
+
+// waitServed waits up to 60 s until the gateway serves the current routes
+// (gatewayCurrent) and p's whoami() answers through it both "anon" for p's
+// anon key and "authenticated" for a token of p's issuer (which shows the
+// kept issuer key is the one the project trusts).
 func waitServed(t testing.TB, p Project) {
 	deadline := time.Now().Add(time.Minute)
 	for _, c := range []struct{ auth, role string }{{"", "anon"}, {"Bearer " + p.UserToken("authenticated", nil), "authenticated"}} {
@@ -315,7 +350,11 @@ func waitServed(t testing.TB, p Project) {
 			if c.auth != "" {
 				h.Set("Authorization", c.auth)
 			}
-			resp, err := gatewayRoundTrip(t, p, "GET", whoamiPath, h, nil, netip.Addr{})
+			var resp *http.Response
+			err := gatewayCurrent(t, p)
+			if err == nil {
+				resp, err = gatewayRoundTrip(t, p, "GET", whoamiPath, h, nil, netip.Addr{})
+			}
 			switch {
 			case err != nil:
 				last = errText(err)
