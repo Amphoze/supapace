@@ -103,9 +103,18 @@ func TestLimits_StudioJSON(t *testing.T) {
 	const want = `{"socket_call_ms":1000,"slot_wait_ms":10000,"meta_call_ms":57000,"handover_ms":32000,` +
 		`"result_bytes":8388608,"instance_calls":4,"project_calls":2,"project_waiting":32,"parser_slots":1,` +
 		`"resolve_memory_s":60,"resolve_disk_days":7,"snippet_bytes":67108864,"snippet_entries":2000,` +
-		`"audit_file_bytes":8388608}`
+		`"audit_file_bytes":8388608,"meta_body_bytes":3145728}`
 	if got := Limits.StudioJSON(); got != want {
 		t.Fatalf("StudioJSON =\n%s\nwant\n%s", got, want)
+	}
+	// The body bound Studio is given is the one postgres-meta is given: one figure, rendered twice.
+	l := Limits
+	l.MetaBodyMB = 4
+	if got := l.StudioJSON(); !strings.HasSuffix(got, `,"meta_body_bytes":4194304}`) {
+		t.Errorf("with postgres-meta's body limit at 4 MiB, StudioJSON ends %q", got[len(got)-40:])
+	}
+	if env := strings.Join(PgMetaEnv(l), " "); !strings.Contains(env, "PG_META_MAX_BODY_LIMIT_MB=4") {
+		t.Errorf("PgMetaEnv with the limit at 4: %s", env)
 	}
 }
 
@@ -208,7 +217,7 @@ func TestStudioEnv_IsTheFixedSetPlusWhatTheImageMayDeclare(t *testing.T) {
 	}
 	// SUPAPACE_LIMITS is valid JSON.
 	var m map[string]int64
-	if err := json.Unmarshal([]byte(Limits.StudioJSON()), &m); err != nil || len(m) != 14 {
+	if err := json.Unmarshal([]byte(Limits.StudioJSON()), &m); err != nil || len(m) != 15 {
 		t.Fatalf("StudioJSON: %v %d", err, len(m))
 	}
 }

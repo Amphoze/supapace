@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:49:00 +0000
+Subject: [PATCH] query: the record of what is sent to a project's database
+
+One line per statement or type generation, in a file of the project on the server's data
+volume: the time, the project, who asked and in which role, the login used, the kind, and for
+a statement the SHA-256 of its text. The line is JSON with a fixed order of members, so no
+value can end a line or add a member; it is refused when its reader would not take it. It is
+appended and flushed before its writer returns, one write at a time per project; a line that
+would take the file past its bound moves the file to a single older generation first. When
+the line is not on the volume the writer throws 503 audit_unavailable.
+---
+ apps/studio/lib/api/self-hosted/audit.test.ts | 192 ++++++++++++++++++
+ apps/studio/lib/api/self-hosted/audit.ts      | 122 +++++++++++
+ 2 files changed, 314 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/audit.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/audit.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/audit.test.ts b/apps/studio/lib/api/self-hosted/audit.test.ts
+new file mode 100644
+index 00000000..07044bb8
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/audit.test.ts
+@@ -0,0 +1,192 @@
++// SPDX-License-Identifier: Apache-2.0
++// The audit file: what a line is, what a value can do to it, when it rolls, and what racing
++// writes leave. That a statement is on record before it is sent is the wrapper's test.
++import { createHash } from 'node:crypto'
++import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join, resolve as resolvePath } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const VECTORS = resolvePath(import.meta.dirname, '../../../../../vectors')
++const LIMITS = JSON.parse(readFileSync(join(VECTORS, 'limits.json'), 'utf8'))
++const T = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/
++const RW = 'postgres'
++const ref = (n: number) => `project${String(n).padStart(13, '0')}`
++const sha = (text: string) => createHash('sha256').update(text).digest('hex')
++
++describe('api/self-hosted/audit', () => {
++  let dir: string
++  let data: string
++  async function load(limits: object = {}) {
++    vi.stubEnv('SUPAPACE_LIMITS', JSON.stringify({ ...LIMITS, ...limits }))
++    vi.resetModules()
++    return import('./audit')
++  }
++  const lines = (n: number, name = 'audit.log') =>
++    readFileSync(join(data, ref(n), name), 'utf8')
++      .split('\n')
++      .filter((line) => line !== '')
++
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), 'audit-'))
++    data = join(dir, 'data')
++    vi.stubEnv('SUPAPACE_DASH_DATA', data)
++    vi.spyOn(console, 'error').mockImplementation(() => {})
++  })
++  afterEach(() => {
++    vi.unstubAllEnvs()
++    vi.restoreAllMocks()
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  it('a line torn by a crash does not take the next record with it', async () => {
++    const { writeAudit } = await load()
++    const record = (sub: string) => ({
++      ref: ref(1),
++      iss: 'https://issuer.test',
++      sub,
++      role: 'owner',
++      login: RW,
++      kind: 'query' as const,
++    })
++    await writeAudit(record('before'))
++    // an append that the machine did not finish: a part of a line, and no line end
++    const { appendFileSync } = await import('node:fs')
++    appendFileSync(join(data, ref(1), 'audit.log'), '{"t":"2026-11-27T10:00:00.000Z","ref":"proj')
++    await writeAudit(record('after'))
++    await writeAudit(record('last'))
++    const text = readFileSync(join(data, ref(1), 'audit.log'), 'utf8')
++    const whole = lines(1).flatMap((line) => {
++      try {
++        return [JSON.parse(line).sub]
++      } catch {
++        return ['(torn)']
++      }
++    })
++    // the fragment is a line of its own, and every record after it is read
++    expect(whole).toEqual(['before', '(torn)', 'after', 'last'])
++    // and nothing is added to a file that ends as it should
++    expect(text.includes('\n\n')).toBe(false)
++  })
++
++  const odd = [
++    'plain',
++    'two\nlines',
++    'a\r\nb',
++    '{"t":"x","ref":"y"}',
++    '","role":"owner","x":"',
++    'back\\slash and "quotes"',
++    'controls \u0000\u0001\u001f\u007f',
++    'separators \u2028\u2029 and \ud83d\ude00 and a lone \ud800',
++    ' ',
++    'x'.repeat(255),
++  ]
++  it(
++    'writes one line per record, from which exactly the record is read again',
++    { timeout: 60_000 },
++    async () => {
++      const { writeAudit, MAX_LINE_BYTES } = await load()
++      const base = {
++        ref: ref(1),
++        role: 'owner',
++        login: RW,
++        kind: 'query' as const,
++      }
++      const records = odd.flatMap((value, i) => [
++        {
++          ...base,
++          iss: value,
++          sub: odd[(i + 1) % odd.length],
++          sql_sha256: sha(value),
++        },
++        { ...base, iss: 'i', sub: value, role: value, login: value },
++      ])
++      for (const record of records) await writeAudit(record)
++      const text = readFileSync(join(data, ref(1), 'audit.log'), 'utf8')
++      expect(text.endsWith('\n')).toBe(true)
++      const lines = text.slice(0, -1).split('\n')
++      expect(lines).toHaveLength(records.length)
++      lines.forEach((line, i) => {
++        const { t, ...read } = JSON.parse(line)
++        expect(read).toEqual(records[i])
++        expect(t).toMatch(T)
++        expect(Buffer.byteLength(line)).toBeLessThanOrEqual(MAX_LINE_BYTES)
++        // no byte of a line is a control byte: a reader of lines sees one line
++        expect(/[\u0000-\u001f]/.test(line)).toBe(false)
++      })
++    }
++  )
++
++  it('refuses a record its reader would not take, and one that names no project', async () => {
++    const { writeAudit } = await load()
++    const good = {
++      ref: ref(1),
++      iss: 'i',
++      sub: 's',
++      role: 'owner',
++      login: RW,
++      kind: 'query' as const,
++    }
++    const refused = { status: 503, code: 'audit_unavailable' }
++    const bad: object[] = [
++      { ...good, sub: 'x'.repeat(4096) },
++      // every control byte takes six bytes in a line
++      { ...good, sub: '\u0001'.repeat(700) },
++      { ...good, sub: 7 },
++      { ...good, iss: { a: 1 } },
++      { ...good, iss: undefined },
++      { ...good, sql_sha256: 7 },
++      { ...good, ref: '../../../outside' },
++      { ...good, ref: `${ref(1)}/..` },
++      { ...good, ref: ref(1).toUpperCase() },
++      { ...good, ref: '' },
++    ]
++    for (const record of bad) {
++      await expect(writeAudit(record as never)).rejects.toMatchObject(refused)
++    }
++    expect(existsSync(data)).toBe(false)
++    expect(readdirSync(dir)).toEqual([])
++    // control
++    await writeAudit(good)
++    expect(lines(1)).toHaveLength(1)
++    // and without a data directory nothing is written anywhere
++    vi.stubEnv('SUPAPACE_DASH_DATA', 'relative/data')
++    await expect(writeAudit(good)).rejects.toMatchObject(refused)
++    delete process.env.SUPAPACE_DASH_DATA
++    await expect(writeAudit(good)).rejects.toMatchObject(refused)
++  })
++
++  it(
++    'writes that race a roll leave whole lines, in two files, and lose none',
++    { timeout: 60_000 },
++    async () => {
++      // 60 records of 200 bytes and a bound of 8,000: one roll, whoever is first
++      const { writeAudit } = await load({ audit_file_bytes: 8000 })
++      const record = (i: number) => ({
++        ref: ref(1),
++        iss: 'https://issuer.test',
++        sub: `member-${String(i).padStart(3, '0')}`,
++        role: 'owner',
++        login: RW,
++        kind: 'query' as const,
++        sql_sha256: sha(String(i)),
++      })
++      const other = Array.from({ length: 20 }, (_, i) => writeAudit({ ...record(i), ref: ref(2) }))
++      await Promise.all([...Array.from({ length: 60 }, (_, i) => writeAudit(record(i))), ...other])
++      const dir = join(data, ref(1))
++      expect(readdirSync(dir).sort()).toEqual(['audit.log', 'audit.log.1'])
++      const all = [...lines(1, 'audit.log.1'), ...lines(1)]
++      // every record once, each line whole, in the order the writes were asked for
++      expect(all.map((l) => JSON.parse(l).sub)).toEqual(
++        Array.from({ length: 60 }, (_, i) => record(i).sub)
++      )
++      for (const name of ['audit.log', 'audit.log.1']) {
++        expect(statSync(join(dir, name)).size).toBeLessThanOrEqual(8000)
++        expect(readFileSync(join(dir, name), 'utf8').endsWith('}\n')).toBe(true)
++      }
++      // the other project's writes went to its own file, which did not roll
++      expect(readdirSync(join(data, ref(2)))).toEqual(['audit.log'])
++      expect(lines(2)).toHaveLength(20)
++    }
++  )
++})
+diff --git a/apps/studio/lib/api/self-hosted/audit.ts b/apps/studio/lib/api/self-hosted/audit.ts
+new file mode 100644
+index 00000000..46247a04
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/audit.ts
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: Apache-2.0
++// The dashboard's record of what it sends to a project's database: one line per statement or
++// type generation, in a file of the project on the server's data volume, written and flushed
++// before the request leaves. A statement that is not on record is not sent: when the line
++// cannot be written, the caller is refused.
++//
++// A line is one JSON object, its members in this order, each a text:
++//   {"t","ref","iss","sub","role","login","kind","sql_sha256"}
++// `t` is the time in UTC with milliseconds; `kind` is `query` or `typegen`; `sql_sha256` is the
++// hex SHA-256 of the statement's text and is absent for `typegen`. JSON leaves no line end, no
++// control byte and no quote of a value unescaped, so a value cannot end its line or forge a
++// member. The file is `<data>/<ref>/audit.log`; before a line would take it past
++// `audit_file_bytes` it becomes `audit.log.1`, replacing the one before.
++
++import { constants } from 'node:fs'
++import { mkdir, open, rename } from 'node:fs/promises'
++import { isAbsolute, join } from 'node:path'
++
++import { limits } from './limits'
++import { ProjectError } from './project-context'
++
++export type AuditRecord = {
++  ref: string
++  iss: string
++  sub: string
++  role: string
++  login: string
++  kind: 'query' | 'typegen'
++  sql_sha256?: string
++}
++
++/** A line, without its line end, is at most this long: what the audit's reader takes for a record. */
++export const MAX_LINE_BYTES = 4096
++
++const REF = /^[a-z0-9]{20}$/
++const { O_RDWR, O_APPEND, O_CREAT, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_DIRECTORY } = constants
++
++const unavailable = () =>
++  new ProjectError(503, 'audit_unavailable', 'The audit record could not be written')
++
++/** One line appended to the project's file and flushed; the file rolled first when it is full. */
++async function append(dir: string, line: Buffer) {
++  await mkdir(dir, { recursive: true, mode: 0o700 })
++  const file = join(dir, 'audit.log')
++  for (let rolled = false; ; rolled = true) {
++    // never through a link, and never waiting on what is no file: a flush of such a thing fails
++    const fh = await open(file, O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
++    try {
++      const { size } = await fh.stat()
++      if (!rolled && size > 0 && size + line.length > limits().audit_file_bytes) {
++        await rename(file, `${file}.1`)
++        continue
++      }
++      try {
++        // a file that does not end in a line end holds a part of a line, left by a write the
++        // machine did not finish: this record begins a line of its own
++        const torn = size > 0 && (await fh.read(Buffer.alloc(1), 0, 1, size - 1)).buffer[0] !== 0x0a
++        await fh.appendFile(torn ? Buffer.concat([Buffer.from('\n'), line]) : line)
++        await fh.sync()
++      } catch (error) {
++        // a part of a line must not stay: the next record would be read as its end
++        await fh.truncate(size).catch(() => {})
++        throw error
++      }
++      if (size === 0) {
++        // a new file: its name is flushed too
++        const dh = await open(dir, O_RDONLY | O_DIRECTORY)
++        await dh.sync().finally(() => dh.close())
++      }
++      return
++    } finally {
++      await fh.close()
++    }
++  }
++}
++
++// One write at a time per project: a line is whole before the next begins, and a roll moves a
++// file no line is being written to.
++const tails = new Map<string, Promise<void>>()
++
++/**
++ * Writes the record, with the time, and returns when it is flushed. Throws `503
++ * audit_unavailable` when it is not on the volume: the caller sends nothing then.
++ */
++export async function writeAudit(record: AuditRecord): Promise<void> {
++  const { ref, iss, sub, role, login, kind, sql_sha256 } = record
++  const data = process.env.SUPAPACE_DASH_DATA
++  const line = Buffer.from(
++    JSON.stringify({
++      t: new Date().toISOString(),
++      ref,
++      iss,
++      sub,
++      role,
++      login,
++      kind,
++      sql_sha256,
++    }) + '\n'
++  )
++  const texts = [ref, iss, sub, role, login, kind, sql_sha256 ?? ''].every(
++    (s) => typeof s === 'string'
++  )
++  if (!texts || !REF.test(ref) || !data || !isAbsolute(data) || line.length - 1 > MAX_LINE_BYTES) {
++    throw unavailable()
++  }
++  const written = (tails.get(ref) ?? Promise.resolve()).then(() => append(join(data, ref), line))
++  const tail = written.then(
++    () => {},
++    () => {}
++  )
++  tails.set(ref, tail)
++  void tail.then(() => tails.get(ref) === tail && tails.delete(ref))
++  try {
++    await written
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException)?.code
++    console.error(
++      `supapace: the audit record of ${ref} could not be written (${typeof code === 'string' && /^[A-Z0-9_]{1,32}$/.test(code) ? code : 'error'})`
++    )
++    throw unavailable()
++  }
++}

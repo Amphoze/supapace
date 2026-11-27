@@ -199,11 +199,13 @@ logged
 # project, none of the process. That the marks are in the process and that the search finds
 # them is the control: no route answers one, so each is planted — read from the container's
 # environment as a process started in it sees it, and appended to a page the server answered.
-PLANTED='spmarkurl spmarkPassword spmarkpghost spmarkdb spmarkmeta'
+PLANTED='spmarkurl spmarkPassword spmarkpghost spmarkdb'
 studio -e SUPABASE_URL=http://spmarkurl -e POSTGRES_PASSWORD=spmarkPassword \
-  -e POSTGRES_HOST=spmarkpghost -e POSTGRES_DB=spmarkdb -e STUDIO_PG_META_URL=http://spmarkmeta ||
+  -e POSTGRES_HOST=spmarkpghost -e POSTGRES_DB=spmarkdb ||
   { echo "manifest.sh: the server did not restart" >&2; exit 1; }
-marked() { grep -i -c -e spmark -e '10\.212\.' "$1"; }
+# a marked value, the wire proxy's address, or the address of a postgres-meta instance
+META_ADDRS=$(printf '%s' "$META" | sed 's/http:\/\///g; s/:8080//g; s/\./\\./g; s/,/\\|/g')
+marked() { grep -i -c -e spmark -e '10\.212\.' -e "$META_ADDRS" "$1"; }
 own
 curl -s --path-as-is -m 60 -o "$T/page" "$U/project/$A" -H "X-Supapace-Assertion: $TOKEN" -H 'Accept: text/html'
 docker exec "$PREFIX-studio" node -e 'for (const [k, v] of Object.entries(process.env)) console.log(k + "=" + v)' >"$T/env"
@@ -212,7 +214,7 @@ for m in $PLANTED; do
   { cat "$T/page" && grep -F -- "$m" "$T/env"; } >"$T/planted"
   [ "$(marked "$T/planted")" -gt 0 ] && n=$((n + 1))
 done
-put 'a marked value of the process, planted in a page: the search finds it (control)' "$n of 5, the page alone: $(marked "$T/page")" "$([ "$n" = 5 ] && [ "$(marked "$T/page")" = 0 ] && echo ok || echo FAIL)" "GET /project/$A"
+put 'a marked value of the process, planted in a page: the search finds it (control)' "$n of 4, the page alone: $(marked "$T/page")" "$([ "$n" = 4 ] && [ "$(marked "$T/page")" = 0 ] && echo ok || echo FAIL)" "GET /project/$A"
 while IFS=$'\t' read -r kind id methods; do
   [ "$kind" = page ] || continue
   own

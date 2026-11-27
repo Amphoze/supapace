@@ -14,7 +14,11 @@
 #   tok REF SUB ROLE [PURPOSE [IAT_OFFSET [LIFETIME]]]   an assertion as the gateway signs one
 #   studio [docker args]    (re)start the server; its memory is empty, its data volume stays
 #   socket [MODE]           (re)start the control plane's stand-in (answer, silent, refuse:CODE)
-#   seen                    how many requests postgres-meta's stand-in has received
+#   pgmeta [stub args]      (re)start the two postgres-meta stand-ins (instance 0 and 1) with the
+#                           stub's options; a server started before does not know them: start
+#                           it again with `studio`
+#   seen [0|1]              how many requests the postgres-meta stand-ins have received: both,
+#                           or the one instance
 # Members: of A the owner oa, the developer da, the read_only member ra; of B ob and rb; of C
 # oc and rc; `both` is an owner of A and of B. Every answer's time is the clock's.
 set -uo pipefail
@@ -28,8 +32,7 @@ A=aaaaaaaaaaaaaaaaaaa1 B=bbbbbbbbbbbbbbbbbbb2 C=ccccccccccccccccccc3
 PA=20001 PB=20002 PC=20003
 ISS=https://issuer.test
 NODE=node-1
-# postgres-meta's header key, the file crypto.key of the keys directory. Until the address of
-# postgres-meta comes from the node's settings, the server takes it from STUDIO_PG_META_URL.
+# postgres-meta's header key, the file crypto.key of the keys directory.
 CRYPTO='proof-only-header-key_0123456789abcdefghijklmnopqrstuvwxyzABCDEF'
 fails=0 rows=0
 
@@ -48,7 +51,7 @@ finish() {
 }
 
 standins_down() {
-  docker rm -f "$PREFIX-studio" "$PREFIX-socket" "$PREFIX-pgmeta" >/dev/null 2>&1
+  docker rm -f "$PREFIX-studio" "$PREFIX-socket" "$PREFIX-pgmeta-0" "$PREFIX-pgmeta-1" >/dev/null 2>&1
   docker network rm "$PREFIX-net" >/dev/null 2>&1
   # files the server and the stand-ins wrote under other uids
   [ -z "${T:-}" ] || docker run --rm "${L[@]}" --network none -v "$T:/t" "$NODE_BASE" rm -rf /t/data /t/sock >/dev/null 2>&1
@@ -83,6 +86,22 @@ socket() {
   return 1
 }
 
+# The two postgres-meta instances, as the node's setting names them: by address, in their order.
+META=
+pgmeta() {
+  local i ip
+  META=
+  for i in 0 1; do
+    docker rm -f "$PREFIX-pgmeta-$i" >/dev/null 2>&1
+    docker run -d --name "$PREFIX-pgmeta-$i" "${L[@]}" --network "$PREFIX-net" \
+      --user "$(id -u):$(id -g)" -v "$T/bin/sp-dashstub:/sp-dashstub:ro" -v "$T/keys/crypto.key:/crypto.key:ro" \
+      "$NODE_BASE" /sp-dashstub pgmeta --listen :8080 --crypto-key-file /crypto.key "$@" >/dev/null || return 1
+    ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PREFIX-pgmeta-$i")
+    [ -n "$ip" ] || return 1
+    META+="${META:+,}http://$ip:8080"
+  done
+}
+
 # The server as a node runs it: its uid, a read-only root, no capability, the eight settings.
 STUDIO_ENV=()
 studio() {
@@ -90,7 +109,7 @@ studio() {
   docker run -d --name "$PREFIX-studio" "${L[@]}" --network "$PREFIX-net" \
     --user 65527:65527 --read-only --tmpfs /tmp --memory 1g --cap-drop ALL --security-opt no-new-privileges \
     -v "$T/sock:/run/dash:ro" -v "$T/keys:/etc/dash:ro" -v "$T/data:/var/lib/dash" \
-    "${STUDIO_ENV[@]}" "$@" "$IMAGE" >/dev/null || return 1
+    "${STUDIO_ENV[@]}" -e "SUPAPACE_PGMETA=$META" "$@" "$IMAGE" >/dev/null || return 1
   local i ip
   ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PREFIX-studio")
   U=http://$ip:3000
@@ -103,8 +122,10 @@ studio() {
 }
 
 seen() {
-  docker exec "$PREFIX-studio" node -e \
-    'fetch("http://pgmeta:8080/_seen").then((r) => r.json()).then((j) => console.log(j.length ? j[j.length - 1].n : 0))'
+  docker exec "$PREFIX-studio" node -e '
+    const urls = process.env.SUPAPACE_PGMETA.split(",").filter((u, i) => !process.argv[1] || process.argv[1] == i)
+    Promise.all(urls.map((u) => fetch(u + "/_seen").then((r) => r.json())))
+      .then((all) => console.log(all.reduce((n, j) => n + (j && j.length ? j[j.length - 1].n : 0), 0)))' "$@"
 }
 
 dsn() { printf 'postgresql://%s:%s@10.212.0.6:%s/postgres?sslmode=disable' "$1" "$2" "$3"; }
@@ -148,15 +169,10 @@ standins_up() {
   } >"$T/table.json"
 
   docker network create --internal "${L[@]}" "$PREFIX-net" >/dev/null || return 1
-  docker run -d --name "$PREFIX-pgmeta" "${L[@]}" --network "$PREFIX-net" --network-alias pgmeta \
-    --user "$(id -u):$(id -g)" -v "$T/bin/sp-dashstub:/sp-dashstub:ro" -v "$T/keys/crypto.key:/crypto.key:ro" \
-    "$NODE_BASE" /sp-dashstub pgmeta --listen :8080 --crypto-key-file /crypto.key --delay-ms 40 >/dev/null || return 1
   STUDIO_ENV=(-e NODE_ENV=production -e PORT=3000 -e "SUPAPACE_NODE_ID=$NODE"
     -e SUPAPACE_DASH_SOCKET=/run/dash/dash.sock -e SUPAPACE_DASH_KEYS=/etc/dash -e SUPAPACE_DASH_DATA=/var/lib/dash
-    -e SUPAPACE_PGCAP=10.212.0.6:20000:21023 -e SUPAPACE_PGMETA=http://10.212.0.4:8080,http://10.212.0.5:8080
-    -e "SUPAPACE_LIMITS=$LIMITS"
-    -e STUDIO_PG_META_URL=http://pgmeta:8080)
-  socket && studio
+    -e SUPAPACE_PGCAP=10.212.0.6:20000:21023 -e "SUPAPACE_LIMITS=$LIMITS")
+  pgmeta --delay-ms 40 && socket && studio
 }
 
 # ask METHOD PATH [TOKEN [curl args]] — one request, the path sent as written; prints

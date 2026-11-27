@@ -106,8 +106,9 @@ func (l LimitSet) StudioJSON() string {
 		SnippetBytes      int64 `json:"snippet_bytes"`
 		SnippetEntries    int   `json:"snippet_entries"`
 		AuditFileBytes    int64 `json:"audit_file_bytes"`
+		MetaBodyBytes     int   `json:"meta_body_bytes"`
 	}{l.SocketCallMS, l.SlotWaitMS, l.MetaCallMS, l.StudioHandoverMS, l.StudioResultBytes, l.InstanceCalls,
 		l.ProjectCalls, l.ProjectWaiting, l.ParserSlots, l.ResolveMemorySecs, l.ResolveDiskDays, l.SnippetBytes,
-		l.SnippetEntries, l.AuditFileBytes})
+		l.SnippetEntries, l.AuditFileBytes, l.MetaBodyMB * mib})
 	return string(b)
 }

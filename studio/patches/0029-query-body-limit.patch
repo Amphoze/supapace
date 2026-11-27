@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:14:59 +0000
+Subject: [PATCH] query: the bound of a request body among the server's bounds
+
+SUPAPACE_LIMITS gains a fifteenth member, meta_body_bytes: the largest request body
+postgres-meta takes, which the control plane renders from the figure it gives postgres-meta
+itself. A value without it, like a value with a member this server does not know, stops the
+server.
+---
+ apps/studio/lib/api/self-hosted/limits.test.ts | 1 +
+ apps/studio/lib/api/self-hosted/limits.ts      | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/apps/studio/lib/api/self-hosted/limits.test.ts b/apps/studio/lib/api/self-hosted/limits.test.ts
+index cae358e2..f4fa7f4c 100644
+--- a/apps/studio/lib/api/self-hosted/limits.test.ts
++++ b/apps/studio/lib/api/self-hosted/limits.test.ts
+@@ -23,6 +23,7 @@ const MEMBERS = [
+   'snippet_bytes',
+   'snippet_entries',
+   'audit_file_bytes',
++  'meta_body_bytes',
+ ]
+ 
+ describe('api/self-hosted/limits', () => {
+diff --git a/apps/studio/lib/api/self-hosted/limits.ts b/apps/studio/lib/api/self-hosted/limits.ts
+index 88fb909f..37e3b8e8 100644
+--- a/apps/studio/lib/api/self-hosted/limits.ts
++++ b/apps/studio/lib/api/self-hosted/limits.ts
+@@ -19,6 +19,7 @@ const MEMBERS = [
+   'snippet_bytes',
+   'snippet_entries',
+   'audit_file_bytes',
++  'meta_body_bytes',
+ ] as const
+ 
+ export type Limits = Readonly<Record<(typeof MEMBERS)[number], number>>

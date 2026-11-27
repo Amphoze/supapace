@@ -1,0 +1,373 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:00:00 +0000
+Subject: [PATCH] query: further cases of the path to postgres-meta
+
+A statement that was never sent is on no record, and one sent twice is on record twice; a
+call site's wish for the read-only login reaches the call; a request's later call is not cut
+by the bound of its first; the byte bound holds for an answer that does not announce its
+size; a handler that catches a refused call holds no slot; an audit file that is a pipe,
+unread or held full, is refused at once; many projects at once on both instances keep to
+their own; an error a statement raises under the code or the text of a refused login is not
+taken for one.
+---
+ .../api/self-hosted/pg-meta-further.test.ts   | 350 ++++++++++++++++++
+ 1 file changed, 350 insertions(+)
+ create mode 100644 apps/studio/lib/api/self-hosted/pg-meta-further.test.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/pg-meta-further.test.ts b/apps/studio/lib/api/self-hosted/pg-meta-further.test.ts
+new file mode 100644
+index 00000000..cace2415
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/pg-meta-further.test.ts
+@@ -0,0 +1,350 @@
++// SPDX-License-Identifier: Apache-2.0
++// Further cases of the one path to postgres-meta: what is on record for a statement that was
++// never sent; a request's later call under the bound of its first; the byte bound of an answer
++// that does not announce its size; a handler that catches a refused call; an audit file that is
++// a pipe, unread or held full; many projects at once on both instances while one of them is
++// refused its login; and an error a statement raises itself under the code of a refused login.
++import { execFileSync } from 'node:child_process'
++import { createHash } from 'node:crypto'
++import { closeSync, constants, existsSync, mkdirSync, openSync, rmSync, writeSync } from 'node:fs'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { dsn, port, ref, RO, RW, startKit, type Arrived, type Kit } from './pg-meta-testkit'
++
++vi.mock('@sentry/react', () => ({
++  startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
++  captureException: () => {},
++}))
++
++let kit: Kit
++async function start(limits: Parameters<typeof startKit>[0] = {}) {
++  kit = await startKit(limits)
++  vi.stubEnv('SUPAPACE_PGMETA', kit.addresses)
++  vi.spyOn(console, 'error').mockImplementation(() => {})
++  return kit
++}
++afterEach(async () => {
++  await kit?.stop()
++  vi.unstubAllEnvs()
++  vi.restoreAllMocks()
++})
++
++const sha = (text: string) => createHash('sha256').update(text).digest('hex')
++const hashes = (lines: string[]) => lines.map((line) => JSON.parse(line).sql_sha256)
++// a login the database refuses at connection time, as postgres-meta passes it on
++const refused = { code: '28P01', severity: 'FATAL', message: 'm' }
++
++describe('the record is of what was sent', () => {
++  it('a statement refused for want of a slot, or left while waiting, is on no record', async () => {
++    await start({ instance_calls: 1, project_calls: 1, project_waiting: 1, slot_wait_ms: 400 })
++    const meta = kit.metas[1]
++    meta.park()
++    const held = kit.statement(kit.context(1), 'select 1')
++    await meta.arrivals(1)
++    expect(hashes(kit.audit(1))).toEqual([sha('select 1')])
++
++    // the wait reaches its bound
++    await expect(kit.run(kit.context(1), 'select 2')).rejects.toMatchObject({ code: 'busy' })
++    // the one waiting place is taken: refused at once
++    const client = new AbortController()
++    const waiting = kit.statement(kit.context(1), 'select 3', client.signal)
++    waiting.catch(() => {})
++    await expect(kit.run(kit.context(1), 'select 4')).rejects.toMatchObject({ code: 'busy' })
++    // the client that waits leaves
++    client.abort()
++    await expect(waiting).rejects.toMatchObject({ code: 'client_gone' })
++    // another project that finds the instance full
++    await expect(kit.run(kit.context(2), 'select 5')).rejects.toMatchObject({ code: 'busy' })
++
++    // none of the four reached postgres-meta, and none is in a file
++    expect(meta.seen).toHaveLength(1)
++    expect(hashes(kit.audit(1))).toEqual([sha('select 1')])
++    expect(existsSync(join(kit.data, ref(2)))).toBe(false)
++
++    // control: once the slot is free the next statement is recorded, then sent
++    meta.seen[0].res.end('[]')
++    await (await held).text()
++    meta.onRequest = (a) => a.res.end('[]')
++    await kit.run(kit.context(1), 'select 6')
++    expect(hashes(kit.audit(1))).toEqual([sha('select 1'), sha('select 6')])
++  })
++
++  it('a statement sent twice after a refused login is on record twice', async () => {
++    await start()
++    const meta = kit.metas[1]
++    kit.control.answers.set(
++      ref(1),
++      kit.answer(ref(1), port(1), 'owner', { dsn_rw: dsn(RW, port(1), 'new') })
++    )
++    meta.onRequest = (a) => {
++      a.res.statusCode = a.dsn.includes(':new@') ? 200 : 400
++      a.res.end(a.dsn.includes(':new@') ? '[]' : JSON.stringify(refused))
++    }
++    expect(await kit.run(kit.context(1), 'select 7')).toBe('[]')
++    expect(meta.seen.map((a) => a.dsn)).toEqual([dsn(RW, port(1)), dsn(RW, port(1), 'new')])
++    // each on a connection of its own, closed after it
++    expect(meta.seen.map((a) => a.headers.connection)).toEqual(['close', 'close'])
++    expect(hashes(kit.audit(1))).toEqual([sha('select 7'), sha('select 7')])
++  })
++})
++
++describe('a call site that asks for the read-only login', () => {
++  it('is sent the read-only string through executeQuery too, whatever the member', async () => {
++    await start()
++    const { executeQuery } = await import('./query')
++    const run = (readOnly?: boolean) =>
++      kit.request(kit.context(1), () => executeQuery({ query: 'select 1', readOnly }))
++    await run(true)
++    await run(false)
++    await run()
++    expect(kit.metas[1].seen.map((a) => a.dsn)).toEqual([
++      dsn(RO, port(1)),
++      dsn(RW, port(1)),
++      dsn(RW, port(1)),
++    ])
++    expect(kit.audit(1).map((line) => JSON.parse(line).login)).toEqual([RO, RW, RW])
++  })
++})
++
++describe('a request with two calls', () => {
++  it('the bound of the first answer’s hand-over does not cut the second answer', async () => {
++    await start({ handover_ms: 300 })
++    const meta = kit.metas[1]
++    // the second call takes longer than the hand-over's bound
++    meta.onRequest = (a) =>
++      a.body.includes('first') ? a.res.end('[1]') : setTimeout(() => a.res.end('[2]'), 600)
++    const call = (sql: string) => kit.pgMeta.callPgMeta({ kind: 'query', sql })
++    const response = await kit.request(kit.context(1), async () => {
++      await call('first')
++      return new Response((await call('second')).text)
++    })
++    expect(await (response as Response).text()).toBe('[2]')
++    // and the request's one slot is free
++    meta.onRequest = (a) => a.res.end('[]')
++    await kit.run(kit.context(1))
++    await kit.run(kit.context(1))
++  })
++
++  it('a second call made after the first one’s bound has passed is handed over', async () => {
++    await start({ handover_ms: 200 })
++    const call = (sql: string) => kit.pgMeta.callPgMeta({ kind: 'query', sql })
++    const response = await kit.request(kit.context(1), async () => {
++      await call('first')
++      // the handler is busy for longer than the bound: the slot is taken back meanwhile
++      await new Promise((done) => setTimeout(done, 400))
++      return new Response((await call('second')).text.padEnd(200_000))
++    })
++    expect((await (response as Response).text()).trimEnd()).toBe('[]')
++  })
++
++  it('a statement sent again is not cut by the bound of its first send', async () => {
++    await start({ handover_ms: 200 })
++    const meta = kit.metas[1]
++    kit.control.answers.set(
++      ref(1),
++      kit.answer(ref(1), port(1), 'owner', { dsn_rw: dsn(RW, port(1), 'new') })
++    )
++    meta.onRequest = (a) => {
++      if (a.dsn.includes(':new@')) return void setTimeout(() => a.res.end('[7]'), 500)
++      a.res.statusCode = 400
++      a.res.end(JSON.stringify(refused))
++    }
++    expect(await kit.run(kit.context(1))).toBe('[7]')
++  })
++})
++
++describe('the byte bound of an answer that does not announce its size', () => {
++  it('one byte past the bound is 400 result_too_large; exactly the bound is taken', async () => {
++    const bound = 200_000
++    await start({ result_bytes: bound, instance_calls: 1, project_calls: 1 })
++    const meta = kit.metas[1]
++    // in pieces, no length announced: the bytes are counted as they arrive
++    const inPieces = (size: number) => (a: Arrived) => {
++      for (let left = size; left > 0; left -= 50_000) {
++        a.res.write('y'.repeat(Math.min(left, 50_000)))
++      }
++      a.res.end()
++    }
++    meta.onRequest = inPieces(bound + 1)
++    await expect(kit.run(kit.context(1))).rejects.toMatchObject({
++      status: 400,
++      code: 'result_too_large',
++    })
++    meta.onRequest = inPieces(bound)
++    expect(await kit.run(kit.context(2))).toHaveLength(bound)
++  })
++})
++
++describe('a handler that catches a refused call and answers all the same', () => {
++  it('holds no slot for its answer: the call gave it back when it failed', async () => {
++    await start({ instance_calls: 1, project_calls: 1, slot_wait_ms: 400, meta_call_ms: 200 })
++    const meta = kit.metas[1]
++    meta.park()
++    // the call passes its deadline; the handler answers with a body of its own, which nobody reads
++    const answered = await kit.request(kit.context(1), async () => {
++      const failed = await kit.pgMeta.callPgMeta({ kind: 'query', sql: 'select 1' }).catch((e) => e)
++      return new Response(JSON.stringify({ message: String(failed.code) }).padEnd(300_000))
++    })
++    expect((answered as Response).status).toBe(200)
++    // unread, and yet the instance's one slot is another project's at once
++    meta.onRequest = (a) => a.res.end('[]')
++    expect(await kit.run(kit.context(2))).toBe('[]')
++    expect((await (answered as Response).text()).trimEnd()).toBe('{"message":"query_deadline"}')
++  })
++})
++
++describe('an audit file that is a pipe', () => {
++  it('nobody reads it: refused 503 at once, and the slot is given back', async () => {
++    await start({ instance_calls: 1, project_calls: 1 })
++    const dir = join(kit.data, ref(1))
++    mkdirSync(dir, { recursive: true })
++    execFileSync('mkfifo', [join(dir, 'audit.log')])
++    await expect(kit.run(kit.context(1))).rejects.toMatchObject({
++      status: 503,
++      code: 'audit_unavailable',
++    })
++    expect(kit.metas[1].seen).toHaveLength(0)
++    // control: a file in its place, and the instance's one slot
++    rmSync(join(dir, 'audit.log'))
++    expect(await kit.run(kit.context(1))).toBe('[]')
++  })
++
++  it('something holds it full: refused 503 at once, never waited on', async () => {
++    await start({ instance_calls: 1, project_calls: 1 })
++    const dir = join(kit.data, ref(1))
++    mkdirSync(dir, { recursive: true })
++    execFileSync('mkfifo', [join(dir, 'audit.log')])
++    // another holder of the pipe has filled it and takes nothing out: a write that waited for
++    // room would wait for ever, with the statement's slot
++    const holder = openSync(join(dir, 'audit.log'), constants.O_RDWR | constants.O_NONBLOCK)
++    const piece = Buffer.alloc(4096, 0x78)
++    expect(() => {
++      for (;;) writeSync(holder, piece)
++    }).toThrow(/EAGAIN/)
++    await expect(kit.run(kit.context(1))).rejects.toMatchObject({
++      status: 503,
++      code: 'audit_unavailable',
++    })
++    expect(kit.metas[1].seen).toHaveLength(0)
++    // control: a file in its place, and the instance's one slot
++    closeSync(holder)
++    rmSync(join(dir, 'audit.log'))
++    expect(await kit.run(kit.context(1))).toBe('[]')
++  })
++})
++
++describe('many projects at once', () => {
++  it(
++    'every answer and every record is its own project’s, while one project is refused its login',
++    { timeout: 60_000 },
++    async () => {
++      await start({ slot_wait_ms: 60_000, project_waiting: 1000 })
++      // six projects, three on each instance; project 3's kept string is no longer taken
++      const instance = (n: number) => n % 2
++      const mine = (n: number) => port(n, instance(n))
++      const fresh = dsn(RW, mine(3), 'new')
++      kit.control.answers.set(ref(3), kit.answer(ref(3), mine(3), 'owner', { dsn_rw: fresh }))
++      for (const meta of kit.metas) {
++        meta.onRequest = (a) =>
++          setTimeout(() => {
++            if (a.port === mine(3) && a.dsn !== fresh) {
++              a.res.statusCode = 400
++              return a.res.end(JSON.stringify({ ...refused, formattedError: 'f' }))
++            }
++            a.res.end(JSON.stringify({ port: a.port, dsn: a.dsn, sql: JSON.parse(a.body).query }))
++          }, Math.random() * 6)
++      }
++      const sql = (i: number) => `select ${i}`
++      const answers = await Promise.all(
++        Array.from({ length: 180 }, async (_, i) => {
++          const n = 1 + (i % 6)
++          const text = await kit.run(kit.context(n, 'owner', {}, instance(n)), sql(i))
++          return { n, i, ...(JSON.parse(text) as { port: number; dsn: string; sql: string }) }
++        })
++      )
++      for (const { n, i, ...answer } of answers) {
++        expect(answer).toEqual({
++          port: mine(n),
++          dsn: n === 3 ? fresh : dsn(RW, mine(n)),
++          sql: sql(i),
++        })
++      }
++      // each instance was sent its own projects' statements and no other's
++      for (const [at, meta] of kit.metas.entries()) {
++        expect(meta.seen.every((a) => a.port % 2 === at)).toBe(true)
++        expect(meta.most).toBeLessThanOrEqual(4)
++      }
++      expect(kit.metas[0].seen.length + kit.metas[1].seen.length).toBe(180 + 30)
++      // each project's file holds its own statements: once each, twice for the one sent again
++      for (let n = 1; n <= 6; n++) {
++        const lines = kit.audit(n).map((line) => JSON.parse(line))
++        expect(lines.every((record) => record.ref === ref(n))).toBe(true)
++        const own = Array.from({ length: 30 }, (_, k) => sha(sql(6 * k + n - 1)))
++        const want = n === 3 ? [...own, ...own] : own
++        expect(lines.map((record) => record.sql_sha256).sort()).toEqual(want.sort())
++      }
++      // only the refused project's entries were dropped and asked for again
++      expect(new Set(kit.control.asked)).toEqual(new Set([kit.assertion(ref(3)).text]))
++    }
++  )
++})
++
++describe('an error a statement raises under the code or the text of a refused login', () => {
++  // Any member can send such a statement, a read_only member too. It is not a login the
++  // database refused: a refusal at connection time differs from a raised error in what
++  // postgres-meta passes on — its severity is FATAL, where a raised error's is ERROR — and the
++  // database client's own report of a signature that does not match carries no code at all.
++  const raised: [string, object][] = [
++    [
++      'the code of a refused password',
++      {
++        error: 'ERROR:  28P01: as if refused\n',
++        severity: 'ERROR',
++        code: '28P01',
++        message: 'as if refused',
++        where: 'PL/pgSQL function inline_code_block line 1 at RAISE',
++        routine: 'exec_stmt_raise',
++        formattedError: 'ERROR:  28P01: as if refused\n',
++      },
++    ],
++    [
++      'the text of a signature that does not match',
++      {
++        error: 'ERROR:  P0001: SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature does not match\n',
++        severity: 'ERROR',
++        code: 'P0001',
++        message: 'SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature does not match',
++        routine: 'exec_stmt_raise',
++        formattedError: 'f',
++      },
++    ],
++  ]
++  for (const [name, answer] of raised) {
++    it(`${name}: nothing is dropped, nobody is asked, nothing is logged`, async () => {
++      await start()
++      const said = vi.mocked(console.error)
++      const dash = await import('./dash-socket')
++      const { executeQuery } = await import('./query')
++      // another member of the project is kept, in memory and on the disk
++      kit.control.answers.set(ref(1), kit.answer(ref(1), port(1), 'owner'))
++      const other = kit.assertion(ref(1), 'owner', 'another-member')
++      await dash.resolve(other)
++      const entry = join(kit.data, ref(1), 'cache', 'rw.bin')
++      expect(existsSync(entry)).toBe(true)
++      expect(kit.control.asked).toHaveLength(1)
++
++      kit.metas[1].onRequest = (a) => {
++        a.res.statusCode = 400
++        a.res.end(JSON.stringify(answer))
++      }
++      const result = await kit.request(kit.context(1), () => executeQuery({ query: 'do $$…$$' }))
++      // the statement's own error, passed on as any other
++      expect(result.error).toBeInstanceOf(Error)
++      expect(existsSync(entry)).toBe(true)
++      await dash.resolve(other)
++      expect(kit.control.asked).toHaveLength(1)
++      expect(said).not.toHaveBeenCalled()
++    })
++  }
++})

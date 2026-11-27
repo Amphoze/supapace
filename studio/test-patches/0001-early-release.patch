@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:54:12 +0000
+Subject: [PATCH] early-release: the slot given back at postgres-meta's answer
+ (test build only)
+
+Never a part of the product. A build with this patch gives a statement's slot back when
+postgres-meta has answered instead of when the answer has been handed over to the client;
+it exists to show what the product's rule bounds: with it, the answers held for clients
+that do not take them grow with the clients.
+---
+ .../self-hosted/pg-meta.early-release.test.ts | 35 +++++++++++++++++++
+ apps/studio/lib/api/self-hosted/pg-meta.ts    |  9 ++---
+ 2 files changed, 38 insertions(+), 6 deletions(-)
+ create mode 100644 apps/studio/lib/api/self-hosted/pg-meta.early-release.test.ts
+
+diff --git a/apps/studio/lib/api/self-hosted/pg-meta.early-release.test.ts b/apps/studio/lib/api/self-hosted/pg-meta.early-release.test.ts
+new file mode 100644
+index 00000000..2af5eb7f
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/pg-meta.early-release.test.ts
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: Apache-2.0
++// TEST BUILD ONLY. With a slot given back at postgres-meta's answer, nothing bounds the
++// answers this server holds for clients that do not take them: they grow with the readers.
++// The product holds as many as the project has slots, whatever the readers (pg-meta.test.ts,
++// "results that readers do not take stay within the project's slots").
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { startKit, type Kit } from './pg-meta-testkit'
++
++describe('the slot given back at postgres-meta’s answer', () => {
++  let kit: Kit
++  afterEach(async () => {
++    await kit.stop()
++    vi.unstubAllEnvs()
++  })
++
++  it.each([8, 16, 32])(
++    '%i readers that take nothing: as many answers are held at once',
++    async (readers) => {
++      kit = await startKit()
++      vi.stubEnv('SUPAPACE_PGMETA', kit.addresses)
++      const meta = kit.metas[1]
++      meta.onRequest = (a) => a.res.end(JSON.stringify('x'.repeat(300_000)))
++      const held = await Promise.all(
++        Array.from({ length: readers }, () => kit.statement(kit.context(1)))
++      )
++      // every statement was sent and answered though no answer was taken: the project has
++      // two slots, and `readers` answers of it are in this process
++      expect(meta.seen).toHaveLength(readers)
++      expect(held.filter((response) => response.status === 200 && !response.bodyUsed)).toHaveLength(
++        readers
++      )
++    }
++  )
++})
+diff --git a/apps/studio/lib/api/self-hosted/pg-meta.ts b/apps/studio/lib/api/self-hosted/pg-meta.ts
+index 7e4ae7fd..92a86815 100644
+--- a/apps/studio/lib/api/self-hosted/pg-meta.ts
++++ b/apps/studio/lib/api/self-hosted/pg-meta.ts
+@@ -395,12 +395,9 @@ async function send(context: ProjectContext, flight: Flight, call: PgMetaCall):
+       call.kind === 'query' ? createHash('sha256').update(call.sql).digest('hex') : undefined,
+   })
+   const answer = await exchange(target, method, path, dsn, body, flight.signal)
+-  // the hand-over of what postgres-meta answered is bounded from here
+-  flight.timer = setTimeout(() => {
+-    flight.late = true
+-    free(flight)
+-    flight.cut?.()
+-  }, limits().handover_ms)
++  // TEST BUILD ONLY, never a part of the product: the slot is given back as soon as
++  // postgres-meta has answered, not when the answer has been handed over to the client.
++  free(flight)
+   return { ...answer, dsn, port }
+ }
+ 

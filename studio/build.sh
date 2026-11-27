@@ -403,6 +403,7 @@ measure() {
   head -c 48 /dev/urandom | base64 | tr '+/' '-_' >"$m/keys/crypto.key"
   local node=(-v "$m:/data:ro" -e SUPAPACE_NODE_ID=build -e SUPAPACE_DASH_SOCKET=/run/dash/dash.sock
     -e SUPAPACE_DASH_KEYS=/data/keys -e SUPAPACE_DASH_DATA=/tmp/dash -e SUPAPACE_PGCAP=10.212.0.6:20000:21023
+    -e SUPAPACE_PGMETA=http://10.212.0.4:8080,http://10.212.0.5:8080
     -e "SUPAPACE_LIMITS=$(cat "$W/vectors/limits.json")")
   start() { # start [docker args] — the candidate as $c, until it answers
     docker rm -f "$c" >/dev/null 2>&1 || true

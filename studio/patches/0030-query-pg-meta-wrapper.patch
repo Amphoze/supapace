@@ -1,0 +1,3337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:49:40 +0000
+Subject: [PATCH] query: one bounded, audited path to postgres-meta
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every statement and every type generation of the server goes through one function. It takes
+the connection string from the request's project — the read-only one whenever the member's
+role is read_only, whatever the call site asks — waits for a slot of the project's
+postgres-meta instance, writes the audit record and sends nothing when that fails, and asks
+the instance the control plane names with two headers of its own: nothing a caller hands in
+is passed on. The call has a deadline and the answer a byte bound.
+
+Slots: a bounded number of calls in flight per instance and per project, granted to the
+waiting projects in turn; a project is given a further slot only while two are free; a wait
+is bounded in time and in places. A request keeps its slot until its response has been taken
+by the client, piece by piece, until the client has gone, or until the hand-over has lasted
+its own bound, when the body is cut. The request guard hands every response over this way.
+
+When the database does not take the login, what is kept of the project is dropped and the
+control plane asked once; the call is sent again only if it now names another string.
+
+The address of postgres-meta is the node's setting, two instances, read in this module
+alone and checked when the server starts; upstream's address constant and its last helper
+are gone.
+---
+ apps/studio/lib/api/apiHelpers.ts             |   28 -
+ .../api/self-hosted/generate-types.test.ts    |  195 +--
+ .../lib/api/self-hosted/generate-types.ts     |   39 +-
+ .../lib/api/self-hosted/header-key.test.ts    |    1 +
+ .../lib/api/self-hosted/pg-meta-guard.test.ts |   86 +
+ .../lib/api/self-hosted/pg-meta-testkit.ts    |  253 +++
+ .../lib/api/self-hosted/pg-meta.test.ts       | 1406 +++++++++++++++++
+ apps/studio/lib/api/self-hosted/pg-meta.ts    |  521 ++++++
+ .../api/self-hosted/project-values.test.ts    |   47 +-
+ apps/studio/lib/api/self-hosted/query.ts      |   36 +-
+ .../lib/api/self-hosted/request-guard.test.ts |    6 +-
+ .../lib/api/self-hosted/request-guard.ts      |   10 +-
+ .../lib/api/self-hosted/secrets.test.ts       |   39 +-
+ .../api/self-hosted/statement-senders.test.ts |  201 +--
+ apps/studio/lib/constants/index.ts            |    3 -
+ apps/studio/turbo.jsonc                       |    2 -
+ 16 files changed, 2498 insertions(+), 375 deletions(-)
+ create mode 100644 apps/studio/lib/api/self-hosted/pg-meta-guard.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/pg-meta-testkit.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/pg-meta.test.ts
+ create mode 100644 apps/studio/lib/api/self-hosted/pg-meta.ts
+
+diff --git a/apps/studio/lib/api/apiHelpers.ts b/apps/studio/lib/api/apiHelpers.ts
+index 239bf565..af38b565 100644
+--- a/apps/studio/lib/api/apiHelpers.ts
++++ b/apps/studio/lib/api/apiHelpers.ts
+@@ -1,10 +1,7 @@
+ import type { IncomingHttpHeaders } from 'node:http'
+ import { snakeCase } from 'lodash'
+-import type { NextApiRequest } from 'next'
+ import z from 'zod'
+ 
+-import { PG_META_URL } from '@/lib/constants'
+-
+ /**
+  * Construct headers for a request to postgres-meta: of what it is handed, the content type and
+  * the encrypted connection string, and nothing else. No cookie, no authorization and no key of
+@@ -139,28 +136,3 @@ export class InternalServerError extends Error {
+     this.name = 'InternalServerError'
+   }
+ }
+-
+-/**
+- * Construct the pgMeta redirection url passing along the filtering query params
+- * @param req
+- * @param endpoint
+- */
+-export function getPgMetaRedirectUrl(req: NextApiRequest, endpoint: string) {
+-  const query = Object.entries(req.query).reduce((query, entry) => {
+-    const [key, value] = entry
+-    if (Array.isArray(value)) {
+-      for (const v of value) {
+-        query.append(key, v)
+-      }
+-    } else if (value) {
+-      query.set(key, value)
+-    }
+-    return query
+-  }, new URLSearchParams())
+-
+-  let url = `${PG_META_URL}/${endpoint}`
+-  if (Object.keys(req.query).length > 0) {
+-    url += `?${query}`
+-  }
+-  return url
+-}
+diff --git a/apps/studio/lib/api/self-hosted/generate-types.test.ts b/apps/studio/lib/api/self-hosted/generate-types.test.ts
+index 766c9978..b3d9da21 100644
+--- a/apps/studio/lib/api/self-hosted/generate-types.test.ts
++++ b/apps/studio/lib/api/self-hosted/generate-types.test.ts
+@@ -1,187 +1,142 @@
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { generateTypescriptTypes } from './generate-types'
+-import { projectContext, runWithProject, type Assertion } from './project-context'
+-
+-vi.mock('@/data/fetchers', () => ({
+-  fetchGet: vi.fn(),
+-}))
+-
+-vi.mock('@/lib/constants', () => ({
+-  PG_META_URL: 'http://localhost:8080',
+-}))
+-
+-// The connection string is the real one, of the request's project; only the encryption
+-// is replaced, by a mark that shows what was encrypted.
+-vi.mock('./util', async (original) => ({
+-  ...(await original<typeof import('./util')>()),
+-  assertSelfHosted: vi.fn(),
+-  encryptString: (text: string) => `encrypted(${text})`,
+-}))
++import { dsn, port, RO, RW, seal, startKit, type Kit } from './pg-meta-testkit'
++import { isStudioError } from '@/lib/errors/studio-errors'
+ 
+ // A distinctive, non-default value so the assertions verify the URL reflects the
+ // exposed schemas of the request's project — whatever they are — rather than
+ // coupling the test to a specific default.
+ const EXPOSED_SCHEMAS = ['public', 'custom_schema', 'graphql_public']
+-
+-const REF_A = 'abcdefghij0123456789'
+-const REF_B = 'bcdefghij0123456789a'
+-const dsn = (login: string, port: number) =>
+-  `postgresql://${login}:pw${port}@10.212.0.6:${port}/postgres?sslmode=disable`
+-
+-function context(ref: string, port: number, role: Assertion['role'] = 'owner') {
+-  return projectContext(
+-    { text: 'v1.a.b', ref, iss: 'https://issuer.test', sub: 'u', name: 'U', role, purpose: '' },
+-    {
+-      ref,
+-      name: 'p',
+-      state: 'active',
+-      db_version: '17.6.1',
+-      pg_meta: port % 2,
+-      ...(role === 'read_only' ? {} : { dsn_rw: dsn('postgres', port) }),
+-      dsn_ro: dsn('supabase_read_only_user', port),
+-      api_url: `https://${ref}.example.test`,
+-      data_api: { schemas: EXPOSED_SCHEMAS, extra_search_path: [], max_rows: null },
+-      generation: 1,
+-      at: '2026-11-19T10:00:00Z',
+-    }
+-  )
+-}
+-const forA = <T>(fn: () => T) => runWithProject(context(REF_A, 20001), fn)
++const DATA_API = { data_api: { schemas: EXPOSED_SCHEMAS, extra_search_path: [], max_rows: null } }
+ 
+ describe('api/self-hosted/generate-types', () => {
+-  let mockFetchGet: ReturnType<typeof vi.fn>
+-  let mockAssertSelfHosted: ReturnType<typeof vi.fn>
++  let kit: Kit
++  let generateTypescriptTypes: typeof import('./generate-types').generateTypescriptTypes
+ 
+   beforeEach(async () => {
+-    const fetchers = await import('@/data/fetchers')
+-    const util = await import('./util')
+-
+-    mockFetchGet = vi.mocked(fetchers.fetchGet)
+-    mockFetchGet.mockReset()
+-    mockAssertSelfHosted = vi.mocked(util.assertSelfHosted)
++    kit = await startKit()
++    vi.stubEnv('SUPAPACE_PGMETA', kit.addresses)
++    generateTypescriptTypes = (await import('./generate-types')).generateTypescriptTypes
++    kit.metas[1].onRequest = (a) => a.res.end('export type User = {}')
++  })
++  afterEach(async () => {
++    await kit.stop()
++    vi.unstubAllEnvs()
+   })
++  const forA = <T>(fn: () => T) => kit.request(kit.context(1, 'owner', DATA_API), fn)
++  const sent = () => kit.metas[1].seen
+ 
+   describe('generateTypescriptTypes', () => {
+-    it('should call assertSelfHosted', async () => {
+-      mockFetchGet.mockResolvedValue({ types: 'export type User = {}' })
+-
+-      await forA(() => generateTypescriptTypes({ headers: {} }))
+-
+-      expect(mockAssertSelfHosted).toHaveBeenCalled()
+-    })
+-
+     it('should request types for the configured exposed schemas', async () => {
+-      mockFetchGet.mockResolvedValue({ types: 'export type User = {}' })
+-
+       await forA(() => generateTypescriptTypes({ headers: {} }))
+ 
+-      const callUrl = mockFetchGet.mock.calls[0][0]
+-      expect(callUrl).toContain('http://localhost:8080/generators/typescript')
+-      // Forwards the project's exposed schemas, encoded, as the plural allowlist param.
+-      expect(callUrl).toContain('included_schemas=public%2Ccustom_schema%2Cgraphql_public')
++      const url = new URL(sent()[0].url, 'http://x')
++      expect(sent()[0].method).toBe('GET')
++      expect(url.pathname).toBe('/generators/typescript')
++      // Forwards the exposed-schemas config as the plural allowlist param.
++      expect(url.searchParams.get('included_schemas')).toBe(EXPOSED_SCHEMAS.join(','))
+       // No hardcoded exclude list — the exposed-schemas config is the source of truth.
+-      expect(callUrl).not.toContain('excluded_schemas=')
++      expect(sent()[0].url).not.toContain('excluded_schemas=')
+     })
+ 
+-    it('should pass headers to fetchGet, with the connection string of the request’s project', async () => {
+-      mockFetchGet.mockResolvedValue({ types: 'export type User = {}' })
+-
++    it('sends the connection string of the request’s project and none of the caller’s headers', async () => {
+       await forA(() =>
+         generateTypescriptTypes({
+-          headers: { Authorization: 'Bearer token', 'Custom-Header': 'value' },
++          headers: {
++            Authorization: 'Bearer token',
++            'Custom-Header': 'value',
++            cookie: 'a=b',
++          },
+         })
+       )
+ 
+-      expect(mockFetchGet).toHaveBeenCalledWith(expect.any(String), {
+-        headers: {
+-          authorization: 'Bearer token',
+-          'custom-header': 'value',
+-          'x-connection-encrypted': `encrypted(${dsn('postgres', 20001)})`,
+-        },
+-      })
++      expect(sent()[0].dsn).toBe(dsn(RW, port(1)))
++      expect(Object.keys(sent()[0].headers).sort()).toEqual([
++        'connection',
++        'content-type',
++        'host',
++        'x-connection-encrypted',
++      ])
+     })
+ 
+     it('never forwards a connection string the caller handed in, in any spelling of the header', async () => {
+-      mockFetchGet.mockResolvedValue({ types: '' })
+-      const planted = `encrypted(${dsn('postgres', 20002)})`
++      const planted = seal(dsn(RW, port(2)))
+ 
+       for (const name of [
+         'x-connection-encrypted',
+         'X-Connection-Encrypted',
+         'X-CONNECTION-ENCRYPTED',
+       ]) {
+-        mockFetchGet.mockClear()
+         await forA(() => generateTypescriptTypes({ headers: { [name]: planted } }))
+-        expect(mockFetchGet.mock.calls[0][1]).toEqual({
+-          headers: { 'x-connection-encrypted': `encrypted(${dsn('postgres', 20001)})` },
+-        })
+       }
+-      mockFetchGet.mockClear()
+       await forA(() =>
+-        generateTypescriptTypes({ headers: new Headers({ 'X-Connection-Encrypted': planted }) })
++        generateTypescriptTypes({
++          headers: new Headers({ 'X-Connection-Encrypted': planted }),
++        })
+       )
+-      expect(JSON.stringify(mockFetchGet.mock.calls[0][1])).not.toContain('20002')
++      expect(sent()).toHaveLength(4)
++      for (const s of sent()) {
++        expect(s.dsn).toBe(dsn(RW, port(1)))
++        expect(JSON.stringify(s.headers)).not.toContain(planted)
++      }
+     })
+ 
+     it('names each of two interleaved requests’ own project, and a read_only member’s read-only login', async () => {
+-      mockFetchGet.mockImplementation(async (_url: string, options: any) => {
+-        await new Promise((r) => setTimeout(r, Math.random() * 5))
+-        return { types: options.headers['x-connection-encrypted'] }
+-      })
+-      const request = async (ref: string, port: number, role: Assertion['role']) => {
+-        const got: any = await runWithProject(context(ref, port, role), async () => {
++      kit.metas[1].onRequest = (a) =>
++        setTimeout(() => a.res.end(a.dsn), Math.floor(Math.random() * 5))
++      const request = async (n: number, role: 'owner' | 'developer' | 'read_only') => {
++        const got = await kit.request(kit.context(n, role), async () => {
+           await new Promise((r) => setTimeout(r, Math.random() * 5))
+           return generateTypescriptTypes({ headers: {} })
+         })
+-        const login = role === 'read_only' ? 'supabase_read_only_user' : 'postgres'
+-        expect(got.types).toBe(`encrypted(${dsn(login, port)})`)
++        expect(got).toBe(dsn(role === 'read_only' ? RO : RW, port(n)))
+       }
+       await Promise.all(
+         Array.from({ length: 30 }, (_, n) =>
+           n % 2
+-            ? request(REF_A, 20001, n % 3 ? 'owner' : 'read_only')
+-            : request(REF_B, 20002, n % 3 ? 'developer' : 'read_only')
++            ? request(1, n % 3 ? 'owner' : 'read_only')
++            : request(2, n % 3 ? 'developer' : 'read_only')
+         )
+       )
+-      expect(mockFetchGet).toHaveBeenCalledTimes(30)
++      expect(sent()).toHaveLength(30)
+     })
+ 
+     it('throws outside a request, and asks postgres-meta nothing', async () => {
+-      mockFetchGet.mockResolvedValue({ types: '' })
+-
+       await expect(generateTypescriptTypes({ headers: {} })).rejects.toMatchObject({
+         code: 'no_project_context',
+       })
+-      expect(mockFetchGet).not.toHaveBeenCalled()
++      expect(sent()).toHaveLength(0)
+     })
+ 
+-    it('should return types from fetchGet response', async () => {
++    it('should return the types postgres-meta answers, as text or as JSON', async () => {
+       const mockTypes = 'export type User = { id: number; name: string }'
+-      mockFetchGet.mockResolvedValue({ types: mockTypes })
+-
+-      const result = await forA(() => generateTypescriptTypes({ headers: {} }))
++      kit.metas[1].onRequest = (a) => a.res.end(mockTypes)
++      expect(await forA(() => generateTypescriptTypes({ headers: {} }))).toBe(mockTypes)
+ 
+-      expect(result).toEqual({ types: mockTypes })
++      kit.metas[1].onRequest = (a) => a.res.end(JSON.stringify({ types: mockTypes }))
++      expect(await forA(() => generateTypescriptTypes({}))).toEqual({
++        types: mockTypes,
++      })
+     })
+ 
+-    it('should handle fetchGet errors', async () => {
+-      const mockError = new Error('Network error')
+-      mockFetchGet.mockRejectedValue(mockError)
++    it('should answer postgres-meta’s error as an error with its status', async () => {
++      kit.metas[1].onRequest = (a) => {
++        a.res.statusCode = 500
++        a.res.end(JSON.stringify({ error: 'the generator failed' }))
++      }
++      const result = await forA(() => generateTypescriptTypes({}))
++      expect(isStudioError(result)).toBe(true)
++      expect(result).toMatchObject({
++        code: 500,
++        message: 'the generator failed',
++      })
++    })
+ 
++    it('should handle a postgres-meta that does not answer', async () => {
++      kit.metas[1].onRequest = (a) => a.res.socket?.destroy()
+       await expect(forA(() => generateTypescriptTypes({ headers: {} }))).rejects.toThrow(
+-        'Network error'
++        'postgres-meta gave no usable answer'
+       )
+     })
+-
+-    it('should work without headers parameter', async () => {
+-      mockFetchGet.mockResolvedValue({ types: '' })
+-
+-      await forA(() => generateTypescriptTypes({}))
+-
+-      expect(mockFetchGet).toHaveBeenCalledWith(expect.any(String), {
+-        headers: { 'x-connection-encrypted': `encrypted(${dsn('postgres', 20001)})` },
+-      })
+-    })
+   })
+ })
+diff --git a/apps/studio/lib/api/self-hosted/generate-types.ts b/apps/studio/lib/api/self-hosted/generate-types.ts
+index 2fede54e..31400843 100644
+--- a/apps/studio/lib/api/self-hosted/generate-types.ts
++++ b/apps/studio/lib/api/self-hosted/generate-types.ts
+@@ -1,7 +1,7 @@
++import { callPgMeta } from './pg-meta'
+ import { dataApi } from './project-values'
+-import { assertSelfHosted, encryptString, getConnectionString } from './util'
+-import { fetchGet } from '@/data/fetchers'
+-import { PG_META_URL } from '@/lib/constants'
++import { assertSelfHosted } from './util'
++import { classifyResponseError, readResponseError } from '@/data/error-classification'
+ import type { StudioError } from '@/lib/errors/studio-errors'
+ 
+ export type GenerateTypescriptTypesOptions = {
+@@ -17,24 +17,31 @@ type GenerateTypescriptTypesResult = {
+  *
+  * _Only call this from server-side self-hosted code._
+  */
+-export async function generateTypescriptTypes({
+-  headers,
+-}: GenerateTypescriptTypesOptions): Promise<GenerateTypescriptTypesResult | StudioError> {
++export async function generateTypescriptTypes(
++  _options: GenerateTypescriptTypesOptions
++): Promise<GenerateTypescriptTypesResult | StudioError> {
+   assertSelfHosted()
+ 
+-  // The database is the one of the request's project, and no other: a connection string a
+-  // caller hands in, under any spelling of the header, is replaced, never forwarded.
+-  const named = new Headers(headers)
+-  named.set('x-connection-encrypted', encryptString(getConnectionString({ readOnly: false })))
+-
++  // supapace: the one path to postgres-meta. It names the database of the request's project
++  // itself and passes nothing of a caller's headers on; its refusals are thrown.
++  //
+   // Use the schemas the project's Data API exposes so generated
+   // types match the Data API surface, instead of a hardcoded include/exclude list.
+   // Note the param is `included_schemas` (plural) — pg-meta treats a non-empty list
+   // as a strict allowlist; the singular spelling is silently ignored (includes all).
+-  const response = await fetchGet<GenerateTypescriptTypesResult>(
+-    `${PG_META_URL}/generators/typescript?included_schemas=${encodeURIComponent(dataApi().schemas)}`,
+-    { headers: Object.fromEntries(named) }
+-  )
++  const { status, text } = await callPgMeta({ kind: 'typegen', schemas: dataApi().schemas })
+ 
+-  return response
++  if (status < 200 || status > 299) {
++    const raw = readResponseError({ status, headers: new Headers(), text })
++    return classifyResponseError({
++      ...raw,
++      message: raw.message ?? `An error has occurred: ${status}`,
++    })
++  }
++  try {
++    return JSON.parse(text)
++  } catch {
++    // postgres-meta answers the types as plain text
++    return text as unknown as GenerateTypescriptTypesResult
++  }
+ }
+diff --git a/apps/studio/lib/api/self-hosted/header-key.test.ts b/apps/studio/lib/api/self-hosted/header-key.test.ts
+index 6553d055..ffb95899 100644
+--- a/apps/studio/lib/api/self-hosted/header-key.test.ts
++++ b/apps/studio/lib/api/self-hosted/header-key.test.ts
+@@ -29,6 +29,7 @@ describe('the header key', () => {
+     vi.stubEnv('SUPAPACE_DASH_DATA', join(dir, 'data'))
+     vi.stubEnv('SUPAPACE_DASH_KEYS', dir)
+     vi.stubEnv('SUPAPACE_PGCAP', '10.212.0.6:20000:21023')
++    vi.stubEnv('SUPAPACE_PGMETA', 'http://10.212.0.4:8080,http://10.212.0.5:8080')
+     vi.stubEnv('SUPAPACE_NODE_ID', VECTORS.node)
+     delete process.env.TSS_PRERENDERING
+     exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+diff --git a/apps/studio/lib/api/self-hosted/pg-meta-guard.test.ts b/apps/studio/lib/api/self-hosted/pg-meta-guard.test.ts
+new file mode 100644
+index 00000000..da639bdb
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/pg-meta-guard.test.ts
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: Apache-2.0
++// The request guard hands every request over through the path to postgres-meta: what a handler
++// asks of postgres-meta holds its slot until the guard's response has been taken.
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { port, ref, startKit, type Kit } from './pg-meta-testkit'
++
++// The assertion is the verifier's own test; here the header names the project.
++vi.mock('./assertion', () => ({
++  checkAssertionSettings: () => {},
++  verifyAssertion: (text: string | null) => ({
++    text: `v1.${text}.s`,
++    ref: text,
++    iss: 'https://issuer.test',
++    sub: 'u',
++    name: 'U',
++    role: 'owner',
++    purpose: '',
++  }),
++}))
++
++// a router with no route: every path is a page
++const router = {
++  parseLocation: (location: { pathname: string }) => ({
++    pathname: location.pathname,
++  }),
++  getMatchedRoutes: () => [null, {}, undefined] as [unknown, Record<string, unknown>, undefined],
++}
++
++describe('the guard and the path to postgres-meta', () => {
++  let kit: Kit
++  afterEach(async () => {
++    await kit.stop()
++    vi.unstubAllEnvs()
++  })
++
++  it('a guarded request’s statement holds its slot until the response is taken', async () => {
++    kit = await startKit({
++      instance_calls: 1,
++      project_calls: 1,
++      slot_wait_ms: 150,
++    })
++    vi.stubEnv('SUPAPACE_PGMETA', kit.addresses)
++    const guard = await import('./request-guard')
++    const meta = kit.metas[1]
++    meta.onRequest = (a) => a.res.end(JSON.stringify('x'.repeat(200_000)))
++    for (const n of [1, 2]) kit.control.answers.set(ref(n), kit.answer(ref(n), port(n), 'owner'))
++    const send = (n: number, signal?: AbortSignal) =>
++      guard.guardRequest(
++        {
++          request: new Request('http://studio.test/x', {
++            headers: { 'x-supapace-assertion': ref(n) },
++            signal,
++          }),
++          pathname: '/x',
++          next: async () => {
++            const { text } = await kit.pgMeta.callPgMeta({
++              kind: 'query',
++              sql: 'select 1',
++            })
++            return new Response(text)
++          },
++        },
++        () => router
++      ) as Promise<Response>
++
++    const first = await send(1)
++    expect(first.status).toBe(200)
++    // answered, not taken: the other project's request finds no slot and is told so
++    const refused = await send(2)
++    expect([refused.status, await refused.json()]).toEqual([
++      429,
++      { code: 'busy', message: expect.any(String) },
++    ])
++    // taken: the slot is free
++    expect(await first.text()).toHaveLength(200_002)
++    expect((await (await send(2)).text()).length).toBe(200_002)
++
++    // and a client that leaves gives it back
++    const client = new AbortController()
++    await send(1, client.signal)
++    client.abort()
++    expect((await (await send(2)).text()).length).toBe(200_002)
++    expect(meta.seen.map((a) => a.port)).toEqual([port(1), port(2), port(1), port(2)])
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/pg-meta-testkit.ts b/apps/studio/lib/api/self-hosted/pg-meta-testkit.ts
+new file mode 100644
+index 00000000..0bcb1dd6
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/pg-meta-testkit.ts
+@@ -0,0 +1,253 @@
++// SPDX-License-Identifier: Apache-2.0
++// For the tests of the path to postgres-meta: two HTTP servers of the test as its two
++// instances, a server on a Unix socket as the control plane, a data and a keys directory of
++// the test, and the modules under test loaded fresh. A server opens the header it is sent with
++// the test's key, as postgres-meta does, and so shows which connection string it was sent. A
++// test file sets the address of the two instances from `addresses`.
++
++import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { createServer, type IncomingHttpHeaders, type Server, type ServerResponse } from 'node:http'
++import type { AddressInfo } from 'node:net'
++import { tmpdir } from 'node:os'
++import { join, resolve as resolvePath } from 'node:path'
++import crypto from 'crypto-js'
++import { vi } from 'vitest'
++
++import type { Limits } from './limits'
++import type { Assertion, ProjectContext } from './project-context'
++
++const VECTORS = resolvePath(import.meta.dirname, '../../../../../vectors')
++const ISS = 'https://issuer.test'
++// The key of the header that names the database, as the server under test reads it.
++export const HEADER_KEY = Buffer.alloc(48, 9).toString('base64url') + '\n'
++/** The header as the server under test seals it. */
++export const seal = (text: string) => crypto.AES.encrypt(text, HEADER_KEY).toString()
++const open = (sealed: string) => {
++  try {
++    return crypto.AES.decrypt(sealed, HEADER_KEY).toString(crypto.enc.Utf8)
++  } catch {
++    return ''
++  }
++}
++
++/** A project ref of the test's own: twenty characters. */
++export const ref = (n: number) => `project${String(n).padStart(13, '0')}`
++/** The port the test gives project `n` on instance `instance`: its parity names the instance. */
++export const port = (n: number, instance = 1) => 20000 + 2 * n + instance
++export const dsn = (login: string, p: number, password = `pw${p}`) =>
++  `postgresql://${login}:${password}@10.212.0.6:${p}/postgres?sslmode=disable`
++export const RW = 'postgres'
++export const RO = 'supabase_read_only_user'
++
++export type Arrived = {
++  method: string
++  url: string
++  headers: IncomingHttpHeaders
++  body: string
++  res: ServerResponse
++  /** the connection string the request was sent with, and its port */
++  dsn: string
++  port: number
++  /** set when the connection has ended */
++  closed: boolean
++}
++
++/** An HTTP server of the test as one postgres-meta instance. */
++export class Meta {
++  seen: Arrived[] = []
++  /** the most requests that were unanswered at once */
++  most = 0
++  /** what is done with a request that has arrived: by default it is answered `[]` at once */
++  onRequest: (arrived: Arrived) => void = (arrived) => arrived.res.end('[]')
++  private waiting: (() => void)[] = []
++  private open = 0
++  readonly server: Server = createServer((req, res) => {
++    const chunks: Buffer[] = []
++    req.on('data', (chunk) => chunks.push(chunk))
++    req.on('end', () => {
++      const sent = open(String(req.headers['x-connection-encrypted']))
++      const arrived: Arrived = {
++        method: req.method ?? '',
++        url: req.url ?? '',
++        headers: req.headers,
++        body: Buffer.concat(chunks).toString('utf8'),
++        res,
++        dsn: sent,
++        port: Number(/:(\d+)\/postgres/.exec(sent)?.[1]),
++        closed: false,
++      }
++      this.most = Math.max(this.most, ++this.open)
++      res.on('close', () => {
++        arrived.closed = true
++        this.open--
++        this.wake()
++      })
++      this.seen.push(arrived)
++      this.wake()
++      this.onRequest(arrived)
++    })
++  })
++
++  private wake() {
++    for (const w of this.waiting.splice(0)) w()
++  }
++  /** Leaves every request unanswered until the test answers it. */
++  park() {
++    this.onRequest = () => {}
++  }
++  /** Resolves, with all requests so far, when `test` holds: checked at every arrival and close. */
++  async until(test: (seen: Arrived[]) => boolean): Promise<Arrived[]> {
++    while (!test(this.seen)) await new Promise<void>((done) => this.waiting.push(done))
++    return this.seen
++  }
++  /** Resolves when `count` requests have arrived. */
++  arrivals(count: number) {
++    return this.until((seen) => seen.length >= count)
++  }
++  get address() {
++    return `http://127.0.0.1:${(this.server.address() as AddressInfo).port}`
++  }
++}
++
++export type Kit = Awaited<ReturnType<typeof startKit>>
++
++/**
++ * Starts the servers, sets the node's settings but the address of postgres-meta — the test
++ * file sets that one, from `addresses` — and loads the modules. `limits` replaces members of
++ * the default bounds.
++ */
++export async function startKit(limits: Partial<Limits> = {}) {
++  const dir = mkdtempSync(join(tmpdir(), 'pg-meta-'))
++  const data = join(dir, 'data')
++  writeFileSync(join(dir, 'cache.key'), Buffer.alloc(32, 7).toString('base64url') + '\n')
++  writeFileSync(join(dir, 'crypto.key'), HEADER_KEY)
++  const metas = [new Meta(), new Meta()]
++  for (const m of metas) await new Promise<void>((done) => m.server.listen(0, '127.0.0.1', done))
++
++  // The control plane: it answers `resolve` with what `answers` holds for the ref, or refuses.
++  const control = {
++    asked: [] as string[],
++    answers: new Map<string, unknown>(),
++    refusal: undefined as { status: number; code: string } | undefined,
++  }
++  const socket = createServer((req, res) => {
++    const text = String(req.headers['x-supapace-assertion'])
++    control.asked.push(text)
++    res.setHeader('content-type', 'application/json')
++    if (control.refusal) {
++      res.statusCode = control.refusal.status
++      return res.end(JSON.stringify({ code: control.refusal.code }))
++    }
++    res.end(JSON.stringify(control.answers.get(text.split('.')[1])))
++  })
++  await new Promise<void>((done) => socket.listen(join(dir, 'dash.sock'), done))
++
++  const all = {
++    ...JSON.parse(readFileSync(join(VECTORS, 'limits.json'), 'utf8')),
++    ...limits,
++  }
++  vi.stubEnv('SUPAPACE_LIMITS', JSON.stringify(all))
++  vi.stubEnv('SUPAPACE_DASH_SOCKET', join(dir, 'dash.sock'))
++  vi.stubEnv('SUPAPACE_DASH_DATA', data)
++  vi.stubEnv('SUPAPACE_DASH_KEYS', dir)
++  vi.stubEnv('SUPAPACE_PGCAP', '10.212.0.6:20000:21023')
++
++  vi.resetModules()
++  const contexts = await import('./project-context')
++  const pgMeta = await import('./pg-meta')
++
++  /** What the control plane answers for a project; `p`'s parity names the instance. */
++  const answer = (r: string, p: number, role: Assertion['role'], more: object = {}) => ({
++    ref: r,
++    name: 'p',
++    state: 'active' as const,
++    db_version: '17.6.1',
++    pg_meta: p % 2,
++    ...(role === 'read_only' ? {} : { dsn_rw: dsn(RW, p) }),
++    dsn_ro: dsn(RO, p),
++    api_url: `https://${r}.example.test`,
++    data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
++    generation: 1,
++    at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
++    ...more,
++  })
++  /** The assertion of the test's member of a project: its text names the ref to the stand-in. */
++  const assertion = (r: string, role: Assertion['role'] = 'owner', sub = 'u'): Assertion => ({
++    text: `v1.${r}.s`,
++    ref: r,
++    iss: ISS,
++    sub,
++    name: 'U',
++    role,
++    purpose: '',
++  })
++  /** The context of a request of project `n`, which is on instance `instance`. */
++  const context = (
++    n: number,
++    role: Assertion['role'] = 'owner',
++    more: object = {},
++    instance = 1
++  ): ProjectContext =>
++    contexts.projectContext(assertion(ref(n), role), answer(ref(n), port(n, instance), role, more))
++
++  /** Runs `fn` as a request of the context's project and hands its response over. */
++  const request = <T>(c: ProjectContext, fn: () => T | Promise<T>, signal?: AbortSignal) =>
++    contexts.runWithProject(c, () =>
++      pgMeta.handOver(new Request('http://studio.test/', { signal }), fn)
++    )
++  /** A request that sends one statement and answers with what postgres-meta answered. */
++  const statement = (c: ProjectContext, sql = 'select 1', signal?: AbortSignal) =>
++    request(
++      c,
++      async () => {
++        const { status, text } = await pgMeta.callPgMeta({
++          kind: 'query',
++          sql,
++        })
++        return new Response(text, { status })
++      },
++      signal
++    )
++  /** The same, its response read to the end: the request is over, its slot free. */
++  const run = async (c: ProjectContext, sql?: string) => (await statement(c, sql)).text()
++
++  return {
++    dir,
++    data,
++    metas,
++    addresses: metas.map((m) => m.address).join(','),
++    control,
++    contexts,
++    pgMeta,
++    answer,
++    assertion,
++    context,
++    request,
++    statement,
++    run,
++    /** The lines of a project's audit file, or of its rolled one. */
++    audit: (n: number, name = 'audit.log') =>
++      readFileSync(join(data, ref(n), name), 'utf8')
++        .split('\n')
++        .filter((line) => line !== ''),
++    async stop() {
++      for (const m of metas) {
++        m.server.closeAllConnections()
++        await new Promise((done) => m.server.close(done))
++      }
++      await new Promise((done) => socket.close(done))
++      rmSync(dir, { recursive: true, force: true })
++    },
++  }
++}
++
++/** A promise and its two ends. */
++export function deferred<T = void>() {
++  let resolve!: (value: T) => void
++  let reject!: (error: unknown) => void
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res
++    reject = rej
++  })
++  return { promise, resolve, reject }
++}
+diff --git a/apps/studio/lib/api/self-hosted/pg-meta.test.ts b/apps/studio/lib/api/self-hosted/pg-meta.test.ts
+new file mode 100644
+index 00000000..e27ae1d7
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/pg-meta.test.ts
+@@ -0,0 +1,1406 @@
++// SPDX-License-Identifier: Apache-2.0
++// The one path to postgres-meta: which database and instance a call names, the slots, the
++// bounds on the call, the answer and its hand-over, and what follows a refused login. An HTTP
++// server of the test stands for each postgres-meta instance.
++import { createHash } from 'node:crypto'
++import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
++import { join, resolve as resolvePath } from 'node:path'
++import { afterEach, describe, expect, it, vi, type MockInstance } from 'vitest'
++
++import {
++  deferred,
++  dsn,
++  port,
++  ref,
++  RO,
++  RW,
++  seal,
++  startKit,
++  type Arrived,
++  type Kit,
++} from './pg-meta-testkit'
++
++vi.mock('@sentry/react', () => ({
++  startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
++  captureException: () => {},
++}))
++
++let kit: Kit
++let said: MockInstance
++async function start(limits: Parameters<typeof startKit>[0] = {}) {
++  kit = await startKit(limits)
++  vi.stubEnv('SUPAPACE_PGMETA', kit.addresses)
++  said = vi.spyOn(console, 'error').mockImplementation(() => {})
++  return kit
++}
++afterEach(async () => {
++  await kit?.stop()
++  vi.unstubAllEnvs()
++  vi.restoreAllMocks()
++})
++
++const VECTORS = resolvePath(import.meta.dirname, '../../../../../vectors')
++/** The assertion key file of the token vectors, where the guard's start check reads it. */
++function writeAssertionKey(dir: string) {
++  const { public_file } = JSON.parse(readFileSync(join(VECTORS, 'tokens.json'), 'utf8'))
++  writeFileSync(join(dir, 'assert.pub'), public_file + '\n')
++}
++
++const busy = { status: 429, code: 'busy' }
++const settled = (p: Promise<unknown>) =>
++  p.then(
++    () => 'fulfilled',
++    (error) => error
++  )
++/** Answers a parked request and reads the client's response to its end: the slot is free. */
++async function finish(arrived: Arrived, pending: Promise<Response>, body = '[]') {
++  arrived.res.end(body)
++  return (await pending).text()
++}
++const ports = (seen: Arrived[]) => seen.map((a) => a.port)
++
++describe('which database a call names', () => {
++  it('sends a statement for the request’s project to its instance, with two headers of its own', async () => {
++    await start()
++    await kit.run(kit.context(1), 'select 42')
++    await kit.run(kit.context(2, 'owner', {}, 0))
++    const [, one] = kit.metas
++    expect(one.seen).toHaveLength(1)
++    expect(one.seen[0]).toMatchObject({
++      method: 'POST',
++      url: '/query',
++      port: port(1),
++    })
++    expect(one.seen[0].body).toBe('{"query":"select 42"}')
++    expect(one.seen[0].headers['x-connection-encrypted']).not.toContain('postgresql')
++    expect(one.seen[0].dsn).toBe(dsn(RW, port(1)))
++    // these, and what the transport adds
++    expect(Object.keys(one.seen[0].headers).sort()).toEqual([
++      'connection',
++      'content-length',
++      'content-type',
++      'host',
++      'x-connection-encrypted',
++    ])
++    // the other project is on the other instance, and only there
++    expect(ports(kit.metas[0].seen)).toEqual([port(2, 0)])
++  })
++
++  it('passes parameters on, and the read-only string when the call site asks for it', async () => {
++    await start()
++    await kit.request(kit.context(1), () =>
++      kit.pgMeta.callPgMeta({
++        kind: 'query',
++        sql: 'select $1',
++        parameters: [7],
++        readOnly: true,
++      })
++    )
++    const [sent] = kit.metas[1].seen
++    expect(sent.body).toBe('{"query":"select $1","parameters":[7]}')
++    expect(sent.dsn).toBe(dsn(RO, port(1)))
++  })
++
++  // every shape a caller's headers can take, each naming another project's database
++  const planted = seal(dsn(RW, port(9)))
++  const hostile: [string, HeadersInit][] = [
++    ['the header as a route passes it', { 'x-connection-encrypted': planted }],
++    ['the header in another spelling', { 'X-Connection-Encrypted': planted }],
++    ['both spellings', { 'x-connection-encrypted': planted, 'X-CONNECTION-ENCRYPTED': planted }],
++    ['a Headers object', new Headers({ 'x-connection-encrypted': planted })],
++    ['a list of pairs', [['x-connection-encrypted', planted]]],
++    ['the plain header postgres-meta reads', { pg: dsn(RW, port(9)), cookie: 'a=b', apiKey: 'k' }],
++  ]
++  it.each(hostile)(
++    'a read_only member is sent the read-only string whatever the call site asks: %s',
++    async (_, headers) => {
++      await start()
++      const { executeQuery } = await import('./query')
++      const { generateTypescriptTypes } = await import('./generate-types')
++      const member = kit.context(1, 'read_only')
++      await kit.request(member, () => executeQuery({ query: 'select 1', readOnly: false, headers }))
++      await kit.request(member, () => generateTypescriptTypes({ headers }))
++      const seen = kit.metas[1].seen
++      expect(seen.map((a) => a.method)).toEqual(['POST', 'GET'])
++      for (const sent of seen) {
++        expect(sent.dsn).toBe(dsn(RO, port(1)))
++        expect(JSON.stringify(sent.headers)).not.toContain(planted)
++        expect(Object.keys(sent.headers)).not.toEqual(expect.arrayContaining(['pg']))
++        expect(Object.keys(sent.headers)).not.toEqual(expect.arrayContaining(['cookie']))
++        expect(Object.keys(sent.headers)).not.toEqual(expect.arrayContaining(['apikey']))
++      }
++      // control: an owner's same calls name the read-write login
++      await kit.request(kit.context(1), () => executeQuery({ query: 'select 1', headers }))
++      expect(seen[2].dsn).toBe(dsn(RW, port(1)))
++    }
++  )
++
++  it('refuses 403 no_read_only_login without a read-only string, and sends and records nothing', async () => {
++    await start()
++    const { generateTypescriptTypes } = await import('./generate-types')
++    const noLogin = { status: 403, code: 'no_read_only_login' }
++    const member = kit.context(1, 'read_only', { dsn_ro: undefined })
++    await expect(kit.run(member)).rejects.toMatchObject(noLogin)
++    await expect(kit.request(member, () => generateTypescriptTypes({}))).rejects.toMatchObject(
++      noLogin
++    )
++    // an owner whose call site asks for the read-only login
++    const owner = kit.context(1, 'owner', { dsn_ro: undefined })
++    await expect(
++      kit.request(owner, () => kit.pgMeta.callPgMeta({ kind: 'query', sql: 's', readOnly: true }))
++    ).rejects.toMatchObject(noLogin)
++    expect(kit.metas[1].seen).toHaveLength(0)
++    expect(existsSync(join(kit.data, ref(1)))).toBe(false)
++    // control: the owner's own login is there
++    await kit.run(owner)
++    expect(kit.metas[1].seen).toHaveLength(1)
++  })
++
++  it('type generation names the schemas as one parameter, whatever they hold', async () => {
++    await start()
++    await kit.request(kit.context(1), () =>
++      kit.pgMeta.callPgMeta({
++        kind: 'typegen',
++        schemas: 'public,a b&excluded_schemas=x#y',
++      })
++    )
++    const [sent] = kit.metas[1].seen
++    expect(sent.method).toBe('GET')
++    const url = new URL(sent.url, 'http://x')
++    expect(url.pathname).toBe('/generators/typescript')
++    expect([...url.searchParams]).toEqual([['included_schemas', 'public,a b&excluded_schemas=x#y']])
++    expect(sent.body).toBe('')
++  })
++
++  it('sends nothing outside a request, or for a request that is not handed over', async () => {
++    await start()
++    const call = () => kit.pgMeta.callPgMeta({ kind: 'query', sql: 'select 1' })
++    await expect(call()).rejects.toMatchObject({ code: 'no_project_context' })
++    await expect(kit.contexts.runWithProject(kit.context(1), call)).rejects.toMatchObject({
++      status: 500,
++      code: 'no_project_context',
++    })
++    await expect(kit.pgMeta.parserSlot(() => 1)).rejects.toMatchObject({
++      code: 'no_project_context',
++    })
++    expect(kit.metas[1].seen).toHaveLength(0)
++  })
++
++  it('refuses a statement that is no text, and one larger than the bound of a body', async () => {
++    const bound = 2000
++    await start({ meta_body_bytes: bound })
++    for (const sql of [undefined, null, 7, { a: 1 }, ['select 1']]) {
++      const call = () => kit.pgMeta.callPgMeta({ kind: 'query', sql: sql as never })
++      await expect(kit.request(kit.context(1), call)).rejects.toMatchObject({
++        status: 400,
++        code: 'bad_request',
++      })
++    }
++    const room = bound - '{"query":""}'.length
++    await expect(kit.run(kit.context(1), 'x'.repeat(room + 1))).rejects.toMatchObject({
++      status: 413,
++      code: 'body_too_large',
++    })
++    // what a byte takes when it is sent counts, not the text's length
++    await expect(kit.run(kit.context(1), 'é'.repeat(room / 2 + 1))).rejects.toMatchObject({
++      code: 'body_too_large',
++    })
++    expect(kit.metas[1].seen).toHaveLength(0)
++    expect(existsSync(join(kit.data, ref(1)))).toBe(false)
++    // control: the largest that fits is sent
++    await kit.run(kit.context(1), 'x'.repeat(room))
++    expect(kit.metas[1].seen[0].body).toHaveLength(bound)
++  })
++})
++
++describe('the address of postgres-meta', () => {
++  async function check(value: string | undefined) {
++    await start()
++    if (value === undefined) delete process.env.SUPAPACE_PGMETA
++    else vi.stubEnv('SUPAPACE_PGMETA', value)
++    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
++      throw new Error('the process exited')
++    })
++    return { exit, check: () => kit.pgMeta.checkPgMetaSettings() }
++  }
++
++  it('is two addresses in the one form', async () => {
++    const { exit, check: run } = await check('http://10.212.0.4:8080,http://10.212.0.5:8080')
++    run()
++    expect(exit).not.toHaveBeenCalled()
++    expect(said).not.toHaveBeenCalled()
++  })
++
++  it.each([
++    ['nothing', undefined],
++    ['an empty value', ''],
++    ['one address', 'http://10.212.0.4:8080'],
++    ['three', 'http://10.212.0.4:8080,http://10.212.0.5:8080,http://10.212.0.6:8080'],
++    ['an empty second', 'http://10.212.0.4:8080,'],
++    ['a host name', 'http://pgmeta:8080,http://10.212.0.5:8080'],
++    ['another scheme', 'https://10.212.0.4:8080,http://10.212.0.5:8080'],
++    ['a path', 'http://10.212.0.4:8080/,http://10.212.0.5:8080'],
++    ['a login', 'http://u@10.212.0.4:8080,http://10.212.0.5:8080'],
++    ['no port', 'http://10.212.0.4,http://10.212.0.5:8080'],
++    ['port 0', 'http://10.212.0.4:0,http://10.212.0.5:8080'],
++    ['a port above 65535', 'http://10.212.0.4:65536,http://10.212.0.5:8080'],
++    ['an octet above 255', 'http://10.212.0.256:8080,http://10.212.0.5:8080'],
++    ['an octet with a leading zero', 'http://10.212.00.4:8080,http://10.212.0.5:8080'],
++    ['a space', 'http://10.212.0.4:8080, http://10.212.0.5:8080'],
++    ['a line end', 'http://10.212.0.4:8080,http://10.212.0.5:8080\n'],
++  ])('stops the server with %s, at the start check and at the first call', async (_, value) => {
++    const { exit, check: run } = await check(value)
++    expect(run).toThrow('the process exited')
++    expect(exit).toHaveBeenCalledWith(1)
++    expect(said).toHaveBeenCalledTimes(1)
++    expect(String(said.mock.calls[0][0])).toMatch(
++      /^supapace: SUPAPACE_PGMETA is not .*; the server stops$/
++    )
++    await expect(kit.run(kit.context(1))).rejects.toThrow('the process exited')
++    expect(kit.metas[1].seen).toHaveLength(0)
++  })
++
++  it('the start check of the server reaches it', async () => {
++    await start()
++    vi.stubEnv('SUPAPACE_NODE_ID', 'node-1')
++    writeAssertionKey(kit.dir)
++    delete process.env.SUPAPACE_PGMETA
++    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
++      throw new Error('the process exited')
++    })
++    const guard = await import('./request-guard')
++    expect(() => guard.checkStart()).toThrow('the process exited')
++    expect(String(said.mock.calls[0][0])).toContain('SUPAPACE_PGMETA')
++    // control: with the address the same check passes
++    vi.resetModules()
++    vi.stubEnv('SUPAPACE_PGMETA', kit.addresses)
++    exit.mockClear()
++    ;(await import('./request-guard')).checkStart()
++    expect(exit).not.toHaveBeenCalled()
++  })
++})
++
++describe('the audit record', () => {
++  const T = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/
++  const sha = (text: string) => createHash('sha256').update(text).digest('hex')
++
++  it('is in the file, flushed, before the request arrives, with its members and its time', async () => {
++    await start()
++    // the order of things: a flush that has returned, a request that has arrived
++    const order: string[] = []
++    const { open } = await import('node:fs/promises')
++    const probe = await open(join(kit.dir, 'probe'), 'w')
++    const handle = Object.getPrototypeOf(probe)
++    await probe.close()
++    const sync = handle.sync
++    vi.spyOn(handle, 'sync').mockImplementation(async function (this: unknown) {
++      await sync.call(this)
++      order.push('flushed')
++    })
++    const atArrival: string[][] = []
++    kit.metas[1].onRequest = (arrived) => {
++      order.push('arrived')
++      atArrival.push(kit.audit(1))
++      arrived.res.end('[]')
++    }
++    const before = Date.now()
++    await kit.run(kit.context(1), 'select 1')
++    await kit.run(kit.context(1, 'read_only'), 'select\n2')
++    const after = Date.now()
++
++    // the file and its name the first time, the file alone the second
++    expect(order).toEqual(['flushed', 'flushed', 'arrived', 'flushed', 'arrived'])
++    expect(atArrival.map((lines) => lines.length)).toEqual([1, 2])
++    const [first, second] = atArrival[1].map((line) => JSON.parse(line))
++    expect(Object.keys(first)).toEqual([
++      't',
++      'ref',
++      'iss',
++      'sub',
++      'role',
++      'login',
++      'kind',
++      'sql_sha256',
++    ])
++    expect(first).toMatchObject({
++      ref: ref(1),
++      iss: 'https://issuer.test',
++      sub: 'u',
++      role: 'owner',
++      login: RW,
++      kind: 'query',
++      sql_sha256: sha('select 1'),
++    })
++    expect(second).toMatchObject({
++      role: 'read_only',
++      login: RO,
++      sql_sha256: sha('select\n2'),
++    })
++    for (const record of [first, second]) {
++      expect(record.t).toMatch(T)
++      expect(Date.parse(record.t)).toBeGreaterThanOrEqual(before)
++      expect(Date.parse(record.t)).toBeLessThanOrEqual(after)
++    }
++    // the file is the server's alone
++    expect(statSync(join(kit.data, ref(1), 'audit.log')).mode & 0o777).toBe(0o600)
++    expect(statSync(join(kit.data, ref(1))).mode & 0o777).toBe(0o700)
++  })
++
++  it('records type generation as such, without a statement’s hash', async () => {
++    await start()
++    const { generateTypescriptTypes } = await import('./generate-types')
++    let atArrival: string[] = []
++    kit.metas[1].onRequest = (arrived) => {
++      atArrival = kit.audit(1)
++      arrived.res.end('export type T = {}')
++    }
++    await kit.request(kit.context(1, 'developer'), () => generateTypescriptTypes({}))
++    expect(atArrival).toHaveLength(1)
++    const record = JSON.parse(atArrival[0])
++    expect(Object.keys(record)).toEqual(['t', 'ref', 'iss', 'sub', 'role', 'login', 'kind'])
++    expect(record).toMatchObject({
++      kind: 'typegen',
++      role: 'developer',
++      login: RW,
++    })
++  })
++
++  it('a project’s records are in its own file', async () => {
++    await start()
++    await kit.run(kit.context(1), 'select 1')
++    await kit.run(kit.context(2), 'select 2')
++    expect(kit.audit(1).map((l) => JSON.parse(l).ref)).toEqual([ref(1)])
++    expect(kit.audit(2).map((l) => JSON.parse(l).sql_sha256)).toEqual([sha('select 2')])
++  })
++
++  it('rolls the file at its bound and keeps one generation', async () => {
++    // a record of these is 209 bytes with its line end: four fit, the fifth rolls
++    await start({ audit_file_bytes: 1000 })
++    const dir = join(kit.data, ref(1))
++    const size = (name: string) => statSync(join(dir, name)).size
++    const n = (lines: string[]) => lines.map((l) => JSON.parse(l).sql_sha256)
++    const hashes = Array.from({ length: 11 }, (_, i) => sha(`select ${i}`))
++    for (let i = 0; i < 4; i++) await kit.run(kit.context(1), `select ${i}`)
++    expect(readdirSync(dir)).toEqual(['audit.log'])
++    expect(size('audit.log')).toBeLessThanOrEqual(1000)
++    expect(size('audit.log') + size('audit.log') / 4).toBeGreaterThan(1000)
++
++    await kit.run(kit.context(1), 'select 4')
++    expect(readdirSync(dir).sort()).toEqual(['audit.log', 'audit.log.1'])
++    expect(n(kit.audit(1, 'audit.log.1'))).toEqual(hashes.slice(0, 4))
++    expect(n(kit.audit(1))).toEqual(hashes.slice(4, 5))
++
++    // the next roll replaces the generation: the oldest records are gone, nothing else is kept
++    for (let i = 5; i < 11; i++) await kit.run(kit.context(1), `select ${i}`)
++    expect(readdirSync(dir).sort()).toEqual(['audit.log', 'audit.log.1'])
++    expect(n(kit.audit(1, 'audit.log.1'))).toEqual(hashes.slice(4, 8))
++    expect(n(kit.audit(1))).toEqual(hashes.slice(8, 11))
++    expect(size('audit.log.1')).toBeLessThanOrEqual(1000)
++  })
++
++  describe('that cannot be written', () => {
++    const refused = { status: 503, code: 'audit_unavailable' }
++    // Each case leaves the project's file unwritable; `mend` makes it writable again.
++    const cases: [string, (dir: string) => Promise<() => void> | (() => void)][] = [
++      [
++        'the directory read-only',
++        async (dir) => {
++          const { chmodSync, mkdirSync, writeFileSync: write } = await import('node:fs')
++          mkdirSync(dir, { recursive: true })
++          chmodSync(dir, 0o500)
++          let writable = true
++          try {
++            write(join(dir, 'probe'), '')
++          } catch {
++            writable = false
++          }
++          if (writable) {
++            // this user writes where the mode forbids it: a file system that takes no file
++            vi.stubEnv('SUPAPACE_DASH_DATA', '/sys/kernel')
++            return () => vi.stubEnv('SUPAPACE_DASH_DATA', kit.data)
++          }
++          return () => chmodSync(dir, 0o700)
++        },
++      ],
++      [
++        'the file replaced by a directory',
++        async (dir) => {
++          const { mkdirSync, rmdirSync } = await import('node:fs')
++          mkdirSync(join(dir, 'audit.log'), { recursive: true })
++          return () => rmdirSync(join(dir, 'audit.log'))
++        },
++      ],
++      [
++        'the file replaced by a pipe that something reads',
++        async (dir) => {
++          const { execFileSync } = await import('node:child_process')
++          const { constants, mkdirSync, openSync, closeSync, rmSync } = await import('node:fs')
++          mkdirSync(dir, { recursive: true })
++          execFileSync('mkfifo', [join(dir, 'audit.log')])
++          const reader = openSync(join(dir, 'audit.log'), constants.O_RDONLY | constants.O_NONBLOCK)
++          return () => {
++            closeSync(reader)
++            rmSync(join(dir, 'audit.log'))
++          }
++        },
++      ],
++      [
++        'the file replaced by a link to another file',
++        async (dir) => {
++          const { mkdirSync, symlinkSync, rmSync, writeFileSync: write } = await import('node:fs')
++          mkdirSync(dir, { recursive: true })
++          write(join(kit.dir, 'elsewhere'), '')
++          symlinkSync(join(kit.dir, 'elsewhere'), join(dir, 'audit.log'))
++          return () => {
++            expect(statSync(join(kit.dir, 'elsewhere')).size).toBe(0)
++            rmSync(join(dir, 'audit.log'))
++          }
++        },
++      ],
++      [
++        'a write that fails',
++        async () => {
++          const { open } = await import('node:fs/promises')
++          const probe = await open(join(kit.dir, 'probe'), 'w')
++          const handle = Object.getPrototypeOf(probe)
++          await probe.close()
++          const spy = vi.spyOn(handle, 'appendFile').mockImplementation(async function (this: {
++            write: (text: string) => Promise<unknown>
++          }) {
++            // a part of the line reaches the file, then the volume is full
++            await this.write('{"t":"part of a li')
++            throw Object.assign(new Error('no space'), { code: 'ENOSPC' })
++          })
++          return () => spy.mockRestore()
++        },
++      ],
++      [
++        'a flush that fails',
++        async () => {
++          const { open } = await import('node:fs/promises')
++          const probe = await open(join(kit.dir, 'probe'), 'w')
++          const handle = Object.getPrototypeOf(probe)
++          await probe.close()
++          const spy = vi
++            .spyOn(handle, 'sync')
++            .mockRejectedValue(Object.assign(new Error('input/output error'), { code: 'EIO' }))
++          return () => spy.mockRestore()
++        },
++      ],
++    ]
++    it.each(cases)('%s: the statement is refused 503 and nothing is sent', async (_, breakIt) => {
++      await start({ instance_calls: 1, project_calls: 1 })
++      const { generateTypescriptTypes } = await import('./generate-types')
++      const mend = await breakIt(join(kit.data, ref(1)))
++      await expect(kit.run(kit.context(1), 'select 1')).rejects.toMatchObject(refused)
++      await expect(
++        kit.request(kit.context(1), () => generateTypescriptTypes({}))
++      ).rejects.toMatchObject(refused)
++      expect(kit.metas[1].seen).toHaveLength(0)
++      // one line each for the operator, with the ref and the system's own error name alone
++      expect(said.mock.calls.map((c) => String(c[0]))).toEqual(
++        Array(2).fill(
++          expect.stringMatching(
++            new RegExp(
++              `^supapace: the audit record of ${ref(1)} could not be written \\((E[A-Z]+|error)\\)$`
++            )
++          )
++        )
++      )
++      // control: the same statement runs once the file can be written — and the slot of the
++      // refused ones was given back: the instance has one
++      mend()
++      await kit.run(kit.context(1), 'select 1')
++      expect(kit.metas[1].seen).toHaveLength(1)
++      const lines = kit.audit(1)
++      expect(lines).toHaveLength(1)
++      expect(JSON.parse(lines[0]).kind).toBe('query')
++    })
++  })
++
++  it('a statement’s text reaches the record as its hash alone', async () => {
++    await start()
++    const sql = `select 1; --\n{"t":"2000-01-01T00:00:00.000Z","ref":"${ref(2)}","kind":"query"}\n`
++    await kit.run(kit.context(1), sql)
++    const lines = kit.audit(1)
++    expect(lines).toHaveLength(1)
++    expect(JSON.parse(lines[0]).sql_sha256).toBe(sha(sql))
++    expect(lines[0]).not.toContain('2000-01-01')
++  })
++})
++
++/** A statement of project `n` that postgres-meta has received and not answered: it holds a slot. */
++async function inFlight(n: number, signal?: AbortSignal, instance = 1) {
++  const meta = kit.metas[instance]
++  const count = meta.seen.length
++  const pending = kit.statement(kit.context(n, 'owner', {}, instance), undefined, signal)
++  pending.catch(() => {})
++  const seen = await meta.arrivals(count + 1)
++  return { pending, arrived: seen[count] }
++}
++/** A statement that is expected to wait or to be refused: its end is looked at later. */
++function asked(n: number, signal?: AbortSignal) {
++  const pending = kit.statement(kit.context(n), undefined, signal)
++  pending.catch(() => {})
++  return pending
++}
++
++describe('slots', () => {
++  it('four calls in flight an instance; a fifth is sent when one is over', async () => {
++    await start({ slot_wait_ms: 300 })
++    const [zero, one] = kit.metas
++    zero.park()
++    one.park()
++    const held = []
++    for (const n of [1, 2, 3, 4]) held.push(await inFlight(n))
++    // a fifth project finds none within its wait, and nothing was sent for it
++    await expect(kit.run(kit.context(5))).rejects.toMatchObject(busy)
++    expect(one.seen).toHaveLength(4)
++    // the other instance has its own four
++    const other = []
++    for (const n of [6, 7, 8, 9]) other.push(await inFlight(n, undefined, 0))
++    expect(zero.seen).toHaveLength(4)
++    // one is over: the next is sent
++    const fifth = asked(5)
++    await finish(held[0].arrived, held[0].pending)
++    await one.arrivals(5)
++    expect(one.seen[4].port).toBe(port(5))
++    expect([zero.most, one.most]).toEqual([4, 4])
++    expect(await finish(one.seen[4], fifth)).toBe('[]')
++  })
++
++  it('grants the waiting projects in turn, not the one that asked most', async () => {
++    await start()
++    const meta = kit.metas[1]
++    meta.park()
++    const fillers = []
++    for (const n of [1, 2, 3, 4]) fillers.push(await inFlight(n))
++    // project 5 asks three times before 6 and 7 ask once each
++    const waiting = [asked(5), asked(5), asked(5), asked(6), asked(7)]
++    for (const filler of fillers.slice(0, 3)) {
++      const count = meta.seen.length
++      await finish(filler.arrived, filler.pending)
++      await meta.arrivals(count + 1)
++    }
++    expect(ports(meta.seen.slice(4))).toEqual([port(5), port(6), port(7)])
++    // the fourth slot frees: project 5 holds one and would take the last one as its second
++    await finish(fillers[3].arrived, fillers[3].pending)
++    await finish(meta.seen[5], waiting[3])
++    // now two are free: its second is sent
++    await meta.arrivals(8)
++    expect(meta.seen[7].port).toBe(port(5))
++    expect(meta.most).toBe(4)
++  })
++
++  it('two projects that wait for one slot take it in turn, whoever asked first', async () => {
++    await start({ instance_calls: 1, project_calls: 1 })
++    const meta = kit.metas[1]
++    meta.park()
++    const holder = await inFlight(1)
++    // project 2 asks three times, then project 3 three times
++    const waiting = [asked(2), asked(2), asked(2), asked(3), asked(3), asked(3)]
++    await finish(holder.arrived, holder.pending)
++    const turns = [2, 3, 2, 3, 2, 3]
++    for (let i = 0; i < 6; i++) {
++      const seen = await meta.arrivals(i + 2)
++      expect(seen[i + 1].port).toBe(port(turns[i]))
++      // a project's waiters are served in the order they asked
++      const mine = waiting[(turns[i] - 2) * 3 + Math.floor(i / 2)]
++      expect(await finish(seen[i + 1], mine)).toBe('[]')
++    }
++    expect(meta.most).toBe(1)
++  })
++
++  it('a project that fills its waiting places does not keep another project from a slot', async () => {
++    await start()
++    const meta = kit.metas[1]
++    meta.park()
++    const first = await inFlight(1)
++    const second = await inFlight(1)
++    const many = Array.from({ length: 32 }, () => asked(1))
++    // two slots are free: another project is sent at once, past the thirty-two
++    const other = await inFlight(2)
++    const third = await inFlight(3)
++    // the instance is full; project 4 waits behind project 1's thirty-two, and is first
++    const fourth = asked(4)
++    await finish(third.arrived, third.pending)
++    await meta.arrivals(5)
++    expect(meta.seen[4].port).toBe(port(4))
++    await finish(meta.seen[4], fourth)
++    // and project 1's own are still waiting, each for its turn
++    await finish(first.arrived, first.pending)
++    await meta.arrivals(6)
++    expect(meta.seen[5].port).toBe(port(1))
++    void [second, other, many]
++  })
++
++  it('the thirty-third waiter of a project is 429 busy at once', async () => {
++    await start({ slot_wait_ms: 60_000 })
++    const meta = kit.metas[1]
++    meta.park()
++    const held = [await inFlight(1), await inFlight(1)]
++    const waiting = Array.from({ length: 32 }, () => asked(1))
++    await expect(kit.run(kit.context(1))).rejects.toMatchObject(busy)
++    // another project still waits or runs: the places are the project's own
++    const other = await inFlight(2)
++    // control: none of the thirty-two was refused; the first of them is sent when a slot frees
++    await finish(held[0].arrived, held[0].pending)
++    await meta.arrivals(4)
++    expect(meta.seen[3].port).toBe(port(1))
++    expect(await finish(meta.seen[3], waiting[0])).toBe('[]')
++    void other
++  })
++
++  it('a wait that reaches its bound is 429 busy, and its place in the queue is gone', async () => {
++    await start({ slot_wait_ms: 250, instance_calls: 1, project_calls: 1 })
++    const meta = kit.metas[1]
++    meta.park()
++    const held = await inFlight(1)
++    const began = performance.now()
++    await expect(kit.run(kit.context(2), 'select 2')).rejects.toMatchObject(busy)
++    expect(performance.now() - began).toBeGreaterThanOrEqual(245)
++    expect(meta.seen).toHaveLength(1)
++    // the slot frees: the statement that gave up is not sent after all
++    const next = asked(3)
++    await finish(held.arrived, held.pending)
++    await meta.arrivals(2)
++    expect(await finish(meta.seen[1], next)).toBe('[]')
++    expect(meta.seen.map((a) => a.port)).toEqual([port(1), port(3)])
++  })
++
++  describe('a project’s further slot', () => {
++    // held by the project, held by other projects (one each), and whether its next call is sent
++    const states: [number, number, boolean][] = [
++      [0, 0, true],
++      [0, 3, true],
++      [0, 4, false],
++      [1, 0, true],
++      [1, 1, true],
++      [1, 2, false], // one is free, and it is not given as a second
++      [1, 3, false],
++      [2, 0, false], // its own bound
++      [2, 1, false],
++      [2, 2, false],
++    ]
++    it.each(states)('holding %i with %i held by others: sent %s', async (own, others, granted) => {
++      await start({ slot_wait_ms: 200 })
++      const meta = kit.metas[1]
++      meta.park()
++      for (let i = 0; i < own; i++) await inFlight(1)
++      for (let i = 0; i < others; i++) await inFlight(2 + i)
++      const next = asked(1)
++      if (granted) {
++        await meta.arrivals(own + others + 1)
++        expect(meta.seen[own + others].port).toBe(port(1))
++      } else {
++        await expect(next).rejects.toMatchObject(busy)
++        expect(meta.seen).toHaveLength(own + others)
++      }
++      expect(meta.most).toBeLessThanOrEqual(4)
++    })
++
++    it('is granted as soon as two are free before the grant', async () => {
++      await start()
++      const meta = kit.metas[1]
++      meta.park()
++      await inFlight(1)
++      const others = [await inFlight(2), await inFlight(3)]
++      const next = asked(1)
++      // one free: a project that holds none is sent ...
++      const fresh = await inFlight(4)
++      expect(meta.seen).toHaveLength(4)
++      // ... and when two of them are over, the waiting second is
++      await finish(fresh.arrived, fresh.pending)
++      await finish(others[0].arrived, others[0].pending)
++      await meta.arrivals(5)
++      expect(meta.seen[4].port).toBe(port(1))
++      void next
++    })
++  })
++
++  it('a request’s calls take one slot, one after the other', async () => {
++    await start({ instance_calls: 1, project_calls: 1, slot_wait_ms: 300 })
++    const meta = kit.metas[1]
++    meta.onRequest = (a) => setTimeout(() => a.res.end(JSON.stringify(a.body)), 20)
++    const call = (sql: string) => kit.pgMeta.callPgMeta({ kind: 'query', sql })
++    const texts = await kit.request(kit.context(1), async () => {
++      const first = await call('a')
++      const [second, third] = await Promise.all([call('b'), call('c')])
++      return [first, second, third].map((answer) => JSON.parse(JSON.parse(answer.text)).query)
++    })
++    expect(texts).toEqual(['a', 'b', 'c'])
++    expect(meta.most).toBe(1)
++    // the request is over: its slot is another project's
++    expect(await kit.run(kit.context(2))).toContain('select 1')
++  })
++})
++
++describe('the bounds of a call', () => {
++  it('a call past its deadline is 504 query_deadline, is closed, and its slot is free', async () => {
++    await start({ meta_call_ms: 300, instance_calls: 1, project_calls: 1 })
++    const meta = kit.metas[1]
++    meta.park()
++    const began = performance.now()
++    await expect(kit.run(kit.context(1))).rejects.toMatchObject({
++      status: 504,
++      code: 'query_deadline',
++    })
++    expect(performance.now() - began).toBeGreaterThanOrEqual(295)
++    await meta.until((seen) => seen[0].closed)
++    // a head in time and a body that never ends is past the deadline as well
++    meta.onRequest = (a) => a.res.write('[')
++    await expect(kit.run(kit.context(2))).rejects.toMatchObject({
++      code: 'query_deadline',
++    })
++    await meta.until((seen) => seen[1].closed)
++    // control, and the slot: the instance has one, and the next call is sent and answered
++    meta.onRequest = (a) => a.res.end('[]')
++    expect(await kit.run(kit.context(3))).toBe('[]')
++  })
++
++  it('an answer past the byte bound is 400 result_too_large, and reading stops there', async () => {
++    await start({ result_bytes: 100_000, instance_calls: 1, project_calls: 1 })
++    const meta = kit.metas[1]
++    const tooLarge = { status: 400, code: 'result_too_large' }
++    // 64 MiB offered in pieces, as fast as they are taken
++    const piece = Buffer.alloc(64 * 1024, 'x')
++    let written = 0
++    meta.onRequest = (a) => {
++      const more = () => {
++        while (!a.closed && written < 64 * 1024 * 1024) {
++          written += piece.length
++          if (!a.res.write(piece)) return a.res.once('drain', more)
++        }
++        a.res.end()
++      }
++      more()
++    }
++    await expect(kit.run(kit.context(1))).rejects.toMatchObject(tooLarge)
++    await meta.until((seen) => seen[0].closed)
++    expect(meta.seen[0].res.writableFinished).toBe(false)
++    expect(written).toBeLessThan(64 * 1024 * 1024)
++
++    // an answer that announces its size is refused unread
++    meta.onRequest = (a) => {
++      a.res.setHeader('content-length', 100_001)
++      a.res.write('x')
++    }
++    await expect(kit.run(kit.context(2))).rejects.toMatchObject(tooLarge)
++    await meta.until((seen) => seen[1].closed)
++
++    // control: the largest answer that fits, and the slot of the refused ones
++    meta.onRequest = (a) => a.res.end('y'.repeat(100_000))
++    expect(await kit.run(kit.context(3))).toHaveLength(100_000)
++  })
++
++  describe('an answer that is not what was asked', () => {
++    const raw = (text: string | Buffer) => (a: Arrived) => {
++      a.res.socket?.write(text)
++      a.res.socket?.end()
++    }
++    const cases: [string, (a: Arrived) => void][] = [
++      ['a connection closed without an answer', (a) => a.res.socket?.destroy()],
++      ['bytes that are not HTTP', raw('220 hello\r\n\r\n')],
++      [
++        'a body that ends before its announced length',
++        raw('HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n[1,2'),
++      ],
++      [
++        'a body that is not UTF-8',
++        raw(
++          Buffer.concat([
++            Buffer.from('HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\n'),
++            Buffer.from([0x22, 0xff, 0xfe, 0x22]),
++          ])
++        ),
++      ],
++      ['a header block of 9 KiB', raw(`HTTP/1.1 200 OK\r\nx: ${'h'.repeat(9216)}\r\n\r\n[]`)],
++    ]
++    it.each(cases)('%s: an error with no detail, and the slot is free', async (_, answer) => {
++      await start({ instance_calls: 1, project_calls: 1 })
++      const meta = kit.metas[1]
++      meta.onRequest = answer
++      const failed = await settled(kit.run(kit.context(1)))
++      expect(failed).toBeInstanceOf(Error)
++      expect((failed as Error).message).toBe('postgres-meta gave no usable answer')
++      meta.onRequest = (a) => a.res.end('[]')
++      expect(await kit.run(kit.context(2))).toBe('[]')
++      expect(said).not.toHaveBeenCalled()
++    })
++
++    it('an instance that is not there: the same error, at once, and no slot is lost', async () => {
++      await start({ instance_calls: 1, project_calls: 1 })
++      const meta = kit.metas[0]
++      await new Promise((done) => meta.server.close(done))
++      for (const n of [1, 2]) {
++        const failed = await settled(kit.run(kit.context(n, 'owner', {}, 0)))
++        expect((failed as Error).message).toBe('postgres-meta gave no usable answer')
++      }
++      await new Promise<void>((done) => meta.server.listen(0, '127.0.0.1', done))
++    })
++
++    it('a redirect is not followed, and what is no result is an error of the statement', async () => {
++      await start()
++      const { executeQuery } = await import('./query')
++      const [zero, one] = kit.metas
++      const run = () => kit.request(kit.context(1), () => executeQuery({ query: 'select 1' }))
++      one.onRequest = (a) => {
++        a.res.writeHead(307, { location: `${zero.address}/query` })
++        a.res.end()
++      }
++      expect((await run()).error).toBeInstanceOf(Error)
++      expect(zero.seen).toHaveLength(0)
++      one.onRequest = (a) => a.res.end('<html>spmark-steered text</html>')
++      expect((await run()).error).toBeInstanceOf(Error)
++      one.onRequest = (a) => {
++        a.res.statusCode = 500
++        a.res.end('{"unexpected":"shape"}')
++      }
++      expect((await run()).error).toBeInstanceOf(Error)
++      one.onRequest = (a) => {
++        a.res.statusCode = 400
++        a.res.end(JSON.stringify({ message: 'm', code: '42601', formattedError: 'f' }))
++      }
++      expect((await run()).error).toMatchObject({
++        code: '42601',
++        statusCode: 400,
++        message: 'm',
++      })
++      // control
++      one.onRequest = (a) => a.res.end('[{"a":1}]')
++      expect(await run()).toEqual({ data: [{ a: 1 }], error: undefined })
++      // nothing of an answer is logged
++      expect(said).not.toHaveBeenCalled()
++    })
++  })
++})
++
++describe('a client that goes away', () => {
++  it('while it waits: it leaves the queue', async () => {
++    await start({ instance_calls: 1, project_calls: 1, project_waiting: 1 })
++    const meta = kit.metas[1]
++    meta.park()
++    const held = await inFlight(1)
++    const client = new AbortController()
++    const waiting = asked(2, client.signal)
++    client.abort()
++    await expect(waiting).rejects.toMatchObject({ code: 'client_gone' })
++    // its waiting place is free again, and the slot goes to the next project
++    const again = asked(2)
++    const other = asked(3)
++    await finish(held.arrived, held.pending)
++    await meta.arrivals(2)
++    await finish(meta.seen[1], again)
++    await meta.arrivals(3)
++    expect(ports(meta.seen)).toEqual([port(1), port(2), port(3)])
++    void other
++  })
++
++  it('while postgres-meta works: the call is closed and the slot is free', async () => {
++    await start({ instance_calls: 1, project_calls: 1 })
++    const meta = kit.metas[1]
++    meta.park()
++    const client = new AbortController()
++    const held = await inFlight(1, client.signal)
++    const next = asked(2)
++    client.abort()
++    await expect(held.pending).rejects.toMatchObject({ code: 'client_gone' })
++    await meta.until((seen) => seen[0].closed)
++    // nobody answered the first: the second is sent because the first's client left
++    await meta.arrivals(2)
++    expect(await finish(meta.seen[1], next)).toBe('[]')
++  })
++
++  it('before it has taken the answer: the slot is free', async () => {
++    await start({ instance_calls: 1, project_calls: 1 })
++    const meta = kit.metas[1]
++    meta.onRequest = (a) => a.res.end(JSON.stringify('z'.repeat(500_000)))
++    const client = new AbortController()
++    const response = await kit.statement(kit.context(1), undefined, client.signal)
++    const reader = response.body!.getReader()
++    await reader.read()
++    const next = asked(2)
++    client.abort()
++    expect((await (await next).text()).length).toBe(500_002)
++    // and a reader that closes what it was reading
++    const closing = await kit.statement(kit.context(3))
++    await closing.body!.cancel()
++    expect((await kit.run(kit.context(4))).length).toBe(500_002)
++  })
++
++  it('a client that leaves while the record is written is sent nothing', async () => {
++    await start()
++    const client = new AbortController()
++    const { open } = await import('node:fs/promises')
++    const probe = await open(join(kit.dir, 'probe'), 'w')
++    const handle = Object.getPrototypeOf(probe)
++    await probe.close()
++    const sync = handle.sync
++    vi.spyOn(handle, 'sync').mockImplementation(async function (this: unknown) {
++      client.abort()
++      await sync.call(this)
++    })
++    await expect(kit.statement(kit.context(1), undefined, client.signal)).rejects.toMatchObject({
++      code: 'client_gone',
++    })
++    expect(kit.metas[1].seen).toHaveLength(0)
++    vi.restoreAllMocks()
++    // its slot is free: the project has its two again
++    kit.metas[1].park()
++    await inFlight(1)
++    await inFlight(1)
++  })
++
++  it('a client that was gone before it asked is sent nothing', async () => {
++    await start()
++    const client = new AbortController()
++    client.abort()
++    await expect(kit.statement(kit.context(1), undefined, client.signal)).rejects.toMatchObject({
++      code: 'client_gone',
++    })
++    expect(kit.metas[1].seen).toHaveLength(0)
++    expect(existsSync(join(kit.data, ref(1)))).toBe(false)
++  })
++
++  it(
++    'many requests whose clients leave at every moment: every slot is free after, and none twice',
++    { timeout: 120_000 },
++    async () => {
++      await start({ slot_wait_ms: 60_000 })
++      const meta = kit.metas[1]
++      const body = JSON.stringify('y'.repeat(200_000))
++      meta.onRequest = (a) => setTimeout(() => a.res.end(body), Math.random() * 8)
++      const ends = { read: 0, left: 0 }
++      const one = async (i: number) => {
++        const client = new AbortController()
++        // 0 before it asks; 1 while it waits or postgres-meta works; 2 with the answer
++        // untouched; 3 with a part of it taken; 4 never
++        const when = i % 5
++        if (when === 0) client.abort()
++        if (when === 1) setTimeout(() => client.abort(), Math.random() * 400)
++        const response = await kit.statement(kit.context(1 + (i % 6)), `select ${i}`, client.signal)
++        if (when !== 2) {
++          const reader = response.body!.getReader()
++          await reader.read()
++          if (when !== 3) {
++            while (!(await reader.read()).done);
++            return ends.read++
++          }
++        }
++        client.abort()
++        ends.left++
++      }
++      const results = await Promise.allSettled(Array.from({ length: 400 }, (_, i) => one(i)))
++      const codes = results.map((r) => (r.status === 'rejected' ? r.reason?.code : 'done'))
++      // every kind of end was among them
++      expect(ends.read).toBeGreaterThan(0)
++      expect(ends.left).toBeGreaterThan(0)
++      expect(codes).toContain('client_gone')
++      expect(codes.filter((c) => !['done', 'client_gone', 'busy'].includes(c))).toEqual([])
++      // never more in flight than the instance has slots
++      expect(meta.most).toBeLessThanOrEqual(4)
++
++      // every slot is free: four more projects are all sent at once ...
++      const sent = meta.seen.length
++      meta.park()
++      const last = []
++      for (const n of [11, 12, 13, 14]) last.push(await inFlight(n))
++      // ... and none was given back twice: a fifth finds no slot until one of them is over
++      const fifth = asked(15)
++      const first = last.shift()!
++      await finish(first.arrived, first.pending)
++      await meta.arrivals(sent + 5)
++      expect(meta.most).toBeLessThanOrEqual(4)
++      last.push({ arrived: meta.seen[sent + 4], pending: fifth })
++      // and no project of the storm is left holding or waiting: each has its two again
++      for (const held of last) await finish(held.arrived, held.pending)
++      await meta.until((seen) => seen.every((a) => a.closed))
++      for (let n = 1; n <= 6; n++) {
++        meta.park()
++        const held = [await inFlight(n), await inFlight(n)]
++        for (const h of held) await finish(h.arrived, h.pending)
++      }
++    }
++  )
++})
++
++describe('the hand-over of an answer', () => {
++  const large = JSON.stringify('x'.repeat(300_000))
++
++  it('holds the slot while a slow reader takes the body, and frees it when it has', async () => {
++    await start({ instance_calls: 1, project_calls: 1, slot_wait_ms: 150 })
++    const meta = kit.metas[1]
++    meta.onRequest = (a) => {
++      a.res.statusCode = a.port === port(1) ? 203 : 200
++      a.res.end(a.port === port(1) ? large : '[]')
++    }
++    const response = await kit.request(kit.context(1), async () => {
++      const { status, text } = await kit.pgMeta.callPgMeta({
++        kind: 'query',
++        sql: 'select 1',
++      })
++      return new Response(text, {
++        status,
++        headers: { 'content-type': 'application/json', 'x-kept': '1' },
++      })
++    })
++    expect([
++      response.status,
++      response.headers.get('content-type'),
++      response.headers.get('x-kept'),
++    ]).toEqual([203, 'application/json', '1'])
++    const reader = response.body!.getReader()
++    const pieces = [(await reader.read()).value!]
++    // the answer has arrived and a part of it is taken: the slot is still the reader's
++    await expect(kit.run(kit.context(2))).rejects.toMatchObject(busy)
++    pieces.push((await reader.read()).value!)
++    await expect(kit.run(kit.context(2))).rejects.toMatchObject(busy)
++    expect(meta.seen).toHaveLength(1)
++    for (let i = 2; i < 5; i++) pieces.push((await reader.read()).value!)
++    // the last piece is out and the reader has not come back for more: still the reader's
++    await expect(kit.run(kit.context(2))).rejects.toMatchObject(busy)
++    expect((await reader.read()).done).toBe(true)
++    // the body is whole, in pieces no larger than one hand-over
++    expect(Buffer.concat(pieces).toString()).toBe(large)
++    expect(pieces.map((p) => p.length)).toEqual([65536, 65536, 65536, 65536, 300_002 - 4 * 65536])
++    // taken to its end: the slot is free
++    expect(await kit.run(kit.context(2))).toBe('[]')
++  })
++
++  it.each([
++    ['takes a part and stops', 1],
++    ['takes nothing', 0],
++  ])(
++    'a reader that %s and does not close loses the slot at the bound, and the body is cut',
++    async (_, reads) => {
++      await start({ instance_calls: 1, project_calls: 1, handover_ms: 300 })
++      const meta = kit.metas[1]
++      meta.onRequest = (a) => a.res.end(a.port === port(1) ? large : '[]')
++      const began = performance.now()
++      const response = await kit.statement(kit.context(1))
++      const reader = response.body!.getReader()
++      for (let i = 0; i < reads; i++) await reader.read()
++      // another project's statement waits for the slot, and has it when the bound is reached
++      expect(await kit.run(kit.context(2))).toBe('[]')
++      expect(performance.now() - began).toBeGreaterThanOrEqual(295)
++      // cut without the reader doing anything: whoever sends the body on learns of it
++      await expect(reader.closed).rejects.toThrow('the response was not taken in time')
++      await expect(reader.read()).rejects.toThrow('the response was not taken in time')
++    }
++  )
++
++  it('a response that holds nothing of postgres-meta is passed on as it is', async () => {
++    await start()
++    const plain = new Response('page')
++    expect(await kit.request(kit.context(1), () => plain)).toBe(plain)
++    const other = { response: new Response('page') }
++    expect(await kit.request(kit.context(1), () => other)).toBe(other)
++  })
++
++  it('a request that fails after its call gives the slot back, as does one that answers no body', async () => {
++    await start({ instance_calls: 1, project_calls: 1 })
++    const call = () => kit.pgMeta.callPgMeta({ kind: 'query', sql: 'select 1' })
++    await expect(
++      kit.request(kit.context(1), async () => {
++        await call()
++        throw new TypeError('broken')
++      })
++    ).rejects.toThrow('broken')
++    await kit.request(kit.context(2), async () => {
++      await call()
++      return new Response(null, { status: 204 })
++    })
++    const wrapped = await kit.request(kit.context(3), async () => ({
++      response: new Response((await call()).text),
++      context: 'kept by the caller',
++    }))
++    expect(await (wrapped as Response).text()).toBe('[]')
++    expect(await kit.run(kit.context(4))).toBe('[]')
++  })
++
++  it('results that readers do not take stay within the project’s slots', async () => {
++    await start({ slot_wait_ms: 200 })
++    const meta = kit.metas[1]
++    meta.onRequest = (a) => a.res.end(large)
++    const readers = await Promise.allSettled(
++      Array.from({ length: 8 }, () => kit.statement(kit.context(1)))
++    )
++    // two answers are held for readers; the six others were never asked of postgres-meta
++    expect(readers.filter((r) => r.status === 'fulfilled')).toHaveLength(2)
++    expect(readers.filter((r) => r.status === 'rejected' && r.reason.code === 'busy')).toHaveLength(
++      6
++    )
++    expect(meta.seen).toHaveLength(2)
++  })
++})
++
++describe('the parser slot', () => {
++  it('one parse at a time a project; another project’s is its own', async () => {
++    await start()
++    const order: string[] = []
++    const gate = deferred()
++    const parse = (n: number, name: string, wait?: Promise<void>) =>
++      kit.request(kit.context(n), () =>
++        kit.pgMeta.parserSlot(async () => {
++          order.push(`${name} in`)
++          await wait
++          order.push(`${name} out`)
++          return name
++        })
++      )
++    const first = parse(1, 'first', gate.promise)
++    const second = parse(1, 'second')
++    expect(await parse(2, 'other')).toBe('other')
++    expect(order).toEqual(['first in', 'other in', 'other out'])
++    gate.resolve()
++    expect(await Promise.all([first, second])).toEqual(['first', 'second'])
++    expect(order.slice(3)).toEqual(['first out', 'second in', 'second out'])
++  })
++
++  it('a parse that waits to the bound is 429 busy; a failed one and a client that left free the slot', async () => {
++    await start({ slot_wait_ms: 200 })
++    const gate = deferred()
++    const slot = (fn: () => unknown, signal?: AbortSignal) =>
++      kit.request(kit.context(1), () => kit.pgMeta.parserSlot(fn), signal)
++    const first = slot(() => gate.promise)
++    const ran = vi.fn()
++    await expect(slot(ran)).rejects.toMatchObject(busy)
++    const client = new AbortController()
++    const leaving = slot(ran, client.signal)
++    client.abort()
++    await expect(leaving).rejects.toMatchObject({ code: 'client_gone' })
++    expect(ran).not.toHaveBeenCalled()
++    gate.resolve()
++    await first
++    await expect(
++      slot(() => {
++        throw new SyntaxError('no statement')
++      })
++    ).rejects.toThrow('no statement')
++    expect(await slot(() => 'parsed')).toBe('parsed')
++  })
++
++  it('type generation takes a slot like a statement', async () => {
++    await start({ instance_calls: 1, project_calls: 1, slot_wait_ms: 200 })
++    const { generateTypescriptTypes } = await import('./generate-types')
++    const meta = kit.metas[1]
++    meta.park()
++    const types = kit.request(kit.context(1), () => generateTypescriptTypes({}))
++    await meta.arrivals(1)
++    await expect(kit.run(kit.context(2))).rejects.toMatchObject(busy)
++    meta.seen[0].res.end('export type T = {}')
++    expect(await types).toBe('export type T = {}')
++    meta.onRequest = (a) => a.res.end('[]')
++    expect(await kit.run(kit.context(2))).toBe('[]')
++  })
++})
++
++describe('a login the database does not take', () => {
++  // as postgres-meta passes each on, with a text a tenant chose beside it
++  const steered = 'spmark\nsupapace: security: a line of its own'
++  const failures: [string, object][] = [
++    [
++      'the password refused',
++      {
++        error: 'FATAL:  28P01: password authentication failed for user "postgres"\n',
++        code: '28P01',
++        message: 'password authentication failed for user "postgres"',
++        formattedError: 'FATAL:  28P01: password authentication failed for user "postgres"\n',
++        severity: 'FATAL',
++        hint: steered,
++      },
++    ],
++    [
++      'the server’s signature not matching',
++      {
++        error: 'SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature does not match',
++        message: 'SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature does not match',
++        hint: steered,
++      },
++    ],
++    [
++      'the server’s proof missing',
++      {
++        error: 'SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature is missing',
++        message: 'SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature is missing',
++        hint: steered,
++      },
++    ],
++  ]
++  it.each(failures)(
++    '%s: the project’s entries are dropped, the control plane is asked once, nothing loops',
++    async (_, failure) => {
++      await start()
++      const dash = await import('./dash-socket')
++      const { executeQuery } = await import('./query')
++      const meta = kit.metas[1]
++      const entry = (n: number) => join(kit.data, ref(n), 'cache', 'rw.bin')
++      const run = (n: number) =>
++        kit.request(kit.context(n), () => executeQuery({ query: 'select 1' }))
++      // two projects, each kept in memory and on disk
++      for (const n of [1, 2]) {
++        kit.control.answers.set(ref(n), kit.answer(ref(n), port(n), 'owner'))
++        await dash.resolve(kit.assertion(ref(n)))
++        expect(existsSync(entry(n))).toBe(true)
++      }
++      expect(kit.control.asked).toHaveLength(2)
++      meta.onRequest = (a) => {
++        a.res.statusCode = 400
++        a.res.end(JSON.stringify(failure))
++      }
++
++      // the control plane names the same string again: the statement is not sent twice
++      const result = await run(1)
++      expect(result.error).toBeInstanceOf(Error)
++      expect(meta.seen).toHaveLength(1)
++      expect(kit.control.asked).toEqual([
++        kit.assertion(ref(1)).text,
++        kit.assertion(ref(2)).text,
++        kit.assertion(ref(1)).text,
++      ])
++      // logged as a security event, with the ref and the port and nothing a tenant chose
++      const lines = said.mock.calls.map((c) => String(c[0]))
++      expect(lines).toHaveLength(1)
++      expect(lines[0]).toMatch(
++        new RegExp(
++          `^supapace: security: the database of ${ref(1)} at port ${port(1)} did not take the login: [a-z ]+$`
++        )
++      )
++      // the other project's entries are where they were: it is answered without a question
++      await dash.resolve(kit.assertion(ref(2)))
++      expect(kit.control.asked).toHaveLength(3)
++
++      // the control plane now names another string: sent once more with it, and never a third time
++      kit.control.answers.set(
++        ref(1),
++        kit.answer(ref(1), port(1), 'owner', {
++          dsn_rw: dsn(RW, port(1), 'new'),
++        })
++      )
++      expect((await run(1)).error).toBeInstanceOf(Error)
++      expect(meta.seen.slice(1).map((a) => a.dsn)).toEqual([
++        dsn(RW, port(1)),
++        dsn(RW, port(1), 'new'),
++      ])
++      expect(kit.control.asked).toHaveLength(4)
++      expect(said).toHaveBeenCalledTimes(3)
++      // each of the two was on record before it was sent
++      expect(kit.audit(1)).toHaveLength(3)
++
++      // a control plane that does not answer for the project: its refusal is the request's
++      // answer, and what was kept of the project is gone from the disk — the other's is not
++      kit.control.refusal = { status: 503, code: 'unavailable' }
++      await expect(run(1)).rejects.toMatchObject({
++        status: 503,
++        code: 'unavailable',
++      })
++      expect(existsSync(join(kit.data, ref(1), 'cache'))).toBe(false)
++      expect(existsSync(entry(2))).toBe(true)
++      expect(existsSync(join(kit.data, ref(1), 'audit.log'))).toBe(true)
++      kit.control.refusal = undefined
++
++      // with the new string taken, the statement of the same request succeeds
++      meta.onRequest = (a) => {
++        a.res.statusCode = a.dsn.includes(':new@') ? 200 : 400
++        a.res.end(a.dsn.includes(':new@') ? '[{"ok":1}]' : JSON.stringify(failure))
++      }
++      expect(await run(1)).toEqual({ data: [{ ok: 1 }], error: undefined })
++      // nothing a tenant chose reached a log line, and every line is one line
++      for (const [line] of said.mock.calls) {
++        expect(String(line)).not.toContain('spmark')
++        expect(String(line)).not.toContain('\n')
++      }
++    }
++  )
++
++  it('sent again to another instance, it takes that instance’s slot and gives the first one back', async () => {
++    await start({ instance_calls: 1, project_calls: 1, slot_wait_ms: 200 })
++    const { executeQuery } = await import('./query')
++    const [zero, one] = kit.metas
++    one.onRequest = (a) => {
++      a.res.statusCode = 400
++      a.res.end(JSON.stringify(failures[0][1]))
++    }
++    zero.park()
++    // between the two questions the control plane has moved the project to the other instance
++    kit.control.answers.set(ref(1), kit.answer(ref(1), port(1, 0), 'owner'))
++    const moved = kit.request(kit.context(1), () => executeQuery({ query: 'select 1' }))
++    moved.catch(() => {})
++    await zero.arrivals(1)
++    expect(zero.seen[0].dsn).toBe(dsn(RW, port(1, 0)))
++    // the resend is in flight at instance 0: that instance's one slot is the request's ...
++    await expect(kit.run(kit.context(2, 'owner', {}, 0))).rejects.toMatchObject(busy)
++    // ... and the slot of instance 1, where the login was refused, is another project's again
++    one.onRequest = (a) => a.res.end('[]')
++    expect(await kit.run(kit.context(3))).toBe('[]')
++    zero.seen[0].res.end('[{"ok":1}]')
++    expect(await moved).toEqual({ data: [{ ok: 1 }], error: undefined })
++  })
++
++  it('sent again to the same instance, it keeps its slot: a project that waits comes after', async () => {
++    await start({ instance_calls: 1, project_calls: 1 })
++    const { executeQuery } = await import('./query')
++    const meta = kit.metas[1]
++    meta.park()
++    kit.control.answers.set(
++      ref(1),
++      kit.answer(ref(1), port(1), 'owner', { dsn_rw: dsn(RW, port(1), 'new') })
++    )
++    const resent = kit.request(kit.context(1), () => executeQuery({ query: 'select 1' }))
++    await meta.arrivals(1)
++    const waiting = asked(2)
++    meta.seen[0].res.statusCode = 400
++    meta.seen[0].res.end(JSON.stringify(failures[0][1]))
++    await meta.arrivals(2)
++    expect(meta.seen[1].dsn).toBe(dsn(RW, port(1), 'new'))
++    meta.seen[1].res.end('[{"ok":1}]')
++    expect(await resent).toEqual({ data: [{ ok: 1 }], error: undefined })
++    await meta.arrivals(3)
++    expect(meta.seen[2].port).toBe(port(2))
++    expect(await finish(meta.seen[2], waiting)).toBe('[]')
++    expect(meta.most).toBe(1)
++  })
++
++  it('another error of the database drops and asks nothing', async () => {
++    await start()
++    const { executeQuery } = await import('./query')
++    kit.metas[1].onRequest = (a) => {
++      a.res.statusCode = 400
++      a.res.end(
++        JSON.stringify({
++          message: 'syntax error',
++          code: '42601',
++          formattedError: 'f',
++        })
++      )
++    }
++    const result = await kit.request(kit.context(1), () => executeQuery({ query: 'selec' }))
++    expect(result.error).toMatchObject({ code: '42601' })
++    // neither is an error that only shares a part of a refused login's marks: the code without
++    // the severity of a refusal at connection time, that severity with another code, the
++    // client's text under a code, the text further on in a message
++    const text = 'SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature does not match'
++    for (const answer of [
++      { code: '28P01', message: 'm', formattedError: 'f' },
++      { code: '28P01', severity: 'ERROR', message: 'm', formattedError: 'f' },
++      { code: '28P01', severity: 'fatal', message: 'm', formattedError: 'f' },
++      { code: '53300', severity: 'FATAL', message: 'sorry, too many clients already' },
++      { code: 'P0001', message: text },
++      { code: '', message: text },
++      { message: `x ${text}` },
++      { message: ['SASL: SCRAM-SERVER-FINAL-MESSAGE: x'] },
++    ]) {
++      kit.metas[1].onRequest = (a) => {
++        a.res.statusCode = 400
++        a.res.end(JSON.stringify(answer))
++      }
++      await kit.request(kit.context(1), () => executeQuery({ query: 'do $$…$$' }))
++    }
++    // a result that only looks like a refused login is a result
++    kit.metas[1].onRequest = (a) =>
++      a.res.end(JSON.stringify({ code: '28P01', message: 'password authentication failed' }))
++    await kit.request(kit.context(1), () => executeQuery({ query: 'select 1' }))
++    expect(kit.control.asked).toEqual([])
++    expect(said).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/studio/lib/api/self-hosted/pg-meta.ts b/apps/studio/lib/api/self-hosted/pg-meta.ts
+new file mode 100644
+index 00000000..7e4ae7fd
+--- /dev/null
++++ b/apps/studio/lib/api/self-hosted/pg-meta.ts
+@@ -0,0 +1,521 @@
++// SPDX-License-Identifier: Apache-2.0
++// The one path from this server to postgres-meta. A statement or a type generation of any
++// route goes through callPgMeta, which, in order:
++//
++//   1. takes the connection string from the request's project: the read-only one whenever the
++//      member's role is read_only, whatever the call site asks;
++//   2. waits for a slot of the project's postgres-meta instance: a bounded number of calls in
++//      flight per instance and per project, granted to the waiting projects in turn;
++//   3. writes the audit record, flushed, and sends nothing when it cannot be written;
++//   4. sends the request with two headers of its own and nothing a caller handed in, to the
++//      instance the control plane names, and reads the answer under a deadline and a byte cap.
++//
++// The slot is held until the response made from the answer has been handed over to the
++// client, the client has gone, or the hand-over's own deadline has passed. Nothing else in
++// this server knows where postgres-meta is.
++
++import { AsyncLocalStorage } from 'node:async_hooks'
++import { createHash } from 'node:crypto'
++import { request as httpRequest } from 'node:http'
++
++import { writeAudit } from './audit'
++import { checkDsn, dropProject, resolve } from './dash-socket'
++import { limits, orStop } from './limits'
++import {
++  getProjectContext,
++  projectContext,
++  ProjectError,
++  runWithProject,
++  type ProjectContext,
++} from './project-context'
++import { encryptString, getConnectionString } from './util'
++
++export type PgMetaCall =
++  | { kind: 'query'; sql: string; parameters?: unknown[]; readOnly?: boolean }
++  | { kind: 'typegen'; schemas: string }
++
++/** postgres-meta's answer: its status and its body, which was valid UTF-8. */
++export type PgMetaAnswer = { status: number; text: string }
++
++/** A response is handed over in pieces of this size, each when the one before was taken. */
++const PIECE_BYTES = 64 * 1024
++// How the database client's own reports begin that the server did not prove it holds the
++// password: no signature, another signature, a server error in its place.
++const NO_PROOF = 'SASL: SCRAM-SERVER-FINAL-MESSAGE: '
++
++const busy = () => new ProjectError(429, 'busy', 'Too many statements at once; try again')
++const gone = () => new ProjectError(499, 'client_gone', 'The client has gone')
++const noContext = () =>
++  new ProjectError(500, 'no_project_context', 'No project context for this request')
++const noAnswer = () => new Error('postgres-meta gave no usable answer')
++
++// --- where postgres-meta is ---------------------------------------------------------------------
++
++type Instance = { host: string; port: number }
++let instances: readonly Instance[] | undefined
++
++/**
++ * The two postgres-meta instances, in the order the control plane numbers them:
++ * `http://<IPv4 address>:<port>,http://<IPv4 address>:<port>`. Read at the first use or by
++ * the start check; a missing or malformed value stops the process.
++ */
++function pgMetaInstances(): readonly Instance[] {
++  return (instances ??= orStop(() => {
++    const octet = '(?:0|[1-9][0-9]{0,2})'
++    const url = new RegExp(`^http://(${octet}(?:\\.${octet}){3}):([1-9][0-9]{0,4})$`)
++    const found = (process.env.SUPAPACE_PGMETA ?? '').split(',').map((text) => {
++      const m = url.exec(text)
++      const ok = m && m[1].split('.').every((o) => Number(o) <= 255) && Number(m[2]) <= 65535
++      return ok ? { host: m[1], port: Number(m[2]) } : undefined
++    })
++    if (found.length !== 2 || !found[0] || !found[1]) {
++      throw new Error('SUPAPACE_PGMETA is not http://<address>:<port>,http://<address>:<port>')
++    }
++    return [found[0], found[1]]
++  }))
++}
++
++/** Reads and checks this module's settings now; a missing or malformed one stops the process. */
++export function checkPgMetaSettings() {
++  limits()
++  pgMetaInstances()
++}
++
++// --- slots ---------------------------------------------------------------------------------------
++
++type Queue = { held: number; waiting: (() => void)[] }
++// `projects` is in the order of the round: a project that is granted a slot goes to its end.
++type Lane = {
++  cap: number
++  each: number
++  spare: number
++  busy: number
++  projects: Map<string, Queue>
++}
++
++/**
++ * Grants what can be granted: to the first project of the round that waits, holds less than
++ * its own bound and finds a slot free — two free, when it already holds one, so that a
++ * project never takes the last slot of its instance as its second.
++ */
++function grant(lane: Lane) {
++  for (let granted = true; granted; ) {
++    granted = false
++    for (const [ref, queue] of lane.projects) {
++      if (queue.waiting.length === 0 || queue.held >= lane.each) continue
++      if (lane.cap - lane.busy < (queue.held > 0 ? lane.spare : 1)) continue
++      queue.held++
++      lane.busy++
++      lane.projects.delete(ref)
++      lane.projects.set(ref, queue)
++      queue.waiting.shift()!()
++      granted = true
++      break
++    }
++  }
++}
++
++/**
++ * Waits for a slot of the lane for the project and resolves with its release, to be called
++ * once. Refused `429 busy` when the project's waiting places are
++ * taken and when the wait reaches its bound; a client that goes away leaves the queue.
++ */
++function acquire(lane: Lane, ref: string, signal: AbortSignal): Promise<() => void> {
++  const { slot_wait_ms, project_waiting } = limits()
++  const queue = lane.projects.get(ref) ?? { held: 0, waiting: [] }
++  lane.projects.set(ref, queue)
++  const tidy = () => {
++    if (queue.held === 0 && queue.waiting.length === 0 && lane.projects.get(ref) === queue) {
++      lane.projects.delete(ref)
++    }
++  }
++  return new Promise((resolve, reject) => {
++    let timer: ReturnType<typeof setTimeout> | undefined
++    const settle = () => {
++      clearTimeout(timer)
++      signal.removeEventListener('abort', onGone)
++    }
++    const leave = (error: ProjectError) => {
++      settle()
++      const at = queue.waiting.indexOf(granted)
++      if (at >= 0) queue.waiting.splice(at, 1)
++      tidy()
++      reject(error)
++    }
++    const onGone = () => leave(gone())
++    const granted = () => {
++      settle()
++      resolve(() => {
++        queue.held--
++        lane.busy--
++        tidy()
++        grant(lane)
++      })
++    }
++    if (signal.aborted) return leave(gone())
++    if (queue.waiting.length >= project_waiting) return leave(busy())
++    timer = setTimeout(() => leave(busy()), slot_wait_ms)
++    signal.addEventListener('abort', onGone, { once: true })
++    queue.waiting.push(granted)
++    grant(lane)
++  })
++}
++
++const newLane = (cap: number, each: number, spare: number): Lane => ({
++  cap,
++  each,
++  spare,
++  busy: 0,
++  projects: new Map(),
++})
++
++let lanes: Lane[] | undefined
++/** The lane of a postgres-meta instance. */
++function laneOf(instance: number): Lane | undefined {
++  const { instance_calls, project_calls } = limits()
++  lanes ??= pgMetaInstances().map(() => newLane(instance_calls, project_calls, 2))
++  return lanes[instance]
++}
++
++// --- a request and its slot ---------------------------------------------------------------------
++
++// What this module keeps for one request of the server: at most one slot, taken by its first
++// call and held, whatever else it calls, until its response has been handed over.
++type Flight = {
++  signal: AbortSignal
++  /** the request's calls run one at a time */
++  turn: Promise<void>
++  release?: () => void
++  /** runs when the hand-over has taken its bound */
++  timer?: ReturnType<typeof setTimeout>
++  late: boolean
++  cut?: () => void
++}
++const flights = new AsyncLocalStorage<Flight>()
++
++function free(flight: Flight) {
++  clearTimeout(flight.timer)
++  flight.timer = undefined
++  const release = flight.release
++  flight.release = undefined
++  release?.()
++}
++
++/**
++ * Runs the rest of a request, `next`, and hands its response over. While the response holds
++ * what postgres-meta answered, the request keeps its slot: the body is given out in pieces,
++ * each when the one before has been taken, and the slot is freed when the last one has —
++ * or when the client goes away, or when the hand-over has lasted `handover_ms` from
++ * postgres-meta's answer, at which point the body is cut.
++ */
++export async function handOver<T>(request: Request, next: () => T | Promise<T>) {
++  const flight: Flight = {
++    signal: request.signal,
++    turn: Promise.resolve(),
++    late: false,
++  }
++  request.signal.addEventListener('abort', () => free(flight), { once: true })
++  let result: T
++  try {
++    result = await flights.run(flight, next)
++  } catch (error) {
++    free(flight)
++    throw error
++  }
++  if (!flight.release && !flight.late) return result
++  const response =
++    result instanceof Response ? result : (result as { response?: unknown } | undefined)?.response
++  if (!(response instanceof Response) || !response.body) {
++    // nothing whose hand-over could be followed
++    free(flight)
++    return result
++  }
++  const source = response.body.getReader()
++  let rest = new Uint8Array(0)
++  let out: ReadableStreamDefaultController<Uint8Array> | undefined
++  const cut = () => {
++    out?.error(new Error('the response was not taken in time'))
++    void source.cancel().catch(() => {})
++  }
++  const body = new ReadableStream<Uint8Array>(
++    {
++      start(controller) {
++        out = controller
++      },
++      async pull(controller) {
++        if (flight.late) return cut()
++        if (rest.length === 0) {
++          const { done, value } = await source.read()
++          if (flight.late) return
++          if (done) {
++            free(flight)
++            return controller.close()
++          }
++          rest = value
++        }
++        controller.enqueue(rest.subarray(0, PIECE_BYTES))
++        rest = rest.subarray(PIECE_BYTES)
++      },
++      cancel(reason) {
++        free(flight)
++        return source.cancel(reason)
++      },
++    },
++    { highWaterMark: 0 }
++  )
++  flight.cut = cut
++  return new Response(body, {
++    status: response.status,
++    statusText: response.statusText,
++    headers: response.headers,
++  })
++}
++
++// --- one request to postgres-meta -------------------------------------------------------------
++
++/**
++ * Sends one request and reads its answer, within `meta_call_ms` from now and up to
++ * `result_bytes`. Refused `504 query_deadline` and `400 result_too_large`; the connection is
++ * closed then, and when the client goes away, and nothing more is read.
++ */
++function exchange(
++  target: Instance,
++  method: string,
++  path: string,
++  dsn: string,
++  body: string | undefined,
++  signal: AbortSignal
++): Promise<PgMetaAnswer> {
++  const { meta_call_ms, result_bytes } = limits()
++  if (signal.aborted) return Promise.reject(gone())
++  return new Promise((resolve, reject) => {
++    // these and no other: nothing of the client's request is passed on
++    const headers: Record<string, string | number> = {
++      'Content-Type': 'application/json',
++      'x-connection-encrypted': encryptString(dsn),
++    }
++    if (body !== undefined) headers['Content-Length'] = Buffer.byteLength(body)
++    const req = httpRequest({
++      ...target,
++      method,
++      path,
++      agent: false,
++      maxHeaderSize: 8192,
++      headers,
++    })
++    const end = (error: Error | undefined, answer?: PgMetaAnswer) => {
++      clearTimeout(timer)
++      signal.removeEventListener('abort', onGone)
++      req.destroy()
++      if (error || !answer) reject(error ?? noAnswer())
++      else resolve(answer)
++    }
++    const onGone = () => end(gone())
++    const timer = setTimeout(
++      () => end(new ProjectError(504, 'query_deadline', 'The statement took too long')),
++      meta_call_ms
++    )
++    signal.addEventListener('abort', onGone, { once: true })
++    req.on('response', (res) => {
++      const tooLarge = () =>
++        end(new ProjectError(400, 'result_too_large', 'The result is too large'))
++      if (Number(res.headers['content-length']) > result_bytes) return tooLarge()
++      const chunks: Buffer[] = []
++      let size = 0
++      res.on('data', (chunk: Buffer) => {
++        size += chunk.length
++        if (size > result_bytes) tooLarge()
++        else chunks.push(chunk)
++      })
++      res.on('end', () => {
++        try {
++          const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
++          end(undefined, { status: res.statusCode ?? 0, text })
++        } catch {
++          end(noAnswer())
++        }
++      })
++      res.on('error', () => end(noAnswer()))
++      res.on('close', () => end(noAnswer()))
++    })
++    req.on('error', () => end(noAnswer()))
++    req.end(body)
++  })
++}
++
++/** The request a call is: a statement as JSON, or the type generation of the named schemas. */
++function requestOf(call: PgMetaCall): {
++  method: string
++  path: string
++  body?: string
++} {
++  if (call.kind !== 'query') {
++    const query = new URLSearchParams({
++      included_schemas: String(call.schemas),
++    })
++    return { method: 'GET', path: `/generators/typescript?${query}` }
++  }
++  if (typeof call.sql !== 'string') {
++    throw new ProjectError(400, 'bad_request', 'The statement is not a text')
++  }
++  const body = JSON.stringify({ query: call.sql, parameters: call.parameters })
++  // what postgres-meta takes: the control plane gives both the one figure
++  if (Buffer.byteLength(body) > limits().meta_body_bytes) {
++    throw new ProjectError(413, 'body_too_large', 'The statement is too large')
++  }
++  return { method: 'POST', path: '/query', body }
++}
++
++type Sent = PgMetaAnswer & { dsn: string; port: number }
++
++/** One call for the project of `context`: the string, the slot, the record, the request. */
++async function send(context: ProjectContext, flight: Flight, call: PgMetaCall): Promise<Sent> {
++  const dsn = runWithProject(context, () =>
++    getConnectionString({
++      readOnly: call.kind === 'query' && call.readOnly === true,
++    })
++  )
++  const { login, port } = checkDsn(dsn)
++  const lane = laneOf(context.pg_meta)
++  const target = pgMetaInstances()[context.pg_meta]
++  if (!lane || !target) {
++    throw new ProjectError(503, 'project_unavailable', 'The project is not available')
++  }
++  const { method, path, body } = requestOf(call)
++
++  flight.release ??= await acquire(lane, context.ref, flight.signal)
++  await writeAudit({
++    ref: context.ref,
++    iss: context.principal.iss,
++    sub: context.principal.sub,
++    role: context.role,
++    login,
++    kind: call.kind,
++    sql_sha256:
++      call.kind === 'query' ? createHash('sha256').update(call.sql).digest('hex') : undefined,
++  })
++  const answer = await exchange(target, method, path, dsn, body, flight.signal)
++  // the hand-over of what postgres-meta answered is bounded from here
++  flight.timer = setTimeout(() => {
++    flight.late = true
++    free(flight)
++    flight.cut?.()
++  }, limits().handover_ms)
++  return { ...answer, dsn, port }
++}
++
++/**
++ * How an answer says that the database did not take the login, or undefined. A password
++ * refused when the connection is made is the code 28P01 with the severity FATAL; a proof
++ * that failed is the client's own error, which has no code. An error that a statement raises
++ * is neither: its severity is ERROR, and it has a code.
++ */
++function authFailure({ status, text }: PgMetaAnswer): string | undefined {
++  if (status >= 200 && status < 300) return undefined
++  let value: unknown
++  try {
++    value = JSON.parse(text)
++  } catch {
++    return undefined
++  }
++  const { severity, code, message } = (typeof value === 'object' && value ? value : {}) as {
++    severity?: unknown
++    code?: unknown
++    message?: unknown
++  }
++  if (code === '28P01' && severity === 'FATAL') return 'the password was refused'
++  if (code === undefined && typeof message === 'string' && message.startsWith(NO_PROOF)) {
++    return 'the server did not prove it holds the password'
++  }
++  return undefined
++}
++
++/**
++ * Asks postgres-meta, for the project of the request, as the member's role allows. Throws a
++ * ProjectError for every refusal of this server: `403 no_read_only_login`, `429 busy`, `503
++ * audit_unavailable`, `504 query_deadline`, `400 result_too_large`, `413 body_too_large`.
++ *
++ * When the database refuses the login, what is kept of the project is dropped and the
++ * control plane is asked once more; the call is sent again, once, only if the control plane
++ * now names another connection string.
++ */
++export async function callPgMeta(call: PgMetaCall): Promise<PgMetaAnswer> {
++  // read before the first wait: what follows a wait must not run for another request
++  const context = getProjectContext()
++  const flight = flights.getStore()
++  if (!flight) throw noContext()
++  const before = flight.turn
++  let done = () => {}
++  flight.turn = new Promise((r) => (done = r))
++  await before
++  const failed = (sent: Sent) => {
++    const failure = authFailure(sent)
++    if (failure) {
++      console.error(
++        `supapace: security: the database of ${context.ref} at port ${sent.port} did not take the login: ${failure}`
++      )
++    }
++    return failure !== undefined
++  }
++  try {
++    clearTimeout(flight.timer)
++    flight.late = false
++    let sent = await send(context, flight, call)
++    if (failed(sent)) {
++      dropProject(context.ref)
++      const assertion = {
++        text: context.assertion,
++        ref: context.ref,
++        ...context.principal,
++        role: context.role,
++        purpose: context.purpose,
++      }
++      const fresh = projectContext(assertion, await resolve(assertion))
++      const again = runWithProject(fresh, () =>
++        getConnectionString({
++          readOnly: call.kind === 'query' && call.readOnly === true,
++        })
++      )
++      if (again !== sent.dsn) {
++        // another instance has its own slots: the one held is given back first
++        if (fresh.pg_meta !== context.pg_meta) free(flight)
++        clearTimeout(flight.timer)
++        sent = await send(fresh, flight, call)
++        failed(sent)
++      }
++    }
++    return { status: sent.status, text: sent.text }
++  } catch (error) {
++    free(flight)
++    throw error
++  } finally {
++    done()
++  }
++}
++
++// --- the statement parser -----------------------------------------------------------------------
++
++const parsers = new Map<string, Lane>()
++
++/**
++ * Runs `parse` in a parser slot of the request's project: `parser_slots` at a time per
++ * project, a further request waiting as for a statement's slot.
++ */
++export async function parserSlot<T>(parse: () => T | Promise<T>): Promise<T> {
++  const { ref } = getProjectContext()
++  const flight = flights.getStore()
++  if (!flight) throw noContext()
++  const { parser_slots } = limits()
++  const lane = parsers.get(ref) ?? newLane(parser_slots, parser_slots, 1)
++  parsers.set(ref, lane)
++  try {
++    const release = await acquire(lane, ref, flight.signal)
++    try {
++      return await parse()
++    } finally {
++      release()
++    }
++  } finally {
++    if (lane.projects.size === 0 && parsers.get(ref) === lane) parsers.delete(ref)
++  }
++}
+diff --git a/apps/studio/lib/api/self-hosted/project-values.test.ts b/apps/studio/lib/api/self-hosted/project-values.test.ts
+index 59c03c9d..d4ce94ba 100644
+--- a/apps/studio/lib/api/self-hosted/project-values.test.ts
++++ b/apps/studio/lib/api/self-hosted/project-values.test.ts
+@@ -5,7 +5,7 @@
+ import { existsSync } from 'node:fs'
+ import { join } from 'node:path'
+ import { setTimeout as sleep } from 'node:timers/promises'
+-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { projectContext, runWithProject, type ResolveAnswer } from './project-context'
+ 
+@@ -13,20 +13,9 @@ vi.mock('@sentry/react', () => ({
+   startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
+   captureException: () => {},
+ }))
+-vi.mock('@/lib/constants', async (original) => ({
+-  ...(await original<Record<string, unknown>>()),
+-  IS_PLATFORM: false,
+-  PG_META_URL: 'http://meta.test',
+-}))
+-vi.mock('@/lib/constants/index', async (original) => ({
+-  ...(await original<Record<string, unknown>>()),
+-  IS_PLATFORM: false,
+-  PG_META_URL: 'http://meta.test',
+-}))
+-vi.mock('./util', async (original) => ({
+-  ...(await original<typeof import('./util')>()),
+-  encryptString: (text: string) => `encrypted(${text})`,
+-}))
++// What is asked of postgres-meta goes through its one caller: here each call is seen and answered.
++const pgMeta = vi.hoisted(() => vi.fn())
++vi.mock('./pg-meta', () => ({ callPgMeta: pgMeta }))
+ const lints = vi.hoisted(() => vi.fn())
+ vi.mock('@/lib/api/self-hosted/lints', () => ({ getLints: lints }))
+ 
+@@ -104,26 +93,18 @@ const ROUTES: [string, string, string, (ref: string) => unknown][] = [
+ ]
+ 
+ describe('per-project values from the request context', () => {
+-  let sent: string[]
++  let sent: { kind: string; sql?: string; schemas?: string }[]
+ 
+   beforeEach(() => {
+     sent = []
+     lints.mockReset()
+     lints.mockImplementation(async () => ({ data: [], error: undefined }))
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string) => {
+-        sent.push(String(url))
+-        await sleep(Math.random() * 5)
+-        return new Response(JSON.stringify({ types: '' }), {
+-          status: 200,
+-          headers: { 'Content-Type': 'application/json' },
+-        })
+-      })
+-    )
+-  })
+-  afterEach(() => {
+-    vi.unstubAllGlobals()
++    pgMeta.mockReset()
++    pgMeta.mockImplementation(async (call) => {
++      sent.push(call)
++      await sleep(Math.random() * 5)
++      return { status: 200, text: '[]' }
++    })
+   })
+ 
+   it.each(ROUTES)(
+@@ -163,8 +144,8 @@ describe('per-project values from the request context', () => {
+     expect(lints.mock.calls.map(([o]: any) => o.exposedSchemas).sort()).toEqual(
+       refs.map(schemas).sort()
+     )
+-    expect(sent.map((url) => new URL(url).searchParams.get('included_schemas')).sort()).toEqual(
+-      refs.map(schemas).sort()
++    expect(sent.map((call) => [call.kind, call.schemas]).sort()).toEqual(
++      refs.map((ref) => ['typegen', schemas(ref)]).sort()
+     )
+   })
+ 
+@@ -201,7 +182,7 @@ describe('per-project values from the request context', () => {
+     // control: a statement on the same path is seen
+     const { executeQuery } = await import('./query')
+     await runWithProject(context(REF_A), () => executeQuery({ query: 'select version()' }))
+-    expect(sent).toEqual(['http://meta.test/query'])
++    expect(sent.map((call) => [call.kind, call.sql])).toEqual([['query', 'select version()']])
+     sent = []
+     for (const [, module, path] of ROUTES) {
+       const got = await runWithProject(context(REF_A), () => get(module, path, REF_A))
+diff --git a/apps/studio/lib/api/self-hosted/query.ts b/apps/studio/lib/api/self-hosted/query.ts
+index f1e4e53c..065cd19e 100644
+--- a/apps/studio/lib/api/self-hosted/query.ts
++++ b/apps/studio/lib/api/self-hosted/query.ts
+@@ -1,9 +1,8 @@
+ import * as Sentry from '@sentry/react'
+ 
+-import { constructHeaders } from '../apiHelpers'
++import { callPgMeta } from './pg-meta'
+ import { databaseErrorSchema, PgMetaDatabaseError, WrappedResult } from './types'
+-import { assertSelfHosted, encryptString, getConnectionString } from './util'
+-import { PG_META_URL } from '@/lib/constants/index'
++import { assertSelfHosted } from './util'
+ 
+ export type QueryOptions = {
+   query: string
+@@ -21,41 +20,26 @@ export async function executeQuery<T = unknown>({
+   query,
+   parameters,
+   readOnly = false,
+-  headers,
+ }: QueryOptions): Promise<WrappedResult<T[]>> {
+   assertSelfHosted()
+ 
+-  const connectionString = getConnectionString({ readOnly })
+-  const connectionStringEncrypted = encryptString(connectionString)
+-
+-  const requestBody: { query: string; parameters?: unknown[] } = { query }
+-  if (parameters !== undefined) {
+-    requestBody.parameters = parameters
+-  }
+-
+   return await Sentry.startSpan({ name: 'pg-meta.query', op: 'db.query' }, async (span) => {
+-    const response = await fetch(`${PG_META_URL}/query`, {
+-      method: 'POST',
+-      headers: constructHeaders({
+-        ...headers,
+-        'Content-Type': 'application/json',
+-        'x-connection-encrypted': connectionStringEncrypted,
+-      }),
+-      body: JSON.stringify(requestBody),
+-    })
++    // supapace: the one path to postgres-meta. It names the database of the request's project
++    // itself and passes nothing of a caller's headers on; its refusals are thrown.
++    const { status, text } = await callPgMeta({ kind: 'query', sql: query, parameters, readOnly })
+ 
+     try {
+-      const result = await response.json()
++      const result = JSON.parse(text)
+ 
+-      if (!response.ok) {
++      if (status < 200 || status > 299) {
+         const { message, code, formattedError } = databaseErrorSchema.parse(result)
+         span.setAttribute('db.error', 1)
+-        span.setAttribute('db.status_code', response.status)
+-        const error = new PgMetaDatabaseError(message, code, response.status, formattedError)
++        span.setAttribute('db.status_code', status)
++        const error = new PgMetaDatabaseError(message, code, status, formattedError)
+         return { data: undefined, error }
+       }
+ 
+-      span.setAttribute('db.status_code', response.status)
++      span.setAttribute('db.status_code', status)
+       return { data: result, error: undefined }
+     } catch (error) {
+       span.setAttribute('db.error', 1)
+diff --git a/apps/studio/lib/api/self-hosted/request-guard.test.ts b/apps/studio/lib/api/self-hosted/request-guard.test.ts
+index f9cb5273..f03c5e67 100644
+--- a/apps/studio/lib/api/self-hosted/request-guard.test.ts
++++ b/apps/studio/lib/api/self-hosted/request-guard.test.ts
+@@ -639,11 +639,12 @@ describe('api/self-hosted/request-guard', () => {
+       'SUPAPACE_DASH_KEYS',
+       'SUPAPACE_DASH_DATA',
+       'SUPAPACE_PGCAP',
+-      'SUPAPACE_PGMETA',
+       'SUPAPACE_LIMITS',
+     ]
+     async function prerender(value: string, keep: string[] = []) {
+       vi.resetModules()
++      // the address of postgres-meta is its module's to read: the guard does not name it
++      if (!keep.includes('SUPAPACE_PGMETA')) delete process.env.SUPAPACE_PGMETA
+       for (const name of NODE_NAMES) if (!keep.includes(name)) delete process.env[name]
+       vi.stubEnv('TSS_PRERENDERING', value)
+       guard = await import('./request-guard')
+@@ -687,7 +688,7 @@ describe('api/self-hosted/request-guard', () => {
+     it.each(['TRUE', '1', 'yes', ' true', 'true ', ''])(
+       'serves as a node when the switch is "%s"',
+       async (value) => {
+-        await prerender(value, NODE_NAMES)
++        await prerender(value, [...NODE_NAMES, 'SUPAPACE_PGMETA'])
+         await expectRefused(send('/', { headers: SHELL }), 401, 'bad_assertion')
+         const { response } = await send('/', {
+           headers: SHELL,
+@@ -821,6 +822,7 @@ describe('api/self-hosted/request-guard', () => {
+       ['SUPAPACE_DASH_SOCKET', 'SUPAPACE_DASH_SOCKET'],
+       ['SUPAPACE_DASH_DATA', 'SUPAPACE_DASH_DATA'],
+       ['SUPAPACE_NODE_ID', 'SUPAPACE_NODE_ID'],
++      ['SUPAPACE_PGMETA', 'SUPAPACE_PGMETA'],
+     ])('stops the server without %s, with no request', async (name, said_) => {
+       vi.resetModules()
+       delete process.env[name]
+diff --git a/apps/studio/lib/api/self-hosted/request-guard.ts b/apps/studio/lib/api/self-hosted/request-guard.ts
+index 2ce48bd9..f7886684 100644
+--- a/apps/studio/lib/api/self-hosted/request-guard.ts
++++ b/apps/studio/lib/api/self-hosted/request-guard.ts
+@@ -15,6 +15,7 @@
+ import { checkAssertionSettings, verifyAssertion } from './assertion'
+ import { checkSettings, resolve } from './dash-socket'
+ import { orStop } from './limits'
++import { checkPgMetaSettings, handOver } from './pg-meta'
+ import { projectContext, ProjectError, runWithProject } from './project-context'
+ import { checkHeaderKey } from './util'
+ 
+@@ -87,8 +88,8 @@ let prerender: boolean | undefined
+ /**
+  * True only in the build's prerender: the build starts this server once, without a node's
+  * settings, and asks for the application shell. The switch is the process's environment and
+- * nothing a request carries. A process that has the switch together with any setting of a
+- * node stops: a node never serves in this mode.
++ * nothing a request carries. A process that has the switch together with one of the six
++ * settings of a node tested below stops: a node never serves in this mode.
+  */
+ function buildPrerender(): boolean {
+   return (prerender ??= orStop(() => {
+@@ -99,7 +100,6 @@ function buildPrerender(): boolean {
+       process.env.SUPAPACE_DASH_KEYS !== undefined ||
+       process.env.SUPAPACE_DASH_DATA !== undefined ||
+       process.env.SUPAPACE_PGCAP !== undefined ||
+-      process.env.SUPAPACE_PGMETA !== undefined ||
+       process.env.SUPAPACE_LIMITS !== undefined
+     ) {
+       throw new Error('TSS_PRERENDERING is set on a node: the build’s prerender is never served')
+@@ -117,6 +117,7 @@ export function checkStart() {
+   checkSettings()
+   checkAssertionSettings()
+   checkHeaderKey()
++  checkPgMetaSettings()
+ }
+ 
+ // --- the guard -------------------------------------------------------------------------------
+@@ -165,7 +166,8 @@ export async function guardRequest(
+     }
+ 
+     const context = projectContext(assertion, await resolve(assertion))
+-    return await runWithProject(context, () => next())
++    // what the request asks of postgres-meta holds a slot until its response is handed over
++    return await runWithProject(context, () => handOver(request, next))
+   } catch (error) {
+     if (error instanceof ProjectError) return refusal(error)
+     throw error
+diff --git a/apps/studio/lib/api/self-hosted/secrets.test.ts b/apps/studio/lib/api/self-hosted/secrets.test.ts
+index 276a99a8..24a616b7 100644
+--- a/apps/studio/lib/api/self-hosted/secrets.test.ts
++++ b/apps/studio/lib/api/self-hosted/secrets.test.ts
+@@ -18,20 +18,6 @@ vi.mock('@sentry/react', () => ({
+   startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
+   captureException: () => {},
+ }))
+-// postgres-meta is a server of this file; its address is known once it listens
+-const { meta, withMeta } = vi.hoisted(() => {
+-  const meta = { url: '' }
+-  const withMeta = async (original: () => Promise<Record<string, unknown>>) => ({
+-    ...(await original()),
+-    get PG_META_URL() {
+-      return meta.url
+-    },
+-  })
+-  return { meta, withMeta }
+-})
+-vi.mock('@/lib/constants', withMeta)
+-vi.mock('@/lib/constants/index', withMeta)
+-
+ const VECTOR_DIR = resolvePath(import.meta.dirname, '../../../../../vectors')
+ const VECTORS = JSON.parse(readFileSync(join(VECTOR_DIR, 'tokens.json'), 'utf8'))
+ const LIMITS = readFileSync(join(VECTOR_DIR, 'limits.json'), 'utf8').trim()
+@@ -221,7 +207,10 @@ describe('secrets and keys', () => {
+     vi.stubEnv('SUPAPACE_DASH_KEYS', dir)
+     vi.stubEnv('SUPAPACE_PGCAP', '10.212.0.6:20000:21023')
+     vi.stubEnv('SUPAPACE_NODE_ID', VECTORS.node)
+-    meta.url = `http://127.0.0.1:${(pgMeta.address() as AddressInfo).port}`
++    // postgres-meta is a server of this file, named to the server under test as a node names
++    // its two instances: both are this one
++    const address = `http://127.0.0.1:${(pgMeta.address() as AddressInfo).port}`
++    vi.stubEnv('SUPAPACE_PGMETA', `${address},${address}`)
+     for (const [name, value] of Object.entries(PROCESS)) vi.stubEnv(name, value)
+     delete process.env.TSS_PRERENDERING
+ 
+@@ -559,17 +548,8 @@ describe('secrets and keys', () => {
+   })
+ 
+   describe('the headers sent to postgres-meta', () => {
+-    // what the HTTP client itself adds to any request; none of it is the caller's
+-    const CLIENT = [
+-      'accept',
+-      'accept-encoding',
+-      'accept-language',
+-      'connection',
+-      'content-length',
+-      'host',
+-      'sec-fetch-mode',
+-      'user-agent',
+-    ]
++    // what the transport itself adds to any request; none of it is the caller's
++    const CLIENT = ['connection', 'content-length', 'host']
+     // everything a browser, or someone with a member's session, can put on a request
+     const planted = {
+       cookie: 'session=planted-cookie',
+@@ -621,6 +601,13 @@ describe('secrets and keys', () => {
+       const { status } = await send(path, assertion(REF_A, 'owner'), { headers: planted })
+       expect(status).toBe(200)
+       expect(metaSeen).toHaveLength(1)
++      // the one sender of this server: its two headers, and no request id of a client of its own
++      expect(Object.keys(metaSeen[0].headers).sort()).toEqual([
++        'connection',
++        'content-type',
++        'host',
++        'x-connection-encrypted',
++      ])
+       const sent = JSON.stringify(metaSeen[0].headers)
+       expect(metaSeen[0].headers).not.toHaveProperty('cookie')
+       expect(metaSeen[0].headers).not.toHaveProperty('apikey')
+diff --git a/apps/studio/lib/api/self-hosted/statement-senders.test.ts b/apps/studio/lib/api/self-hosted/statement-senders.test.ts
+index 1bbf3c2e..e0b6c068 100644
+--- a/apps/studio/lib/api/self-hosted/statement-senders.test.ts
++++ b/apps/studio/lib/api/self-hosted/statement-senders.test.ts
+@@ -2,68 +2,29 @@
+ // Every path of the server that sends a statement or a type-generation request
+ // names the request's project, whatever a caller hands in — the handlers behind the opt-in
+ // routes included, which take a ref and a connection string from the request body.
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { projectContext, runWithProject, type Assertion } from './project-context'
++import { dsn, port, ref, RO, RW, seal, startKit, type Kit } from './pg-meta-testkit'
+ 
+ vi.mock('@sentry/react', () => ({
+   startSpan: (_o: unknown, fn: (span: unknown) => unknown) => fn({ setAttribute: () => {} }),
+   captureException: () => {},
+ }))
+-vi.mock('@/lib/constants', async (original) => ({
+-  ...(await original<Record<string, unknown>>()),
+-  IS_PLATFORM: false,
+-  PG_META_URL: 'http://meta.test',
+-}))
+-vi.mock('@/lib/constants/index', async (original) => ({
+-  ...(await original<Record<string, unknown>>()),
+-  IS_PLATFORM: false,
+-  PG_META_URL: 'http://meta.test',
+-}))
+-vi.mock('./util', async (original) => ({
+-  ...(await original<typeof import('./util')>()),
+-  assertSelfHosted: () => {},
+-  encryptString: (text: string) => `encrypted(${text})`,
+-}))
+-
+-const REF_A = 'abcdefghij0123456789'
+-const REF_B = 'bcdefghij0123456789a'
+-const dsn = (login: string, port: number) =>
+-  `postgresql://${login}:pw${port}@10.212.0.6:${port}/postgres?sslmode=disable`
+-const PLANTED = `encrypted(${dsn('postgres', 20002)})`
+ 
+-function context(ref: string, port: number, role: Assertion['role'] = 'owner') {
+-  return projectContext(
+-    { text: 'v1.a.b', ref, iss: 'https://issuer.test', sub: 'u', name: 'U', role, purpose: '' },
+-    {
+-      ref,
+-      name: 'p',
+-      state: 'active',
+-      db_version: '17.6.1',
+-      pg_meta: port % 2,
+-      ...(role === 'read_only' ? {} : { dsn_rw: dsn('postgres', port) }),
+-      dsn_ro: dsn('supabase_read_only_user', port),
+-      api_url: `https://${ref}.example.test`,
+-      data_api: { schemas: ['public'], extra_search_path: [], max_rows: null },
+-      generation: 1,
+-      at: '2026-11-19T10:00:00Z',
+-    }
+-  )
+-}
++const PLANTED = seal(dsn(RW, port(2)))
+ 
+ describe('statements name the project of the request', () => {
+-  let sent: { url: string; headers: Headers }[]
++  let kit: Kit
+ 
+-  beforeEach(() => {
+-    sent = []
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, init: RequestInit) => {
+-        sent.push({ url: String(url), headers: new Headers(init.headers) })
+-        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+-      })
+-    )
++  beforeEach(async () => {
++    kit = await startKit({ slot_wait_ms: 120_000 })
++    vi.stubEnv('SUPAPACE_PGMETA', kit.addresses)
+   })
++  afterEach(async () => {
++    await kit.stop()
++    vi.unstubAllEnvs()
++  })
++  const sent = () => kit.metas[1].seen
+ 
+   // every shape a caller's headers can take, each naming another project's database
+   const hostile: [string, HeadersInit][] = [
+@@ -71,7 +32,10 @@ describe('statements name the project of the request', () => {
+     ['the header in another spelling', { 'X-Connection-Encrypted': PLANTED } as HeadersInit],
+     [
+       'both spellings',
+-      { 'x-connection-encrypted': PLANTED, 'X-CONNECTION-ENCRYPTED': PLANTED } as HeadersInit,
++      {
++        'x-connection-encrypted': PLANTED,
++        'X-CONNECTION-ENCRYPTED': PLANTED,
++      } as HeadersInit,
+     ],
+     ['a Headers object', new Headers({ 'x-connection-encrypted': PLANTED })],
+     ['a list of pairs', [['x-connection-encrypted', PLANTED]]],
+@@ -79,40 +43,45 @@ describe('statements name the project of the request', () => {
+ 
+   it.each(hostile)('executeQuery sends the context’s string, given %s', async (_, headers) => {
+     const { executeQuery } = await import('./query')
+-    await runWithProject(context(REF_A, 20001), () => executeQuery({ query: 'select 1', headers }))
+-    expect(sent).toHaveLength(1)
+-    expect(sent[0].url).toBe('http://meta.test/query')
+-    expect(sent[0].headers.get('x-connection-encrypted')).toBe(
+-      `encrypted(${dsn('postgres', 20001)})`
+-    )
+-    expect(JSON.stringify([...sent[0].headers])).not.toContain('20002')
++    await kit.request(kit.context(1), () => executeQuery({ query: 'select 1', headers }))
++    expect(sent()).toHaveLength(1)
++    expect(sent()[0].url).toBe('/query')
++    expect(sent()[0].dsn).toBe(dsn(RW, port(1)))
++    expect(JSON.stringify(sent()[0].headers)).not.toContain(PLANTED)
+   })
+ 
+   it('a read_only member’s statement uses the read-only login whatever the call site asks', async () => {
+     const { executeQuery } = await import('./query')
+-    await runWithProject(context(REF_A, 20001, 'read_only'), () =>
+-      executeQuery({ query: 'select 1', readOnly: false, headers: hostile[0][1] })
+-    )
+-    expect(sent[0].headers.get('x-connection-encrypted')).toBe(
+-      `encrypted(${dsn('supabase_read_only_user', 20001)})`
++    await kit.request(kit.context(1, 'read_only'), () =>
++      executeQuery({
++        query: 'select 1',
++        readOnly: false,
++        headers: hostile[0][1],
++      })
+     )
++    expect(sent()[0].dsn).toBe(dsn(RO, port(1)))
+   })
+ 
+   it('the client-side SQL helper, handed the server’s fetcher, a foreign ref and a foreign string, reaches the context’s project', async () => {
+     const { executeSql } = await import('@/data/sql/execute-sql-mutation')
+     const { executeQuery } = await import('./query')
+-    await runWithProject(context(REF_A, 20001), () =>
++    await kit.request(kit.context(1), () =>
+       executeSql(
+-        { projectRef: REF_B, connectionString: PLANTED, sql: 'select 1' } as any,
++        {
++          projectRef: ref(2),
++          connectionString: PLANTED,
++          sql: 'select 1',
++        } as any,
+         undefined,
+-        { 'x-connection-encrypted': PLANTED, 'X-Connection-Encrypted': PLANTED } as HeadersInit,
++        {
++          'x-connection-encrypted': PLANTED,
++          'X-Connection-Encrypted': PLANTED,
++        } as HeadersInit,
+         executeQuery as any
+       )
+     )
+-    expect(sent).toHaveLength(1)
+-    expect(sent[0].headers.get('x-connection-encrypted')).toBe(
+-      `encrypted(${dsn('postgres', 20001)})`
+-    )
++    expect(sent()).toHaveLength(1)
++    expect(sent()[0].dsn).toBe(dsn(RW, port(1)))
+   }, 120_000) // the helper's module graph is large; its first import is slow on a busy host
+ 
+   it(
+@@ -120,66 +89,68 @@ describe('statements name the project of the request', () => {
+     { timeout: 120_000 },
+     async () => {
+       const { getDatabaseOperations } = await import('./mcp')
+-      const ops = getDatabaseOperations({ headers: { 'x-connection-encrypted': PLANTED } })
+-      await runWithProject(context(REF_A, 20001), async () => {
+-        await ops.executeSql(REF_B, { query: 'select 1', read_only: false } as any)
+-        await ops.listMigrations(REF_B as any)
++      const ops = getDatabaseOperations({
++        headers: { 'x-connection-encrypted': PLANTED },
+       })
+-      expect(sent).toHaveLength(2)
+-      for (const s of sent) {
+-        expect(s.headers.get('x-connection-encrypted')).toBe(`encrypted(${dsn('postgres', 20001)})`)
+-      }
++      await kit.request(kit.context(1), async () => {
++        await ops.executeSql(ref(2), {
++          query: 'select 1',
++          read_only: false,
++        } as any)
++        await ops.listMigrations(ref(2) as any)
++      })
++      expect(sent()).toHaveLength(2)
++      for (const s of sent()) expect(s.dsn).toBe(dsn(RW, port(1)))
+     }
+   )
+ 
+-  it('an owner\u2019s context without a read-write string is unavailable, not served read-only', async () => {
++  it('an owner’s context without a read-write string is unavailable, not served read-only', async () => {
+     const { getConnectionString } = await import('./util')
+-    const ctx = { ...context(REF_A, 20001), dsn_rw: undefined } as any
+-    expect(() => runWithProject(ctx, () => getConnectionString({ readOnly: false }))).toThrow(
+-      expect.objectContaining({ status: 503, code: 'project_unavailable' })
+-    )
++    const ctx = { ...kit.context(1), dsn_rw: undefined } as any
++    expect(() =>
++      kit.contexts.runWithProject(ctx, () => getConnectionString({ readOnly: false }))
++    ).toThrow(expect.objectContaining({ status: 503, code: 'project_unavailable' }))
+   })
+ 
+-  it('outside a request nothing is sent, whatever is handed in', async () => {
++  it('outside a request nothing is sent, whatever is handed in', { timeout: 120_000 }, async () => {
+     const { executeQuery } = await import('./query')
+     const { getDatabaseOperations } = await import('./mcp')
+     await expect(executeQuery({ query: 'select 1', headers: hostile[0][1] })).rejects.toMatchObject(
+       { code: 'no_project_context' }
+     )
+     await expect(
+-      getDatabaseOperations({ headers: hostile[0][1] }).executeSql(REF_B, {
++      getDatabaseOperations({ headers: hostile[0][1] }).executeSql(ref(2), {
+         query: 'select 1',
+       } as any)
+     ).rejects.toMatchObject({ code: 'no_project_context' })
+-    expect(sent).toHaveLength(0)
++    expect(sent()).toHaveLength(0)
++    expect(kit.metas[0].seen).toHaveLength(0)
+   })
+ 
+-  it('two projects’ statements, interleaved with failures, never carry the other’s string', async () => {
+-    const { executeQuery } = await import('./query')
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, init: RequestInit) => {
+-        const h = new Headers(init.headers)
+-        await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 5)))
+-        sent.push({ url: String(init.body), headers: h })
+-        if (Math.random() < 0.3) throw new Error('connection lost')
+-        return new Response('[]', { status: 200 })
+-      })
+-    )
+-    const one = (ref: string, port: number, i: number) =>
+-      runWithProject(context(ref, port), async () => {
+-        for (let k = 0; k < 4; k++) {
+-          await executeQuery({ query: `select '${ref}:${i}:${k}'` }).catch(() => undefined)
+-        }
+-      })
+-    await Promise.all(
+-      Array.from({ length: 60 }, (_, i) => (i % 2 ? one(REF_A, 20001, i) : one(REF_B, 20002, i)))
+-    )
+-    expect(sent).toHaveLength(240)
+-    const ports = sent.map((s) => /:(2000\d)\//.exec(s.headers.get('x-connection-encrypted')!)![1])
+-    expect(ports.filter((p) => p === '20001')).toHaveLength(120)
+-    expect(ports.filter((p) => p === '20002')).toHaveLength(120)
+-    // each statement went with the string of the project that issued it
+-    sent.forEach((s, n) => expect(s.url.includes(REF_A)).toBe(ports[n] === '20001'))
+-  })
++  it(
++    'two projects’ statements, interleaved with failures, never carry the other’s string',
++    { timeout: 120_000 },
++    async () => {
++      const { executeQuery } = await import('./query')
++      kit.metas[1].onRequest = (a) =>
++        setTimeout(
++          () => (Math.random() < 0.3 ? a.res.socket?.destroy() : a.res.end('[]')),
++          Math.floor(Math.random() * 5)
++        )
++      const one = (n: number, i: number) =>
++        kit.request(kit.context(n), async () => {
++          for (let k = 0; k < 4; k++) {
++            await executeQuery({ query: `select '${ref(n)}:${i}:${k}'` }).catch(() => undefined)
++          }
++        })
++      await Promise.all(Array.from({ length: 40 }, (_, i) => one(1 + (i % 2), i)))
++      expect(sent()).toHaveLength(160)
++      expect(sent().filter((s) => s.port === port(1))).toHaveLength(80)
++      expect(sent().filter((s) => s.port === port(2))).toHaveLength(80)
++      // each statement went with the string of the project that issued it
++      for (const s of sent()) {
++        expect(s.dsn).toBe(dsn(RW, s.body.includes(ref(1)) ? port(1) : port(2)))
++      }
++    }
++  )
+ })
+diff --git a/apps/studio/lib/constants/index.ts b/apps/studio/lib/constants/index.ts
+index 2dc1022e..72ac8080 100644
+--- a/apps/studio/lib/constants/index.ts
++++ b/apps/studio/lib/constants/index.ts
+@@ -45,9 +45,6 @@ export const API_URL = (() => {
+   return '/api'
+ })()
+ 
+-export const PG_META_URL = IS_PLATFORM
+-  ? process.env.PLATFORM_PG_META_URL
+-  : process.env.STUDIO_PG_META_URL
+ export const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
+ 
+ /**
+diff --git a/apps/studio/turbo.jsonc b/apps/studio/turbo.jsonc
+index d75a00dc..877dc9b9 100644
+--- a/apps/studio/turbo.jsonc
++++ b/apps/studio/turbo.jsonc
+@@ -65,8 +65,6 @@
+         "NEXT_PUBLIC_IS_NIMBUS",
+         "NEXT_PUBLIC_ONGOING_INCIDENT",
+         // These envs are technically passthrough env vars because they're only used on the server side
+-        "PLATFORM_PG_META_URL",
+-        "STUDIO_PG_META_URL",
+         "PG_META_CRYPTO_KEY",
+         "PGRST_DB_SCHEMAS",
+         "PGRST_DB_MAX_ROWS",

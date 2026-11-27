@@ -6235,3 +6235,131 @@ Known limits
 - The quotas and the ruleset are the defaults' until the daemon's first start.
 - The version the escrow document names is fixed unless the build sets main.supapacedVersion.
 - A store that leaves objects out of its listings offers an older state unseen.
+
+### 2026-11-27 — Studio: one bounded, audited path to postgres-meta
+Patches 0028-0032 (topic query; 0032 holds further tests). Every statement and type generation
+of the dashboard's server reaches postgres-meta through one function. Upstream's address
+constant (PG_META_URL) and getPgMetaRedirectUrl are deleted.
+- lib/api/self-hosted/pg-meta.ts:
+  - callPgMeta(call) -> {status, text}; call is {kind:'query', sql, parameters?, readOnly?} or
+    {kind:'typegen', schemas}. In order: the connection string of the request's project (the
+    read-only one whenever the member's role is read_only or the call site asks); the request
+    body built and bounded; a slot; the audit record, flushed; the request to the instance the
+    control plane names (pg_meta 0 or 1) with Content-Type and x-connection-encrypted and nothing
+    a caller handed in; the answer read under a deadline and a byte bound. One connection per
+    call, closed after it; no redirect is followed.
+  - handOver(request, next): called by the request guard around next(). A request holds at most
+    one slot and its calls run one after the other on it. The slot is kept until the response
+    has been handed to the client in pieces of 64 KiB, the client has gone, or handover_ms have
+    passed since postgres-meta's last answer (the body is then cut).
+  - parserSlot(fn): parser_slots parses at a time per project (POST /api/parse-query).
+  - checkPgMetaSettings(): reads SUPAPACE_PGMETA and the limits; checkStart() calls it.
+- SUPAPACE_PGMETA is exactly http://<IPv4>:<port>,http://<IPv4>:<port> in instance order, as
+  dashcfg.StudioEnv renders it. Anything else stops the server at start ("supapace:
+  SUPAPACE_PGMETA is not http://<address>:<port>,http://<address>:<port>; the server stops").
+  The request guard no longer tests its presence in the prerender mode (six settings do).
+- Refusals, thrown as ProjectError and answered by the guard as {code, message}:
+  403 no_read_only_login (no read-only string for a read_only member or a read-only call site);
+  400 bad_request (a statement that is no text); 413 body_too_large (the serialised body above
+  meta_body_bytes; before a slot, on no record); 429 busy (the project's project_waiting places
+  taken, or slot_wait_ms waited); 503 audit_unavailable; 504 query_deadline (meta_call_ms from
+  the send); 400 result_too_large (more than result_bytes, announced or counted; reading stops);
+  499 client_gone; 500 no_project_context outside a guarded request. postgres-meta giving no
+  usable answer (no connection, not HTTP, a short body, not UTF-8, a head above 8 KiB) is a
+  plain Error with a fixed text and no address; the client gets 500 {"error":{}}.
+- Slots: instance_calls in flight per instance, project_calls per project; a project's second
+  slot only while two are free; waiting projects are granted in turn. A slot is freed on every
+  end: the answer handed over, an error, the deadline, a bound, the client gone.
+- A login the database refuses is an answer that is not 2xx and holds either code 28P01 with
+  severity FATAL (a password refused when the connection is made), or no code and a message
+  that begins "SASL: SCRAM-SERVER-FINAL-MESSAGE: " (the database client's own report that the
+  server did not prove it holds the password). An error a statement raises is neither. Then:
+  one log line "supapace: security: the database of <ref> at port <port> did not take the
+  login: <reason>", dropProject(ref), one resolve; the call is sent once more only if the
+  control plane now names another connection string, never a third time. Sent again to another
+  instance, it gives the first instance's slot back and takes one of the other's.
+- lib/api/self-hosted/audit.ts: writeAudit(record), MAX_LINE_BYTES = 4096. The file is
+  <SUPAPACE_DASH_DATA>/<ref>/audit.log (0600; its directory 0700): one JSON line per request SENT
+  to postgres-meta, members in this order, each a string:
+  {"t","ref","iss","sub","role","login","kind","sql_sha256"} - t is UTC with milliseconds; kind
+  is query or typegen; sql_sha256 is the hex SHA-256 of the statement's text, absent for typegen.
+  Written after the slot is granted; appended and flushed (the directory too for a new file)
+  before the request leaves; the file becomes audit.log.1 (one generation) before a line would
+  take it past audit_file_bytes. It is opened for reading and writing, never through a link and
+  never waiting: a file that does not end in a line end (a write the machine did not finish)
+  gets one first, so the fragment is a line of its own. Not written: 503 audit_unavailable,
+  nothing sent, one log line "supapace: the audit record of <ref> could not be written
+  (<errno>)". A statement refused before it is sent (403, 400, 413, 429, a client that left
+  while waiting) is on no record; a statement sent twice is on record twice; a record does not
+  say that the statement ran.
+- SUPAPACE_LIMITS has exactly fifteen members, in this order: socket_call_ms, slot_wait_ms,
+  meta_call_ms, handover_ms, result_bytes, instance_calls, project_calls, project_waiting,
+  parser_slots, resolve_memory_s, resolve_disk_days, snippet_bytes, snippet_entries,
+  audit_file_bytes, meta_body_bytes. dashcfg.LimitSet.StudioJSON() renders the last one from
+  MetaBodyMB x 2^20, the figure postgres-meta's own body limit is rendered from; there is no
+  second field. This server stops at start on fourteen members ("meta_body_bytes is missing") and
+  a server built before this change stops on fifteen ("unknown member"): the daemon and the
+  image must come from the same commit.
+- studio/gates/85-single-caller.sh (eight seeds): the name SUPAPACE_PGMETA occurs in no source
+  file of the build tree but pg-meta.ts and unit tests (*.test.ts, *.test.tsx); pg-meta.ts
+  exports exactly PgMetaAnswer, PgMetaCall, callPgMeta, checkPgMetaSettings, handOver,
+  parserSlot; no file that is no unit test imports a module named *.test. It is a tripwire for
+  the setting's name, not a proof: an address written into the code, the container's name, an
+  escaped identifier, a glob import of test modules, or a change inside the wrapper pass it.
+  A patch that touches the path to postgres-meta is read with that in mind.
+- studio/prove/stand-ins.bash: two postgres-meta stand-ins, `pgmeta [stub args]` (containers
+  <prefix>-pgmeta-0 and -1), named to the server by address through SUPAPACE_PGMETA, which
+  `studio` appends from $META; `seen [0|1]` counts both instances or one, 0 before a first
+  request. No proof names a single postgres-meta host any more. STUDIO_PG_META_URL is gone from
+  the stand-ins, from manifest.sh's planted list (four values) and marked list (which looks for
+  the instances' addresses instead) and from env.tsv, with PLATFORM_PG_META_URL; turbo.jsonc
+  lost both names. secrets.sh rows 5.x read the request count and the headers at the project's
+  instance; type generation carries the same two headers as a statement. The measured
+  containers of build.sh are given SUPAPACE_PGMETA.
+- studio/prove/bounds.sh IMAGE (55 rows, about five minutes; the pinned postgres-meta image must
+  be loaded, it is never pulled): the instance and the record; no record, no send; the byte
+  bounds of an answer and of a body; the slot wait, the deadline, clients leaving; the hand-over
+  and its bound; the connection-string vectors read by the pinned image's parser as they arrive
+  and as that image rewrites them (row 6.0.1 fails when its rewrite changes), the refused ones
+  never sent.
+- studio/test-patches/0001-early-release.patch: never part of the product; `build.sh image
+  --variant early-release` builds supapace-studio:early-release and leaves the product's tag,
+  archive and record as they were. It frees the slot at postgres-meta's answer; bounds.sh then
+  fails rows 5.3, 5.5, 5.7, 5.8, 5.9.7, 5.9.8, 5.10 and no other.
+Caller rules:
+- Reach postgres-meta only through executeQuery, generateTypescriptTypes or callPgMeta; never
+  read or write its address elsewhere; a new export of pg-meta.ts must join the gate's list.
+- callPgMeta runs inside a guarded request, in the request's own flow: a callback the response's
+  consumer drives has no context (500 no_project_context).
+- A handler that asks postgres-meta answers with a Response that has a body; otherwise its slot
+  ends when the handler returns.
+- Headers handed to executeQuery or generateTypescriptTypes are ignored.
+What the next work inherits:
+- The node's dashboard wiring: SUPAPACE_PGMETA exactly as rendered; the image and the daemon
+  from one commit (a mismatch of the limits is a start loop with one log line - show it in the
+  node check); Studio's data directory writable by its uid, or every statement is 503; the
+  volume sized for every project's snippets, two audit generations and cache together (a full
+  volume refuses every project's statements). To confirm on a node: a wrong password through
+  the wire proxy reaches the server as severity FATAL, code 28P01, and the security line is
+  logged. The severity is the database server's localised word: pin the cluster's message
+  language (lc_messages=C on its command line); today the image's own file sets it. With
+  another word a refused password is not seen: nothing is dropped, and a member with a rotated
+  password in its kept answer gets the database's refusal for at most resolve_memory_s.
+  The audit's reader: the eight members, lines up to 4 KiB, "sent" (possibly twice), not "ran".
+  The limits test's control image is supapace-studio:early-release.
+- Pages and the shell: a loader or a stream callback has no project context; a route that asks
+  postgres-meta returns its Response from the handler.
+- The hidden surfaces: the opt-in AI and MCP files call executeQuery from stream callbacks and
+  fail closed there; MCP passes parameters, which the record's hash does not cover.
+Known limits:
+- The record holds the hash of the statement's text, not its parameters; no served route passes
+  any.
+- Any member, a read_only one too, can roll its own project's two audit generations out with
+  statements of its own, and can hold its project's slots.
+- A login that really is refused costs, per statement, the project's kept entries and one
+  question of the control plane, against that project's budget there.
+- result_bytes bounds the bytes of an answer, not what parsing it allocates. Three projects can
+  hold an instance's four slots.
+- One Studio process writes a data volume: one writer per project's audit file is a rule of the
+  process.
+- A request whose client leaves costs eleven log lines of the server framework's own.

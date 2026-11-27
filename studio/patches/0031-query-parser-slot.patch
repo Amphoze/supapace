@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amphoze <184834775+Amphoze@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:49:40 +0000
+Subject: [PATCH] query: one parse at a time per project
+
+The statement parser runs in the server's one process. A project's requests to it take the
+project's parser slot, one after the other; a request that waits to the bound is refused
+429 busy.
+---
+ apps/studio/routes/api/parse-query.ts | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/apps/studio/routes/api/parse-query.ts b/apps/studio/routes/api/parse-query.ts
+index b6818a1d..f30d93ef 100644
+--- a/apps/studio/routes/api/parse-query.ts
++++ b/apps/studio/routes/api/parse-query.ts
+@@ -132,7 +132,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
+   }
+ }
+ 
+-const webHandler = toWebHandler(handler)
++// supapace: one parse at a time per project. The module is loaded when a request arrives: this
++// file is shared with the browser's bundle.
++const webHandler = toWebHandler(async (req, res) => {
++  const { parserSlot } = await import('@/lib/api/self-hosted/pg-meta')
++  return parserSlot(() => handler(req, res))
++})
+ 
+ export const Route = createFileRoute('/api/parse-query')({
+   server: { handlers: { POST: webHandler } },

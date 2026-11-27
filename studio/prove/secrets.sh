@@ -16,7 +16,7 @@
 #     refused and its body holds no key, while the settings are still answered;
 #   - the signing-keys route lists the control plane's public keys and no other, for each role;
 #   - a statement reaches postgres-meta with the content type and the encrypted connection
-#     string beside the HTTP client's own headers, and nothing the caller sent;
+#     string beside the transport's own headers, and nothing the caller sent;
 #   - no file of the image's bundles holds upstream's default JWT secret, and the server's log
 #     holds no key, no assertion and no connection string.
 # The names the server reads from its environment are held by the build's gate 60-env, whose
@@ -187,8 +187,8 @@ for who in 'oa owner' 'da developer' 'ra read_only'; do
   check 4.$n.2 "the key list as ${who#* }: the control plane's anon key alone" "$(got "$s") $(grep -c '"api_key":"spmark-anon-alpha"' "$T/b") $(hits)" "200 [anon] [] 1 0"
 done
 
-# --- 5. what a statement carries to postgres-meta
-n0=$(seen)
+# --- 5. what a statement carries to postgres-meta (project A's instance: the second of the two)
+n0=$(seen 1)
 planted=(-H 'Cookie: sid=spplanted' -H 'apikey: spplanted' -H 'apiKey: spplanted2' -H 'Authorization: Bearer spplanted'
   -H 'X-Connection-Encrypted: spplanted' -H 'X-Request-Id: spplanted' -H 'User-Agent: spplanted' -H 'Accept: spplanted/x' -H 'Referer: https://spplanted.example/')
 JSON=(-H 'Content-Type: application/json')
@@ -198,17 +198,17 @@ check 5.3 "the migration list, the same" "$(ask GET "/api/v1/projects/$A/databas
 check 5.4 "type generation, the same" "$(ask GET "/api/v1/projects/$A/types/typescript" "$(tok $A oa owner)" "${planted[@]}")" "200 postgres:$PA"
 # what postgres-meta's stand-in recorded for them: "<requests>|<names, /query>|<names, the rest>|<planted or marked values>"
 recorded=$(docker exec "$PREFIX-studio" node -e '
-  const own = ["accept", "accept-encoding", "accept-language", "connection", "content-length", "sec-fetch-mode", "user-agent"]
-  fetch("http://pgmeta:8080/_seen").then((r) => r.json()).then((all) => {
-    const mine = all.filter((r) => r.n > Number(process.argv[1]))
+  const own = ["connection", "content-length"]
+  fetch(process.env.SUPAPACE_PGMETA.split(",")[1] + "/_seen").then((r) => r.json()).then((all) => {
+    const mine = (all || []).filter((r) => r.n > Number(process.argv[1]))
     const names = (pick) => [...new Set(mine.filter((r) => pick(r.path)).flatMap((r) => Object.keys(r.headers)))]
       .filter((h) => !own.includes(h)).sort().join(" ")
     const bad = JSON.stringify(mine).match(/spplanted|spmark[A-Za-z]|spmark-service/g) || []
     console.log([mine.length, names((p) => p === "/query"), names((p) => p !== "/query"), bad.length].join("|"))
   })' "$n0")
 check 5.5 "requests postgres-meta received for them" "$(printf '%s' "$recorded" | cut -d'|' -f1)" 4
-check 5.6 "the headers of a statement beside the HTTP client's own" "$(printf '%s' "$recorded" | cut -d'|' -f2)" "content-type x-connection-encrypted"
-check 5.7 "the headers of type generation beside them (its sender adds a request id)" "$(printf '%s' "$recorded" | cut -d'|' -f3)" "content-type x-connection-encrypted x-request-id"
+check 5.6 "the headers of a statement beside the transport's own" "$(printf '%s' "$recorded" | cut -d'|' -f2)" "content-type x-connection-encrypted"
+check 5.7 "the headers of type generation: the same two, from the same one sender" "$(printf '%s' "$recorded" | cut -d'|' -f3)" "content-type x-connection-encrypted"
 check 5.8 "planted values, or values of the process, in any header of them" "$(printf '%s' "$recorded" | cut -d'|' -f4)" 0
 
 # --- 6. the image's files, and the server's log
