@@ -6406,3 +6406,10 @@ Known limits:
   about 111 MiB, so about four rounds fit one node. e20's repository holds about half the
   replication job's file cap (1037 of 2048 files). Re-run e24 at every image
   bump of the cluster image (the platform session's startup list is one image's).
+
+### 2026-11-27 — check-exp under an older shellcheck
+
+- The CI runner's shellcheck (0.9.0) reports a function reached only through a trap as SC2317;
+  newer versions report it as SC2329. ag/lab.sh's EXIT-trap handler disables both by directive.
+- A lint step must pass under the runner's tool version, not only the workstation's: print the
+  version in the step (CI does) and prefer a directive with a reason over a global exclusion.

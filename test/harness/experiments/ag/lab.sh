@@ -46,7 +46,7 @@ kit=/var/lib/sp-exp/ag
 	{ say "$kit exists in $node: a run is going on there, or one ended without cleaning up; make node-down NODE=$node"; exit 1; }
 
 tmp='' kit_made=''
-# shellcheck disable=SC2329 # the EXIT trap
+# shellcheck disable=SC2317,SC2329 # the EXIT trap (two codes: older and newer shellcheck)
 cleanup() {
 	trap '' INT TERM
 	set +e
