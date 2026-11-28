@@ -2271,12 +2271,20 @@ func TestNodeCheck_PlatformServiceRows(t *testing.T) {
 	if err := a.EnsureGateway(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, n := range []string{"gateway", "control-plane-db"} {
+	a.cfg.PoolerLabel = "db"
+	t.Cleanup(swap(&pdbProvision, func(context.Context, string, string) error { return nil }))
+	mkdirs(t, filepath.Join(a.p.PlatformDir(), "pdb", "data")) // initialised before
+	os.WriteFile(filepath.Join(a.p.PlatformDir(), "pdb", "data", "PG_VERSION"), []byte("17\n"), 0o600)
+	os.WriteFile(filepath.Join(a.p.PlatformDir(), "pdb", "initialised"), nil, 0o444)
+	if err := a.EnsurePlatformDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"gateway", "control-plane-db", "platform-db"} {
 		if r := rows(t, a)[n]; !r.OK {
 			t.Fatalf("control: %s row %+v after its ensure", n, r)
 		}
 	}
-	for name, ctr := range map[string]string{"gateway": "sp-gateway", "control-plane-db": "sp-cp-db"} {
+	for name, ctr := range map[string]string{"gateway": "sp-gateway", "control-plane-db": "sp-cp-db", "platform-db": "sp-platform-db"} {
 		c := f.ctrs[ctr]
 		for what, change := range map[string]func(){
 			"not running":   func() { c.Running = false },

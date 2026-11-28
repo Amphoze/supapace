@@ -6790,3 +6790,85 @@ Known limits:
 - On a node with a studio domain the row `proxy` fails until the daemon ensures the proxy, so
   `supapace node check` exits 1 there, with or without `POOLER=1`.
 - The suite's reset removes nothing of the outside lab; there is nothing of it in the node yet.
+
+### 2026-11-28 — agent: the platform database on a node with a pooler label
+internal/agent (platformdb.go; nodecheck.go, gate.go).
+- sp-platform-db holds the pooler's registry. Derived state: never backed up; registering the
+  projects again rebuilds it.
+- (*Agent).EnsurePlatformDB(ctx) error. Without a pooler label: nothing, nil, no Docker call.
+  With a label and a configuration poolcfg.For refuses: nothing made, the refusal returned.
+  Else, in this order: the node secret; the directories and the two access files; an
+  initialisation when there is no database; the container adopted, started or made again; the
+  registry role and database over the socket. Idempotent. Never two calls at once (one task
+  name, one directory): call it from the daemon's round, before the pooler's ensure.
+- (*Agent).CheckPlatformDB(ctx): the node-check row platform-db. It fails when the restart rule
+  catches the container ("sp-platform-db is restarting; its last log line: ..."), or when the
+  container is absent, stopped, of another configuration or at another address. Not blocking
+  (Blocking exempts it). No row without a label; one failing row carrying the refusal when
+  poolcfg.For refuses.
+- Until the daemon calls the ensure, every node with a label has the failing row
+  "sp-platform-db absent" and 'supapace node check' exits 1 there; the node stays contained.
+- The container: the control-plane image at uid and gid 65525 (poolcfg.PlatformDBUID; not in
+  the image's account file), network platform at poolcfg's PlatformDB address (base + 7) and no
+  other, the control-plane database's hardening, 256 MiB, 128 pids, restart unless-stopped, role
+  label platform-db, no environment of its own. Settings: listen_addresses=<that address>,
+  max_connections=40, password_encryption=scram-sha-256, hba_file and ident_file in /etc/sp.
+- Files under /var/lib/supapace/platform/pdb (root 0700): data and sock (65525, 0700 as made;
+  the image sets sock to 3775 at each start), etc (root 0755) with pg_hba.conf and
+  pg_ident.conf (root 0444), and the stamp "initialised" (root 0444, empty). The access file
+  is exactly:
+    local all postgres peer map=agent
+    host supavisor supavisor_meta <pooler address>/32 scram-sha-256
+  and the mapping "agent root postgres". A file found changed on disk is written back and the
+  container made again; the row reports "another configuration" until then.
+- A database is the stamp and data/PG_VERSION together. The stamp is written last, after the
+  initialisation task ended with code 0 and left a version file. Without either: the stamp is
+  removed (an error there stops the repair), the server's container and a left-over
+  task-pdb-initdb are removed by name, data is emptied, and the task runs again. A task killed
+  part-way leaves a version file and no stamp, so it is repaired by the next call.
+- The task task-pdb-initdb: same image, uid 65525, no network, the data directory alone
+  mounted, the image's initdb with --auth=reject. The superuser has no password. The image's
+  entrypoint is never asked to initialise: under the exact access file its own first session is
+  refused, and without a password variable it refuses an empty directory.
+- The secret /etc/supapace/pooler/meta.password: 64 lower-case hexadecimal characters, root
+  0600 in a root 0700 directory, made once and never replaced. It is written under a temporary
+  name (.meta.password.*) in that directory, synced and linked into place, so its name never
+  holds a partial file; when two makers race, both return the one that was linked first.
+  Anything else at the name (a link, a directory, a FIFO, another mode, owner or form) is
+  refused before a container is made; the error names the path, never the content. The server
+  is given a SCRAM-SHA-256 verifier of it (4096 iterations, a fresh salt at every call).
+- Over the socket, as postgres (root maps to it), at every call: role supavisor_meta - login,
+  nosuperuser, nocreatedb, nocreaterole, noreplication, connection limit 30, the verifier;
+  database supavisor owned by it; CONNECT revoked from PUBLIC on supavisor and on postgres.
+  Measured for a call that adopts: about 100 ms, 7 commits, 600 bytes of WAL; sessions stay.
+- The wait for the server, tried every second while the container runs: at most 3 minutes when
+  this call made or started the container, at most 10 seconds when it found it running - a
+  restart loop costs the caller 10 seconds a call. Errors: "stopped before it answered",
+  "did not answer within <bound>"; any other session error is returned at once.
+- Node check: platform-members accepts sp-platform-db at its address with its role label on a
+  node with a label that poolcfg.For accepts; anywhere else it is a foreign member (blocking).
+  Start gate, on every node: only sp-platform-db may hold the platform database's address:
+    <container> holds <address> on platform, the address of sp-platform-db
+- Its log: on standard error (one entrypoint line a start on standard output); lines of about
+  150 bytes; driver json-file. A read over the cap on standard error is halved as for the other
+  databases.
+- Measured: 34 MiB and 7 processes idle, 78 MiB and 37 with 30 sessions.
+- Caller rules: read the secret through metaPassword and make it nowhere else; a name in the
+  secrets directory that begins with ".meta.password." is not a secret; never mount pdb/sock
+  into another container (a process of uid 0 that reaches the socket is the superuser); build
+  the argument list with pdbConfig only after the profile and the access files are on disk.
+- Known limits:
+  - A stamped directory the server cannot start on is not repaired by itself: the row names the
+    restart loop; remove pdb/initialised and the next ensure makes the database again.
+  - Another image reference makes the container again on the same data; another major version
+    needs that removal too.
+  - A paused container: each call returns after 10 seconds and the row stays OK.
+  - Removing the label by hand, or a configuration poolcfg.For refuses, leaves a foreign member
+    that stops every project until the container is removed. Nothing removes it.
+  - A temporary name left by a process killed while making the secret is never cleaned.
+  - The verifier is written at every call. The two syncs of the secret are not under test.
+- Tests: TestPlatformDB_*, TestNodeCheck_PlatformDB*, TestNodeCheck_PlatformServiceRows,
+  TestPlatformMembers_PlatformDBOnlyWithALabel,
+  TestGate_ForeignHolderOfThePlatformDBAddressRefuses; on a bare node, as root:
+  make node-proof PKG=internal/agent RUN='TestPlatformDB_|TestNode_PlatformDB'
+  (no CI job runs it).

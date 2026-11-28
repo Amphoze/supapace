@@ -16,6 +16,7 @@ import (
 	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
+	"github.com/Amphoze/supapace/internal/poolcfg"
 )
 
 // refuse is the gate's error: ErrContainment, the reason, and the cause when
@@ -159,7 +160,7 @@ func (a *Agent) checkProject(ctx context.Context, s Spec) error {
 		return refuse(incomplete{err}, "read container configuration")
 	}
 	addr := a.cfg.PlatformAddr(i).String()
-	fixed := dashMembers(dashcfg.Static(a.cfg))
+	fixed := append(dashMembers(dashcfg.Static(a.cfg)), dashMember{poolcfg.PlatformDBName, pdbRole, poolcfg.Static(a.cfg).PlatformDB.String()})
 	for _, c := range confs {
 		// 6
 		if why := c.capViolation(); why != "" {

@@ -20,6 +20,7 @@ import (
 	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgsock"
+	"github.com/Amphoze/supapace/internal/poolcfg"
 )
 
 // NodeCheck reports one row per node-wide condition containment rests on.
@@ -31,7 +32,8 @@ import (
 // daemon's configuration): they fail but do not block (Blocking). On a node
 // whose dashboard is configured the wire proxy has two rows: proxy, its
 // liveness, which does not block either, and proxy-networks, which does.
-// Only host-side facts are read.
+// On a node with a pooler label the row platform-db reports the platform
+// database, not blocking either. Only host-side facts are read.
 func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	var rows []nodecfg.CheckResult
 	add := func(name string, err error) {
@@ -115,6 +117,7 @@ func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	if dash {
 		add(rowProxy, proxyLive)
 	}
+	rows = append(rows, a.CheckPlatformDB(ctx)...)
 	return rows
 }
 
@@ -133,9 +136,10 @@ const (
 // containment_failed: every failing row except the platform services' — the
 // control-plane database, the gateway and the wire proxy's liveness (a proxy
 // that is down, or between an ensure's removal and creation, is an outage;
-// where it sits is the row proxy-networks, which blocks).
+// where it sits is the row proxy-networks, which blocks) and the platform
+// database.
 func Blocking(r nodecfg.CheckResult) bool {
-	return !r.OK && r.Name != rowControlPlane && r.Name != rowGateway && r.Name != rowProxy
+	return !r.OK && r.Name != rowControlPlane && r.Name != rowGateway && r.Name != rowProxy && r.Name != rowPlatformDB
 }
 
 // checkPlatformContainer: name exists, runs, carries the configuration label
@@ -677,6 +681,7 @@ func (a *Agent) checkPlatformMembers(ctx context.Context) error {
 	if ad, ok, _ := a.dashAddrs(); ok {
 		dash = dashMembers(ad)
 	}
+	pdb, pdbOK, _ := a.poolAddrs()
 	for _, c := range confs {
 		if why := c.capViolation(); why != "" {
 			return fmt.Errorf("%s: %s", c.name(), why)
@@ -685,6 +690,12 @@ func (a *Agent) checkPlatformMembers(ctx context.Context) error {
 		if c.name() == gatewayName {
 			if addr != a.cfg.GatewayIP {
 				return fmt.Errorf("%s at %s, want %s", gatewayName, addr, a.cfg.GatewayIP)
+			}
+			continue
+		}
+		if pdbOK && c.name() == poolcfg.PlatformDBName {
+			if addr != pdb.PlatformDB.String() || c.Labels[labelRole] != pdbRole {
+				return fmt.Errorf("%s at %s: not at %s with the role label %s", c.name(), addr, pdb.PlatformDB, pdbRole)
 			}
 			continue
 		}
