@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/Amphoze/supapace/internal/dashcfg"
-	"github.com/Amphoze/supapace/internal/dockerx"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/pgsock"
 )
@@ -29,8 +28,10 @@ import (
 // development node (the dev-mode marker) the host-global rows core_pattern,
 // br_netfilter, file-max and protected-hardlinks are informational too. The rows gateway and
 // control-plane-db report the platform services (running, with this
-// daemon's configuration): they fail but do not block (Blocking). Only
-// host-side facts are read.
+// daemon's configuration): they fail but do not block (Blocking). On a node
+// whose dashboard is configured the wire proxy has two rows: proxy, its
+// liveness, which does not block either, and proxy-networks, which does.
+// Only host-side facts are read.
 func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	var rows []nodecfg.CheckResult
 	add := func(name string, err error) {
@@ -73,6 +74,15 @@ func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 	add("platform-members", a.checkPlatformMembers(ctx))
 	add("project-addresses", orErr(netsErr, func() error { return a.checkProjectAddresses(ctx, nets) }))
 	add("forwarding", a.checkForwarding(ctx))
+	// The wire proxy, where the node has one: where it sits and what its table
+	// serves (blocking), and below, with the platform's services, its liveness.
+	ad, dash, _ := a.dashAddrs()
+	var proxyLive error
+	if dash {
+		var proxyNets error
+		proxyLive, proxyNets = a.checkProxy(ctx, ad)
+		add(rowProxyNetworks, proxyNets)
+	}
 	hostGlobal("core_pattern", a.checkCorePattern())
 	hostGlobal("br_netfilter", a.checkBrNetfilter())
 	hostGlobal("file-max", a.checkFileMax())
@@ -102,6 +112,9 @@ func (a *Agent) NodeCheck(ctx context.Context) []nodecfg.CheckResult {
 			_, _, conf, err := a.gatewayConfig(ctx)
 			return conf, err
 		}))
+	if dash {
+		add(rowProxy, proxyLive)
+	}
 	return rows
 }
 
@@ -117,9 +130,12 @@ const (
 )
 
 // Blocking reports whether r is a failing row that makes the node
-// containment_failed: every failing row except the platform services'.
+// containment_failed: every failing row except the platform services' — the
+// control-plane database, the gateway and the wire proxy's liveness (a proxy
+// that is down, or between an ensure's removal and creation, is an outage;
+// where it sits is the row proxy-networks, which blocks).
 func Blocking(r nodecfg.CheckResult) bool {
-	return !r.OK && r.Name != rowControlPlane && r.Name != rowGateway
+	return !r.OK && r.Name != rowControlPlane && r.Name != rowGateway && r.Name != rowProxy
 }
 
 // checkPlatformContainer: name exists, runs, carries the configuration label
@@ -697,9 +713,8 @@ func (a *Agent) checkPostgRESTMember(ctx context.Context, c ctrConf, addr string
 	if pn == nil {
 		return fmt.Errorf("%s: no project network", c.name())
 	}
-	s, _ := strings.CutPrefix(pn.BridgeName, "spp")
-	i, err := strconv.Atoi(s)
-	if err != nil || nodecfg.BridgeName(i) != pn.BridgeName || a.projectNetMismatch(pn, i) != "" {
+	i, ok := a.sliceOf(pn)
+	if !ok {
 		return fmt.Errorf("%s: project network is not the platform's", c.name())
 	}
 	if want := a.cfg.PlatformAddr(i).String(); addr != want {
@@ -759,17 +774,6 @@ func (a *Agent) checkFileMax() error {
 	return nil
 }
 
-// sliceOf is the slice index of project network n — the number in its bridge
-// name, when its subnet is that slice — or -1 when it is no slice of this
-// node.
-func (a *Agent) sliceOf(n *dockerx.Network) int {
-	i, err := strconv.Atoi(strings.TrimPrefix(n.BridgeName, "spp"))
-	if err != nil || !samePrefix(n.Subnet, a.cfg.Slice(i)) {
-		return -1
-	}
-	return i
-}
-
 // checkProjectAddresses holds the members of every network named like a
 // project's to the start gate's member rule (memberViolation): an extra or a
 // misplaced member fails the row, a missing one does not. Members are read as
@@ -797,9 +801,9 @@ func (a *Agent) checkProjectAddresses(ctx context.Context, nets []dockerNet) err
 		if err != nil {
 			return err
 		}
-		i := a.sliceOf(pn)
+		i, slice := a.sliceOf(pn)
 		for _, c := range confs {
-			if i < 0 {
+			if !slice {
 				return fmt.Errorf("%s: member rule: %s is on it, and it is not a slice of this node", n.name, c.name())
 			}
 			if why := a.memberViolation(c, ref, i); why != "" {

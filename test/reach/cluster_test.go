@@ -1342,9 +1342,9 @@ func quotaRefusal(t *testing.T, S Project, quotaMB int) {
 // the first backup's steps after 4 and the control plane's catch-up before 12.
 func createSteps(layout int) []string {
 	if layout == 2 {
-		return []string{"2", "3", "4a", "4", "5a", "5b", "5c", "5d", "6", "7", "9", "11", "12a", "12b", "12"}
+		return []string{"2", "3", "4a", "4", "5a", "5b", "5c", "5d", "6", "7", "7a", "9", "11", "12a", "12b", "12"}
 	}
-	return []string{"2", "3", "4a", "4", "6", "7", "9", "11", "12"}
+	return []string{"2", "3", "4a", "4", "6", "7", "7a", "9", "11", "12"}
 }
 
 // TestReach14_SagaAndIdentity: a daemon killed at each step boundary of a

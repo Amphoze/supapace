@@ -2141,7 +2141,7 @@ func TestNodeCheck_Rows(t *testing.T) {
 		}},
 		{"postgrest with NET_RAW", "platform-members", func(a *Agent, f *fakeHost) { f.ctrs[pr].CapAdd = []string{"NET_RAW"} }},
 		{"postgrest without its labels", "platform-members", func(a *Agent, f *fakeHost) { f.ctrs[pr].Labels = map[string]string{} }},
-		{"postgrest's network not the platform's", "platform-members", func(a *Agent, f *fakeHost) {
+		{"postgrest's network not the platform's", "platform-members,project-addresses", func(a *Agent, f *fakeHost) {
 			f.nets["proj-"+testRef].Internal = false
 		}},
 		{"gateway at another address", "platform-members", func(a *Agent, f *fakeHost) { f.ctrs["sp-gateway"].Nets["platform"] = "10.212.0.3" }},

@@ -23,8 +23,9 @@ import (
 )
 
 // Create steps. Step 1 (the project row and this operation) is the admin
-// API's; steps 7a, 8 and 10 do not exist in this phase. 5a-5d, 12a and 12b
-// are steps of a layout-2 project only.
+// API's; steps 8 and 10 do not exist in this phase. 5a-5d, 12a and 12b are
+// steps of a layout-2 project only. 7a is in every create: on a node without
+// a wire proxy the agent does nothing and the step completes at once.
 var createSteps = []step{
 	{id: "2", do: (*job).createSecrets},
 	{id: "3", do: (*job).place},
@@ -36,6 +37,7 @@ var createSteps = []step{
 	{id: "5d", do: (*job).replicate},
 	{id: "6", do: (*job).putKeys},
 	{id: "7", do: (*job).mintTokens},
+	{id: "7a", do: (*job).attachProxy},
 	{id: "9", do: (*job).postgrest},
 	{id: "11", do: (*job).publish},
 	{id: "12a", do: (*job).switchCP},
@@ -423,6 +425,17 @@ func (x *job) mintTokens(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// 7a: the node's wire proxy attached to the project network, then the
+// project's slice added to the proxy's table. The agent knows whether the node
+// has a proxy; RemoveNetwork (delete D4, abort C6) undoes both.
+func (x *job) attachProxy(ctx context.Context) error {
+	s, err := x.current(ctx)
+	if err != nil {
+		return err
+	}
+	return x.r.ag.AttachProxy(ctx, s)
 }
 
 // 9: PostgREST (its files rendered and its start gate passed by the agent).

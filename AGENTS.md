@@ -6508,3 +6508,140 @@ internal/agent (gate.go, nodecheck.go, postgrest.go, platform.go), internal/dash
   on a node (make node-proof PKG=internal/agent) TestNode_ForwardingDefaultsAndApplied and
   TestNode_GateProjectNetworkMembers. A test that needs a scratch member for the capability
   rule puts it on the platform network, never on a project's.
+
+### 2026-11-28 — The wire proxy on the node: container, table, attachments, two node-check rows
+
+One container per node, `sp-pgcap`, carries the dashboard's SQL connections. It sits on the
+platform network at `dashcfg.Addrs.Pgcap` and at host 4 of every project network it serves, and
+reads one table, `<platform dir>/dash/pgcap/pgcap.json`. `internal/agent/dashnet.go` makes the
+container, writes the table and attaches and detaches the proxy. `EnsureProxy`, `AttachProxy`
+and `DetachProxy` do nothing on a node without a studio domain, or on one whose configuration
+`dashcfg.For` refuses.
+
+Provided (methods of `*agent.Agent`):
+- `EnsureProxy(ctx, list func(context.Context) ([]Spec, error)) error` — takes the table's
+  lock, calls `list` once for the live projects, then: the table with this daemon's classes
+  and the slices of the listed projects it is attached to; `sp-pgcap` running with this
+  daemon's configuration (made again when its label, its platform membership or its address
+  differ, and then started from a table without slices); attached at host 4 of every listed
+  project whose network exists; detached from every other network but `platform`. Every
+  project is tried and the errors are joined: after a failed attach a project keeps its slice
+  and attachment only where the proxy already held the slice's own address, and a network that
+  has not the slice's shape is never kept. An error of `list` is returned with nothing
+  changed; a nil `list` is refused.
+- `AttachProxy(ctx, s Spec) error` — a create's step `7a`: attach at host 4, then add the slice
+  with `dashcfg.Limits.Proxy.ConnsPerProject`. Makes the container when the node has none, from
+  the table on disk (one without slices when there is no file). Starts a stopped proxy.
+  Idempotent. An absent project network is an error.
+- `DetachProxy(ctx, ref string) error` — remove the slice from the table, then detach. Called
+  by `RemoveNetwork` first; a failure there leaves the network. Idempotent; nil when the network
+  is absent. The slice is read from the network itself.
+- `RemoveProxy(ctx) error` — on any node, under the table's lock: removes `sp-pgcap`, and with
+  it its attachments, only under its exact name with the role label `pgcap`, by the id that was
+  inspected. Nil when there is none. A container of that name without the label is left and is
+  an error naming it. The table stays: with no proxy `proxy-networks` passes, `proxy` reports
+  the absence, and `EnsureProxy` makes the proxy again and attaches the listed projects.
+- `RemoveDashboard(ctx) error` — only on a node whose dashboard is NOT configured: removes
+  `sp-studio`, `sp-pgmeta-0`, `sp-pgmeta-1` (each under its exact name with its own role label,
+  by the inspected id; one without its label is left silently) and the proxy as `RemoveProxy`
+  does (so a container named `sp-pgcap` that is not the platform's is an error here), then the
+  proxy's table. Keys and Studio's data stay. Every container is tried; the errors are joined.
+  The daemon calls it at a start, before the node check, and logs its error
+  (`cmd/supapaced/boot.go`, asserted at use): what it left is for the member rows to judge.
+- `saga.Agent` gained `AttachProxy(context.Context, agent.Spec) error`. Step `7a` follows `7`
+  in every create and completes at once where the agent does nothing. It has no compensation of
+  its own: `RemoveNetwork` (delete D4, abort C6) undoes it.
+
+The table:
+- `pgcap.Table.Marshal`'s bytes, written whole by rename, root `0444` in a root `0755`
+  directory (every write puts the directory's mode back), at most 1 MiB, never read through a
+  link, not rewritten when already in place.
+- One lock (`proxyMu`) from the read of the file to the last Docker call of each method; the
+  node check's read, `RemoveProxy` and `RemoveDashboard` take it too.
+- Two orders, everywhere: a slice enters the table after the proxy holds its address on that
+  network; it leaves the table before the proxy leaves the network.
+- Refused before anything is attached or written: a table `pgcap.ParseTable` refuses (terms
+  above the ceiling among its rules), one above 1 MiB, one whose terms at their class's cost
+  plus 16 MiB pass 80 % of the container's memory. The step that asked fails with that reason.
+- A file that is no table (not canonical, a link, too large) makes attach and detach fail and
+  change nothing; only `EnsureProxy` replaces it.
+- A network of a project's name that has not this node's shape for the slice is never joined
+  (`ErrContainment`).
+
+A proxy the runtime holds between two restarts: the runtime then refuses to connect or
+disconnect it. Every call that changes an attachment goes through one helper (`proxyNetwork`):
+when the call fails and the runtime reports the proxy restarting, the proxy is stopped, the
+call made once more, and the proxy started again — so a create, a delete or an abort does not
+wait for the proxy to be well. A proxy that runs, or whose state cannot be read, is never
+stopped for a failing call.
+
+The container: image `supapace-pgcap:local` (it must be in the node's store; nothing is
+pulled), uid 65529, the dashboard containers' hardening and the settings against forwarding,
+64 MiB memory and swap, 64 pids, `nofile` from the table (1,216 on a default node), the table's
+directory read-only at `/etc/pgcap`, `GOMEMLIMIT` at half the memory limit, the command
+`/pgcap /etc/pgcap/pgcap.json`, role label `pgcap`. Its configuration label covers the options,
+the command, the image id, the seccomp profile and the table's shape (listen, block, slice
+prefix, ceiling; per class its name, port base, peers, pool and buffer sizes). A change of any
+of them re-creates the container and cuts every dashboard SQL connection of the node — so does
+a changed per-peer cap, which enters `nofile`. A changed rate, allowance or deadline rewrites
+the file only.
+
+Node check, on a configured node only (`NodeCheck` appends both rows itself):
+- `proxy-networks` — BLOCKING. Fails when the proxy, running or not, is attached to a network
+  that is neither `platform` nor a project network of this node (named `proj-<ref>`, with a
+  slice's bridge, subnet, internal flag and isolated gateway); when the table holds a slice for
+  which no such network exists; when the proxy or one of its networks cannot be read. A table
+  that cannot be read or parsed does not fail it: the attachments are then judged alone, and
+  the file is the row `proxy`'s to report. Passes when there is no proxy.
+- `proxy` — reported, not blocking (`agent.Blocking` exempts it as it does `gateway`). Fails
+  when `sp-pgcap` is absent, stopped, of another configuration or at another address, or caught
+  by the restart rule; when the table is absent, unreadable or no table; when a slice of the
+  table lacks the proxy at host 4; when an attachment has no slice; when the proxy's log of
+  the last five seconds names a port of the table it could not open.
+- One restart rule (`dashRestarting`) for `sp-studio`, `sp-pgmeta-0`, `sp-pgmeta-1` and
+  `sp-pgcap`: the runtime is restarting the container, or it restarted and its last start is
+  under a minute old, or its restart count grew since the last check of that name. A count
+  below the one last seen counts from nought: the runtime counts anew at a start by hand, and
+  at the agent's own start of a stopped or held proxy.
+- `platform-members` and `project-addresses` read a project network's slice by the same strict
+  rule (`sliceOf`): a member on a `proj-…` network that is not internal with an isolated gateway
+  fails both rows.
+
+Rules for whoever wires this into the daemon:
+- Call `EnsureProxy` at every daemon start and in the repair round; `list` returns the placed
+  projects that are not deleting or later. Nothing else starts a stopped proxy, attaches a
+  project created before the node had a studio domain, or re-attaches one whose network was
+  made again by a recovery.
+- `list` runs with the table's lock held, so no create's attach falls between the reading of
+  the list and the work. Every attach, detach, removal and node check waits behind it: it must
+  return promptly (give it a deadline), and it must not take or wait for a project's own lock
+  or anything else a saga step holds across its agent call — those steps are waiting for it.
+- What `proxy-networks` reports is repaired by `EnsureProxy`, by `RemoveProxy` (which starts
+  nothing, so it may run on a node that is not contained) or by hand. A start's node check
+  runs before the store is open: a row that fails there stops the tenants first.
+- `EnsureImageFiles` and `EnsurePlatformNetworks` come first. One agent per process: the lock
+  and the restart counts are package state.
+
+Known limits:
+- The restart count is the daemon's memory. Its first check of a name compares nothing, so at
+  a start the count never fails a row; a container made again counts from nought; a growth is
+  reported once, to the caller that reads it.
+- After `make reach-reboot DASH=1` the proxy is stopped (the harness stops nested containers by
+  hand, which the restart policy does not undo): `bridge_members_d` is red on a dashboard node
+  until the daemon calls `EnsureProxy` at a start. `make reach DASH=1`, and both targets on a
+  node without a dashboard, pass.
+- The agent has no list of projects. A network made by hand with exactly a slice's shape under
+  a project-like name passes `proxy-networks`; the row `proxy` reports the attachment.
+- With a table that cannot be parsed the blocking row cannot judge the table's slices; the
+  proxy itself keeps the last table it read.
+- The row `proxy` asks the runtime for the last five seconds of log and judges what one call
+  returns (64 KiB): on a node of about a hundred slices that all log every second, a line past
+  that bound is not seen.
+- If the daemon's context ends between the helper's stop and its start, a proxy that was held
+  between two restarts stays stopped until the next attach or ensure starts it.
+- The blocking row `forwarding` judges whatever container is named `sp-pgcap`, on any node, by
+  that name alone: one that is not the platform's and was not created with the settings fails
+  it. `RemoveDashboard` and `RemoveProxy` leave such a container and say so; it is removed by
+  hand.
+- The public resolver's leg of the hostile-cluster node proof runs only when
+  `SUPAPACE_PUBLIC_RESOLVER` names one in the proof's environment.

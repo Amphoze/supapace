@@ -14,11 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -159,32 +161,99 @@ func (a *Agent) CheckDashboard(ctx context.Context) []nodecfg.CheckResult {
 	return rows
 }
 
-// restartFormat reads whether Docker is restarting a container, how often it
-// has restarted it and when its process last started.
-const restartFormat = "{{.State.Restarting}} {{.RestartCount}} {{.State.StartedAt}}"
+// RemoveDashboard removes, on a node whose dashboard is not configured — no
+// studio domain, or a configuration dashcfg.For refuses —, the dashboard's
+// containers, with them the wire proxy's attachments to project networks, and
+// the proxy's table. Left there they are members no node check accepts:
+// platform-members and project-addresses fail and a daemon start stops every
+// project. Call it before the node check of a daemon start. A container is
+// removed only under its exact name with its role label; one of that name
+// without the label is not the platform's and is left to those rows (the
+// proxy's name so held is also an error here: RemoveProxy). The keys and
+// Studio's data stay. On a configured node it does nothing. Every container
+// is tried; the errors are joined.
+func (a *Agent) RemoveDashboard(ctx context.Context) error {
+	if _, ok, _ := a.dashAddrs(); ok {
+		return nil
+	}
+	proxyMu.Lock() // the proxy and its table have one hand at a time
+	defer proxyMu.Unlock()
+	var errs []error
+	for _, m := range dashMembers(dashcfg.Addrs{}) {
+		if m.name == dashcfg.PgcapName {
+			errs = append(errs, removeProxy(ctx))
+			continue
+		}
+		c, err := dockerInspectContainer(ctx, m.name)
+		if err == nil && c != nil && c.Labels[labelRole] == m.role {
+			slog.Info("removing " + m.name + ": this node's dashboard is not configured")
+			_, err = dockerRun(ctx, "rm", "-f", "--", c.ID) // the container inspected, whatever holds the name now
+		}
+		errs = append(errs, err)
+	}
+	// A node given a dashboard again starts its proxy from no slice.
+	if err := os.Remove(a.proxyTablePath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// restartFormat reads a container's id, whether Docker is restarting it, how
+// often it has restarted it and when its process last started.
+const restartFormat = "{{.Id}} {{.State.Restarting}} {{.RestartCount}} {{.State.StartedAt}}"
+
+// restartSeen is, per container name, the container the last check saw and
+// its restart count then: this daemon's memory, under restartMu.
+var (
+	restartMu   sync.Mutex
+	restartSeen = map[string]struct {
+		id string
+		n  int
+	}{}
+)
 
 // dashRestarting fails a container Docker is restarting, or has restarted and
 // started again within the last minute — Docker reports it running in both
 // cases, and a process that dies a few seconds after each start is up most of
-// the time — with its last log line, at most 256 bytes: Studio exits at
-// start, with one line, when a setting its start check reads is missing or
-// invalid. A re-created container counts from 0. nil when none of this holds
-// or it cannot be inspected (checkPlatformContainer then reports what it
-// finds).
+// the time — or has restarted since the last check: Docker spaces a crashing
+// container's restarts up to a minute apart, so a slow crash loop is seen
+// only by its count. The failure carries the container's last log line, at
+// most 256 bytes: Studio exits at start, with one line, when a setting its
+// start check reads is missing or invalid. A container made since the last
+// check counts from nought, and so does one whose count is below the one
+// last seen (the runtime counts anew at a start by hand, or by an ensure
+// that found it stopped); this daemon's first check of a name has nothing
+// to compare with; a growth is reported once, to the check that sees it. nil
+// when none of this holds or it cannot be inspected (checkPlatformContainer
+// then reports what it finds).
 func dashRestarting(ctx context.Context, name string) error {
 	out, err := dockerRun(ctx, "container", "inspect", "--format", restartFormat, "--", name)
 	f := strings.Fields(out)
-	if err != nil || len(f) != 3 {
+	if err != nil || len(f) != 4 {
 		return nil
 	}
-	n, _ := strconv.Atoi(f[1])
-	started, terr := time.Parse(time.RFC3339Nano, f[2])
+	n, _ := strconv.Atoi(f[2])
+	started, terr := time.Parse(time.RFC3339Nano, f[3])
+	restartMu.Lock()
+	seen, known := restartSeen[name]
+	grown := 0
+	switch {
+	case known && seen.id == f[0] && n >= seen.n:
+		grown = n - seen.n
+	case known:
+		grown = n
+	}
+	seen.id, seen.n = f[0], n
+	restartSeen[name] = seen
+	restartMu.Unlock()
 	var why string
 	switch {
-	case f[0] == "true":
+	case f[1] == "true":
 		why = "is restarting"
 	case n > 0 && terr == nil && time.Since(started) < time.Minute:
 		why = fmt.Sprintf("restarted %d times, the last start %s ago", n, time.Since(started).Round(time.Second))
+	case grown > 0:
+		why = fmt.Sprintf("restarted %d times since the last check", grown)
 	default:
 		return nil
 	}

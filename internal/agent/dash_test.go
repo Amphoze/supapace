@@ -63,6 +63,9 @@ func newDashFix(t *testing.T, domain string) *dashFix {
 	a.cfg.StudioDomain = domain
 	x := &dashFix{a: a, f: f, d: dashcfg.PathsFor(a.p), owners: map[string][2]int{}, stdin: map[string][]byte{},
 		restarting: map[string]bool{}, restarts: map[string]int{}, started: map[string]time.Time{}, logs: map[string]string{}}
+	restartMu.Lock()
+	clear(restartSeen) // no check of another test's node came before
+	restartMu.Unlock()
 	if domain != "" {
 		ad, err := dashcfg.For(a.cfg)
 		if err != nil {
@@ -162,7 +165,11 @@ func newDashFix(t *testing.T, domain string) *dashFix {
 		if len(args) > 2 && args[0] == "container" && args[1] == "inspect" && flagValue(args, "--format") == restartFormat {
 			name := positional(args)[0]
 			f.mu.Lock()
-			_, ok := f.ctrs[name]
+			c, ok := f.ctrs[name]
+			id := ""
+			if ok {
+				id = c.ID
+			}
 			f.mu.Unlock()
 			if !ok {
 				return "", errors.New("docker: no such container"), true
@@ -173,12 +180,26 @@ func newDashFix(t *testing.T, domain string) *dashFix {
 			if !ok {
 				st = time.Now().Add(-time.Hour)
 			}
-			return fmt.Sprintf("%t %d %s\n", x.restarting[name], x.restarts[name], st.UTC().Format(time.RFC3339Nano)), nil, true
+			return fmt.Sprintf("%s %t %d %s\n", id, x.restarting[name], x.restarts[name], st.UTC().Format(time.RFC3339Nano)), nil, true
 		}
 		if args[0] == "create" {
 			x.mu.Lock()
 			x.stdin[flagValue(args, "--name")] = slices.Clone(stdin)
 			x.mu.Unlock()
+		}
+		// A removal by id, as Docker resolves one.
+		if pos := positional(args); args[0] == "rm" && len(pos) == 1 {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if err := f.failVerb["rm"]; err != nil {
+				return "", err, true
+			}
+			for name, c := range f.ctrs {
+				if c.ID == pos[0] {
+					delete(f.ctrs, name)
+					return "", nil, true
+				}
+			}
 		}
 		return "", nil, false
 	}
@@ -1574,5 +1595,224 @@ func TestDashFiles_ModeLinkAndKeyDirChecked(t *testing.T) {
 	}
 	if fi, err := os.Lstat(filepath.Join(kd, keyCrypto)); err != nil || fi.Mode()&os.ModeSymlink == 0 {
 		t.Errorf("the link was replaced (%v)", err)
+	}
+}
+
+// TestCheckDashboard_RestartCountSinceTheLastCheck: Docker spaces a crashing
+// container's restarts up to a minute apart and reports it running in
+// between, so a crash loop that slow passes the one-minute rule. Each
+// container row also fails when its restart count grew since the last check.
+func TestCheckDashboard_RestartCountSinceTheLastCheck(t *testing.T) {
+	x := newDashFix(t, "studio.test")
+	ctx := context.Background()
+	if err := x.a.EnsureDashboard(ctx); err != nil {
+		t.Fatal(err)
+	}
+	failing := func() (bad []string, detail string) {
+		for _, r := range x.a.CheckDashboard(ctx) {
+			if !r.OK {
+				bad = append(bad, r.Name)
+				detail += r.Detail
+			}
+		}
+		return
+	}
+	set := func(name string, n int) {
+		x.mu.Lock()
+		x.restarts[name] = n
+		x.logs[name] = "the server's last line\n"
+		x.mu.Unlock()
+	}
+	names := []string{dashcfg.StudioName, dashcfg.PgMeta0Name, dashcfg.PgMeta1Name}
+	// Restarts of before this daemon's first check are not news (every start
+	// in this test is an hour old).
+	for _, name := range names {
+		set(name, 4)
+	}
+	if bad, d := failing(); len(bad) != 0 {
+		t.Fatalf("the first check: failing %q: %s", bad, d)
+	}
+	for _, name := range names {
+		set(name, 6)
+		if bad, d := failing(); !slices.Equal(bad, []string{name}) || !strings.Contains(d, "restarted 2 times since the last check") ||
+			!strings.Contains(d, "the server's last line") {
+			t.Errorf("%s restarted twice since: failing %q: %s", name, bad, d)
+		}
+		if bad, d := failing(); len(bad) != 0 {
+			t.Errorf("%s, no restart since: failing %q: %s", name, bad, d)
+		}
+		// Made again since the last check, it counts from nought, not from six.
+		x.f.mu.Lock()
+		x.f.ctrs[name].Labels[labelConfig] = "other"
+		x.f.mu.Unlock()
+		if err := x.a.EnsureDashboard(ctx); err != nil {
+			t.Fatal(err)
+		}
+		set(name, 1)
+		if bad, d := failing(); !slices.Equal(bad, []string{name}) || !strings.Contains(d, "restarted 1 times since the last check") {
+			t.Errorf("%s made again and restarted once: failing %q: %s", name, bad, d)
+		}
+		set(name, 0)
+		x.f.mu.Lock()
+		x.f.ctrs[name].Labels[labelConfig] = "other"
+		x.f.mu.Unlock()
+		if err := x.a.EnsureDashboard(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if bad, d := failing(); len(bad) != 0 {
+			t.Errorf("%s made again, never restarted: failing %q: %s", name, bad, d)
+		}
+	}
+}
+
+// TestRemoveDashboard_OnlyWhereTheDashboardIsNotConfigured: a node that has
+// lost its dashboard configuration keeps none of the dashboard's containers —
+// left there, the node check's member rows fail at the next daemon start and
+// every project is stopped. They are removed by exact name and role label;
+// nothing else is touched, and a configured node is left alone.
+func TestRemoveDashboard_OnlyWhereTheDashboardIsNotConfigured(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		lose func(*Agent)
+	}{
+		{"no studio domain", func(a *Agent) { a.cfg.StudioDomain = "" }},
+		{"a configuration that cannot host one", func(a *Agent) { a.cfg.UIDBase, a.cfg.UIDCount = 65000, 1000 }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := newProxyFix(t, "studio.test")
+			ctx := context.Background()
+			s := x.project(14)
+			healthy(x.a, x.f, s)
+			tenants(x.a, x.f, s)
+			if err := x.a.EnsureDashboard(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := x.a.AttachProxy(ctx, s); err != nil {
+				t.Fatal(err)
+			}
+			keys := x.keyTexts(t)
+			// Configured: nothing is read, nothing removed.
+			x.f.resetLog()
+			if err := x.a.RemoveDashboard(ctx); err != nil || len(x.f.calls()) != 0 {
+				t.Fatalf("on a configured node: %v, calls %q", err, x.f.calls())
+			}
+			if err := x.a.CheckContainment(ctx, s); err != nil {
+				t.Fatalf("control: the project starts on the configured node: %v", err)
+			}
+			c.lose(x.a)
+			// What an operator would see without the removal.
+			if err := x.a.checkPlatformMembers(ctx); err == nil || !strings.Contains(err.Error(), "foreign member") {
+				t.Fatalf("control: platform-members with the containers left: %v", err)
+			}
+			if err := x.a.CheckContainment(ctx, s); err == nil || !strings.Contains(err.Error(), "member rule") {
+				t.Fatalf("control: a start with the proxy left on the project network: %v", err)
+			}
+			// Not the platform's: the same name under another role label, and the
+			// role label under another name.
+			x.f.mu.Lock()
+			x.f.ctrs[dashcfg.PgMeta1Name].Labels[labelRole] = "studio" // not its own
+			x.f.mu.Unlock()
+			x.f.ctr(fakeCtr{Name: dashcfg.StudioName + "-old", Running: true, CapDrop: []string{"ALL"}, Labels: map[string]string{labelRole: "studio"}})
+			x.f.ctr(fakeCtr{Name: dashcfg.PgcapName + "2", Running: true, CapDrop: []string{"ALL"}, Labels: map[string]string{labelRole: "pgcap"}})
+			// Each is removed by the id that was inspected, never by its name: a
+			// container put under that name in between is not the one judged.
+			ids := map[string]string{}
+			x.f.mu.Lock()
+			for name, c := range x.f.ctrs {
+				ids[c.ID] = name
+			}
+			x.f.mu.Unlock()
+			x.f.resetLog()
+			if err := x.a.RemoveDashboard(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var removed []string
+			for _, a := range x.f.argv("rm") {
+				if !slices.Equal(a[:len(a)-1], []string{"rm", "-f", "--"}) || ids[a[len(a)-1]] == "" {
+					t.Errorf("removal %q, want one by the container's id", a)
+				}
+				removed = append(removed, ids[a[len(a)-1]])
+			}
+			if want := []string{dashcfg.StudioName, dashcfg.PgMeta0Name, dashcfg.PgcapName}; !slices.Equal(removed, want) {
+				t.Errorf("removed %q, want %q", removed, want)
+			}
+			if m := x.f.mutations(); len(m) != 3 {
+				t.Errorf("Docker calls that change something: %q, want the three removals", m)
+			}
+			x.f.mu.Lock()
+			var left []string
+			for n := range x.f.ctrs {
+				left = append(left, n)
+			}
+			x.f.mu.Unlock()
+			slices.Sort(left)
+			if want := []string{"pg-" + s.Ref, "postgrest-" + s.Ref, "sp-gateway", dashcfg.PgcapName + "2", dashcfg.PgMeta1Name, dashcfg.StudioName + "-old"}; !slices.Equal(left, want) {
+				t.Errorf("containers left %q, want %q", left, want)
+			}
+			// The proxy's table goes with it: a node given a dashboard again
+			// starts from no slice. The keys stay.
+			if _, err := os.Lstat(x.path); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the proxy's table is still there (%v)", err)
+			}
+			if !slices.Equal(x.keyTexts(t), keys) {
+				t.Error("the keys changed")
+			}
+			// Again: nothing left to do.
+			x.f.resetLog()
+			if err := x.a.RemoveDashboard(ctx); err != nil || len(x.f.mutations()) != 0 {
+				t.Errorf("again: %v, %q", err, x.f.mutations())
+			}
+			// With the strangers gone too (an operator's work), neither the
+			// member rows nor a start is refused.
+			x.f.mu.Lock()
+			for _, n := range []string{dashcfg.PgMeta1Name, dashcfg.StudioName + "-old", dashcfg.PgcapName + "2"} {
+				delete(x.f.ctrs, n)
+			}
+			x.f.mu.Unlock()
+			if err := x.a.checkPlatformMembers(ctx); err != nil {
+				t.Errorf("platform-members after the removal: %v", err)
+			}
+			nets, err := dockerNetworks(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := x.a.checkProjectAddresses(ctx, nets); err != nil {
+				t.Errorf("project-addresses after the removal: %v", err)
+			}
+			if err := x.a.CheckContainment(ctx, s); err != nil {
+				t.Errorf("a start after the removal: %v", err)
+			}
+			// A removal that fails is reported, and the others still happen.
+			x.a.cfg = nodecfg.Default("sp.test")
+			x.a.cfg.Uplinks, x.a.cfg.StudioDomain = []string{"eth0"}, "studio.test"
+			if err := x.a.EnsureDashboard(ctx); err != nil {
+				t.Fatal(err)
+			}
+			c.lose(x.a)
+			boom := errors.New("docker: daemon busy")
+			x.f.failInspect[dashcfg.StudioName] = boom
+			if err := x.a.RemoveDashboard(ctx); !errors.Is(err, boom) {
+				t.Errorf("a container that cannot be inspected: %v", err)
+			}
+			x.f.mu.Lock()
+			_, studio := x.f.ctrs[dashcfg.StudioName]
+			_, meta := x.f.ctrs[dashcfg.PgMeta0Name]
+			x.f.mu.Unlock()
+			if !studio || meta {
+				t.Errorf("after the failed inspection: Studio there %v, postgres-meta there %v", studio, meta)
+			}
+		})
+	}
+}
+
+// A fake without a dashboard fixture answers the restart reading for any
+// container it has: never restarted, started an hour ago.
+func init() {
+	fakeVerbs[restartFormat] = func(f *fakeHost, args []string, _ []byte) (string, error) {
+		c, ok := f.resolve(positional(args)[0])
+		if !ok {
+			return "", errors.New("docker: no such container")
+		}
+		return fmt.Sprintf("%s false 0 %s\n", c.ID, time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)), nil
 	}
 }

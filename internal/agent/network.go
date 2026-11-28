@@ -30,9 +30,14 @@ func (a *Agent) EnsureNetwork(ctx context.Context, s Spec) error {
 }
 
 // RemoveNetwork removes proj-<ref> whatever its options (delete, abort);
-// nil when absent. Its members must be gone.
+// nil when absent. Its members must be gone, but for the wire proxy: its
+// slice leaves the proxy's table and the proxy the network first
+// (DetachProxy), and a failure there leaves the network in place.
 func (a *Agent) RemoveNetwork(ctx context.Context, ref string) error {
 	if err := checkRef(ref); err != nil {
+		return err
+	}
+	if err := a.DetachProxy(ctx, ref); err != nil {
 		return err
 	}
 	n, err := dockerInspectNetwork(ctx, networkName(ref))

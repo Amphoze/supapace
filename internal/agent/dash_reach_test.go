@@ -584,3 +584,62 @@ func TestNode_NoStudioDomain_LeavesTheNodeAsItWas(t *testing.T) {
 		t.Errorf("the node changed:\nbefore\n%s\nafter\n%s", before, after)
 	}
 }
+
+// TestNode_DashboardContainersRemovedWhereItIsNotConfigured: Studio and the
+// two postgres-meta instances, made by the agent, on a node that then loses
+// its studio domain: the node check's member row refuses them, the removal
+// takes exactly them away, the row passes again, and the keys stay.
+func TestNode_DashboardContainersRemovedWhereItIsNotConfigured(t *testing.T) {
+	a, _ := dashNode(t)
+	ctx := context.Background()
+	names := []string{dashcfg.StudioName, dashcfg.PgMeta0Name, dashcfg.PgMeta1Name}
+	present := func() (out []string) {
+		for _, n := range names {
+			if c, err := dockerInspectContainer(ctx, n); err != nil {
+				t.Fatal(err)
+			} else if c != nil {
+				out = append(out, n)
+			}
+		}
+		return out
+	}
+	if err := a.checkPlatformMembers(ctx); err != nil {
+		t.Fatalf("control: platform-members on the configured node: %v", err)
+	}
+	if err := a.RemoveDashboard(ctx); err != nil || len(present()) != 3 {
+		t.Fatalf("on a configured node the removal acted: %v, left %q", err, present())
+	}
+	// A bystander on the platform network under a name of its own, with a
+	// dashboard role label: not the platform's, never removed.
+	const other = "sp-test-dash-bystander"
+	nodeDockerQuiet("rm", "-f", other)
+	t.Cleanup(func() { nodeDockerQuiet("rm", "-f", other) })
+	im, err := nodecfg.LockedImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeDocker(t, "create", "--name", other, "--label", "supapace.test=1", "--label", labelRole+"=studio", "--cap-drop", "ALL",
+		"--entrypoint", "sleep", im.ControlPlane, "86400")
+
+	a.cfg.StudioDomain = ""
+	err = a.checkPlatformMembers(ctx)
+	if err == nil || !strings.Contains(err.Error(), "foreign member") {
+		t.Fatalf("control: platform-members with the containers left: %v", err)
+	}
+	t.Logf("before the removal, platform-members: %v", err)
+	if err := a.RemoveDashboard(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if left := present(); len(left) != 0 {
+		t.Errorf("still there: %q", left)
+	}
+	if c, err := dockerInspectContainer(ctx, other); err != nil || c == nil {
+		t.Errorf("the bystander was removed (%v)", err)
+	}
+	if err := a.checkPlatformMembers(ctx); err != nil {
+		t.Errorf("platform-members after the removal: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dashcfg.PathsFor(a.p).KeyDir(), keyAssert)); err != nil {
+		t.Errorf("the keys went with the containers: %v", err)
+	}
+}

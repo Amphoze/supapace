@@ -65,6 +65,13 @@ func (d *daemon) boot(ctx context.Context) (nftOK, ok bool) {
 		contain("platform networks", err)
 	}
 	d.bootRecord(ctx, nftOK)
+	// A node whose dashboard is not configured keeps none of the dashboard's
+	// containers: the node check's member rows refuse them.
+	if r, ok := d.ag.(interface{ RemoveDashboard(context.Context) error }); ok {
+		if err := r.RemoveDashboard(ctx); err != nil {
+			slog.Error("boot: removing the dashboard's containers", "err", clean(err))
+		}
+	}
 	for _, r := range d.ag.NodeCheck(ctx) {
 		if agent.Blocking(r) {
 			contain("node check "+r.Name, errors.New(r.Detail))

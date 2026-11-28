@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Amphoze/supapace/internal/dashcfg"
 	"github.com/Amphoze/supapace/internal/nodecfg"
 )
 
@@ -167,11 +168,18 @@ func clusterEgress(t *testing.T, A, B Project) {
 	t.Run("bridge_members_d", func(t *testing.T) {
 		// Every other member of A's bridge, on every TCP port it listens on: dropped
 		// by the bridge policy (B3 admits only the cluster's 5432), reached once an
-		// accept for that bridge is inserted.
-		var dsts []string
+		// accept for that bridge is inserted. On a node with a studio domain the
+		// wire proxy is the third member, at host 4, where it listens on nothing:
+		// the ports it has open on its platform address are dropped there by the
+		// same policy, and refused once the accept is inserted.
+		var dsts, closed []string
 		members := networkMembers(t, "proj-"+A.Ref)
-		if !slices.Equal(members, []string{pgA, restA}) {
-			t.Fatalf("members of proj-%s: %v, want exactly %s and %s", A.Ref, members, pgA, restA)
+		want := []string{pgA, restA}
+		if conf.StudioDomain != "" {
+			want = append(want, dashcfg.PgcapName)
+		}
+		if !slices.Equal(members, want) {
+			t.Fatalf("members of proj-%s: %v, want exactly %v", A.Ref, members, want)
 		}
 		for _, m := range members {
 			if m == pgA {
@@ -183,6 +191,9 @@ func clusterEgress(t *testing.T, A, B Project) {
 					own = l.Prefix.Addr()
 				}
 			}
+			if m == dashcfg.PgcapName {
+				own = dashcfg.ProxyAddr(conf, A.SubnetIndex)
+			}
 			for _, l := range nsListeners(t, m) {
 				ip := l.Addr.Addr()
 				switch {
@@ -193,18 +204,29 @@ func clusterEgress(t *testing.T, A, B Project) {
 					dsts = append(dsts, netip.AddrPortFrom(own, l.Addr.Port()).String())
 				case ip == own:
 					dsts = append(dsts, l.Addr.String())
+				case m == dashcfg.PgcapName:
+					closed = append(closed, netip.AddrPortFrom(own, l.Addr.Port()).String())
 				}
 			}
 		}
 		if len(dsts) == 0 {
 			t.Fatalf("no other member of %s listens on TCP: the member probe would have nothing to reach", brA)
 		}
+		if conf.StudioDomain != "" && len(closed) == 0 {
+			t.Fatalf("%s has no port open on its platform address: nothing shows that it is closed on %s", dashcfg.PgcapName, brA)
+		}
 		for _, d := range dsts {
 			wantVerdict(t, "pg-A → bridge member", pgA, "timeout", "tcp", d)
+		}
+		for _, d := range closed {
+			wantVerdict(t, "pg-A → the wire proxy's port at its address on "+brA, pgA, "timeout", "tcp", d)
 		}
 		withRuleInserted(t, "bridge supapace", "forward", fmt.Sprintf(`meta ibrname %q ether type ip accept`, brA), func() {
 			for _, d := range dsts {
 				wantVerdict(t, "control (d): pg-A → bridge member with an accept inserted for "+brA, pgA, "connected", "tcp", d)
+			}
+			for _, d := range closed {
+				wantVerdict(t, "control (d): pg-A → the wire proxy with an accept inserted for "+brA+" (nothing listens there)", pgA, "refused", "tcp", d)
 			}
 		})
 	})

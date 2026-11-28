@@ -71,6 +71,8 @@ type Agent interface {
 	HostState(context.Context, agent.Spec) (agent.HostState, error) // restore submit and T1
 
 	SetReadOnlyLogin(context.Context, agent.Spec) error // restart R6
+
+	AttachProxy(context.Context, agent.Spec) error // create 7a; undone inside RemoveNetwork
 }
 
 // Jobs is what the steps need from the backup job runner; *backup.Runner

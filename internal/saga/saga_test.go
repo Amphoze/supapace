@@ -196,6 +196,14 @@ type fakeAgent struct {
 
 	roLogins []string // the read-only password of each SetReadOnlyLogin call that took effect
 
+	// withProxy: the node has a studio domain, so its agent keeps a wire proxy.
+	// proxy is then the projects whose slice the proxy serves; order, every
+	// change of proxy and network, as it happened.
+	withProxy bool
+	proxy     map[string]bool
+	order     []string
+	asked     []agent.Spec // every AttachProxy, whatever the node
+
 	gwLag   int   // polls that still report an older route generation
 	gwAhead int64 // added to the generation the gateway reports (it may be past the one written)
 }
@@ -280,9 +288,46 @@ func (f *fakeAgent) RemoveNetwork(ctx context.Context, ref string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// As the agent: the proxy's slice and attachment go first.
+	if f.proxy[ref] {
+		delete(f.proxy, ref)
+		f.effects["detach "+ref]++
+		f.order = append(f.order, "detach "+ref)
+	}
 	if f.network[ref] {
 		delete(f.network, ref)
 		f.effects["rmnet "+ref]++
+		f.order = append(f.order, "rmnet "+ref)
+	}
+	return nil
+}
+
+// AttachProxy, like the agent's, does nothing on a node without a studio
+// domain: no call is recorded there, only that it was asked. With one it is
+// a call like any other and needs the project's network.
+func (f *fakeAgent) AttachProxy(ctx context.Context, s agent.Spec) error {
+	f.mu.Lock()
+	f.asked = append(f.asked, s)
+	withProxy := f.withProxy
+	f.mu.Unlock()
+	if !withProxy {
+		return ctx.Err()
+	}
+	if err := f.enter(ctx, sc("AttachProxy", s), &s); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.network[s.Ref] {
+		return errors.New("attach: no project network")
+	}
+	if !f.proxy[s.Ref] {
+		if f.proxy == nil {
+			f.proxy = map[string]bool{}
+		}
+		f.proxy[s.Ref] = true
+		f.effects["attach "+s.Ref]++
+		f.order = append(f.order, "attach "+s.Ref)
 	}
 	return nil
 }
@@ -1011,8 +1056,8 @@ func failOn(method string) func(c call) error {
 }
 
 // createIDs are the steps of a create at layout 0 or 1; createIDs2 at layout 2.
-var createIDs = []string{"2", "3", "4a", "4", "6", "7", "9", "11", "12"}
-var createIDs2 = []string{"2", "3", "4a", "4", "5a", "5b", "5c", "5d", "6", "7", "9", "11", "12a", "12b", "12"}
+var createIDs = []string{"2", "3", "4a", "4", "6", "7", "7a", "9", "11", "12"}
+var createIDs2 = []string{"2", "3", "4a", "4", "5a", "5b", "5c", "5d", "6", "7", "7a", "9", "11", "12a", "12b", "12"}
 
 // ───────── tables ─────────
 
@@ -1583,9 +1628,9 @@ func TestRun_AttemptDeadlineFailsAttempt(t *testing.T) {
 	r.attemptDeadline = 3 * time.Second
 	r.backoff = []time.Duration{time.Hour}
 	e.start(r)
-	// Steps 3 to 7 succeed; step 9 outlives the attempt and is ended by it.
+	// Steps 3 to 7a succeed; step 9 outlives the attempt and is ended by it.
 	op := e.wait(id, "backed off", func(op store.Operation) bool { return op.State == "pending" && op.Attempts == 2 })
-	if !strings.HasPrefix(op.LastError, "timeout: ") || op.Step != "7" {
+	if !strings.HasPrefix(op.LastError, "timeout: ") || op.Step != "7a" {
 		t.Fatalf("op = %+v", op)
 	}
 	// One deadline for the whole attempt, not one per step.
@@ -3865,4 +3910,121 @@ func TestSpec_AnUnreadableReadOnlySecretIsAnError(t *testing.T) {
 	if s, err := r.SpecFor(context.Background(), ref); err == nil {
 		t.Fatalf("spec built with an unreadable secret (password %d bytes)", len(s.Secrets.ReadOnlyPassword))
 	}
+}
+
+// ───────── the wire proxy's step ─────────
+
+// TestCreate_Step7a_AlwaysInTheTable: the step tables are one static map, so
+// the step that attaches the node's wire proxy is in every create, right
+// after step 7 and under an id of its own. On a node without a studio domain
+// it is entered, completes at once and attaches nothing; on a node with one
+// it attaches the project once, whatever is resumed.
+func TestCreate_Step7a_AlwaysInTheTable(t *testing.T) {
+	var ids []string
+	for _, s := range tables["create"] {
+		ids = append(ids, s.id)
+	}
+	if i := slices.Index(ids, "7a"); i < 1 || ids[i-1] != "7" || ids[i+1] != "9" {
+		t.Fatalf("create steps %v: 7a is not between 7 and 9", ids)
+	}
+	sorted := slices.Sorted(slices.Values(ids))
+	if len(slices.Compact(sorted)) != len(ids) || slices.Contains(ids, "8") || slices.Contains(ids, "10") {
+		t.Fatalf("create steps %v: an id is used twice, or a reserved one is used", ids)
+	}
+	if createLayout2["7a"] {
+		t.Fatal("7a is a step of one layout only")
+	}
+	for _, studio := range []bool{false, true} {
+		t.Run(fmt.Sprintf("studio domain %v", studio), func(t *testing.T) {
+			e := newEnv(t)
+			e.ag.withProxy = studio
+			ref, id := e.create()
+			e.failpoint("create:7a")
+			<-e.run(e.runner()) // the failpoint fires: the step is entered
+			if op := e.op(id); op.State != "running" || op.Step != "7" {
+				t.Fatalf("at 7a: %+v", op)
+			}
+			e.ag.locked(func() {
+				if len(e.ag.asked) != 0 {
+					t.Fatalf("the agent was asked before the step: %v", e.ag.asked)
+				}
+			})
+			e.start(e.runner())
+			op := e.waitState(id, "done")
+			wantSeq(t, e.steps(id), createIDs)
+			// Two attempts: the one the failpoint ended, and the rest of the create.
+			if op.Attempts != 2 || op.LastError != "" {
+				t.Fatalf("attempts %d, last error %q: the step did not complete at once", op.Attempts, op.LastError)
+			}
+			// The agent decides, so it is asked on every node — once, with the
+			// project's placement. Only a node with a studio domain records a call:
+			// after the network exists and before PostgREST starts.
+			m := e.ag.methods(ref)
+			i := slices.Index(m, "AttachProxy")
+			if !studio && i >= 0 || studio && (i < 0 || m[i+1] != "EnsurePostgREST" || slices.Index(m, "EnsureNetwork") > i || len(e.ag.callsOf(ref, "AttachProxy")) != 1) {
+				t.Fatalf("calls %v", m)
+			}
+			slice := *e.project(ref).SubnetIndex
+			e.ag.locked(func() {
+				if a := e.ag.asked; len(a) != 1 || a[0].Ref != ref || a[0].SubnetIndex != slice || a[0].Generation != 1 {
+					t.Errorf("the agent was asked %v, want once for %s at slice %d", a, ref, slice)
+				}
+				if got, want := e.ag.effects["attach "+ref], map[bool]int{false: 0, true: 1}[studio]; got != want {
+					t.Errorf("attached %d times, want %d", got, want)
+				}
+				if e.ag.proxy[ref] != studio {
+					t.Errorf("the proxy serves the project: %v, want %v", e.ag.proxy[ref], studio)
+				}
+			})
+		})
+	}
+}
+
+// TestAbort_After7a_SliceRemovedThenNetworkRemoved: the step has no entry of
+// its own in the compensation list. What undoes it is RemoveNetwork, which
+// takes the slice out of the proxy's table and the proxy off the network
+// before the network goes; the abort of a create that got past 7a reaches
+// it, after both tenant containers are stopped, and may run it twice.
+func TestAbort_After7a_SliceRemovedThenNetworkRemoved(t *testing.T) {
+	e := newEnv(t)
+	e.ag.withProxy = true
+	ref, id := e.create()
+	e.ag.setErr(failOn("EnsurePostgREST")) // step 9, after 7a
+	r := e.runner()
+	e.start(r)
+	if op := e.waitState(id, "failed"); op.Step != "7a" {
+		t.Fatalf("failed after step %s: %s", op.Step, op.LastError)
+	}
+	e.ag.locked(func() {
+		if !e.ag.proxy[ref] || !e.ag.network[ref] {
+			t.Fatalf("control: before the abort the proxy serves %v, the network exists %v", e.ag.proxy[ref], e.ag.network[ref])
+		}
+	})
+	e.ag.reset()
+	e.ag.setErr(nil)
+	// The first run of the list stops after the network's removal was asked
+	// for and before it is recorded: the next run asks again.
+	var failed atomic.Bool
+	e.ag.setErr(func(c call) error {
+		if c.Method == "PurgeDir" && failed.CompareAndSwap(false, true) {
+			return errBoom
+		}
+		return nil
+	})
+	_, err := r.Abort(context.Background(), ref)
+	must(t, err)
+	e.waitState(id, "aborted")
+	m := e.ag.methods(ref)
+	if n := len(e.ag.callsOf(ref, "RemoveNetwork")); n != 2 {
+		t.Fatalf("RemoveNetwork called %d times, want once per run of the list: %v", n, m)
+	}
+	if i := slices.Index(m, "RemoveNetwork"); slices.Index(m, "StopPostgREST") > i || slices.Index(m, "StopCluster") > i || slices.Contains(m, "AttachProxy") {
+		t.Fatalf("calls %v", m)
+	}
+	e.ag.locked(func() {
+		wantSeq(t, e.ag.order[len(e.ag.order)-2:], []string{"detach " + ref, "rmnet " + ref})
+		if e.ag.proxy[ref] || e.ag.network[ref] || e.ag.effects["detach "+ref] != 1 || e.ag.effects["rmnet "+ref] != 1 {
+			t.Fatalf("after the abort: proxy %v, network %v, effects %v", e.ag.proxy[ref], e.ag.network[ref], e.ag.effects)
+		}
+	})
 }
