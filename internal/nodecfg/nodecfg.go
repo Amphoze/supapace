@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +45,13 @@ type Config struct {
 	CPDiskQuotaMB    int      `json:"cp_disk_quota_mb,omitempty"` // 0: not set, resolved at use by CPQuotas
 	CPRepoQuotaMB    int      `json:"cp_repo_quota_mb,omitempty"` // likewise
 	StudioDomain     string   `json:"studio_domain,omitempty"`    // the dashboard's domain; empty: no dashboard
+	PoolerLabel      string   `json:"pooler_label,omitempty"`     // the pooler zone <label>.<domain>; empty: no pooler
+	PublicAddrs      []string `json:"public_addrs,omitempty"`     // every IPv4 address under which the outside sees this node
+	EgressSubnet     string   `json:"egress_subnet,omitempty"`    // empty: defaultEgressSubnet
+	ProxyMaxConns    int      `json:"proxy_max_conns,omitempty"`  // 0: the default of the pooler's connection arithmetic
+	RestIdleStopS    int      `json:"rest_idle_stop_s,omitempty"` // 0: the REST service is never stopped for idleness
+	OffsiteWindowS   int      `json:"offsite_window_s,omitempty"` // development nodes only; 0: the built-in window
+	RekeySettleS     int      `json:"rekey_settle_s,omitempty"`   // development nodes only; 0: the built-in wait
 }
 
 type Images struct {
@@ -246,8 +254,10 @@ func Load(path string) (Config, error) {
 // parses, the four networks are disjoint, the reserved addresses lie where the
 // layout needs them, the uid range fits and covers every slice, the domain is
 // lowercase DNS labels, the studio domain (when set) is a name disjoint from
-// it on label boundaries, node_id is what the dashboard's tokens can sign, and
-// the images are pinned.
+// it on label boundaries, node_id is what the dashboard's tokens can sign,
+// the images are pinned, the pooler label leaves its hosts valid names, the
+// declared public addresses are outside the node's networks, and the
+// operations' figures are in range.
 func (c Config) Validate() error {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
@@ -323,18 +333,24 @@ func (c Config) Validate() error {
 		bad("docker_pool_size: %d does not fit docker_pool %s", c.DockerPoolSize, pool)
 	}
 	backup := prefix("backup_subnet", c.BackupSubnet)
-	// The five networks are separate bridges and address pools; none may share an address.
+	egress := prefix("egress_subnet", c.Egress())
+	// The six networks are separate bridges and address pools; none may share an address.
 	nets := []struct {
 		name string
 		p    netip.Prefix
-	}{{"project_block", block}, {"platform_subnet", platform}, {"ingress_subnet", ingress}, {"docker_pool", pool}, {"backup_subnet", backup}}
+	}{{"project_block", block}, {"platform_subnet", platform}, {"ingress_subnet", ingress}, {"docker_pool", pool}, {"backup_subnet", backup}, {"egress_subnet", egress}}
+	var valid []netip.Prefix
 	for i, a := range nets {
+		if a.p.IsValid() {
+			valid = append(valid, a.p)
+		}
 		for _, b := range nets[i+1:] {
 			if a.p.IsValid() && b.p.IsValid() && a.p.Overlaps(b.p) {
 				bad("%s: %s overlaps %s %s", a.name, a.p, b.name, b.p)
 			}
 		}
 	}
+	c.validatePooler(valid, bad)
 	// The last uid, base + count − 1, must not pass maxUID; tested without the sum, which can overflow.
 	if c.UIDBase <= 0 || c.UIDBase > maxUID || c.UIDCount <= 0 || c.UIDCount > maxUID-c.UIDBase+1 {
 		bad("uid_base/uid_count: %d/%d out of range", c.UIDBase, c.UIDCount)
@@ -459,4 +475,72 @@ func endsInNumber(s string) bool {
 		last, digits = h, "0123456789abcdef"
 	}
 	return strings.Trim(last, digits) == ""
+}
+
+// The outbound network of the clusters that are given one.
+const EgressBridge, EgressNetwork = "spe0", "tenant-egress"
+
+const defaultEgressSubnet = "10.212.10.0/24"
+
+// Egress is the outbound network's subnet: egress_subnet, or the default.
+func (c Config) Egress() string {
+	if c.EgressSubnet == "" {
+		return defaultEgressSubnet
+	}
+	return c.EgressSubnet
+}
+
+// labelRE is one lowercase DNS label; refShapeRE is a project ref's shape.
+var (
+	labelRE    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	refShapeRE = regexp.MustCompile(`^[a-z0-9]{20}$`)
+)
+
+// thisNetwork (0.0.0.0/8) and reserved (240.0.0.0/4) hold no address the outside
+// can see a node under; IsGlobalUnicast admits both.
+var thisNetwork, reserved = netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("240.0.0.0/4")
+
+// maxPublicAddrs bounds public_addrs; refLen is the length of a project ref.
+const maxPublicAddrs, refLen = 32, 20
+
+// validatePooler checks the members of the pooler and of the operations
+// that use them, given the node's networks (the invalid ones left out).
+func (c Config) validatePooler(nets []netip.Prefix, bad func(string, ...any)) {
+	if l := c.PoolerLabel; l != "" {
+		switch {
+		case !labelRE.MatchString(l):
+			bad("pooler_label: %q is not one DNS label of [a-z0-9-]", l)
+		case refShapeRE.MatchString(l):
+			bad("pooler_label: %q has the shape of a project ref", l)
+		case refLen+1+len(l)+1+len(c.Domain) > 253:
+			bad("pooler_label: %q: a pooler host <ref>.%s.%s would pass 253 characters", l, l, c.Domain)
+		}
+	}
+	seen := map[netip.Addr]bool{}
+	if len(c.PublicAddrs) > maxPublicAddrs {
+		bad("public_addrs: %d addresses, at most %d", len(c.PublicAddrs), maxPublicAddrs)
+	}
+	for _, s := range c.PublicAddrs {
+		a, err := netip.ParseAddr(s)
+		switch {
+		case err != nil || !a.Is4() || !a.IsGlobalUnicast() || thisNetwork.Contains(a) || reserved.Contains(a):
+			bad("public_addrs: %q is not a canonical IPv4 unicast address", s)
+		case seen[a]:
+			bad("public_addrs: %s is named twice", a)
+		case slices.ContainsFunc(nets, func(p netip.Prefix) bool { return p.Contains(a) }):
+			bad("public_addrs: %s lies inside a network of the node", a)
+		}
+		seen[a] = true
+	}
+	if c.RestIdleStopS < 0 || c.RestIdleStopS > 86400 {
+		bad("rest_idle_stop_s: %d is not 0 to 86400", c.RestIdleStopS)
+	}
+	for _, f := range []struct {
+		name string
+		v    int
+	}{{"proxy_max_conns", c.ProxyMaxConns}, {"offsite_window_s", c.OffsiteWindowS}, {"rekey_settle_s", c.RekeySettleS}} {
+		if f.v < 0 {
+			bad("%s: %d must not be negative", f.name, f.v)
+		}
+	}
 }

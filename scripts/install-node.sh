@@ -4,9 +4,13 @@
 #
 #   scripts/install-node.sh --domain D (--dev | --tls-cert F --tls-key F) [--ack-escrow]
 #       [--studio-domain S [--studio-tls-cert F --studio-tls-key F]]
+#       [--pooler-label L [--pooler-tls-cert F --pooler-tls-key F]] [--public-addr A]...
 #
-# The studio pair is required with --studio-domain unless --dev is given or a
-# pair is already stored.
+# The studio pair is required with --studio-domain, and the pooler pair (naming
+# *.<L>.<D> alone) with --pooler-label, unless --dev is given or a pair is
+# already stored. --public-addr, once for each, names every address under
+# which the outside sees the node: what its names resolve to, and every source
+# address the provider gives its outbound traffic.
 #
 # The arguments are passed to `supapaced init` (--no-systemd is refused: this
 # script exists to wire systemd). Binaries come from BIN_DIR (default bin/, as
@@ -18,7 +22,9 @@
 # host before the daemon binary provides `serve`: Docker's drop-in pulls in
 # the daemon unit, which would otherwise restart every second.
 #
-# Steps: check the tools and the two filesystems; block br_netfilter, set
+# Steps: check the tools and the two filesystems; block br_netfilter, list the
+# kernel modules a node needs for the host's boot (loaded by nothing here: the
+# command is printed for a host that is not rebooted), set
 # kernel.core_pattern and fs.protected_hardlinks; install the binaries
 # (supapaced, supapace-arch, supapace when built); supapaced init; enable the
 # units; restart Docker (so its drop-in and daemon.json apply before the first
@@ -133,6 +139,16 @@ chmod 0700 "$ROOT/var/lib/supapace"
 # a node may load it. Core files stay inside the crashing container. Protected
 # hard links: a process links only files it owns or can read and write.
 write "$ROOT/etc/modprobe.d/supapace.conf" 0644 "install br_netfilter /bin/false"
+# The modules the containment tables need, loaded by the host's own boot before
+# the tables' unit; this script loads none.
+write "$ROOT/etc/modules-load.d/supapace.conf" 0644 "nf_conntrack_bridge
+nft_connlimit"
+for m in nf_conntrack_bridge nft_connlimit; do
+	if [ ! -e "$ROOT/sys/module/$m" ]; then
+		log "the kernel modules of /etc/modules-load.d/supapace.conf load at the next boot; to load them now, run: modprobe -a nf_conntrack_bridge nft_connlimit"
+		break
+	fi
+done
 write "$ROOT/etc/sysctl.d/90-supapace.conf" 0644 "kernel.core_pattern = core
 fs.protected_hardlinks = 1"
 sysctl -q -p "$ROOT/etc/sysctl.d/90-supapace.conf"

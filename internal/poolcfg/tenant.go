@@ -109,17 +109,20 @@ var notInAllowList = []netip.Prefix{
 
 // ValidAllowList parses 1 to 32 IPv4 prefixes in canonical form and refuses
 // one that overlaps a network of the node (project block, platform, ingress,
-// Docker pool, backup), this network, loopback, link-local, multicast or the
-// reserved block: no node-internal address is ever written into a list.
+// Docker pool, backup, egress), this network, loopback, link-local, multicast
+// or the reserved block: no node-internal address is ever written into a
+// list. A network of the node that does not parse is an error, never skipped.
 func ValidAllowList(c nodecfg.Config, list []string) ([]netip.Prefix, error) {
 	if len(list) < 1 || len(list) > maxAllowList {
 		return nil, fmt.Errorf("poolcfg: %d allow-list entries, want 1 to %d", len(list), maxAllowList)
 	}
 	deny := append([]netip.Prefix(nil), notInAllowList...)
-	for _, s := range []string{c.ProjectBlock, c.PlatformSubnet, c.IngressSubnet, c.DockerPool, c.BackupSubnet} {
-		if p, err := netip.ParsePrefix(s); err == nil {
-			deny = append(deny, p.Masked())
+	for _, s := range []string{c.ProjectBlock, c.PlatformSubnet, c.IngressSubnet, c.DockerPool, c.BackupSubnet, c.Egress()} {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("poolcfg: the node's network %q does not parse; no list is validated against it", s)
 		}
+		deny = append(deny, p.Masked())
 	}
 	out := make([]netip.Prefix, 0, len(list))
 	for _, s := range list {

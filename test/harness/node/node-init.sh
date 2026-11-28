@@ -109,6 +109,20 @@ if [ "$mode" = full ] && [ -n "${SP_STUDIO_DOMAIN:-}" ]; then
 		[ $# -gt 0 ] || log "supapaced has no --studio-domain: the node starts without a dashboard"
 	fi
 fi
+# A pooler node (make node-up POOLER=1, which passes POOLER and SP_POOLER_LABEL):
+# the archives of the pool directory are loaded, and init is given the label when
+# the daemon binary knows the flag.
+pooler='' label=''
+if [ "${POOLER:-}" = 1 ]; then
+	pooler=1
+	if [ "$mode" = full ] && [ -n "${SP_POOLER_LABEL:-}" ]; then
+		if "$BIN/supapaced" init -h 2>&1 | grep -q -- '-pooler-label'; then
+			label=$SP_POOLER_LABEL
+		else
+			[ $# -gt 0 ] || log "supapaced has no --pooler-label: the node starts without a pooler label"
+		fi
+	fi
+fi
 if [ "${1:-}" = declare-offsite ]; then
 	[ "$mode" != full ] || declare_offsite
 	exit
@@ -125,6 +139,12 @@ count=$(cat "$STATE/boot/count" 2>/dev/null || echo 0)
 echo $((count + 1)) >"$STATE/boot/count.tmp"
 mv "$STATE/boot/count.tmp" "$STATE/boot/count"
 log "boot $((count + 1)), mode $mode"
+# The host's list of the kernel modules a node needs, as the install script
+# writes it; nothing here loads one (a test node has the host's kernel).
+if [ ! -e /etc/modules-load.d/supapace.conf ]; then
+	mkdir -p /etc/modules-load.d
+	printf 'nf_conntrack_bridge\nnft_connlimit\n' >/etc/modules-load.d/supapace.conf
+fi
 
 # 1. The container's /dev is a snapshot taken at start: create the node of every
 # loop device the kernel has, and of the next free one, before mount picks one.
@@ -167,7 +187,7 @@ mount_xfs "$STATE/repo.img" 8G "$REPO" usrquota,nosuid,nodev,noexec
 if [ "$mode" = full ]; then
 	if [ ! -e /etc/supapace/node.json ]; then
 		(umask 077 && "$BIN/supapaced" init --dev --no-systemd --ack-escrow --domain sp.test \
-			${studio:+--studio-domain "$studio"} >"$STATE/init.out" 2>&1) ||
+			${studio:+--studio-domain "$studio"} ${label:+--pooler-label "$label"} >"$STATE/init.out" 2>&1) ||
 			{ log "supapaced init failed; its output is in $STATE/init.out"; exit 1; }
 	fi
 	declare_offsite || { log "declaring the object-store stand-in failed"; exit 1; }
@@ -186,16 +206,24 @@ until docker info >/dev/null 2>&1; do
 	sleep 1
 done
 
+# A pooler node needs the pooler's archive (the lab's own does not count), and the
+# wire proxy's, which make images POOLER=1 saves beside the dashboard's (with a studio
+# domain it is among those already; a loaded image is not loaded again).
+if [ -n "$pooler" ]; then
+	ls /images/pool/*.tar 2>/dev/null | grep -qv '^/images/pool/lab-' || { log "a node started with POOLER=1 has no pooler image archive: run make images POOLER=1"; exit 1; }
+fi
 # Each archive's index.json names its image (scripts/cache-images.sh); load what
 # this daemon lacks, then require every name to resolve. docker load can exit 0
 # after an unpack error, leaving a name that inspects but cannot run and that
 # every later boot would skip: an error in its output fails the boot too, after
 # removing that name.
 loaded=0 refs=
-for tar in /images/*.tar ${studio:+/images/dash/*.tar}; do
+for tar in /images/*.tar ${studio:+/images/dash/*.tar} ${pooler:+/images/pool/*.tar /images/dash/supapace-pgcap.tar}; do
 	[ -e "$tar" ] || continue
 	# A Studio variant (supapace-studio-NAME.tar) is loaded only by the test that wants it.
 	case $tar in /images/dash/supapace-studio-*.tar) continue ;; esac
+	# The pooler lab's own archive (pool-lab.sh) is for its runs alone.
+	case $tar in /images/pool/lab-*) continue ;; esac
 	ref=$(tar -xOf "$tar" index.json | sed -n 's/.*"io.containerd.image.name":"\([^"]*\)".*/\1/p')
 	[ -n "$ref" ] || { log "$tar names no image; run make images"; exit 1; }
 	refs="$refs $ref"

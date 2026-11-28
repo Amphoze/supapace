@@ -102,7 +102,7 @@ fi
 say "supavisor index $SUPAVISOR_INDEX: amd64 $amd64, arm64 $arm64"
 
 mkdir -p "$cache/pool"
-tar=$cache/pool/supavisor-${SUPAVISOR_INDEX:7:12}.tar
+tar=$cache/pool/lab-supavisor-${SUPAVISOR_INDEX:7:12}-$arch.tar
 kit=/var/lib/sp-exp/pool
 # Nothing of a run that is still going, or that ended without cleaning up, is
 # ever reused or removed: refuse before creating anything.

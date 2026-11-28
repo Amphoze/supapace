@@ -26,11 +26,20 @@ IMAGE_CACHE ?= $(HOME)/.cache/supapace/images
 # reads SP_DASH for the images of the lock that only a dashboard node needs.
 DASH ?=
 STUDIO_DOMAIN ?= studio.test
+# POOLER=1: a node with a pooler label. make images also caches the pooler's image
+# into $(IMAGE_CACHE)/pool (the image-cache script reads SP_POOLER) and builds the wire
+# proxy's image; make node-up gives the node the label db and 6 GiB (8 with DASH=1), the
+# node loads the archives of $(IMAGE_CACHE)/pool, and the lab bridge $(NODE)-out with the
+# outside client $(NODE)-client is made beside it (OUT_SUBNET, a documentation range).
+POOLER ?=
 # The node's memory limit in GiB; node-up and node-bare refuse to start the node
 # unless this machine has that and 2 GiB more available.
-NODE_MEM ?= $(if $(DASH),6,4)
+NODE_MEM ?= $(if $(POOLER),$(if $(DASH),8,6),$(if $(DASH),6,4))
 ifneq ($(DASH),)
 export SP_DASH := 1
+endif
+ifneq ($(POOLER),)
+export SP_POOLER := 1
 endif
 BROWSERS_TAR = $(IMAGE_CACHE)/browsers/supapace-browsers.tar
 LOCK := internal/nodecfg/images.lock
@@ -63,6 +72,21 @@ S3_NODE1 = 10.215.$(S3_SLOT).5
 S3_NODE2 = 10.215.$(S3_SLOT).133
 S3_LAB = S3_SLOT=$(S3_SLOT) S3_NET1=$(S3_NET1) S3_NET2=$(S3_NET2) S3_ADDR1=$(S3_ADDR1) S3_ADDR2=$(S3_ADDR2) \
 	S3_NODE1=$(S3_NODE1) S3_NODE2=$(S3_NODE2)
+# POOLER=1: the lab bridge $(NODE)-out, a /28 of 198.51.100.0/24 chosen by the lab slot
+# (pass OUT_SUBNET when two nodes collide), internal and without an address of this machine
+# on it; the node at its base + 8, the outside client $(NODE)-client (the control-plane
+# image, only sleeping) at base + 9, whose address the node keeps in /var/lib/sp/outside.
+OUT_SUBNET ?= 198.51.100.$(shell echo $$(( ($(S3_SLOT) % 15 + 1) * 16 )))/28
+CP_IMAGE = $(call lock_ref,control_plane)
+out_lab = b=$$(echo '$(OUT_SUBNET)' | cut -d/ -f1); p=$$(echo $$b | cut -d. -f1-3); o=$$(echo $$b | cut -d. -f4); \
+	docker network create --label supapace.test=1 --internal -o com.docker.network.bridge.inhibit_ipv4=true \
+		--subnet '$(OUT_SUBNET)' --ip-range $$p.$$o/29 $(NODE)-out >/dev/null || \
+		{ echo "node: cannot create $(NODE)-out on $(OUT_SUBNET); pass another OUT_SUBNET (make node-down NODE=$(NODE) first)" >&2; exit 1; }; \
+	docker run -d --name $(NODE)-client --label supapace.test=1 --network $(NODE)-out --ip $$p.$$((o + 9)) \
+		--cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges --memory 512m --pids-limit 1024 \
+		--init --entrypoint sleep $(CP_IMAGE) infinity >/dev/null && \
+	docker network connect --ip $$p.$$((o + 8)) $(NODE)-out $(NODE) && \
+	docker exec $(NODE) sh -c 'echo "$$0" >/var/lib/sp/outside' $$p.$$((o + 9))
 REACH_FLAGS := -test.v -test.parallel 1
 REACH_ARGS ?=
 
@@ -143,11 +167,12 @@ images: build
 		--build-arg WORKER_SRC_SHA256=$(WORKER_SRC_SHA256) -f deploy/worker/Dockerfile "$(IMAGE_CACHE)/src"
 	$(if $(PULL_ONLY),,scripts/cache-images.sh --save $(WORKER_IMAGE) supapace-worker:local "$(IMAGE_CACHE)/supapace-worker.tar")
 	$(if $(PULL_ONLY),,docker image inspect $(S3_IMAGE) >/dev/null 2>&1 || docker pull -q $(S3_IMAGE))
-	@# DASH=1: the wire proxy's image, and the Studio archive make studio writes.
+	@# DASH=1: the wire proxy's image, and the Studio archive make studio writes; POOLER=1:
+	@# the wire proxy's image too.
 	$(if $(DASH),@test -f "$(IMAGE_CACHE)/dash/supapace-studio.tar" || \
 		{ echo "images: $(IMAGE_CACHE)/dash/supapace-studio.tar is missing: run make studio first" >&2; exit 1; })
-	$(if $(DASH),docker build -t $(PGCAP_IMAGE) -f deploy/pgcap/Dockerfile .)
-	$(if $(DASH),$(if $(PULL_ONLY),,scripts/cache-images.sh --save $(PGCAP_IMAGE) supapace-pgcap:local "$(IMAGE_CACHE)/dash/supapace-pgcap.tar"))
+	$(if $(DASH)$(POOLER),docker build -t $(PGCAP_IMAGE) -f deploy/pgcap/Dockerfile .)
+	$(if $(DASH)$(POOLER),$(if $(PULL_ONLY),,mkdir -p "$(IMAGE_CACHE)/dash" && scripts/cache-images.sh --save $(PGCAP_IMAGE) supapace-pgcap:local "$(IMAGE_CACHE)/dash/supapace-pgcap.tar"))
 
 # The Studio image, its archive and its build record, into $(IMAGE_CACHE)/dash
 # (studio/build.sh image: many minutes, and 10 GiB available). Never part of
@@ -193,7 +218,7 @@ node-up node-bare:
 		[ "$$avail" -ge $$(($(NODE_MEM) + 2)) ] || { echo "node: $$avail GiB available; a node of $(NODE_MEM) GiB needs $$(($(NODE_MEM) + 2))" >&2; exit 1; }
 	docker build --build-arg NODE_IMAGE=$(NODE_BASE) -t $(NODE_IMAGE) test/harness/node
 	mkdir -p $(BIN) "$(IMAGE_CACHE)"
-	docker run -d --privileged --cgroupns private --memory $(NODE_MEM)g --stop-timeout 60 --name $(NODE) -e SP_NODE_MODE=$(MODE)$(if $(DASH), -e SP_STUDIO_DOMAIN=$(STUDIO_DOMAIN)) \
+	docker run -d --privileged --cgroupns private --memory $(NODE_MEM)g --stop-timeout 60 --name $(NODE) -e SP_NODE_MODE=$(MODE)$(if $(DASH), -e SP_STUDIO_DOMAIN=$(STUDIO_DOMAIN))$(if $(POOLER), -e POOLER=1 -e SP_POOLER_LABEL=db) \
 		$(if $(filter 0,$(SP_OFFSITE)),,--add-host $(S3_NAME):$(S3_ADDR1)) \
 		-v $(NODE)-docker:/var/lib/docker -v $(NODE)-state:/var/lib/sp \
 		-v "$(CURDIR)/$(BIN)":$(NODE_BUILD):ro -v "$(IMAGE_CACHE)":/images:ro $(NODE_IMAGE)
@@ -210,12 +235,15 @@ node-up node-bare:
 		echo "node: the daemon did not answer node check within 60 s:" >&2; \
 		docker exec $(NODE) tail -n 20 /var/log/supapaced.log >&2; exit 1; fi
 	$(if $(filter 0,$(SP_OFFSITE)),,NODE=$(NODE) NODE_IMAGE=$(NODE_IMAGE) S3_IMAGE=$(S3_IMAGE) $(S3_LAB) test/harness/s3/setup.sh)
+	$(if $(POOLER),@$(out_lab))
 
 # Volumes go too: a kept Docker volume would leave stale proj-* networks behind. The
 # stand-in's lab first: the node leaves both networks, then the stand-in and the networks go.
 node-down:
 	-@for n in $(NODE)-net $(NODE)-net2; do docker network disconnect -f $$n $(NODE) >/dev/null 2>&1; done; \
 		docker rm -f -v $(NODE)-s3 >/dev/null 2>&1; docker network rm $(NODE)-net $(NODE)-net2 >/dev/null 2>&1; true
+	-@docker network disconnect -f $(NODE)-out $(NODE) >/dev/null 2>&1; docker rm -f -v $(NODE)-client >/dev/null 2>&1; \
+		docker network rm $(NODE)-out >/dev/null 2>&1; true
 	-docker rm -f $(NODE)
 	-docker volume rm $(NODE)-docker $(NODE)-state
 
@@ -224,8 +252,12 @@ node-down:
 # SUPAPACE_BACKUP, when set, is passed on as set: =1 makes a node below layout 2 fail the
 # backup tests instead of skipping them (reach, reach-dash, reach-reboot).
 backup_env = $(if $(SUPAPACE_BACKUP),--env SUPAPACE_BACKUP=$(SUPAPACE_BACKUP))
+# A node with a pooler label is told so (SUPAPACE_POOLER=1), and one with the outside client
+# (SUPAPACE_OUTSIDE=1): a test that needs either then fails instead of skipping.
+pool_env = $$(docker exec $(NODE) grep -qs '"pooler_label"' /etc/supapace/node.json && echo --env SUPAPACE_POOLER=1) \
+	$$(docker exec $(NODE) test -e /var/lib/sp/outside && echo --env SUPAPACE_OUTSIDE=1)
 reach: build
-	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1) $(backup_env))
+	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1) $(backup_env) $(pool_env))
 
 # The suite built with the tags reach and dash (dash.test: every test of reach.test
 # and the dashboard's), on a node started with DASH=1, bracketed as make reach is.
@@ -233,7 +265,7 @@ reach: build
 reach-dash: build
 	CGO_ENABLED=0 $(GO) test -c -tags 'reach dash' -o $(BIN)/dash.test ./test/reach
 	@if [ -f "$(BROWSERS_TAR)" ]; then $(load_browsers); fi
-	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1) $(backup_env),dash.test)
+	$(call node_reach,$(REACH_ARGS),$$(docker container inspect $(NODE)-s3 >/dev/null 2>&1 && echo --env SUPAPACE_STANDIN=1) $(backup_env) $(pool_env),dash.test)
 
 # A package's node tests (TestNode_…, or RUN=<pattern>), built with the reach tag, in a
 # node started bare, with the archives of $(IMAGE_CACHE)/dash loaded into it.

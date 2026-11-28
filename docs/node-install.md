@@ -47,6 +47,16 @@ The node's firewall tables and checks assume nothing else runs on the host:
     `core`);
   - `br_netfilter` not loaded and a modprobe line `install br_netfilter /bin/false` present
     (row `br_netfilter`; the install writes it).
+- **The kernel modules `nf_conntrack_bridge` and `nft_connlimit`**, loaded before the tables'
+  unit: the containment tables need bridge connection tracking and the connection limits.
+  The install lists both in `/etc/modules-load.d/supapace.conf`, which the host's boot reads
+  before the tables' unit, and loads neither: no program of the platform asks the kernel for a
+  module. On a host that is not rebooted after the install, run the command it prints, as
+  root: `modprobe -a nf_conntrack_bridge nft_connlimit`. A test node (`make node-up`) has its
+  host's kernel and writes the same list inside the node, so on a development workstation the
+  workstation's operator runs that command once (`test -e /sys/module/nft_connlimit` shows
+  the module is there) before starting a full-mode test node; a bare node (`make node-bare`)
+  loads no table and needs neither.
 - **The projects filesystem:** XFS mounted at `/var/lib/supapace/projects` with user-quota
   enforcement and project-quota accounting, and nothing mounted over it. For example:
 
@@ -106,7 +116,9 @@ The script, which is safe to rerun:
    (or `pqnoenforce`), and that `/var/lib/supapace/repo` is the topmost mount, XFS of its own
    with `usrquota`, `nosuid`, `nodev` and `noexec`;
 2. makes `/var/lib/supapace` root 0700;
-3. writes `/etc/modprobe.d/supapace.conf` (`install br_netfilter /bin/false`) and
+3. writes `/etc/modprobe.d/supapace.conf` (`install br_netfilter /bin/false`),
+   `/etc/modules-load.d/supapace.conf` (`nf_conntrack_bridge`, `nft_connlimit`; it prints the
+   `modprobe` command when either is not loaded, and runs none) and
    `/etc/sysctl.d/90-supapace.conf` (`kernel.core_pattern = core` and
    `fs.protected_hardlinks = 1`; do not override that setting in a later sysctl file) and
    applies the latter;
@@ -156,6 +168,13 @@ nothing on a second run with the same inputs. It writes:
 
 The domain and development mode are fixed at the first init: a later run with another domain,
 or with `--dev` added or dropped, is refused before anything is written.
+
+`--public-addr A`, once for each address, declares every IPv4 address under which the outside
+sees the node: what its names resolve to, and every source address the provider gives its
+outbound traffic. A node whose outbound address cannot be named declares none. The flags of one
+run replace the stored list (`public_addrs` in `node.json`); a run without the flag keeps it. To
+return to declaring none, remove `public_addrs` from the node file; it takes effect at the
+daemon's next start.
 
 **The key-encryption key.** The first init generates the node's key-encryption key, which
 protects every project's secrets, and prints it as hex:

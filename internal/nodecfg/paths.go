@@ -76,3 +76,12 @@ func (p Paths) CPStanzaSealed() string { return p.at(etcDir, "cp-stanza.sealed")
 func (p Paths) EscrowAcked() string    { return p.at(etcDir, "escrow.acked") }
 func (p Paths) OffsiteCheck() string   { return p.at(etcDir, "offsite.check") }
 func (p Paths) AlertSealed() string    { return p.at(etcDir, "alert.sealed") }
+
+// The pooler's sealed secrets and its zone's certificate pair (a node with a
+// pooler label), the limit table's ruleset file, the gateway's wake socket
+// directory and the backup schedule's cache.
+func (p Paths) PoolerSecrets() string { return p.at(etcDir, "pooler") }
+func (p Paths) PoolerTLS() string     { return p.at(etcDir, "tls-pooler") }
+func (p Paths) NftLimitFile() string  { return p.at(etcDir, "nftables-limit.nft") }
+func (p Paths) WakeDir() string       { return p.at(varDir, "platform", "wake") }
+func (p Paths) ScheduleCache() string { return p.at(varDir, "platform", "schedule.json") }

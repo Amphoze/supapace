@@ -93,3 +93,42 @@ func LockedPostgresVersion() (string, error) {
 // PgMetaImage returns the pinned postgres-meta image the dashboard runs,
 // "<repository>@<index digest>". Only a node with a studio domain uses it.
 func PgMetaImage() (string, error) { return lockedRef("pgmeta") }
+
+// SupavisorImage returns the pinned connection pooler image,
+// "<repository>@<index digest>". Only a node with a pooler label uses it.
+func SupavisorImage() (string, error) { return lockedRef("supavisor") }
+
+// PostgresImages maps every cluster image of the lock to its version: the
+// "postgres" row, at LockedPostgresVersion, and each "postgres@<version>"
+// row, whose tag must carry that version. Two rows naming one image are an
+// error.
+func PostgresImages() (map[string]string, error) {
+	var lock map[string]lockEntry
+	if err := json.Unmarshal(imagesLock, &lock); err != nil {
+		return nil, fmt.Errorf("images.lock: %w", err)
+	}
+	v, err := LockedPostgresVersion()
+	if err != nil {
+		return nil, err
+	}
+	ref, _ := lockedRef("postgres") // checked by LockedPostgresVersion
+	out := map[string]string{ref: v}
+	for key, e := range lock {
+		v, ok := strings.CutPrefix(key, "postgres@")
+		if !ok {
+			continue
+		}
+		if !versionRE.MatchString(v) || !strings.HasSuffix(e.Tag, ":"+v) {
+			return nil, fmt.Errorf("images.lock: %q: the tag %q does not carry the key's version", key, e.Tag)
+		}
+		ref, err := lockedRef(key)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := out[ref]; dup {
+			return nil, fmt.Errorf("images.lock: %q: %s is named by another row", key, ref)
+		}
+		out[ref] = v
+	}
+	return out, nil
+}

@@ -399,6 +399,16 @@ func TestInit_Idempotent(t *testing.T) {
 		t.Fatal("second run changed files")
 	}
 
+	t.Run("a run that carries a label", func(t *testing.T) {
+		m := newNode(t)
+		args := []string{"--domain", "sp.test", "--dev", "--ack-escrow", "--pooler-label", "db"}
+		m.mustInit(args...)
+		before := snapshot(t, m.root)
+		if out := m.mustInit(args...); !strings.Contains(out, "nothing to change") {
+			t.Errorf("second run output %q", out)
+		}
+		unchanged(t, m, before)
+	})
 	t.Run("other domain refused", func(t *testing.T) {
 		code, _, errs := n.run("", "init", "--domain", "other.test", "--dev", "--ack-escrow")
 		if code != 1 || !strings.Contains(errs, "domain") {

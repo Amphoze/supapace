@@ -289,10 +289,10 @@ func TestLoad_OldNodeJSONGetsDefaults(t *testing.T) {
 		t.Errorf("loaded %+v\nwant Default %+v", got, c)
 	}
 	// A value that is present is kept, not replaced by the default.
-	m["backup_subnet"] = "10.212.10.0/24"
+	m["backup_subnet"] = "10.212.11.0/24"
 	set, _ := json.Marshal(m)
 	os.WriteFile(p, set, 0o600)
-	if got, err := Load(p); err != nil || got.BackupSubnet != "10.212.10.0/24" {
+	if got, err := Load(p); err != nil || got.BackupSubnet != "10.212.11.0/24" {
 		t.Errorf("explicit backup_subnet: %q, %v", got.BackupSubnet, err)
 	}
 	// A worker image other than the local one is refused, as for the gateway.
@@ -329,7 +329,7 @@ func TestValidate_BackupSubnetOverlap(t *testing.T) {
 		}
 	}
 	d := c
-	d.BackupSubnet = "10.212.10.0/24"
+	d.BackupSubnet = "10.212.11.0/24"
 	if err := d.Validate(); err != nil {
 		t.Errorf("a free subnet refused: %v", err)
 	}

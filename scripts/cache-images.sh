@@ -10,6 +10,15 @@
 # a studio domain runs ("pgmeta"), in both modes; saved under DIR/dash, which only
 # such a node loads. Without it they are neither pulled nor saved.
 #
+# SP_POOLER=1 (make images POOLER=1): likewise the connection pooler's image
+# ("supavisor"), saved under DIR/pool, which only a node with a pooler label
+# loads; pulled by its index digest in the pull-only mode.
+#
+# An archive is cached when its index.json names the lock's index digest as the
+# digest of its manifest entry and as the image's name: one saved for a single
+# platform names that platform's manifest instead, resolves by that digest only,
+# and is removed and saved again.
+#
 # A digest-only image is saved without a name and would load into the node
 # untagged, unreachable by the reference the platform uses. So the fully qualified
 # "<repository>@<digest>" is written into the archive's index.json as the
@@ -87,6 +96,7 @@ lock=$(dirname "$0")/../internal/nodecfg/images.lock
 entries=$(sed -n 's/^ *"\([a-z_]*\)": *{"tag": *"\([^"]*\)", *"digest": *"\(sha256:[0-9a-f]\{64\}\)".*/\1 \2 \3/p' "$lock" |
 	grep -Ev '^(node|s3_standin|worker_base|worker_source) ' || true)
 [[ ${SP_DASH:-} == 1 ]] || entries=$(grep -Ev '^pgmeta ' <<<"$entries" || true)
+[[ ${SP_POOLER:-} == 1 ]] || entries=$(grep -Ev '^supavisor ' <<<"$entries" || true)
 if [[ $(wc -l <<<"$entries") -lt 3 ]]; then
 	echo "cache-images: cannot read the image entries of $lock" >&2
 	exit 1
@@ -102,15 +112,18 @@ while read -r key tag digest; do
 		continue
 	fi
 	sub=$dir
-	if [[ $key == pgmeta ]]; then
-		sub=$dir/dash
-		mkdir -p "$sub"
-	fi
+	case $key in
+	pgmeta) sub=$dir/dash ;;
+	supavisor) sub=$dir/pool ;;
+	esac
+	mkdir -p "$sub"
 	tar=$sub/$key-${digest:7:12}.tar
-	if [[ -s $tar ]] && tar -xOf "$tar" index.json | grep -q "\"io.containerd.image.name\":\"[^\"]*@$digest\""; then
+	if [[ -s $tar ]] && idx=$(tar -xOf "$tar" index.json) && grep -q "\"digest\":\"$digest\"" <<<"$idx" &&
+		grep -q "\"io.containerd.image.name\":\"[^\"]*@$digest\"" <<<"$idx"; then
 		echo "cached   $ref"
 		continue
 	fi
+	rm -f "$tar"
 	# pull -q prints the reference fully qualified, as the image store keeps it.
 	name=$(docker pull -q "$ref")
 	docker save -o "$tar.tmp" "$ref"

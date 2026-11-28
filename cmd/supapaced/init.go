@@ -33,6 +33,7 @@ import (
 	"github.com/Amphoze/supapace/internal/nodecfg"
 	"github.com/Amphoze/supapace/internal/nodefs"
 	"github.com/Amphoze/supapace/internal/offsite"
+	"github.com/Amphoze/supapace/internal/poolcfg"
 	"github.com/Amphoze/supapace/internal/secrets"
 )
 
@@ -56,6 +57,8 @@ var daemonKeysDropped = []string{"userland-proxy", "icc", "live-restore"}
 type initOpts struct {
 	domain, tlsCert, tlsKey       string
 	studio, studioCert, studioKey string
+	label, poolerCert, poolerKey  string
+	publicAddrs                   []string
 	dev, noSystemd, ack           bool
 }
 
@@ -78,6 +81,13 @@ func initCmd(args []string) int {
 	fl.StringVar(&o.studio, "studio-domain", "", "the dashboard's domain; its hosts are <label>.<studio domain> (set once)")
 	fl.StringVar(&o.studioCert, "studio-tls-cert", "", "certificate chain (PEM) naming the studio domain and *.<studio domain>")
 	fl.StringVar(&o.studioKey, "studio-tls-key", "", "the studio certificate's private key (PEM)")
+	fl.StringVar(&o.label, "pooler-label", "", "the pooler's zone label; its hosts are <ref>.<label>.<domain> (set once)")
+	fl.StringVar(&o.poolerCert, "pooler-tls-cert", "", "certificate (PEM) naming *.<label>.<domain> and nothing else")
+	fl.StringVar(&o.poolerKey, "pooler-tls-key", "", "the pooler certificate's private key (PEM)")
+	fl.Func("public-addr", "an IPv4 address under which the outside sees this node, repeated for each: every address the node's names resolve to, and every source address the provider gives the node's outbound traffic. A node whose outbound address cannot be named (a pool that changes, or one shared with other customers) declares none, and offers no network restrictions. The flags given replace the stored list; a run without the flag keeps it. To return to declaring none, remove public_addrs from the node file", func(s string) error {
+		o.publicAddrs = append(o.publicAddrs, s)
+		return nil
+	})
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
@@ -93,12 +103,18 @@ func initCmd(args []string) int {
 		usage = "--studio-tls-cert and --studio-tls-key go together"
 	case o.studioCert != "" && o.studio == "":
 		usage = "--studio-tls-cert and --studio-tls-key need --studio-domain"
-	case o.dev && (o.tlsCert != "" || o.studioCert != ""):
-		usage = "--dev issues its own certificates and takes no --tls-cert, --tls-key, --studio-tls-cert or --studio-tls-key"
+	case (o.poolerCert == "") != (o.poolerKey == ""):
+		usage = "--pooler-tls-cert and --pooler-tls-key go together"
+	case o.poolerCert != "" && o.label == "":
+		usage = "--pooler-tls-cert and --pooler-tls-key need --pooler-label"
+	case o.dev && (o.tlsCert != "" || o.studioCert != "" || o.poolerCert != ""):
+		usage = "--dev issues its own certificates and takes no --tls-cert, --tls-key, --studio-tls-cert, --studio-tls-key, --pooler-tls-cert or --pooler-tls-key"
 	case !o.dev && o.tlsCert == "" && !exists(filepath.Join(paths.TLSDir(), "cert.pem")):
 		usage = "--tls-cert and --tls-key are required without --dev"
 	case !o.dev && o.studio != "" && o.studioCert == "" && !exists(filepath.Join(dashcfg.PathsFor(paths).StudioTLS(), "cert.pem")):
 		usage = "--studio-tls-cert and --studio-tls-key are required with --studio-domain without --dev"
+	case !o.dev && o.label != "" && o.poolerCert == "" && !exists(filepath.Join(paths.PoolerTLS(), "cert.pem")):
+		usage = "--pooler-tls-cert and --pooler-tls-key are required with --pooler-label without --dev"
 	}
 	if usage != "" {
 		fmt.Fprintf(stderr, "supapaced init: %s\n", usage)
@@ -156,6 +172,35 @@ func initNode(o initOpts) error {
 	if !o.dev && c.StudioDomain != "" && studioCertPEM == nil && !exists(filepath.Join(dashcfg.PathsFor(paths).StudioTLS(), "cert.pem")) {
 		return fmt.Errorf("%s holds studio domain %q and no studio certificate is stored; pass --studio-tls-cert and --studio-tls-key", paths.NodeJSON(), c.StudioDomain)
 	}
+	if err := poolerLabel(&c, o.label); err != nil {
+		return err
+	}
+	var poolerCertPEM, poolerKeyPEM []byte
+	if o.poolerCert != "" {
+		if poolerCertPEM, poolerKeyPEM, err = readPoolerPair(o.poolerCert, o.poolerKey, poolcfg.Zone(c.Domain, c.PoolerLabel)); err != nil {
+			return err
+		}
+	}
+	if !o.dev && c.PoolerLabel != "" && poolerCertPEM == nil && !exists(filepath.Join(paths.PoolerTLS(), "cert.pem")) {
+		return fmt.Errorf("%s holds pooler label %q and no pooler certificate is stored; pass --pooler-tls-cert and --pooler-tls-key", paths.NodeJSON(), c.PoolerLabel)
+	}
+	// The declared addresses are replaced as a whole: a provider can re-address a node.
+	if o.publicAddrs != nil {
+		c.PublicAddrs = o.publicAddrs
+		if err := c.Validate(); err != nil {
+			return fmt.Errorf("--public-addr: %w", err)
+		}
+	}
+	if !o.dev {
+		for _, f := range []struct {
+			name string
+			v    int
+		}{{"offsite_window_s", c.OffsiteWindowS}, {"rekey_settle_s", c.RekeySettleS}} {
+			if f.v != 0 {
+				return fmt.Errorf("%s holds %s, which only a development node (init --dev) may carry; remove it", paths.NodeJSON(), f.name)
+			}
+		}
+	}
 	caPath := filepath.Join(paths.CADir(), "ca.pem")
 	if o.dev && c.StudioDomain != "" && exists(caPath) {
 		ca, _, err := loadCA(caPath, filepath.Join(paths.CADir(), "ca.key"))
@@ -201,7 +246,7 @@ func initNode(o initOpts) error {
 		leftovers[i] = filepath.Join(filepath.Dir(p), "."+filepath.Base(p)+".tmp-*")
 	}
 	studioDir := dashcfg.PathsFor(paths).StudioTLS()
-	for _, d := range []string{etc, paths.TLSDir(), paths.CADir(), studioDir} {
+	for _, d := range []string{etc, paths.TLSDir(), paths.CADir(), studioDir, paths.PoolerTLS()} {
 		leftovers = append(leftovers, filepath.Join(d, ".*.tmp-*"))
 	}
 	w.removeLeftovers(leftovers...)
@@ -238,10 +283,22 @@ func initNode(o initOpts) error {
 			w.etcFile(filepath.Join(studioDir, "cert.pem"), studioCertPEM, 0o600)
 		}
 	}
+	// Without a pooler label nothing of the pooler is written.
+	if c.PoolerLabel != "" {
+		w.dir(paths.PoolerTLS())
+		if poolerCertPEM != nil {
+			w.etcFile(filepath.Join(paths.PoolerTLS(), "key.pem"), poolerKeyPEM, 0o600)
+			w.etcFile(filepath.Join(paths.PoolerTLS(), "cert.pem"), poolerCertPEM, 0o600)
+		}
+	}
 	if o.dev && w.err == nil {
-		base, studio := devCertDue(paths.TLSDir()), c.StudioDomain != "" && devCertDue(studioDir)
-		if base || studio {
-			w.devTLS(c, base, studio)
+		// A CA issued now vouches for no pair in place: every pair is issued again.
+		newCA := !exists(caPath)
+		base := newCA || devCertDue(paths.TLSDir())
+		studio := c.StudioDomain != "" && (newCA || devCertDue(studioDir))
+		pooler := c.PoolerLabel != "" && (newCA || devCertDue(paths.PoolerTLS()))
+		if base || studio || pooler {
+			w.devTLS(c, base, studio, pooler)
 		}
 	}
 	if w.err != nil {
@@ -305,6 +362,51 @@ func studioDomain(c *nodecfg.Config, studio string) error {
 		return fmt.Errorf("this node cannot have a studio domain: %w", err)
 	}
 	return nil
+}
+
+// poolerLabel sets the pooler label of c from the flag, or keeps the one in
+// place: it is set once, at a first init or on a node that has none, and never
+// changed. A node with a label must be one poolcfg.For accepts (addresses,
+// ports, uids), or the pooler could not run on it; that is refused here,
+// before anything is written.
+func poolerLabel(c *nodecfg.Config, label string) error {
+	if label != "" {
+		if c.PoolerLabel != "" && c.PoolerLabel != label {
+			return fmt.Errorf("%s holds pooler label %q; init does not change it", paths.NodeJSON(), c.PoolerLabel)
+		}
+		c.PoolerLabel = label
+		if err := c.Validate(); err != nil {
+			return fmt.Errorf("--pooler-label: %w", err)
+		}
+	}
+	if c.PoolerLabel == "" {
+		return nil
+	}
+	if _, err := poolcfg.For(*c); err != nil {
+		return fmt.Errorf("this node cannot have a pooler: %w", err)
+	}
+	return nil
+}
+
+// readPoolerPair reads the pooler zone's certificate and key and requires
+// them to match, to cover a pooler host of zone, and to name the zone's
+// wildcard and nothing else.
+func readPoolerPair(certFile, keyFile, zone string) (certPEM, keyPEM []byte, err error) {
+	if certPEM, err = readRegular(certFile); err != nil {
+		return nil, nil, err
+	}
+	if keyPEM, err = readRegular(keyFile); err != nil {
+		return nil, nil, err
+	}
+	if err := checkPair(certPEM, keyPEM, "--pooler-tls", strings.Repeat("a", 20)+"."+zone); err != nil {
+		return nil, nil, err
+	}
+	pair, _ := tls.X509KeyPair(certPEM, keyPEM) // checked by checkPair
+	l := pair.Leaf
+	if !slices.Equal(l.DNSNames, []string{"*." + zone}) || len(l.IPAddresses)+len(l.EmailAddresses)+len(l.URIs) != 0 {
+		return nil, nil, fmt.Errorf("--pooler-tls-cert must name *.%s and nothing else", zone)
+	}
+	return certPEM, keyPEM, nil
 }
 
 // checkRange refuses a node whose passwd, group, subuid or subgid already use
@@ -543,9 +645,10 @@ func (w *writer) file(path string, data []byte, mode os.FileMode) {
 // devTLS issues the development CA (unless one is in place), constrained to
 // the node's domain and its studio domain, and with it the server pair for
 // *.<domain> when base is set and the studio pair for the studio domain and
-// its wildcard when studio is set. Each key is written before its
-// certificate, so a certificate on disk always has its key.
-func (w *writer) devTLS(c nodecfg.Config, base, studio bool) {
+// its wildcard when studio is set, and the pooler pair for the pooler zone's
+// wildcard (under the node's domain) when pooler is set. Each key is written
+// before its certificate, so a certificate on disk always has its key.
+func (w *writer) devTLS(c nodecfg.Config, base, studio, pooler bool) {
 	w.dir(paths.CADir())
 	if w.err != nil {
 		return
@@ -593,6 +696,15 @@ func (w *writer) devTLS(c nodecfg.Config, base, studio bool) {
 		w.devPair(dashcfg.PathsFor(paths).StudioTLS(), ca, caKey, &x509.Certificate{
 			Subject:     pkix.Name{CommonName: "*." + c.StudioDomain},
 			DNSNames:    []string{c.StudioDomain, "*." + c.StudioDomain},
+			KeyUsage:    x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		})
+	}
+	if pooler {
+		zone := poolcfg.Zone(c.Domain, c.PoolerLabel)
+		w.devPair(paths.PoolerTLS(), ca, caKey, &x509.Certificate{
+			Subject:     pkix.Name{CommonName: "*." + zone},
+			DNSNames:    []string{"*." + zone},
 			KeyUsage:    x509.KeyUsageDigitalSignature,
 			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		})

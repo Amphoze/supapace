@@ -650,7 +650,7 @@ func TestRecover_AnExistingNodeJSONIsNamedAndOnlyItsUIDRangeTaken(t *testing.T) 
 	r := newRecNode(t)
 	c := nodecfg.Default("sp.test")
 	c.MemAllocMB, c.PidsAlloc, c.Uplinks = 1<<20, 1<<20, nil
-	c.UIDBase, c.BackupSubnet = 1700000, "10.212.10.0/24"
+	c.UIDBase, c.BackupSubnet = 1700000, "10.212.11.0/24"
 	b, _ := json.Marshal(c)
 	r.write("etc/supapace/node.json", string(b), 0o600)
 	os.Chmod(r.etc(), 0o700)

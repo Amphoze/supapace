@@ -6645,3 +6645,148 @@ Known limits:
   hand.
 - The public resolver's leg of the hostile-cluster node proof runs only when
   `SUPAPACE_PUBLIC_RESOLVER` names one in the proof's environment.
+
+### 2026-11-28 — A pooler node: node file, init, image lock and cache, harness
+
+A node has a pooler when its node file names a pooler label. This entry is what the node file,
+`supapaced init`, the image lock, the image cache and the test harness provide for such a node.
+No container, ruleset or daemon wiring is part of it: a labelled node runs as any other until
+those arrive.
+
+Node file (`internal/nodecfg`) — seven members, all `omitempty`; a file without them is written
+byte for byte as before:
+- `pooler_label` (`PoolerLabel`): the pooler zone is `<label>.<domain>`, a project's pooler host
+  `<ref>.<label>.<domain>`. Empty: no pooler.
+- `public_addrs` (`PublicAddrs`): every IPv4 address under which the outside sees the node — what
+  its names resolve to, and every source address the provider gives its outbound traffic.
+- `egress_subnet` (`EgressSubnet`): the outbound network's subnet. Read it through
+  `Config.Egress()`, which returns the member or `10.212.10.0/24`; never read the member.
+  `EgressBridge` is `spe0`, `EgressNetwork` is `tenant-egress`.
+- `proxy_max_conns`, `rest_idle_stop_s`, `offsite_window_s`, `rekey_settle_s`: figures their users
+  resolve; 0 is "the built-in value" (`rest_idle_stop_s` 0: never stopped for idleness).
+- `Validate` — and so `Load`, every daemon start and every `init` — refuses, with joined plain
+  errors that begin with the member's name and come in one fixed order:
+  - a label that is not one DNS label of `[a-z0-9-]` (1 to 63 characters, no hyphen at either
+    end), one with a project ref's shape (20 of `[a-z0-9]`), or one under which
+    `<ref>.<label>.<domain>` passes 253 characters;
+  - a public address that is not dotted IPv4 in canonical form, or is unspecified, broadcast,
+    loopback, link-local or multicast, or lies in `0.0.0.0/8` or the reserved block
+    `240.0.0.0/4`, or repeats, or lies inside a network of the node (project block, platform,
+    ingress, Docker pool, backup, egress); more than 32 of them;
+  - an egress subnet, as `Egress()` resolves it, that is not a masked IPv4 network or overlaps
+    another network of the node;
+  - `rest_idle_stop_s` outside 0 to 86400; a negative `proxy_max_conns`, `offsite_window_s` or
+    `rekey_settle_s` (named in that order).
+- The label's two patterns are written twice: in `Validate` and in `poolcfg.ValidLabel`
+  (`nodecfg` cannot import `poolcfg`); a test holds them equal. Change both together. The 253
+  rule is in `Validate` only.
+- Upgrade: the default egress subnet now counts among the node's networks. A node file whose
+  networks were moved by hand onto `10.212.10.0/24` no longer loads; `init` never wrote one.
+- `Paths`: `PoolerSecrets()` `/etc/supapace/pooler`, `PoolerTLS()` `/etc/supapace/tls-pooler`,
+  `NftLimitFile()` `/etc/supapace/nftables-limit.nft`, `WakeDir()`
+  `/var/lib/supapace/platform/wake`, `ScheduleCache()`
+  `/var/lib/supapace/platform/schedule.json`. Paths only: of these `init` creates `tls-pooler`
+  alone (root 0700; `cert.pem` and `key.pem` root 0600), on a node with a label.
+
+Images (`internal/nodecfg/images.go`, `images.lock`):
+- The lock row `supavisor` holds the tag, the index digest and both platform digests; a test
+  holds it equal to the pooler lab's pins file.
+- `SupavisorImage()`: `<repository>@<index digest>`; an error when the row or its index digest is
+  missing. Never a platform digest.
+- `PostgresImages()`: image reference → version, from the row `postgres` and every row
+  `postgres@<version>`. Errors: a version that is not dotted digits, a tag that does not end in
+  `:<version>`, a row without its index digest, two rows naming one image. The lock has no such
+  row yet, and neither the cache script nor the Makefile reads a key with `@` in it: whoever
+  adds the first one extends both.
+
+`poolcfg.ValidAllowList` refuses the egress subnet as it refuses the node's other networks, and
+a network of the node that does not parse is now an error naming it (it was skipped before).
+
+`supapaced init`:
+- `--pooler-label L`: set once — at the first init, or at a later one of a node that has none.
+  Another label is refused (exit 1, nothing written); without the flag the stored label stays.
+  A labelled node must pass `poolcfg.For` at every init.
+- `--pooler-tls-cert F --pooler-tls-key F`: required with the label unless `--dev` is given or a
+  pair is stored; refused with `--dev`. The first certificate of the file must match the key, be
+  valid now, allow server authentication, and carry the DNS name `*.<label>.<domain>` and no
+  other DNS, address, e-mail or URI name (compared as written, lower case). Its common name is
+  not looked at. Further certificates of the file are stored as given. Regular files of at most
+  1 MiB; a link is followed.
+- `--dev` issues the pair from the node's CA; the zone lies under the base domain, which the
+  CA's name constraint covers. A development pair — the base one, the studio's, the pooler's —
+  is issued again when it cannot be loaded or expires within 30 days, and all of them are
+  whenever the CA itself is issued (none was in place): a pair in place is never left under a
+  CA that is gone. With the CA in place and the pairs valid a run writes nothing. An operator's
+  node has no CA and is never issued a pair; `--dev` cannot be added to it.
+- `--public-addr A`, once for each: the flags of one run replace the stored list; a run without
+  the flag keeps it; nothing else of the node file moves. To return to declaring none, remove
+  `public_addrs` from the node file (the help and the installation document say so). The daemon
+  reads the list at its start.
+- A node file that carries `offsite_window_s` or `rekey_settle_s` is refused without `--dev`;
+  with both, the first is the one named.
+- The node file, with the label, is written before the pair. An interrupted run leaves a
+  labelled node without its pair: the next init asks for it (operator's node) or issues it
+  (development node). Whoever starts the pooler treats a missing pair as a failing check.
+
+`scripts/install-node.sh` passes the new flags to `init`, writes
+`/etc/modules-load.d/supapace.conf` (`nf_conntrack_bridge`, `nft_connlimit`; 0644) and, when
+either is not under `/sys/module`, prints `modprobe -a nf_conntrack_bridge nft_connlimit` for the
+operator to run. It loads no module. `node-init.sh` writes the same file in a test node and
+loads none.
+
+Image cache (`scripts/cache-images.sh`):
+- `SP_POOLER=1` (`make … POOLER=1` exports it): the row `supavisor` is saved, as every row is,
+  into `DIR/pool/supavisor-<12 hex>.tar`, or pulled by its index digest with `--pull-only`.
+  Without the variable the row is neither pulled nor saved.
+- "Cached" means, for every row: the archive's `index.json` names the lock's index digest as a
+  manifest entry's digest and in the image's name. Anything else at the archive's path is
+  removed before the pull and saved again; when the pull fails the path stays empty.
+- The pooler lab's own archive is saved for one platform and fails that check, so the lab keeps
+  it under `pool/lab-supavisor-<12 hex>-<arch>.tar`, which no node loads. A checkout from before
+  this change still uses the pooler's name for it: in a cache shared with such a checkout each
+  side finds the other's file unusable. One cache for each checkout until all carry the change.
+
+Harness (`Makefile`, `test/harness/node/node-init.sh`):
+- `make images POOLER=1`: the pooler's row, and the wire proxy's image built and saved as
+  `dash/supapace-pgcap.tar`, as `DASH=1` does (the save line makes `dash/` itself).
+- `make node-up POOLER=1` and `make node-bare POOLER=1`: 6 GiB (8 with `DASH=1`; `NODE_MEM`
+  overrides); the node container gets `POOLER=1` and `SP_POOLER_LABEL=db`; `node-init.sh` loads
+  `/images/pool/*.tar` except `lab-*`, and `dash/supapace-pgcap.tar`, and in full mode gives
+  `init` `--pooler-label db` when the binary knows the flag. The zone of a test node is
+  `db.sp.test`.
+- A node started with `POOLER=1` from a cache whose `pool/` holds no archive but the lab's stops
+  before it loads any image, with one line naming `make images POOLER=1`. Without `POOLER=1`
+  nothing looks at `pool/`.
+- The outside lab, made once the node is up: the network `$(NODE)-out` — internal, without an
+  address of the host — on `OUT_SUBNET`, by default `198.51.100.<16·(S3_SLOT mod 15 + 1)>/28`;
+  the node at its base + 8; the container `$(NODE)-client` (the control-plane image, sleeping,
+  `NET_ADMIN` its one capability) at base + 9; the client's address in `/var/lib/sp/outside` on
+  the node. Two nodes whose slots agree mod 15 collide: the second `node-up` stops at the
+  network with a line naming `OUT_SUBNET`, its node already running — `make node-down`, then
+  `node-up` with another `OUT_SUBNET`.
+- `make node-down` always removes `$(NODE)-client` and `$(NODE)-out`, by those exact names and
+  without looking at a label: never name a node `<another node>-out` or `<another node>-client`.
+- `make reach` and `make reach-dash` pass `SUPAPACE_POOLER=1` when the node file has a label and
+  `SUPAPACE_OUTSIDE=1` when `/var/lib/sp/outside` exists; the other node targets pass neither.
+- The suite passes on a pooler node: its one test that took a node without a studio domain for
+  a 4 GiB node now takes a pooler node for a 6 GiB one.
+- A harness script must start with its interpreter line: a line in front of it passes `sh -n`
+  and stops the node at its start. A test holds the first line of each.
+
+Known limits:
+- Nothing in the node can run a command in the outside client: the client is a container of the
+  host's Docker that only sleeps, and the node knows its address alone.
+- `init` takes no lock: two runs at once with different labels can both succeed and leave a
+  pair that is not the stored label's. One run at a time.
+- A development CA issued now replaces every pair in place — also the stored copy of an
+  operator's pair, on a node whose node file was removed by hand before `init --dev`.
+- The stop looks for the pooler's archive alone: a cache that has it and lacks
+  `dash/supapace-pgcap.tar` gives a pooler node without the wire proxy's image, silently.
+  `make images POOLER=1` always writes both.
+- The "cached" check reads the digest and the name anywhere in `index.json`, not in one
+  manifest entry: an archive made by hand with the two in different entries is kept.
+- `Validate` puts no bound on the size or kind of the egress subnet beyond "an IPv4 network that
+  overlaps no other".
+- On a node with a studio domain the row `proxy` fails until the daemon ensures the proxy, so
+  `supapace node check` exits 1 there, with or without `POOLER=1`.
+- The suite's reset removes nothing of the outside lab; there is nothing of it in the node yet.

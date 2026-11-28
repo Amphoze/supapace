@@ -1472,7 +1472,7 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 		// project fits (S4 below); S3's slice stays held.
 		// A 4 GiB test node holds four projects of 768 MiB (its ceiling is
 		// three quarters of its memory) and needs no scratch project; the
-		// 6 GiB node of a dashboard holds six. A host install has the
+		// 6 GiB node of a dashboard or of a pooler holds six. A host install has the
 		// machine's own memory, so there the refusal is not asserted.
 		if os.Getenv("SUPAPACE_HOST") == "1" {
 			t.Log("host install: four projects do not fill this machine; the full-node refusal is asserted in the test node")
@@ -1490,7 +1490,7 @@ func TestReach14_SagaAndIdentity(t *testing.T) {
 				waitDone(t, "a create below the node's admission ceiling", id)
 				fill = append(fill, P.Ref)
 			}
-			if nodeConf(t).StudioDomain == "" && len(fill) != 0 {
+			if c := nodeConf(t); c.StudioDomain == "" && c.PoolerLabel == "" && len(fill) != 0 {
 				t.Fatalf("a 4 GiB test node admits %d more projects than A, B, S2 and S3", len(fill))
 			}
 			rows := len(listPlacements(t))
